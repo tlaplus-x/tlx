@@ -33,6 +33,9 @@ pub(crate) struct Args {
     /// counterexamples, but its counts, depth and counterexample may differ
     /// from TLC's. `-tlc` applies none of them.
     pub(crate) tlc: bool,
+    /// Opt-in exact optimization of the supported configured HIR.
+    pub(crate) optimize: bool,
+    pub(crate) optimization_rules: Vec<String>,
     /// `-noautosymmetry`: the default mode applies no symmetry of its own.
     pub(crate) noautosymmetry: bool,
     pub(crate) checksymmetry: bool,
@@ -260,6 +263,8 @@ pub(crate) fn parse_args() -> Args {
         compile: false,
         tier_note: None,
         tlc: false,
+        optimize: false,
+        optimization_rules: Vec::new(),
         noautosymmetry: false,
         checksymmetry: false,
         suggest: false,
@@ -319,6 +324,7 @@ pub(crate) fn parse_args() -> Args {
             "-compile" => a.tier = TierChoice::Compile,
             "-interp" => a.tier = TierChoice::Interp,
             "-tlc" => a.tlc = true,
+            "-optimize" => a.optimize = true,
             "-noautosymmetry" => a.noautosymmetry = true,
             "-checksymmetry" => a.checksymmetry = true,
             "-suggest" => a.suggest = true,

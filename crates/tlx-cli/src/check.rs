@@ -33,8 +33,8 @@ pub(crate) fn check(started: Instant) -> ExitCode {
 }
 
 fn check_once(started: Instant, noautosymmetry: bool, restart: &mut bool) -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("abstract") {
-        return crate::abstraction::run();
+    if std::env::args().nth(1).as_deref() == Some("optimize") {
+        return crate::optimization::run();
     }
     if std::env::args().nth(1).as_deref() == Some("parse") {
         return parse_only();
@@ -91,6 +91,19 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
             return Err(ExitCode::from(2));
         }
     }
+    if a.optimize
+        && !a.tlc
+        && (a.simulate.is_some()
+            || a.checksymmetry
+            || a.coverage.is_some()
+            || a.recover.is_some()
+            || a.checkpoint.is_some_and(|n| n > 0)
+            || ck_env.0.is_some()
+            || ck_env.1.is_some())
+    {
+        eprintln!("tlx: -optimize supports exhaustive checking without simulation, symmetry diagnostics, coverage or checkpoints");
+        return Err(ExitCode::from(2));
+    }
     let ck_interval = a.checkpoint_interval(ck_env.0);
     let recovery = recovery::prepare(&mut a)?;
     // (As TLC's default metadir: next to the specification.)
@@ -114,7 +127,8 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
     if out::tool() {
         out::info(code::TLC_SANY_START, "Starting SANY...");
     }
-    let mut model = stats::timed("front end (parse, sema, cfg)", || load::load_model(&a, seed.or(a.seed).unwrap_or(0)))?;
+    let model_seed = seed.or(a.seed).unwrap_or(0);
+    let mut model = stats::timed("front end (parse, sema, cfg)", || load::load_model(&mut a, model_seed))?;
     if out::tool() {
         out::info(code::TLC_SANY_END, "SANY finished.");
     }

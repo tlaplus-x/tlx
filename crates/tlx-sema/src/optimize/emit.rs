@@ -7,18 +7,18 @@ use super::Artifact;
 
 pub(super) fn emit(model: &Model, remarks: &[String]) -> Artifact {
     let mut module = String::from(
-        "---- MODULE Abstract ----\n\\* Generated mathematical abstraction; this file is not a safety verdict.\nEXTENDS Naturals\n",
+        "---- MODULE Optimized ----\n\\* Generated mathematical abstraction; this file is not a safety verdict.\nEXTENDS Naturals\n",
     );
     let variables = (0..model.variables.len()).map(|i| format!("v{i}")).collect::<Vec<_>>().join(", ");
     writeln!(module, "VARIABLES {variables}").unwrap();
     let mut report = String::from(
-        "Finite abstraction generated; model checking has NOT been performed.\n\
+        "Finite optimization generated; model checking has NOT been performed.\n\
          Scope: configured scalar natural counters and named state invariants.\n\
          Semantics: mathematical naturals, not concrete backend overflow behavior.\n\
          Trust: HIR frontend, restricted lowering, Rust rule checker and TLA+ emitter.\n\
          No Lean/kernel certificate, cached proof authorization, or configuration-family claim.\n\
          Generated traces contain abstract representatives, not concrete counter values.\n\
-         Re-run abstraction after any source, configuration, property or tool change.\n",
+         Re-run optimization after any source, configuration, property or tool change.\n",
     );
     for remark in remarks {
         writeln!(report, "Pass: {remark}").unwrap();

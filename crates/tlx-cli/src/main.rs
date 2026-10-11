@@ -26,7 +26,6 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(60);
 /// The interval with `-progress`.
 const PROGRESS_EVERY_SHORT: Duration = Duration::from_secs(10);
 
-mod abstraction;
 mod args;
 mod autosym;
 mod check;
@@ -34,6 +33,7 @@ mod coverage;
 mod dump_trace;
 mod live;
 mod load;
+mod optimization;
 mod out;
 mod process;
 mod recovery;

@@ -1,4 +1,4 @@
----- MODULE Abstract ----
+---- MODULE Optimized ----
 \* Generated mathematical abstraction; this file is not a safety verdict.
 EXTENDS Naturals
 VARIABLES v0, v1

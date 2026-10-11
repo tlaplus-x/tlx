@@ -1,4 +1,4 @@
-# Finite-abstraction TLC fixtures
+# Optimization TLC fixtures
 
 These bounded models cover constant propagation plus dead-action cleanup, empty next relations
 with safe and failing initial invariants, a successor violation, and a reset whose abstraction
@@ -12,8 +12,8 @@ binary to test (Java and `third_party/tla2tools.jar` must be installed):
 
 ```sh
 cargo build --profile test-release -p tlx-cli -j 3
-python3 crates/tlx-cli/tests/fixtures/abstraction/refresh.py target/test-release/tlx
-cargo test --profile test-release -p tlx-cli --test abstraction -j 3
+python3 crates/tlx-cli/tests/fixtures/optimization/refresh.py target/test-release/tlx
+cargo test --profile test-release -p tlx-cli --test optimization -j 3
 ```
 
 The refresher uses the shared guarded process runner and output normalizer, runs TLC with one

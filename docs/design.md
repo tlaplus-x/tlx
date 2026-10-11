@@ -22,9 +22,9 @@ Where each topic is documented (every topic has one home):
 | Undeclared symmetry in the default mode: what tlx proves, applies and names | [usage.md](usage.md) sections 6.2–6.3 (user-facing contract); [reductions.md](reductions.md) section 2 (proof, guards and bounds); §2.6 places the phase in a run |
 | The value store: `Ref` slots behind `TLX_VALUE_STORE` (experimental, default off) | [value-store.md](value-store.md) |
 | Reductions and the guarantee contract of the default mode | [reductions.md](reductions.md) |
-| Experimental finite abstraction, verification IR and rule-based optimization passes | [abstraction.md](abstraction.md) |
+| Rule-based optimization, verification IR and pass contracts | [optimization.md](optimization.md) |
 
-The experimental finite-abstraction frontend is documented separately from execution optimizations.
+The rule-based optimizer is documented separately from execution-tier lowering.
 Two other documents have an experimental subject: the value store is off by default and incomplete
 (no reclamation, no checkpoint format), and automatic symmetry is the only reduction of the default
 mode that exists. Their **design records** — the store's roadmap (stable state root slots, complete
@@ -47,7 +47,7 @@ names the pinned revision that holds them (DOC-03).
 ### 1.2 Non-goals
 
 - General proof checking (TLAPS) and symbolic checking (Apalache style). The separate
-  [finite-abstraction frontend](abstraction.md) checks instances of restricted rewrite rules
+  [rule-based optimizer](optimization.md) checks instances of restricted rewrite rules
   in Rust; it does not implement a proof kernel or transfer model-checking verdicts.
 - Distributed (multi-machine) checking; tlx is single machine, multi-core.
 - A Java or SANY dependency at run time. The syntax layer is tree-sitter-tlaplus, the semantic layer is written in Rust. SANY and TLC are test oracles only.
@@ -100,11 +100,13 @@ The key point: **the runtime is generic over the `Model` trait** (§7.1). Both m
 
 ### 2.1 Crate map and dependency edges
 
-The explicit finite-abstraction frontend is owned by `tlx-sema::optimize`. It consumes resolved
+The rule-based optimizer is owned by `tlx-sema::optimize`. It consumes resolved
 HIR and a restricted bound configuration, lowers to a mathematical verification IR, runs
-validated optimization passes, and emits a standalone model. `tlx-cli::abstraction` owns its
-artifact command. This pipeline is separate from the execution tiers below; see
-[abstraction.md](abstraction.md) for the rule interface and preservation contract.
+validated optimization passes, and either writes exact rewrites back into HIR for opt-in checking
+or emits a standalone finite model. `tlx-cli::optimization` owns the artifact command; `load`
+applies the exact pipeline before constructing an interpreter. TLC compatibility mode bypasses
+this pipeline. It is separate from execution-tier lowering below; see
+[optimization.md](optimization.md) for the rule interface and preservation contract.
 
 tlx is a Cargo workspace of twelve crates: eleven that build a `tlx` binary or library, plus the
 dev-only `tlx-testkit`.

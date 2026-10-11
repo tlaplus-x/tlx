@@ -33,6 +33,7 @@ for argument or file errors. Documentation checks use this command for complete 
 
 | Option | Default | Effect | Relation to TLC | Audience |
 |---|---|---|---|---|
+| `-optimize` | off | Run validated constant-state propagation, predicate simplification and dead-action elimination before checking; retains concrete states and original invariant names. Restricted scalar-natural INIT/NEXT/INVARIANT fragment with CHECK_DEADLOCK FALSE; unsupported input returns exit 2. Requires exhaustive checking without simulation, symmetry diagnostics, coverage or checkpoint/recovery (including checkpoint environment settings). Counter saturation is export-only; see [optimization.md](optimization.md). | Disabled by `-tlc`, regardless of argument order; original checking proceeds | User |
 | `-checksymmetry` | off | tlx only: bounded diagnostic of the declared `SYMMETRY`, on one interpreter worker: init membership, successor sets, each invariant, VIEW equivariance and each state/action constraint, under generator permutations; no ordinary model checking. Exit 0 = no violation within bounds, 1 = witness, 2 = incomplete or error. Incompatible with simulation, recovery and dumps; details in [usage.md](usage.md) section 6.1 | tlx only | User |
 | `-suggest` | off | With `-checksymmetry`: check every set of model values the cfg binds to a constant, proving tlx's symmetry analysis statically and bounded-checking the proven group (a witness is an internal error, exit 101) or all permutations of a set it does not prove, then print a `SYMMETRY` definition to paste ([usage.md](usage.md) section 6.2). Requires `-checksymmetry` | tlx only | User |
 | `-symmetrystates N` | 1000 | Maximum stored/checked BFS states in symmetry checking; positive. Initial enumeration stops when an additional distinct initial state is found | tlx only | User |
@@ -77,26 +78,26 @@ unknown options (`tlx: unknown option ...`, exit code 2); see [features.md](feat
 Argument errors (a missing or invalid value, an unknown option, several specs) print the reason and
 the usage line and exit with 2.
 
-## Finite abstraction command
+## Optimization command
 
-`tlx abstract Spec.tla -output DIR [-config FILE] [-I DIR]...` generates a finite
+`tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...` generates a finite
 mathematical abstraction using the rule-based verification optimizer. It is separate from
 `tlx check`; generation is not a safety verdict. The supported fragment, pass extension
-interface, artifacts and trust boundary are described in [abstraction.md](abstraction.md).
+interface, artifacts and trust boundary are described in [optimization.md](optimization.md).
 
 | Option | Meaning |
 |---|---|
-| `-output DIR` | Required new destination directory. Emits `Abstract.tla`, `Abstract.cfg` and `abstraction.txt`; refuses an existing path. The parent directory must exist. |
+| `-output DIR` | Required new destination directory. Emits `Optimized.tla`, `Optimized.cfg` and `optimization.txt`; refuses an existing path. The parent directory must exist. |
 | `-config FILE` | Configuration file, defaulting to the specification path with `.cfg` extension. An explicit path is resolved against the working directory; embedded `.tla` configuration sections are not supported by this command. |
 | `-I DIR` | Additional module search directory, repeatable. The normal `TLX_PATH` and `TLX_CLASSPATH` search paths also apply. |
-| `-h`, `--help` | Print abstraction-specific help. |
+| `-h`, `--help` | Print optimization-command help. |
 
 The input configuration must explicitly name INIT, NEXT and at least one INVARIANT, and
 set CHECK_DEADLOCK FALSE. Unsupported constructs or options return exit 2 without a safety
 claim. Successful generation returns exit 0, which means only that artifacts were emitted.
 I/O failures also return exit 2 and can leave an incomplete destination.
 
-For example, after generation, `tlx check DIR/Abstract.tla -interp` checks the generated model.
+For example, after generation, `tlx check DIR/Optimized.tla -interp` checks the generated model.
 Its verdict, counts and trace describe that model. The command does not automatically transfer
 results or validate a concrete trace for the original specification.
 

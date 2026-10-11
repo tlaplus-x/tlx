@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tlx_base::knobs;
 
 /// The first line of the usage message.
-pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
+pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
 
 /// `tlx check -h`.
 const HELP_OPTIONS: &str = "\
@@ -16,8 +16,8 @@ tlx: a compiled TLA+ model checker with TLC-compatible options and output.
 
 usage: tlx check Spec.tla [options]
        tlx parse Spec.tla   (syntax only; no module resolution or model checking)
-       tlx abstract Spec.tla -output DIR [-config FILE] [-I DIR]...
-                           (emit a finite abstraction; see abstract -h)
+       tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...
+                           (emit a finite optimization; see optimize -h)
 
 Options shared with TLC (same names and meaning):
   -config FILE         the configuration file (default: Spec.cfg; a relative
@@ -113,6 +113,7 @@ tlx options:
                        a symmetry of sets of model values that tlx proves
                        (safety checks only; the Optimizations line names
                        it)
+  -optimize            run exact rule-based optimization (disabled by -tlc)
   -noautosymmetry      apply no symmetry tlx proves (default mode)
   -stats [json[=FILE]] report where the time and work went (phases, search
                        work, worker utilization, native/IR/interpreter runs

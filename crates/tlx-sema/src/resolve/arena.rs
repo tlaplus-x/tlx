@@ -1,6 +1,18 @@
 use super::*;
 
 impl Program {
+    /// Commit validated operator rewrites before any evaluation/compilation
+    /// caches exist. Rebuild expression IDs and invalidate all level summaries.
+    pub(crate) fn replace_operator_bodies(&mut self, bodies: impl IntoIterator<Item = (DefId, Expr)>) {
+        for (id, body) in bodies {
+            self.defs[id.idx()].kind = DefKind::Op(body);
+            self.defs[id.idx()].builtin = None;
+        }
+        self.level_memo.fill(None);
+        self.exprs.clear();
+        self.index_exprs();
+    }
+
     pub fn arena_expr(&self, id: ExprId) -> &Expr {
         &self.exprs[id.idx()]
     }

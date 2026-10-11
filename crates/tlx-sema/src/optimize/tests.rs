@@ -5,7 +5,7 @@ use super::passes::{Evidence, Pass, Pipeline, Proposal};
 use super::{lower, verify};
 
 pub(super) fn model() -> Model {
-    let dir = tlx_testkit::TempDir::new("abstraction-validator");
+    let dir = tlx_testkit::TempDir::new("optimization-validator");
     let path = dir.write("M.tla", "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 10\nNext == c' = c + 1 \\/ c' = 0 \\/ UNCHANGED c\nInv == c <= 3\n====\n");
     let mut program = crate::Program::load(&path, &[]).unwrap();
     let cfg = tlx_front::cfg::parse_cfg("INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n").unwrap();

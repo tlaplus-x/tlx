@@ -34,11 +34,15 @@ defect: document the evidence and the intentional difference in `docs/compat.md`
 ## Making changes
 
 - Keep changes focused. Preserve unrelated edits in the working tree.
+- Avoid overengineering. Use the simplest design that meets current requirements;
+  add abstractions, metadata, or extension points only when concrete use cases need them.
 - After every implementation, review your own changes before reporting completion. Check
   correctness, architecture, failure paths, and test coverage; fix issues found, rerun the
   affected checks, and report any unresolved findings.
 - Write code, comments, commit messages, and public documentation in English. Follow the
-  [commit convention](CONTRIBUTING.md#code-and-commits).
+  [commit convention](CONTRIBUTING.md#code-and-commits). Limit commit subjects to 75
+  characters and wrap commit bodies at 75 columns; keep URLs and structured trailers
+  intact when wrapping would break them.
 - Add a focused regression test for a behavior change. Prefer a small specification
   or a Rust unit test that exercises the observable behavior.
 - Document CLI options and `TLX_*` environment variables in

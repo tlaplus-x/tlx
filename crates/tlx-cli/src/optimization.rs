@@ -1,5 +1,5 @@
 //! Artifact-only verification optimization driver. Ordinary checking and its
-//! verdict/reporting paths never consume an abstraction implicitly.
+//! verdict/reporting paths never consume an optimization implicitly.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -7,8 +7,8 @@ use std::process::ExitCode;
 
 use tlx_sema::{optimize, Program};
 
-const HELP: &str = "usage: tlx abstract Spec.tla -output DIR [-config FILE] [-I DIR]...\n\
-    Emit Abstract.tla, Abstract.cfg and abstraction.txt into a new directory.\n\
+const HELP: &str = "usage: tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...\n\
+    Emit Optimized.tla, Optimized.cfg and optimization.txt into a new directory.\n\
     Supports scalar natural counters, INIT/NEXT and state INVARIANTs.\n\
     Requires CHECK_DEADLOCK FALSE; rejects unsupported observations.\n\
     -config FILE  configuration path (default: Spec.cfg)\n\
@@ -21,7 +21,7 @@ pub(crate) fn run() -> ExitCode {
     match generate() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("tlx abstract: {message}");
+            eprintln!("tlx optimize: {message}");
             ExitCode::from(2)
         }
     }
@@ -66,7 +66,7 @@ fn generate() -> Result<(), String> {
     includes.extend(env.path);
     let mut program = Program::load_with_late(&spec, &includes, &env.classpath)
         .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))?;
-    let mut artifact = optimize::abstract_model(&mut program, &cfg).map_err(|error| match error.span {
+    let mut artifact = optimize::optimize_model(&mut program, &cfg).map_err(|error| match error.span {
         Some(span) => format!("{}:{}:{}: {}", program.file(span.file).path.display(), span.line, span.col, error.message),
         None => error.message,
     })?;
@@ -77,10 +77,11 @@ fn generate() -> Result<(), String> {
     // All semantic work finishes before creating the destination. A partial
     // I/O failure is an error, and the explanatory report is written last.
     std::fs::create_dir(&output).map_err(|e| format!("cannot create new output directory {}: {e}", output.display()))?;
-    for (name, contents) in [("Abstract.tla", artifact.module), ("Abstract.cfg", artifact.config), ("abstraction.txt", artifact.report)] {
+    for (name, contents) in [("Optimized.tla", artifact.module), ("Optimized.cfg", artifact.config), ("optimization.txt", artifact.report)]
+    {
         let path = output.join(name);
         std::fs::write(&path, contents).map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    println!("Finite abstraction emitted to {}. Model checking has not been performed; no safety verdict is claimed.", output.display());
+    println!("Finite optimization emitted to {}. Model checking has not been performed; no safety verdict is claimed.", output.display());
     Ok(())
 }

@@ -1,14 +1,40 @@
-# Finite abstraction optimization
+# Rule-based optimization
 
-The experimental abstraction frontend compiles a restricted mathematical TLA+ transition system
-into a finite TLA+ model. It uses a typed verification IR, cached analyses, transformation passes,
-and a separate checker for each rule. The command and its options are documented in
-[configuration.md](configuration.md#finite-abstraction-command).
+The optimizer uses a typed transition IR, cached analyses, transformation passes, and an
+independent checker for each rule. Optimization is the umbrella: constant propagation,
+predicate simplification and dead-action elimination preserve concrete states; counter
+saturation is an abstraction optimization that merges values into representatives.
+Commands and options are documented in [configuration.md](configuration.md#optimization-command).
 
-This workflow emits artifacts only. It does not run the model checker, transfer a success verdict,
-validate concrete counterexamples, or prove a result for a configuration family. Ordinary checking
-does not invoke these passes. The generated model can be checked by TLC or by any tlx execution
-tier; compare those backends on the same generated model.
+There are two consumers of the same verified pass framework:
+
+- Opt-in checking runs the exact cleanup stage and writes validated IR back into the configured
+  HIR roots before interpreter or compiler caches exist. It retains concrete variable values,
+  original invariant names and source locations. Existing execution and reporting paths produce
+  verdicts and genuine traces directly; no abstract-to-concrete trace transfer is needed.
+- Artifact generation also runs saturation, then emits a finite mathematical model. Generation
+  does not run the checker or transfer its verdict. Check the generated model separately; counts
+  and traces describe its graph. Saturation is not enabled in ordinary checking, because its
+  mathematical contract does not preserve eventual machine overflow and trace lifting is absent.
+
+TLC compatibility mode bypasses the opt-in pipeline, including its fragment restrictions. This
+policy applies to this new pipeline, not to all existing semantics-preserving compiler work.
+Unsupported opt-in inputs are diagnosed rather than silently checked without optimization.
+
+## Exact checking boundary
+
+The exact path accepts the fragment below and requires distinct configured INIT, NEXT and
+INVARIANT definitions when applying rewrites. It supports exhaustive checking, not simulation,
+symmetry diagnostics, coverage or checkpoint/recovery. Graph and counterexample dumps still
+contain concrete states. See the option reference for the supported combinations.
+
+The cleanup rules preserve initialization, reachable state values and transitions, and invariant
+truth on reachable states. They never replace increment with saturation. Constant-state
+propagation retains the original value in the state vector, including in failing initial states.
+The HIR writer keeps invariant predicates at state level even when simplified to TRUE or FALSE,
+and keeps an empty Next relation at action level. It invalidates level summaries and rebuilds
+expression IDs before execution creates caches. Rule remarks identify applied transforms;
+optimized-run statistics are labeled rather than presented as TLC compatibility evidence.
 
 ## Supported fragment
 
@@ -30,7 +56,7 @@ Every state variable, action and configured invariant must translate. Missing up
 comparisons and copies, decrement, indexing, structured values, quantifiers, recursive or
 higher-order calls and unsupported observations are refused. Normalization has a shared budget of
 100,000 visited expression nodes and a maximum nesting depth of 128; exceeding it is inconclusive
-and emits no model. It does not claim that the source has no finite abstraction.
+and emits no model. It does not claim that the source has no finite optimization.
 
 Temporal specifications/properties, exploration constraints, views, symmetry, aliases,
 postconditions, possible predicates and configuration overrides are rejected. Deadlock checking
@@ -53,6 +79,7 @@ The implementation lives in `crates/tlx-sema/src/optimize/`, above execution-spe
 | `dead.rs` | Remove actions with a proved FALSE guard, retaining source order |
 | `verify.rs` | Check IR structure, the actual before/after correspondence, rule obligations and whole-model finite-domain closure |
 | `verify_cleanup.rs` | Independently check constant propagation, predicate equivalence and dead-action evidence |
+| `check.rs` | Write exact cleanup results into configured HIR roots, preserving concrete states and original names |
 | `emit.rs` | Emit standalone TLA+, configuration and explanatory mappings from validated finite IR |
 
 The pass interface receives immutable IR and the analysis manager and returns either no change,
@@ -63,7 +90,7 @@ claim can keep stale results alive. Analysis lifetime is one pipeline invocation
 cache across models or requests. Cached analyses include both observation thresholds and
 inductively constant state candidates.
 
-The pipeline has two stages. First, constant propagation, predicate simplification and dead-action
+The artifact pipeline has two stages. The exact-check pipeline runs only the first stage. First, constant propagation, predicate simplification and dead-action
 elimination repeat until the IR stops changing. Saturation then runs with predicate simplification
 and dead-action elimination, again to a fixed point. This ordering removes irrelevant thresholds
 before choosing caps. Each stage has a limit of 64 rounds; failure to converge emits a diagnostic
@@ -75,7 +102,8 @@ To add a rule:
    candidate selection in this module.
 2. Add its evidence variant and an exhaustive checker dispatch in `verify.rs`. Check actual IR
    correspondence as well as applicability; a rule name alone never authorizes a rewrite.
-3. Register the pass in `Pipeline::default`. Add acceptance, refusal, corrupted-evidence and
+3. Register the pass in `Pipeline::default`. Register it in `Pipeline::exact` only if its checked
+   contract preserves concrete reachable states and valid counterexamples without lifting. Add acceptance, refusal, corrupted-evidence and
    composition tests. If the rule extends the input language, extend typed IR, lowering,
    verification and emission together, retaining whole-model finite-domain closure.
 
@@ -153,7 +181,7 @@ whole state domain is a finite product. This does not promise a practically smal
 
 ## Artifacts and trust boundary
 
-The output consists of `Abstract.tla`, `Abstract.cfg`, and `abstraction.txt`. Generated variables,
+The output consists of `Optimized.tla`, `Optimized.cfg`, and `optimization.txt`. Generated variables,
 actions and invariants have collision-free synthetic names; the report maps them to source names
 and locations and explains every counter cap. The destination must be new. Semantic refusal
 creates no destination; an I/O failure returns an error and may leave incomplete files. The report

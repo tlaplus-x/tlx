@@ -157,14 +157,15 @@ binary, and a failure in an early crate hides every crate after it. On the share
 `-j 3`; choose an explicit concurrency limit appropriate to the machine. No local Cargo
 configuration or cross-checkout compiler wrapper is required.
 
-The finite-abstraction CLI regressions run with
-`cargo test --profile test-release -p tlx-cli --test abstraction -j 3`.
+The rule-based optimization CLI regressions run with
+`cargo test --profile test-release -p tlx-cli --test optimization -j 3`.
 They compare original and generated model verdicts against cached TLC output, then check
 counts, depth, violated invariant names and trace lengths for each model across the interpreter,
-compiled IR and native tiers with paranoid checking. Exact generated module/config snapshots
+compiled IR and native tiers with paranoid checking, including opt-in exact cleanup and
+compatibility-mode bypass. Deterministic counterexamples also compare concrete values. Exact generated module/config snapshots
 prevent using an oracle for different emitted input. The reset case has two original states and
-one abstract state, so it also detects accidental abstraction during ordinary `-tlc` checking.
-The [fixture refresh recipe](../crates/tlx-cli/tests/fixtures/abstraction/README.md) needs Java/TLC;
+one abstract state, so it also detects accidental optimization during ordinary `-tlc` checking.
+The [fixture refresh recipe](../crates/tlx-cli/tests/fixtures/optimization/README.md) needs Java/TLC;
 running the Rust regressions does not.
 
 The lint set is declared once in the root `Cargo.toml` (`[workspace.lints]`, inherited with

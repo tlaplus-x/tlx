@@ -29,10 +29,10 @@ pub(super) fn lower(program: &mut Program, cfg: &Config) -> Result<Model, Diagno
         ));
     }
     if cfg.check_deadlock != Some(false) {
-        return Err(Diagnostic::new("abstraction requires CHECK_DEADLOCK FALSE; deadlock transfer is not implemented"));
+        return Err(Diagnostic::new("optimization requires CHECK_DEADLOCK FALSE; deadlock transfer is not implemented"));
     }
     if cfg.invariants.is_empty() {
-        return Err(Diagnostic::new("abstraction requires at least one target INVARIANT"));
+        return Err(Diagnostic::new("optimization requires at least one target INVARIANT"));
     }
     let init = root(program, cfg.init.as_deref().ok_or_else(|| Diagnostic::new("missing INIT"))?)?;
     let next = root(program, cfg.next.as_deref().ok_or_else(|| Diagnostic::new("missing NEXT"))?)?;
@@ -57,7 +57,7 @@ pub(super) fn lower(program: &mut Program, cfg: &Config) -> Result<Model, Diagno
         return Err(Diagnostic::new(errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")));
     }
     if program.vars.is_empty() {
-        return Err(Diagnostic::new("abstraction requires state variables"));
+        return Err(Diagnostic::new("optimization requires state variables"));
     }
     let mut expander = Expander { program, constants, remaining: 100_000, stack: Vec::new() };
     for assumption in &program.assumes {
@@ -137,7 +137,7 @@ impl Expander<'_> {
         self.remaining -= 1;
         if let ExprKind::Builtin { op, .. } = &*e.kind {
             if op.metadata().effect != crate::builtins::Effect::Pure {
-                return Err(Diagnostic::at(e.span, "effectful operators are outside the abstraction contract"));
+                return Err(Diagnostic::at(e.span, "effectful operators are outside the optimization contract"));
             }
         }
         match &*e.kind {

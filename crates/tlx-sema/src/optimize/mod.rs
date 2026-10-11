@@ -1,10 +1,13 @@
-//! Property-relative optimization of a restricted, mathematical transition IR.
+//! Rule-based optimization of a restricted transition IR.
 //!
-//! This pipeline is separate from execution lowering: its rewrites may change
-//! state counts and machine-overflow behavior. Only validated rewrites reach
-//! emission. See docs/abstraction.md for the fragment and trust boundary.
+//! Exact cleanup can feed ordinary checking before execution lowering. The
+//! export pipeline additionally permits mathematical state-space quotients.
+//! Only validated rewrites reach HIR or artifact emission. See docs/optimization.md for the fragment and trust boundary.
 
 mod analysis;
+mod check;
+
+pub use check::optimize_check;
 mod constant;
 mod counter;
 mod dead;
@@ -52,9 +55,9 @@ pub struct Artifact {
 }
 
 /// Lower the complete configured observation set, run the default pass
-/// pipeline, and emit a standalone `Abstract` module. Does not model check or
-/// claim safety. Unsupported inputs never produce a partial abstraction.
-pub fn abstract_model(program: &mut Program, config: &Config) -> Result<Artifact, Diagnostic> {
+/// pipeline, and emit a standalone `Optimized` module. Does not model check or
+/// claim safety. Unsupported inputs never produce a partial optimization.
+pub fn optimize_model(program: &mut Program, config: &Config) -> Result<Artifact, Diagnostic> {
     let model = lower::lower(program, config)?;
     let (model, remarks) = passes::Pipeline::default().run(model)?;
     verify::finite(&model)?;
