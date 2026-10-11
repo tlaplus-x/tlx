@@ -6,6 +6,9 @@ use crate::hir::Span;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Domain {
     Natural,
+    /// A proved inductive singleton, retaining the original exact value.
+    Constant(u32),
+    /// Saturation quotient: the upper endpoint represents the entire tail.
     Interval(u32),
 }
 

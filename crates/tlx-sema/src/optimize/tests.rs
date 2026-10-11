@@ -4,7 +4,7 @@ use super::ir::*;
 use super::passes::{Evidence, Pass, Pipeline, Proposal};
 use super::{lower, verify};
 
-fn model() -> Model {
+pub(super) fn model() -> Model {
     let dir = tlx_testkit::TempDir::new("abstraction-validator");
     let path = dir.write("M.tla", "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 10\nNext == c' = c + 1 \\/ c' = 0 \\/ UNCHANGED c\nInv == c <= 3\n====\n");
     let mut program = crate::Program::load(&path, &[]).unwrap();
@@ -82,7 +82,7 @@ fn pipeline_is_idempotent_and_requires_finite_closure() {
     let original = model();
     assert!(verify::finite(&original).is_err());
     let (once, remarks) = Pipeline::default().run(original).unwrap();
-    assert_eq!(remarks.len(), 1);
+    assert_eq!(remarks.iter().filter(|r| r.starts_with("threshold-counter-saturation/")).count(), 1);
     verify::finite(&once).unwrap();
     let (twice, remarks) = Pipeline::default().run(once.clone()).unwrap();
     assert!(remarks.is_empty());
@@ -119,7 +119,7 @@ fn counter_rule_commutes_with_updates_and_preserves_observations_at_boundaries()
             original.properties[0].predicate = Predicate::Compare { var: 0, op, value };
             let proposed = proposal(&original);
             verify::transformation(&original, &proposed).unwrap();
-            let Evidence::CounterSaturation { caps } = proposed.evidence;
+            let Evidence::CounterSaturation { caps } = proposed.evidence else { panic!("wrong evidence kind") };
             let cap = u64::from(caps[0]);
             for concrete in 0..12u64 {
                 let abstract_value = concrete.min(cap);

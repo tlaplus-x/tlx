@@ -151,3 +151,46 @@ fn instance_substitutions_are_analyzed_after_resolution() {
     let a = abstract_model(&mut program, &parse_cfg(CFG).unwrap()).unwrap();
     assert!(a.report.contains("domain 0..3"), "{}", a.report);
 }
+
+#[test]
+fn cleanup_removes_irrelevant_thresholds_before_saturation() {
+    let a = abstract_source(
+        "VARIABLE c\nInit == c = 0\nNext == (FALSE /\\ c > 2147483647 /\\ c' = c + 1) \\/ (c < 2 /\\ c' = c + 1) \\/ (c >= 2 /\\ c' = 0)\nInv == c <= 2",
+        CFG,
+    ).unwrap();
+    assert!(!a.module.contains("2147483647"));
+    assert!(a.report.contains("domain 0..3"));
+    assert!(a.report.contains("dead-action-elimination/v1"));
+    assert_eq!(a.module.matches(" ==\n    /\\").count(), 3); // Init and two live actions.
+    let a = abstract_source("VARIABLE c\nInit == c = 0\nNext == c' = c + 1\nInv == TRUE \\/ c = 2147483647", CFG).unwrap();
+    assert!(a.report.contains("domain 0..0"));
+    assert!(a.module.contains("Invariant0 == TRUE"));
+}
+
+#[test]
+fn constant_propagation_composes_with_counter_saturation() {
+    let a = abstract_source(
+        "VARIABLES fixed, c\nInit == fixed = 7 /\\ c = 0\nNext == UNCHANGED fixed /\\ c' = c + 1\nInv == fixed = 7 /\\ (c < 3 \\/ c >= 3)",
+        CFG,
+    )
+    .unwrap();
+    assert!(a.report.contains("constant 7; alpha(n) = n"));
+    assert!(a.report.contains("domain 0..3"));
+    assert!(a.module.contains("Invariant0 == ((v1 < 3) \\/ (v1 >= 3))"), "{}", a.module);
+}
+
+#[test]
+fn no_enabled_actions_retains_initial_property_checks() {
+    for inv in ["c = 5", "c /= 5"] {
+        let a = abstract_source(&format!("VARIABLE c\nInit == c = 5\nNext == c < 0 /\\ c' = c + 1\nInv == {inv}"), CFG).unwrap();
+        assert!(a.module.contains("Next == (v0 /= v0) /\\ UNCHANGED <<v0>>"));
+        assert!(a.report.contains("constant 5"));
+        assert!(a.module.contains(if inv == "c = 5" { "Invariant0 == TRUE" } else { "Invariant0 == (v0 /= v0)" }));
+    }
+}
+
+#[test]
+fn cleanup_does_not_make_unsupported_dead_code_acceptable() {
+    let body = "VARIABLE c\nInit == c = 0\nNext == (FALSE /\\ c' = c - 1) \\/ c' = c + 1\nInv == TRUE";
+    assert!(abstract_source(body, CFG).is_err());
+}

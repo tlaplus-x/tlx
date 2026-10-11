@@ -5,13 +5,19 @@
 //! emission. See docs/abstraction.md for the fragment and trust boundary.
 
 mod analysis;
+mod constant;
 mod counter;
+mod dead;
 mod emit;
 mod ir;
 mod lower;
 mod passes;
+mod simplify;
 mod verify;
+mod verify_cleanup;
 
+#[cfg(test)]
+mod cleanup_tests;
 #[cfg(test)]
 mod tests;
 

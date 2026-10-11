@@ -12,7 +12,7 @@ tier; compare those backends on the same generated model.
 
 ## Supported fragment
 
-The first rule supports one or more scalar natural-number state variables:
+The optimizer supports one or more scalar natural-number state variables:
 
 - Initialization is a conjunction assigning each variable one configured natural literal.
 - Next is a disjunction of actions. Each action is a conjunction of state guards and exactly one
@@ -48,7 +48,11 @@ The implementation lives in `crates/tlx-sema/src/optimize/`, above execution-spe
 | `analysis.rs` | Lazily compute thresholds from all guards and properties; own cached analysis results |
 | `passes.rs` | Schedule passes; validate proposals before commit; invalidate analyses after every committed rewrite |
 | `counter.rs` | Propose threshold-counter saturation and its rule parameters |
+| `constant.rs` | Propagate state values proved constant by initialization and every remaining update |
+| `simplify.rs` | Fold domain-implied comparisons and Boolean identities |
+| `dead.rs` | Remove actions with a proved FALSE guard, retaining source order |
 | `verify.rs` | Check IR structure, the actual before/after correspondence, rule obligations and whole-model finite-domain closure |
+| `verify_cleanup.rs` | Independently check constant propagation, predicate equivalence and dead-action evidence |
 | `emit.rs` | Emit standalone TLA+, configuration and explanatory mappings from validated finite IR |
 
 The pass interface receives immutable IR and the analysis manager and returns either no change,
@@ -56,7 +60,14 @@ a diagnostic, or a proposal containing replacement IR and rule-specific evidence
 mutate the current model. The manager checks each proposal against the actual preceding model
 before committing it. All analyses are invalidated on mutation; no pass-provided preservation
 claim can keep stale results alive. Analysis lifetime is one pipeline invocation, with no shared
-cache across models or requests.
+cache across models or requests. Cached analyses include both observation thresholds and
+inductively constant state candidates.
+
+The pipeline has two stages. First, constant propagation, predicate simplification and dead-action
+elimination repeat until the IR stops changing. Saturation then runs with predicate simplification
+and dead-action elimination, again to a fixed point. This ordering removes irrelevant thresholds
+before choosing caps. Each stage has a limit of 64 rounds; failure to converge emits a diagnostic
+and no artifact. The manager validates even a proposal that claims to make no effective change.
 
 To add a rule:
 
@@ -68,10 +79,47 @@ To add a rule:
    composition tests. If the rule extends the input language, extend typed IR, lowering,
    verification and emission together, retaining whole-model finite-domain closure.
 
-The current pipeline contains one pass. It handles independent scalar counter families together;
-it does not implement arbitrary relational rule composition. A second invocation on its finite
-IR output is a no-op within the pipeline. New preservation contracts, such as overapproximation or temporal properties,
-require explicit verification obligations rather than borrowing the counter rule's contract.
+The four passes compose through checked intermediate models. They handle independent scalar
+counter families and pure state predicates, not arbitrary relational abstractions. Running the
+pipeline on its optimized IR is a no-op. New preservation contracts, such as overapproximation or
+temporal properties, require explicit verification obligations.
+
+## Cleanup rules and their arguments
+
+**Constant-state propagation** uses the initial value and every remaining action to prove a
+singleton domain. An unchanged update preserves any initial value; reset preserves it only when
+that initial value is zero. A genuine increment prevents this proof. Guards and target properties
+are never assumed to prove constancy. The pass retains the variable with its exact value, replaces
+its comparisons by truth values, and normalizes its updates to unchanged. The checker independently
+checks the induction conditions, all substitutions, source metadata and unchanged parts of the IR.
+
+Exact singleton domains and saturation domains are distinct. The constant pass never relabels a
+saturated representative as an exact original value: a saturated zero may represent an unbounded
+concrete counter. Saturation preserves singleton domains established by earlier passes.
+
+**Predicate simplification** folds comparisons whose truth is determined by the variable's
+domain, negations of constants, and Boolean identity/absorbing elements. For example, a natural
+counter always satisfies `c >= 0`, and `FALSE /\ P` is false in this pure, total IR. The generator
+uses interval comparisons. The independent checker partitions a scalar comparison's domain at
+its literal and the literal plus one, where its truth can change, and recursively checks the
+Boolean rewrite. This partition check covers the entire domain; it is not bounded state sampling.
+In particular, equal truth at an interval's endpoints is insufficient to fold an equality whose
+matching value lies inside the interval.
+
+**Dead-action elimination** removes only actions whose guard has become literal FALSE. Its
+certificate lists the retained source indices. The checker requires every omitted guard to be
+FALSE and every retained action to be identical and in source order; it also preserves all
+properties and initialization. If all actions disappear, emission produces an impossible action:
+a false state guard conjoined with an explicit UNCHANGED tuple. This has the empty transition
+relation while retaining action level; TLC rejects a constant-level `Next == FALSE`.
+Initial invariants are still checked, including ones simplified to FALSE. The emitter expresses
+a false invariant as the state-level predicate `v0 /= v0`, because TLC rejects an invariant defined
+as constant FALSE during configuration instead of checking it on the initial state.
+
+These passes can make previously unusable threshold partitions finite within the backend range.
+For example, an impossible action guarded by `FALSE /\ c > 2147483647` no longer forces an
+unrepresentable saturation cap. Unsupported source expressions are still rejected during lowering,
+even when they occur in a syntactically dead branch; cleanup never bypasses the language contract.
 
 ## Counter rule and its argument
 
@@ -100,7 +148,7 @@ source metadata against the proposed model. The complete update vectors prevent 
 or unassigned variables from passing validation.
 
 Thus a concrete action maps to its abstract action, and the abstract action can be lifted from
-each concrete representative. Every variable has a checked finite interval afterward, so the
+each concrete representative. Every variable has a checked finite interval or singleton afterward, so the
 whole state domain is a finite product. This does not promise a practically small search.
 
 ## Artifacts and trust boundary
@@ -129,7 +177,9 @@ concrete reconstruction and validation are implemented.
 `tlx-sema` integration tests cover thresholds, source normalization, constants, substitutions,
 independent counters and unsupported uses. Internal optimizer tests deliberately corrupt evidence,
 updates, guards, properties and initialization; test stale proposals and analysis invalidation;
-and exercise the rule's arithmetic at boundary values. These finite test vectors detect defects;
+and exercise arithmetic and predicate rewrites at boundary and interior values. Cleanup tests
+cover false guards, empty Next, mixed singleton/saturation domains, cascaded constants, and
+preservation of failing initial invariants. These finite test vectors detect defects;
 they are not the general proof.
 
 `tlx-cli` integration tests generate models and execute them through the interpreter, compiled IR

@@ -14,8 +14,8 @@ use super::Diagnostic;
 
 pub(super) fn well_formed(model: &Model) -> Result<(), Diagnostic> {
     let n = model.variables.len();
-    if n == 0 || model.initial.len() != n || model.actions.is_empty() || model.properties.is_empty() {
-        return Err(Diagnostic::new("invalid transition IR: missing variables, initial values, actions or properties"));
+    if n == 0 || model.initial.len() != n || model.properties.is_empty() {
+        return Err(Diagnostic::new("invalid transition IR: missing variables, initial values or properties"));
     }
     let mut valid = true;
     model.observations(&mut |var, _, value| valid &= var < n && value <= i32::MAX as u32);
@@ -24,6 +24,9 @@ pub(super) fn well_formed(model: &Model) -> Result<(), Diagnostic> {
         if let Domain::Interval(cap) = variable.domain {
             valid &= cap <= i32::MAX as u32 && model.initial[i] <= cap;
         }
+        if let Domain::Constant(value) = variable.domain {
+            valid &= model.initial[i] == value;
+        }
     }
     for action in &model.actions {
         if action.updates.len() != n {
@@ -31,7 +34,8 @@ pub(super) fn well_formed(model: &Model) -> Result<(), Diagnostic> {
         }
         for (variable, update) in model.variables.iter().zip(&action.updates) {
             valid &= match (&variable.domain, update) {
-                (_, Update::Keep | Update::Reset) | (Domain::Natural, Update::Increment) => true,
+                (_, Update::Keep) | (Domain::Natural | Domain::Interval(_), Update::Reset) | (Domain::Natural, Update::Increment) => true,
+                (Domain::Constant(0), Update::Reset) => true,
                 (Domain::Interval(cap), Update::SaturatingIncrement(k)) => cap == k,
                 _ => false,
             };
@@ -56,6 +60,9 @@ pub(super) fn transformation(before: &Model, proposal: &Proposal) -> Result<(), 
     well_formed(&proposal.model)?;
     match &proposal.evidence {
         Evidence::CounterSaturation { caps } => counter(before, &proposal.model, caps),
+        Evidence::ConstantState { variables } => super::verify_cleanup::constant(before, &proposal.model, variables),
+        Evidence::SimplifyPredicates => super::verify_cleanup::simplify(before, &proposal.model),
+        Evidence::DeadActions { retained } => super::verify_cleanup::dead(before, &proposal.model, retained),
     }
 }
 
@@ -69,18 +76,20 @@ fn counter(before: &Model, after: &Model, caps: &[u32]) -> Result<(), Diagnostic
     for (i, &cap) in caps.iter().enumerate() {
         let a = &before.variables[i];
         let b = &after.variables[i];
-        if a.domain != Domain::Natural
-            || b.domain != Domain::Interval(cap)
-            || a.name != b.name
-            || a.span != b.span
-            || after.initial[i] != before.initial[i].min(cap)
-        {
+        let domain_ok = match a.domain {
+            Domain::Natural => b.domain == Domain::Interval(cap) && after.initial[i] == before.initial[i].min(cap),
+            Domain::Constant(value) | Domain::Interval(value) => a == b && cap == value && after.initial[i] == before.initial[i],
+        };
+        if !domain_ok || a.name != b.name || a.span != b.span {
             return Err(invalid());
         }
     }
     let mut compatible = true;
     // Inspect actual source observations, never the pass's analysis cache.
     before.observations(&mut |var, op, value| {
+        if before.variables[var].domain != Domain::Natural {
+            return;
+        }
         compatible &= match op {
             Comparison::Lt | Comparison::Ge => value <= caps[var],
             Comparison::Eq | Comparison::Ne | Comparison::Le | Comparison::Gt => value < caps[var],
@@ -94,6 +103,12 @@ fn counter(before: &Model, after: &Model, caps: &[u32]) -> Result<(), Diagnostic
             return Err(invalid());
         }
         for (i, (source, target)) in a.updates.iter().zip(&b.updates).enumerate() {
+            if before.variables[i].domain != Domain::Natural {
+                if source != target {
+                    return Err(invalid());
+                }
+                continue;
+            }
             let valid = match (source, target) {
                 (Update::Keep, Update::Keep) | (Update::Reset, Update::Reset) => true,
                 (Update::Increment, Update::SaturatingIncrement(cap)) => *cap == caps[i],

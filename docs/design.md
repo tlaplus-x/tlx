@@ -47,7 +47,7 @@ names the pinned revision that holds them (DOC-03).
 ### 1.2 Non-goals
 
 - General proof checking (TLAPS) and symbolic checking (Apalache style). The separate
-  [finite-abstraction frontend](abstraction.md) checks instances of a restricted rewrite rule
+  [finite-abstraction frontend](abstraction.md) checks instances of restricted rewrite rules
   in Rust; it does not implement a proof kernel or transfer model-checking verdicts.
 - Distributed (multi-machine) checking; tlx is single machine, multi-core.
 - A Java or SANY dependency at run time. The syntax layer is tree-sitter-tlaplus, the semantic layer is written in Rust. SANY and TLC are test oracles only.

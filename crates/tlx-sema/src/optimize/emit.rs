@@ -24,6 +24,15 @@ pub(super) fn emit(model: &Model, remarks: &[String]) -> Artifact {
         writeln!(report, "Pass: {remark}").unwrap();
     }
     for (i, variable) in model.variables.iter().enumerate() {
+        if let Domain::Constant(value) = variable.domain {
+            writeln!(
+                report,
+                "v{i}: {} at file {}:{}:{}; constant {value}; alpha(n) = n (exact on reachable states)",
+                variable.name, variable.span.file.0, variable.span.line, variable.span.col
+            )
+            .unwrap();
+            continue;
+        }
         let Domain::Interval(cap) = variable.domain else { unreachable!("finite IR checked before emission") };
         writeln!(
             report,
@@ -49,10 +58,22 @@ pub(super) fn emit(model: &Model, remarks: &[String]) -> Artifact {
         }
         writeln!(report, "Action{a}: file {}:{}:{}", action.span.file.0, action.span.line, action.span.col).unwrap();
     }
-    writeln!(module, "Next == {}", (0..model.actions.len()).map(|i| format!("Action{i}")).collect::<Vec<_>>().join(" \\/ ")).unwrap();
+    let next = if model.actions.is_empty() {
+        // TLC requires NEXT to be nonconstant. The false state guard makes
+        // this relation empty; UNCHANGED retains action level without ever
+        // admitting a self-loop.
+        format!("(v0 /= v0) /\\ UNCHANGED <<{variables}>>")
+    } else {
+        (0..model.actions.len()).map(|i| format!("Action{i}")).collect::<Vec<_>>().join(" \\/ ")
+    };
+    writeln!(module, "Next == {next}").unwrap();
     let mut config = String::from("INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n");
     for (i, property) in model.properties.iter().enumerate() {
-        writeln!(module, "Invariant{i} == {}", predicate(&property.predicate)).unwrap();
+        // TLC rejects a constant FALSE invariant during configuration. Keep
+        // the equivalent false predicate at state level so the initial-state
+        // violation remains checkable (validated IR always has a variable).
+        let text = if property.predicate == Predicate::Bool(false) { "(v0 /= v0)".to_string() } else { predicate(&property.predicate) };
+        writeln!(module, "Invariant{i} == {text}").unwrap();
         writeln!(config, "INVARIANT Invariant{i}").unwrap();
         writeln!(report, "Invariant{i}: {} at file {}:{}:{}", property.name, property.span.file.0, property.span.line, property.span.col)
             .unwrap();
