@@ -21,6 +21,35 @@ TLC compatibility mode bypasses the opt-in pipeline, including its fragment rest
 policy applies to this new pipeline, not to all existing semantics-preserving compiler work.
 Unsupported opt-in inputs are diagnosed rather than silently checked without optimization.
 
+## Overlap with execution optimization
+
+[design.md](design.md#21-crate-map-and-dependency-edges) owns the division between semantic
+optimization and execution compilation. The semantic pipeline is deliberately restricted; it is
+not a general-purpose HIR optimizer. There is nevertheless some general-purpose work inside it:
+
+| Current mechanism | Overlap and reason for keeping it here |
+|---|---|
+| `lower.rs`: configured constant substitution, first-order call and LET expansion, constant comparison evaluation | Overlaps compiler constant folding and inlining (`tlx-compile/src/lower/expr.rs`, `typed.rs`). Here it normalizes the complete configured roots into the closed IR so that proof rules can inspect them; it is not an inlining profitability policy. |
+| `simplify.rs`: Boolean identities, constant negation, empty/singleton conjunction and disjunction cleanup | Local simplification also occurs during execution lowering and native compilation. This small cleanup consumes facts exposed by semantic rules and makes FALSE guards visible to subsequent passes. The implementations are not identical Boolean optimizers. |
+| `simplify.rs`: domain-implied comparisons | Uses the IR's natural, proved-singleton or saturation domain. Those facts are not merely compile-time literal values. The current pipeline does not infer general inductive counter intervals from guards. |
+| `constant.rs`: inductively constant state | Proves a value from initialization and every remaining update. Backend constant folding alone does not establish that a state variable stays constant across the transition system. |
+| `dead.rs`: removal of FALSE-guard actions | Analogous to local dead-branch cleanup, but removes whole actions from the semantic model. This can expose another inductively constant variable before saturation chooses its thresholds. It is not a general reachability solver. |
+
+For example, a proved constant `fixed = 7` makes `fixed /= 7` false. Boolean cleanup then makes
+an enclosing action guard false, and action removal can reveal another constant. Waiting until
+native compilation to perform that cleanup would miss its role in the semantic fixed point and
+would not benefit interpreter execution or exported models.
+
+The independent checks in `verify_cleanup.rs` intentionally validate the transformation without
+calling its candidate-generation logic. This is a correctness boundary, not redundant backend
+optimization to deduplicate. Keep effect/error behavior, integer semantics and enumeration
+requirements in mind before sharing simplification code across these IRs: semantic predicates
+are a closed, pure fragment; arbitrary execution expressions are not.
+
+There is no measured claim that this frontend cleanup speeds up work already handled by the
+compiler. Further generic rewrites belong here only when a concrete semantic consumer needs
+them; otherwise extend the existing execution optimizer.
+
 ## Exact checking boundary
 
 The exact path accepts the fragment below and requires distinct configured INIT, NEXT and

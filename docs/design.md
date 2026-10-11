@@ -108,6 +108,36 @@ applies the exact pipeline before constructing an interpreter. TLC compatibility
 this pipeline. It is separate from execution-tier lowering below; see
 [optimization.md](optimization.md) for the rule interface and preservation contract.
 
+Optimization ownership follows the information available in each IR. The semantic optimizer
+should focus on facts about the configured transition system: initialization, preservation by
+all transitions, reachable domains, and the observations a transformation must preserve. For
+example, proving that a state variable never changes requires more than folding a constant
+expression inside one generated action. The execution compiler owns representation and local
+code improvements: encoded sets and records, direct updates, expression folding, repeated
+computation elimination, and loop-invariant hoisting (§6.3).
+
+This is a division of responsibility, not a claim that a backend could never perform semantic
+analysis. The current execution IR does not expose the transition-system proof obligations as
+such; lowering or separately compiling actions can obscure them. Semantic results benefit both
+the interpreter and compiled tiers. Keep a transformation where its required facts are explicit,
+and avoid reconstructing source-level proofs in generated C or machine code.
+
+Some local cleanup exists at both levels today. The semantic optimizer folds Boolean identities
+and constant comparisons and expands first-order calls/LETs to expose its restricted IR. The
+compiler also folds eligible constants and inlines operators. Such overlap is justified when
+normalization exposes a semantic proof or consumes its result; it is not a reason to grow a
+second general-purpose algebraic, CSE, or loop optimizer in `tlx-sema`. Keep this cleanup small,
+reuse existing mechanisms when their IR and semantic contracts fit, and require evidence before
+claiming an additional speedup. Do not introduce a shared framework merely to unify a few rules.
+[optimization.md](optimization.md#overlap-with-execution-optimization) records the current overlap.
+
+LLVM provides a useful analogy: general IR transforms live in its
+[target-independent optimizer](https://www.llvm.org/docs/Passes.html), while the
+[SelectionDAG backend](https://www.llvm.org/docs/CodeGenerator.html#selectiondag-instruction-selection-process)
+combines operations again after lowering and legalization expose new opportunities. Repeated
+simplification at different representations is normal. tlx's semantic optimizer is a
+model-specific middle-end stage, not a replacement for execution-IR or native-code optimization.
+
 tlx is a Cargo workspace of twelve crates: eleven that build a `tlx` binary or library, plus the
 dev-only `tlx-testkit`.
 
