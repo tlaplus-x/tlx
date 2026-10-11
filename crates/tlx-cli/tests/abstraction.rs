@@ -117,3 +117,72 @@ fn empty_next_still_checks_true_and_false_initial_invariants() {
         }
     }
 }
+
+// Cached TLC output is tied to the exact generated module/config below. An emitter
+// change must refresh the oracle, not silently reuse evidence for another model.
+fn check_oracle(dir: &std::path::Path, module: &str, oracle: &str) {
+    let code: i32 = oracle.lines().next().unwrap().strip_prefix("# exit ").unwrap().parse().unwrap();
+    assert!(matches!(code, 0 | 12), "fixture must be a completed safety check");
+    let outcome = if code == 0 {
+        "Model checking completed. No error has been found.".to_string()
+    } else {
+        format!("Invariant {} is violated", if module == "Counter" { "Inv" } else { "Invariant0" })
+    };
+    assert!(oracle.contains(&outcome), "oracle missing outcome: {oracle}");
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let run = tlx_testkit::tlx_default!()
+            .args(["check", &format!("{module}.tla"), "-tlc", "-tool", "-workers", "1"])
+            .args(args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, code, "{module}/{tier}: {}", run.text());
+        assert!(run.stdout.contains(&outcome), "{module}/{tier}: {}", run.text());
+        assert_eq!(tlx_testkit::cli::counts(&run.stdout), tlx_testkit::cli::counts(oracle), "{module}/{tier}: {}", run.text());
+        let trace_length = |text: &str| text.lines().filter(|line| line.starts_with("@!@!@STARTMSG 2217:4")).count();
+        assert_eq!(trace_length(&run.stdout), trace_length(oracle), "{module}/{tier}: {}", run.text());
+    }
+}
+
+macro_rules! oracle_case {
+    ($test:ident, $case:literal) => {
+        #[test]
+        fn $test() {
+            let dir = tlx_testkit::TempDir::with_spec(
+                "abstraction-oracle",
+                include_str!(concat!("fixtures/abstraction/", $case, "/Counter.tla")),
+                include_str!(concat!("fixtures/abstraction/", $case, "/Counter.cfg")),
+            );
+            let original = include_str!(concat!("fixtures/abstraction/", $case, "/Counter.tlc.out"));
+            let abstracted = include_str!(concat!("fixtures/abstraction/", $case, "/Abstract.tlc.out"));
+            assert_eq!(original.lines().next(), abstracted.lines().next(), "abstraction must preserve the verdict");
+            if $case == "reset" {
+                assert!(original.contains("2 distinct states found"));
+                assert!(abstracted.contains("1 distinct states found"));
+            }
+            let run = tlx_testkit::tlx!().args(["abstract", "Counter.tla", "-output", "out"]).dir(&dir).run();
+            assert_eq!(run.code, 0, "{}", run.text());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("out/Abstract.tla")).unwrap(),
+                include_str!(concat!("fixtures/abstraction/", $case, "/Abstract.tla")),
+                "emission changed; refresh and review the TLC evidence"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("out/Abstract.cfg")).unwrap(),
+                include_str!(concat!("fixtures/abstraction/", $case, "/Abstract.cfg"))
+            );
+            check_oracle(dir.as_ref(), "Counter", original);
+            check_oracle(&dir.join("out"), "Abstract", abstracted);
+        }
+    };
+}
+
+oracle_case!(cleanup_matches_tlc, "cleanup");
+oracle_case!(empty_next_matches_tlc, "empty-safe");
+oracle_case!(initial_violation_matches_tlc, "empty-violation");
+oracle_case!(successor_violation_matches_tlc, "violation");
+// The original has two states (9, 0); the quotient has one (0). Checking
+// Counter with -tlc must retain the original counts/depth in every tier.
+oracle_case!(tlc_mode_preserves_original_state_space, "reset");
