@@ -77,6 +77,29 @@ unknown options (`tlx: unknown option ...`, exit code 2); see [features.md](feat
 Argument errors (a missing or invalid value, an unknown option, several specs) print the reason and
 the usage line and exit with 2.
 
+## Finite abstraction command
+
+`tlx abstract Spec.tla -output DIR [-config FILE] [-I DIR]...` generates a finite
+mathematical abstraction using the rule-based verification optimizer. It is separate from
+`tlx check`; generation is not a safety verdict. The supported fragment, pass extension
+interface, artifacts and trust boundary are described in [abstraction.md](abstraction.md).
+
+| Option | Meaning |
+|---|---|
+| `-output DIR` | Required new destination directory. Emits `Abstract.tla`, `Abstract.cfg` and `abstraction.txt`; refuses an existing path. The parent directory must exist. |
+| `-config FILE` | Configuration file, defaulting to the specification path with `.cfg` extension. An explicit path is resolved against the working directory; embedded `.tla` configuration sections are not supported by this command. |
+| `-I DIR` | Additional module search directory, repeatable. The normal `TLX_PATH` and `TLX_CLASSPATH` search paths also apply. |
+| `-h`, `--help` | Print abstraction-specific help. |
+
+The input configuration must explicitly name INIT, NEXT and at least one INVARIANT, and
+set CHECK_DEADLOCK FALSE. Unsupported constructs or options return exit 2 without a safety
+claim. Successful generation returns exit 0, which means only that artifacts were emitted.
+I/O failures also return exit 2 and can leave an incomplete destination.
+
+For example, after generation, `tlx check DIR/Abstract.tla -interp` checks the generated model.
+Its verdict, counts and trace describe that model. The command does not automatically transfer
+results or validate a concrete trace for the original specification.
+
 ## Environment variables
 
 | Name | Type | Default | Effect | Audience | Read in |

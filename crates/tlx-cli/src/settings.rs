@@ -16,6 +16,8 @@ tlx: a compiled TLA+ model checker with TLC-compatible options and output.
 
 usage: tlx check Spec.tla [options]
        tlx parse Spec.tla   (syntax only; no module resolution or model checking)
+       tlx abstract Spec.tla -output DIR [-config FILE] [-I DIR]...
+                           (emit a finite abstraction; see abstract -h)
 
 Options shared with TLC (same names and meaning):
   -config FILE         the configuration file (default: Spec.cfg; a relative

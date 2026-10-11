@@ -33,6 +33,9 @@ pub(crate) fn check(started: Instant) -> ExitCode {
 }
 
 fn check_once(started: Instant, noautosymmetry: bool, restart: &mut bool) -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("abstract") {
+        return crate::abstraction::run();
+    }
     if std::env::args().nth(1).as_deref() == Some("parse") {
         return parse_only();
     }

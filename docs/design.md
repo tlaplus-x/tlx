@@ -22,8 +22,10 @@ Where each topic is documented (every topic has one home):
 | Undeclared symmetry in the default mode: what tlx proves, applies and names | [usage.md](usage.md) sections 6.2–6.3 (user-facing contract); [reductions.md](reductions.md) section 2 (proof, guards and bounds); §2.6 places the phase in a run |
 | The value store: `Ref` slots behind `TLX_VALUE_STORE` (experimental, default off) | [value-store.md](value-store.md) |
 | Reductions and the guarantee contract of the default mode | [reductions.md](reductions.md) |
+| Experimental finite abstraction, verification IR and rule-based optimization passes | [abstraction.md](abstraction.md) |
 
-Two of these documents have an experimental subject: the value store is off by default and incomplete
+The experimental finite-abstraction frontend is documented separately from execution optimizations.
+Two other documents have an experimental subject: the value store is off by default and incomplete
 (no reclamation, no checkpoint format), and automatic symmetry is the only reduction of the default
 mode that exists. Their **design records** — the store's roadmap (stable state root slots, complete
 collection lowering, spill) and the reductions this contract was written for but that are not
@@ -44,7 +46,9 @@ names the pinned revision that holds them (DOC-03).
 
 ### 1.2 Non-goals
 
-- Proofs (TLAPS) and symbolic checking (Apalache style).
+- General proof checking (TLAPS) and symbolic checking (Apalache style). The separate
+  [finite-abstraction frontend](abstraction.md) checks instances of a restricted rewrite rule
+  in Rust; it does not implement a proof kernel or transfer model-checking verdicts.
 - Distributed (multi-machine) checking; tlx is single machine, multi-core.
 - A Java or SANY dependency at run time. The syntax layer is tree-sitter-tlaplus, the semantic layer is written in Rust. SANY and TLC are test oracles only.
 - NUMA-aware fingerprint-set sharding (§7.7).
@@ -95,6 +99,12 @@ The central idea is **whole-spec specialisation**. Once the `.cfg` fixes every C
 The key point: **the runtime is generic over the `Model` trait** (§7.1). Both models use the same parallel runtime, the same reporting and the same liveness path. The compiled tier is the default (`-interp` selects the interpreter; with no possible native code, no JIT and no C compiler, the default is the interpreter); the interpreter is the differential baseline for the compiled tier, and its fallback.
 
 ### 2.1 Crate map and dependency edges
+
+The explicit finite-abstraction frontend is owned by `tlx-sema::optimize`. It consumes resolved
+HIR and a restricted bound configuration, lowers to a mathematical verification IR, runs
+validated optimization passes, and emits a standalone model. `tlx-cli::abstraction` owns its
+artifact command. This pipeline is separate from the execution tiers below; see
+[abstraction.md](abstraction.md) for the rule interface and preservation contract.
 
 tlx is a Cargo workspace of twelve crates: eleven that build a `tlx` binary or library, plus the
 dev-only `tlx-testkit`.

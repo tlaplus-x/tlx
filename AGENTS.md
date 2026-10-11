@@ -34,6 +34,9 @@ defect: document the evidence and the intentional difference in `docs/compat.md`
 ## Making changes
 
 - Keep changes focused. Preserve unrelated edits in the working tree.
+- After every implementation, review your own changes before reporting completion. Check
+  correctness, architecture, failure paths, and test coverage; fix issues found, rerun the
+  affected checks, and report any unresolved findings.
 - Write code, comments, commit messages, and public documentation in English. Follow the
   [commit convention](CONTRIBUTING.md#code-and-commits).
 - Add a focused regression test for a behavior change. Prefer a small specification

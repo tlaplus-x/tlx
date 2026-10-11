@@ -2,6 +2,7 @@
 
 pub mod builtins;
 pub mod hir;
+pub mod optimize;
 pub mod resolve;
 pub mod source;
 pub mod visit;
