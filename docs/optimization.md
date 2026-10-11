@@ -1,25 +1,26 @@
 # Rule-based optimization
 
-The optimizer uses a typed transition IR, cached analyses, transformation passes, and an
-independent checker for each rule. Optimization is the umbrella: constant propagation,
-predicate simplification and dead-action elimination preserve concrete states; counter
-saturation is an abstraction optimization that merges values into representatives.
+The goal is to reduce the explored state graph while preserving checked verdicts and genuine
+counterexamples. A faster expression evaluation is not a state reduction. New reduction rules
+need evidence on real specifications, including distinct-state counts and measured runtime.
 Commands and options are documented in [configuration.md](configuration.md#optimization-command).
 
-There are two consumers of the same verified pass framework:
+There are two consumers:
 
-- Opt-in checking runs the exact cleanup stage and writes validated IR back into the configured
-  HIR roots before interpreter or compiler caches exist. It retains concrete variable values,
-  original invariant names and source locations. Existing execution and reporting paths produce
-  verdicts and genuine traces directly; no abstract-to-concrete trace transfer is needed.
-- Artifact generation also runs saturation, then emits a finite mathematical model. Generation
-  does not run the checker or transfer its verdict. Check the generated model separately; counts
-  and traces describe its graph. Saturation is not enabled in ordinary checking, because its
-  mathematical contract does not preserve eventual machine overflow and trace lifting is absent.
+- Opt-in checking proves a projection of concrete state through resolved HIR. The existing VIEW
+  machinery fingerprints the retained components; actions still produce full concrete states.
+  Counterexamples are reconstructed by following actual initial states and successor edges.
+- Artifact generation uses a typed transition IR, cached analyses, transformation passes and
+  independent rule checkers. Cleanup exposes opportunities for threshold-counter saturation,
+  which merges values into representatives. Generation does not transfer a verdict or trace to
+  the source. Saturation remains export-only: its mathematical contract does not preserve eventual
+  machine overflow, and counter-specific trace lifting is absent.
 
-TLC compatibility mode bypasses the opt-in pipeline, including its fragment restrictions. This
-policy applies to this new pipeline, not to all existing semantics-preserving compiler work.
-Unsupported opt-in inputs are diagnosed rather than silently checked without optimization.
+TLC compatibility mode bypasses opt-in reductions. Unknown expressions retain their referenced
+variables; an inapplicable rule leaves ordinary checking unchanged. Artifact generation still
+requires its complete input to fit the restricted fragment below. Standalone constant propagation,
+predicate simplification and dead-action cleanup no longer run in ordinary checking; they remain
+in the artifact pipeline as preparation for state reduction.
 
 ## Overlap with execution optimization
 
@@ -50,24 +51,214 @@ There is no measured claim that this frontend cleanup speeds up work already han
 compiler. Further generic rewrites belong here only when a concrete semantic consumer needs
 them; otherwise extend the existing execution optimizer.
 
-## Exact checking boundary
+## Deriving reductions from compiler analysis and mathematics
 
-The exact path accepts the fragment below and requires distinct configured INIT, NEXT and
-INVARIANT definitions when applying rewrites. It supports exhaustive checking, not simulation,
-symmetry diagnostics, coverage or checkpoint/recovery. Graph and counterexample dumps still
-contain concrete states. See the option reference for the supported combinations.
+Use compiler analyses to discover a candidate equivalence, then prove it against the configured
+transition system. The relevant compiler mechanism is a monotone dataflow problem with joins,
+transfer functions and a fixed point, as in [LLVM's dataflow introduction](https://clang.llvm.org/docs/DataFlowAnalysisIntro.html).
+For projection, the implemented equation is `Live = Roots union Dependencies(Live)`. Its solution
+identifies which components must remain in the state key; it does not delete executable assignments.
 
-The cleanup rules preserve initialization, reachable state values and transitions, and invariant
-truth on reachable states. They never replace increment with saturation. Constant-state
-propagation retains the original value in the state vector, including in failing initial states.
-The HIR writer keeps invariant predicates at state level even when simplified to TRUE or FALSE,
-and keeps an empty Next relation at action level. It invalidates level summaries and rebuilds
-expression IDs before execution creates caches. Rule remarks identify applied transforms;
-optimized-run statistics are labeled rather than presented as TLC compatibility evidence.
+For a proposed state map `P`, related reachable states must satisfy both:
 
-## Supported fragment
+- All checked observations agree whenever `P(s) = P(t)`.
+- The projected successor sets agree: `{P(u) : Next(s,u)} = {P(v) : Next(t,v)}`.
 
-The optimizer supports one or more scalar natural-number state variables:
+Together with coverage of projected initial states, these conditions justify an exact quotient.
+Fewer reachable equivalence classes, rather than simpler expressions, deliver the reduction.
+An overapproximation has a different contract: it can admit spurious violations and needs concrete
+validation and refinement before returning a counterexample.
+
+[Abstract interpretation](https://www.di.ens.fr/~cousot/COUSOTpapers/POPL77.shtml) provides a basis
+for extending the analyses: inductive intervals, finite value sets and relational facts can prove
+which transfer functions and partitions are safe. Range information alone does not reduce states;
+it must justify a projection, a value partition, or another reduction. General interval analysis
+and partition refinement are future extensions, not current checking capabilities. For example,
+merging all counter values above a threshold additionally requires proving that every update and
+observation respects that partition; a later decrement or exact-value test can invalidate it.
+
+The desired domain describes distinguishable values, not just the numeric values that can occur.
+If no observation or future transition distinguishes values at or above 10, the partition can be
+`{0}, ..., {9}, {10, 11, ...}`. If `N > 10` is observed, 10 must remain separate from the class
+above 10. Derive reachable domains from initialization and transitions; a property being checked
+is an observation to preserve, not an assumption that can justify the reduction.
+
+The same criterion applies recursively to structured values. A candidate map must respect every
+observed operation and transfer, including definedness and errors:
+
+| Value | Candidate partition | Obligations |
+|---|---|---|
+| Array or list | Partition each element | Preserve observed indices, order and length; reads, writes and sequence operations must respect the element partition. |
+| Map or record | Partition selected values or fields | Preserve observed keys and domains; value updates and lookups must agree after projection. Merging keys requires a separate proof. |
+| Set | Map each element to its class | Prove that membership, equality, removal and other used operations respect the classes. Cardinality generally forbids collapsing distinct elements into one. |
+
+For example, a list `<<11, 20>>` may have the key `<<Above10, Above10>>` when the two exact values
+are unobservable. Mapping the set `{11, 20}` to `{Above10}` loses its cardinality and cannot
+preserve a cardinality check. Retaining multiplicities can preserve cardinality, but does not by
+itself preserve exact membership or removal. Finite element domains also do not bound list length
+or map domains: those dimensions need their own bounds or proved partitions for a finite state
+space. These are requirements for future structured partitions, not implemented checking rules.
+
+One concrete extension is field liveness conditioned on a finite control state. In the external
+`pragmatic/database-blob/naive` and `improved` specifications, `serverStates` maps servers to
+records. A record's `state` field determines which of `userId`, `metadata` and `image` can still
+affect execution. Completed requests leave old field values behind; new requests overwrite them
+before use. A candidate projection forgets these fields during every phase where they are dead.
+It must propagate liveness backward through phase transitions: clearing a field only in `waiting`
+is not sufficient to establish the successor-class equation if the next phase exposes its old
+value again. Type predicates also need a preservation proof from Init and Next; they cannot simply
+be assumed true. The phase-field rule below derives this projection automatically from the
+configured source. It does not require a user-written VIEW or changes to the specification.
+
+The checking implementation applies this reasoning through conservative projection rules. Their
+dataflow analyses are deliberately bounded. Add richer transfer summaries when an external
+specification demonstrates a useful reduction, with explicit definedness, overflow and trace
+obligations; do not build a general framework merely to imitate LLVM's class hierarchy.
+
+## Unobserved state projection
+
+`projection.rs` computes a conservative cone of influence using backward dataflow analysis.
+Guards, observations and unknown uses seed the live set. A recognized copy `v' = u` adds a
+read-dependency edge from `v` to `u`; literals have no inputs. A worklist propagates liveness
+to a least fixed point. A cycle of copies without a path to an observation stays dead; observing
+one member retains the needed cycle. The current transfer vocabulary is scalar literals,
+whole-variable copies and UNCHANGED. Initialization of omitted variables must use literals.
+Other expressions conservatively retain their referenced variables.
+
+This is a structural rule; it does not inspect variable, action or module names. For example:
+
+```tla
+Init == x = 0 /\ tag = "init"
+Next == (x' = 1 - x /\ tag' = "flip")
+     \/ (UNCHANGED x /\ tag' = "idle")
+Inv == x \in {0, 1}
+```
+
+There are five reachable concrete states. Matching states by `<<x>>` leaves two classes.
+Each stored representative still contains its real `tag`; the rule does not assign a canonical
+replacement to the variable or alter `Next`.
+
+The proof obligations are:
+
+1. Init assigns an integer, Boolean or string literal to the omitted variable. Integer literals
+   must fit the evaluator's integer range. Every recognized next-state binding is a literal
+   assignment, copy of a fully specified current-state value, or UNCHANGED. Unknown transfers
+   retain their target and referenced inputs.
+2. At most one binding can occur on any syntactic alternative of Init or Next. Conjunction adds
+   binding counts; disjunction, IF and CASE take their maximum. This rules out implicit guards
+   such as `UNCHANGED tag /\ tag' = "idle"`, which test the old value even without a read.
+3. The live set contains all guard, bound, selected invariant, initial or action property, state
+   or action constraint, and alias dependencies. It is closed under the inputs of every retained
+   update. Primed references outside recognized assignments count as reads too.
+   Calls and LET helpers are followed by resolved definition identity. Operator actuals are
+   scanned conservatively, including by-name arguments and captured reads.
+4. Referenced expressions have no observable builtin effects. Unknown operator constants,
+   unresolved bodies, recursive action expansion or exhausted analysis budgets disable the rule.
+   Read-dependency scanning handles recursive definitions with a visited set. Traversal is bounded
+   by 100,000 nodes and depth 128; exhaustion yields no projection.
+5. The execution boundary excludes temporal checking, configuration overrides, possible predicates,
+   postconditions and existing VIEW/SYMMETRY. Automatic symmetry runs first and takes precedence.
+
+**Correctness argument.** Let `P(s)` retain every non-omitted component. Related reachable states
+have equal retained values; every stored component is fully specified. A guard or
+other observed expression therefore evaluates identically in related states. On each action
+alternative, a forgotten variable receives a literal, copies a defined value, or remains unchanged,
+without constraining that alternative: the single-binding condition prevents an assignment from becoming an equality
+test against an already-bound value. All retained updates have identical inputs. Consequently,
+every concrete step has a corresponding step with the same projection from every related state,
+and vice versa. Invalid or incomplete alternatives remain invalid independently of omitted values.
+Every projected initial class has an actual initial representative. This gives a bisimulation on
+the reachable graph with identical observations and enabledness, preserving safety and deadlock.
+
+Counts and maximum search depth need not be preserved. The implementation stores concrete
+representatives and reuses class-aware replay, so a reported finite counterexample consists of
+actual source steps, including actual omitted values. Temporal
+properties remain outside the applied contract; a finite quotient lasso alone would not establish
+a genuine concrete liveness counterexample. The HIR analyzer is trusted implementation code with
+this source-level argument and regression tests, not an independently checked proof certificate.
+
+CCF's external `consistency/Consistency.tla` has this pattern: `action` is initialized to `"Init"`
+and assigned labels by the actions, but guards and `TypeOK` do not read it. A bounded local wrapper
+around the unchanged source demonstrates an actual reduction; it is not the upstream unbounded
+configuration. Bounds and measurements belong with reproducible benchmark evidence.
+
+## Phase-dependent field projection
+
+`phase.rs` derives a finite control field and field liveness for a record, or a fixed-domain map
+of records. Names have no special meaning. The motivating inputs are the unchanged external
+database-blob specifications described above; request data becomes irrelevant in different phases.
+BookKeeper's `LedgerChaining` has the same pattern in client records: cached ledger metadata,
+ledger lists and list versions cease to matter in phases that refresh them before use. The rule
+also handles its configured model-value phases and sequence-valued fields.
+
+The analysis first expands resolved first-order calls and LET helpers into an analysis-only tree,
+renaming bound locals to preserve scope. A forward fixed point over Init and every Next alternative
+infers possible scalar values and structural shapes. Unknown expressions widen to an unknown
+domain. Function key sets must be exact, rather than upper bounds on possible elements. Properties
+being checked never narrow these inferred domains. A structural type membership observation can
+be discharged only when the inferred domain proves it always true without hiding type errors.
+The domains include integer lower bounds, sequence elements, record fields and function ranges.
+Integer addition and function override can establish the types of cached data copied from growing
+collections. Unknown function domains can supply range facts, but only exact fixed domains qualify
+as projected maps. These facts prove observations such as membership in `Seq(Nat)`; they do not
+truncate counters or bound sequence length.
+
+For each candidate control field, backward analysis computes `Live[phase, field]`:
+
+1. Reads in guards, update expressions and configured observations seed liveness. Every explicit
+   update expression is scanned, even when its result is otherwise dead, to retain error behavior.
+   A recognized control guard restricts subsequent reads only after the guard has been evaluated.
+   Bound expressions, whole-record uses and cross-actor reads are conservative. First-order
+   by-name substitution keeps actual reads in the callee's control context; effectful actuals
+   still decline expansion even when unused.
+2. A recognized EXCEPT update changes fields of one record, or one bound actor's record in a
+   fixed-domain map. The actor's inferred key domain must be contained in the map domain. Duplicate
+   writes, unknown transfers and multiple bindings of the candidate variable decline the rule.
+   Analysis expands EXCEPT's `@` into a read of the updated point only when preceding writes
+   provably cannot overlap it. Uncertain aliasing declines expansion, including uses through LET.
+3. For a transition from phase `p` to `q`, every field live in `q` that is not overwritten becomes
+   live in `p`. Propagate until no liveness fact changes. The control field always remains live.
+
+The generated VIEW retains every other variable and replaces each dead field by one sentinel in
+the state key. It preserves record fields, map keys and control values. Executable HIR and concrete
+stored states are unchanged. The current implementation applies one projection rule per run:
+whole-variable projection takes precedence, then the proved phase candidate projecting the most
+fields (ties retain source traversal order). This heuristic does not predict reachable state counts. It does
+not combine several candidate records or compose with user VIEW or symmetry.
+
+**Correctness argument.** Forward inference establishes an inductive overapproximation of reachable
+values: it contains Init and is closed under all recognized Next alternatives. Within this domain,
+states with equal projected keys agree on every field live in their common control phase. Ordered
+read roots therefore preserve branch guards, definedness, errors and checked observations. Explicit
+update expressions have equal inputs in related states. A field carried into a live successor
+position is live in the predecessor by backward closure; an overwritten field receives an equal
+value. Other map entries retain their control and live fields. Thus corresponding branches produce
+the same projected successor classes in both directions, with the same enabledness. Together with
+concrete initial representatives this proves an observation-preserving bisimulation, supporting
+safety, deadlock checking and concrete counterexample replay under the shared checking boundary.
+
+This is a trusted static analysis with a correctness argument and regression tests, not an
+independently checked proof certificate. Recursive expansion, higher-order calls, unknown operator
+constants, effects and exhausted analysis budgets decline the rule. Control domains are limited to
+32 mutually comparable literal or configured model values, candidate records to 32 fields, and expanded actions to 512
+alternatives. It does not infer numeric threshold partitions or remove sequence lengths or map keys.
+
+## Checking boundary
+
+Opt-in reductions support exhaustive checking without simulation, symmetry diagnostics, coverage
+or checkpoint/recovery. Dumps contain concrete representatives of reduced classes. Rule remarks
+name the omitted variables or projected fields; reduced statistics are labeled. Unknown source constructs do not
+reject an otherwise valid model. Interpreter and compiled tiers share the same projection and
+replay contract through the existing model capabilities.
+Compiled execution infers result shapes for structural anonymous VIEW expressions from the current
+state layout, then uses the existing VIEW compiler. Rebuilding a state layout rebuilds these shapes;
+unknown shapes retain interpreted state-key evaluation. This execution-layer analysis is separate
+from the state-reduction proof. Measure the complete check: fewer explored states can still cost
+more runtime when projection overhead dominates.
+
+## Artifact input fragment
+
+Artifact generation supports one or more scalar natural-number state variables:
 
 - Initialization is a conjunction assigning each variable one configured natural literal.
 - Next is a disjunction of actions. Each action is a conjunction of state guards and exactly one
@@ -108,7 +299,8 @@ The implementation lives in `crates/tlx-sema/src/optimize/`, above execution-spe
 | `dead.rs` | Remove actions with a proved FALSE guard, retaining source order |
 | `verify.rs` | Check IR structure, the actual before/after correspondence, rule obligations and whole-model finite-domain closure |
 | `verify_cleanup.rs` | Independently check constant propagation, predicate equivalence and dead-action evidence |
-| `check.rs` | Write exact cleanup results into configured HIR roots, preserving concrete states and original names |
+| `projection.rs` | Prove unobserved state projection from resolved HIR for ordinary checking |
+| `phase.rs`, `phase/` | Infer structural domains and phase-dependent field liveness for checking |
 | `emit.rs` | Emit standalone TLA+, configuration and explanatory mappings from validated finite IR |
 
 The pass interface receives immutable IR and the analysis manager and returns either no change,
@@ -119,22 +311,27 @@ claim can keep stale results alive. Analysis lifetime is one pipeline invocation
 cache across models or requests. Cached analyses include both observation thresholds and
 inductively constant state candidates.
 
-The artifact pipeline has two stages. The exact-check pipeline runs only the first stage. First, constant propagation, predicate simplification and dead-action
+The artifact pipeline has two stages. First, constant propagation, predicate simplification and dead-action
 elimination repeat until the IR stops changing. Saturation then runs with predicate simplification
 and dead-action elimination, again to a fixed point. This ordering removes irrelevant thresholds
 before choosing caps. Each stage has a limit of 64 rounds; failure to converge emits a diagnostic
 and no artifact. The manager validates even a proposal that claims to make no effective change.
 
-To add a rule:
+To add an artifact rule:
 
 1. Implement `Pass` in a new module, reusing or extending the shared analyses. Keep heuristic
    candidate selection in this module.
 2. Add its evidence variant and an exhaustive checker dispatch in `verify.rs`. Check actual IR
    correspondence as well as applicability; a rule name alone never authorizes a rewrite.
-3. Register the pass in `Pipeline::default`. Register it in `Pipeline::exact` only if its checked
-   contract preserves concrete reachable states and valid counterexamples without lifting. Add acceptance, refusal, corrupted-evidence and
+3. Register the pass in `Pipeline::default`. Add acceptance, refusal, corrupted-evidence and
    composition tests. If the rule extends the input language, extend typed IR, lowering,
    verification and emission together, retaining whole-model finite-domain closure.
+
+For a checking reduction, analyze resolved HIR and return a proved reduction plan without
+rewriting executable actions. Extend the existing state-identity mechanism only when needed.
+Specify the equivalence relation, all observations it preserves and the concrete replay contract;
+add positive and refusal tests, and demonstrate fewer states on an external model. Add a shared
+pass abstraction only when multiple implemented reductions need it.
 
 The four passes compose through checked intermediate models. They handle independent scalar
 counter families and pure state predicates, not arbitrary relational abstractions. Running the
@@ -242,3 +439,8 @@ they are not the general proof.
 `tlx-cli` integration tests generate models and execute them through the interpreter, compiled IR
 and native tier with paranoid checking. They also check abstract violations, refusal without
 artifacts, preservation of existing outputs, and isolation from compatibility-mode checking.
+
+Projection tests separately cover action alternatives, recursive read dependencies, higher-order
+actuals, duplicate bindings, primed reads and effects. CLI tests exercise state-count reduction,
+concrete safety/deadlock traces, configuration observations, temporal refusal and TLC bypass in
+all execution tiers with paranoid cross-checking.

@@ -208,33 +208,6 @@ oracle_case!(successor_violation_matches_tlc, "violation");
 oracle_case!(tlc_mode_preserves_original_state_space, "reset");
 
 #[test]
-fn check_opt_in_applies_rules_and_tlc_bypasses_unsupported_inputs() {
-    let spec = include_str!("fixtures/optimization/cleanup/Counter.tla");
-    let dir = tlx_testkit::TempDir::with_spec("optimization-opt-in", spec, CFG);
-    let run = tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp"]).dir(&dir).run();
-    assert_eq!(run.code, 0, "{}", run.text());
-    for rule in ["constant-state-propagation", "predicate-simplification", "dead-action-elimination"] {
-        assert!(run.stdout.contains(rule), "{}", run.text());
-    }
-    assert!(!run.stdout.contains("threshold-counter-saturation"));
-    assert!(!dir.join("Optimized.tla").exists());
-    // Decrements are valid ordinary TLA+ but outside the optimizer's fragment.
-    dir.write(
-        "Counter.tla",
-        "---- MODULE Counter ----\nEXTENDS Integers\nVARIABLE c\nInit == c = 1\nNext == c > 0 /\\ c' = c - 1\nInv == c >= 0\n====\n",
-    );
-    let run = tlx_testkit::tlx_default!().check("Counter.tla").arg("-optimize").dir(&dir).run();
-    assert_eq!(run.code, 2, "{}", run.text());
-    assert!(run.stdout.contains("decrements are unsupported"), "{}", run.text());
-    for flags in [["-tlc", "-optimize"], ["-optimize", "-tlc"]] {
-        let run = tlx_testkit::tlx!().check("Counter.tla").args(flags).dir(&dir).run();
-        assert_eq!(run.code, 0, "{}", run.text());
-        assert!(run.stdout.contains("disabled by -tlc"), "{}", run.text());
-        assert!(run.stdout.contains("2 distinct states found"), "{}", run.text());
-    }
-}
-
-#[test]
 fn optimized_check_rejects_unsupported_execution_modes() {
     let dir = tlx_testkit::TempDir::with_spec("optimization-modes", SPEC, CFG);
     for flags in [vec!["-simulate"], vec!["-checksymmetry"], vec!["-coverage", "1"], vec!["-checkpoint", "1"], vec!["-recover", "missing"]]
@@ -246,7 +219,7 @@ fn optimized_check_rejects_unsupported_execution_modes() {
 }
 
 #[test]
-fn exact_optimization_retains_counter_boundary_behavior() {
+fn state_reduction_retains_counter_boundary_behavior() {
     let spec = "---- MODULE Counter ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 2147483647\nNext == c <= 2147483647 /\\ c' = c + 1\nInv == c >= 0 /\\ c <= 2147483647\n====\n";
     let dir = tlx_testkit::TempDir::with_spec("optimization-overflow", spec, CFG);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
@@ -270,6 +243,134 @@ fn exact_optimization_retains_counter_boundary_behavior() {
         assert_eq!(original.code, optimized.code, "{tier}: {}\n{}", original.text(), optimized.text());
         let errors = |text: &str| text.lines().filter(|line| line.starts_with("Error:")).map(str::to_string).collect::<Vec<_>>();
         assert_eq!(errors(&original.stdout), errors(&optimized.stdout), "{tier}");
-        assert!(optimized.stdout.contains("predicate-simplification"), "{tier}: {}", optimized.text());
+        assert!(!optimized.stdout.contains("unobserved-state-projection"), "{tier}: {}", optimized.text());
+    }
+}
+
+const PROJECTION_SPEC: &str = r#"---- MODULE Counter ----
+EXTENDS Integers, TLC
+VARIABLES x, tag
+vars == <<x, tag>>
+Init == x = 0 /\ tag = "init"
+Flip == x' = 1 - x /\ tag' = "flip"
+Idle == UNCHANGED x /\ tag' = "idle"
+Next == Flip \/ Idle
+Spec == Init /\ [][Next]_vars
+Inv == x \in {0, 1}
+Live == <> (x = 1)
+TagInv == tag /= "idle"
+Bound == tag = "init"
+ActionBound == tag' /= "idle"
+Observed == <<x, tag>>
+====
+"#;
+
+#[test]
+fn projection_merges_states_in_every_tier_and_tlc_bypasses_it() {
+    let dir = tlx_testkit::TempDir::with_spec("optimization-projection", PROJECTION_SPEC, CFG);
+    for cfg in [CFG.to_string(), CFG.replace("INIT Init\nNEXT Next", "SPECIFICATION Spec")] {
+        dir.write("Counter.cfg", &cfg);
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            for flags in [vec![], vec!["-optimize"], vec!["-tlc", "-optimize"], vec!["-optimize", "-tlc"]] {
+                let reduced = flags == ["-optimize"];
+                let run = tlx_testkit::tlx_default!()
+                    .check("Counter.tla")
+                    .args(args)
+                    .args(flags)
+                    .args(["-noautosymmetry", "-stats", "json"])
+                    .envs(env.iter().copied())
+                    .env("TLX_PARANOID", "1")
+                    .dir(&dir)
+                    .timeout(Duration::from_secs(60))
+                    .run();
+                assert_eq!(run.code, 0, "{tier}: {}", run.text());
+                let count = if reduced { "2 distinct states found" } else { "5 distinct states found" };
+                assert!(run.stdout.contains(count), "{tier}: {}", run.text());
+                assert_eq!(run.stdout.contains("unobserved-state-projection"), reduced, "{tier}: {}", run.text());
+                assert!(!run.stdout.contains("exact IR cleanup"));
+            }
+        }
+    }
+}
+
+#[test]
+fn projection_preserves_concrete_counterexamples_and_deadlocks() {
+    let spec = PROJECTION_SPEC.replace("1 - x", "x + 1").replace("Flip == x'", "Flip == x < 2 /\\ x'");
+    for (next, inv, deadlock, code) in [("Flip \\/ Idle", "x < 2", false, 12), ("Flip", "x <= 2", true, 11)] {
+        let spec =
+            spec.replace("Next == Flip \\/ Idle", &format!("Next == {next}")).replace("Inv == x \\in {0, 1}", &format!("Inv == {inv}"));
+        let cfg = CFG.replace("FALSE", if deadlock { "TRUE" } else { "FALSE" });
+        let dir = tlx_testkit::TempDir::with_spec("projection-trace", &spec, &cfg);
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            let run = tlx_testkit::tlx_default!()
+                .check("Counter.tla")
+                .args(args)
+                .args(["-optimize", "-noautosymmetry", "-tool"])
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .dir(&dir)
+                .timeout(Duration::from_secs(60))
+                .run();
+            assert_eq!(run.code, code, "{tier}: {}", run.text());
+            assert!(run.stdout.contains("unobserved-state-projection"), "{tier}: {}", run.text());
+            let values: Vec<_> = run.stdout.lines().filter(|l| l.starts_with("/\\ tag =") || l.starts_with("/\\ x =")).collect();
+            assert_eq!(
+                values,
+                ["/\\ x = 0", "/\\ tag = \"init\"", "/\\ x = 1", "/\\ tag = \"flip\"", "/\\ x = 2", "/\\ tag = \"flip\""],
+                "{tier}: {}",
+                run.text()
+            );
+        }
+    }
+}
+
+#[test]
+fn observations_and_temporal_checks_keep_the_full_graph() {
+    for (cfg, expected) in [
+        (CFG.replace("INVARIANT Inv", "INVARIANT TagInv"), 12),
+        (format!("{CFG}CONSTRAINT Bound\n"), 0),
+        (format!("{CFG}ACTION_CONSTRAINT ActionBound\n"), 0),
+        (format!("{CFG}VIEW Observed\n"), 0),
+        (format!("{CFG}PROPERTY Live\n"), 13),
+        (format!("{CFG}CONSTANT Flip <- Idle\n"), 0),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec("projection-observations", PROJECTION_SPEC, &cfg);
+        let run = tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp", "-noautosymmetry"]).dir(&dir).run();
+        assert_eq!(run.code, expected, "{}", run.text());
+        assert!(!run.stdout.contains("unobserved-state-projection"), "{}", run.text());
+    }
+}
+
+#[test]
+fn projection_removes_an_unobserved_copy_cycle() {
+    let spec = r#"---- MODULE Counter ----
+EXTENDS Integers
+VARIABLES x, a, b
+Init == x = 0 /\ a = 0 /\ b = 1
+Next == (x' = 1 - x /\ UNCHANGED <<a, b>>)
+     \/ (UNCHANGED x /\ a' = b /\ b' = a)
+Inv == x \in {0, 1}
+====
+"#;
+    let dir = tlx_testkit::TempDir::with_spec("projection-cycle", spec, CFG);
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        for optimize in [false, true] {
+            let run = tlx_testkit::tlx_default!()
+                .check("Counter.tla")
+                .args(args)
+                .args(if optimize { vec!["-optimize"] } else { vec![] })
+                .arg("-noautosymmetry")
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .dir(&dir)
+                .timeout(Duration::from_secs(60))
+                .run();
+            assert_eq!(run.code, 0, "{tier}: {}", run.text());
+            assert!(
+                run.stdout.contains(if optimize { "2 distinct states found" } else { "4 distinct states found" }),
+                "{tier}: {}",
+                run.text()
+            );
+        }
     }
 }

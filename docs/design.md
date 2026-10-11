@@ -26,8 +26,8 @@ Where each topic is documented (every topic has one home):
 
 The rule-based optimizer is documented separately from execution-tier lowering.
 Two other documents have an experimental subject: the value store is off by default and incomplete
-(no reclamation, no checkpoint format), and automatic symmetry is the only reduction of the default
-mode that exists. Their **design records** — the store's roadmap (stable state root slots, complete
+(no reclamation, no checkpoint format), and several proposed default-mode reductions remain
+unimplemented. Their **design records** — the store's roadmap (stable state root slots, complete
 collection lowering, spill) and the reductions this contract was written for but that are not
 implemented (sleep sets, partial-order reduction, bounded and swarm search, bitstate storage,
 incremental re-checking) — are process material, not current documentation: [README.md](README.md)
@@ -100,13 +100,28 @@ The key point: **the runtime is generic over the `Model` trait** (§7.1). Both m
 
 ### 2.1 Crate map and dependency edges
 
-The rule-based optimizer is owned by `tlx-sema::optimize`. It consumes resolved
-HIR and a restricted bound configuration, lowers to a mathematical verification IR, runs
-validated optimization passes, and either writes exact rewrites back into HIR for opt-in checking
-or emits a standalone finite model. `tlx-cli::optimization` owns the artifact command; `load`
-applies the exact pipeline before constructing an interpreter. TLC compatibility mode bypasses
-this pipeline. It is separate from execution-tier lowering below; see
-[optimization.md](optimization.md) for the rule interface and preservation contract.
+The rule-based optimizer is owned by `tlx-sema::optimize`. Its primary objective is to
+reduce the explored state graph while preserving checked verdicts and genuine counterexamples.
+Opt-in checking analyzes resolved HIR for unobserved state variables and phase-dependent dead
+fields in records or fixed-domain maps. Forward structural domains come from Init and Next;
+backward liveness determines what can be forgotten. Checked invariants remain observations,
+never assumptions. The proved projection uses the existing VIEW fingerprint and concrete replay
+machinery in `tlx-eval`.
+The executable actions and state values remain intact. Automatic symmetry takes precedence;
+TLC compatibility mode bypasses the reduction. Separately, `tlx-cli::optimization` emits finite
+models using a restricted transition IR and validated counter-saturation passes. See
+[optimization.md](optimization.md) for rule contracts, extension points and correctness arguments.
+
+A frontend rule should justify its cost with actual state reduction on a real specification.
+Expression cleanup alone is not evidence of that goal. Retain local cleanup here when it
+normalizes a reduction's input or enables its proof; evaluation-only improvements belong in the
+execution compiler unless a measured need establishes another owner. Compare distinct states
+as well as timings, and do not claim that a rule match necessarily reduces a particular graph.
+Prioritize external configurations that time out, have large reachable graphs, or have a proved
+infinite state space. Small specifications provide focused correctness regressions. Keep the
+selected properties and existing reductions in performance comparisons; an improvement obtained
+only by removing them does not establish a useful optimization of that configuration. Distinguish
+a proved infinite graph from a timeout, and record incomplete runs separately from completed timings.
 
 Optimization ownership follows the information available in each IR. The semantic optimizer
 should focus on facts about the configured transition system: initialization, preservation by
@@ -115,6 +130,14 @@ example, proving that a state variable never changes requires more than folding 
 expression inside one generated action. The execution compiler owns representation and local
 code improvements: encoded sets and records, direct updates, expression folding, repeated
 computation elimination, and loop-invariant hoisting (§6.3).
+
+The domain analysis direction is observational: retain distinctions that guards, checked
+properties and future transitions can detect. A threshold may merge many reachable numeric
+values into one class. The same reasoning extends to elements, fields and keys of arrays,
+sequences, sets and maps, with separate obligations for structure, cardinality and definedness.
+Finite element domains alone do not bound sequence length or map domains. Finer partitions within
+live structured values are future extensions; [optimization.md](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics)
+records their proof requirements and the narrower rules currently implemented.
 
 This is a division of responsibility, not a claim that a backend could never perform semantic
 analysis. The current execution IR does not expose the transition-system proof obligations as

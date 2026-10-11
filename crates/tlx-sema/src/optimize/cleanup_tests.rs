@@ -136,7 +136,7 @@ fn simplified_predicates_preserve_boundary_and_interior_truth() {
                     if match domain {
                         Domain::Natural => true,
                         Domain::Interval(n) => state <= n.into(),
-                        Domain::Constant(n) => state == n.into(),
+                        Domain::Constant(n) => state == u64::from(n),
                     } {
                         assert_eq!(eval(&source.properties[0].predicate, state), eval(&p.model.properties[0].predicate, state));
                     }

@@ -22,7 +22,8 @@ use crate::types::Typing;
 pub(super) struct View {
     /// Index of the VIEW definition in `def_shapes` (where its misses are
     /// recorded).
-    pub(super) def: usize,
+    /// None for an anonymous expression whose shape follows from the layout.
+    pub(super) def: Option<usize>,
     /// Typing of the extended layout (whose last variable is the VIEW's
     /// value).
     pub(super) typing: Typing,
@@ -42,12 +43,16 @@ impl View {
         settings: &Settings,
         notes: &mut Vec<String>,
     ) -> Option<View> {
-        let d = crate::enc::speculate::view_def(base)?;
-        let def = def_shapes.iter().position(|(x, _)| *x == d)?;
-        let mut shape = def_shapes[def].1.clone();
+        let named = crate::enc::speculate::view_def(base);
+        let def = named.and_then(|d| def_shapes.iter().position(|(x, _)| *x == d));
+        let mut shape = match (named, def) {
+            (Some(_), Some(i)) => def_shapes[i].1.clone(),
+            (None, _) => super::view_shape::infer(base.view_expr()?, layout)?,
+            _ => return None,
+        };
         // Components of a tuple VIEW that are state variables: in their
         // layout encoding (plain copies, and they always fit).
-        if let (Some(es), Shape::Tuple(parts)) = (crate::enc::speculate::view_tuple(base, d), &shape) {
+        if let (Some(es), Shape::Tuple(parts)) = (named.and_then(|d| crate::enc::speculate::view_tuple(base, d)), &shape) {
             if es.len() == parts.len() {
                 let parts = es.iter().zip(parts.iter()).map(|(e, s)| match &*e.kind {
                     tlx_sema::hir::ExprKind::Var(v) => layout.vars[v.idx()].clone(),
@@ -57,7 +62,9 @@ impl View {
             }
         }
         let mut def_shapes = def_shapes.to_vec();
-        def_shapes[def].1 = shape.clone();
+        if let Some(i) = def {
+            def_shapes[i].1 = shape.clone();
+        }
         let mut vars = layout.vars.clone();
         vars.push(shape.clone());
         let ext = Arc::new(Layout::new(vars));

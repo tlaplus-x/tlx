@@ -78,3 +78,66 @@ fn print_only_actions_deoptimize_without_repeating_output() {
     assert_eq!(lines, vec!["0"]);
     assert!(model.escape.as_ref().unwrap().deopts.get() > 0, "printing alone must not force the action into the interpreter");
 }
+
+#[test]
+fn anonymous_projection_compiles_and_preserves_observed_distinctions() {
+    let src = r#"---- MODULE Projected ----
+EXTENDS Integers
+VARIABLE r
+Init == r = [mode |-> "idle", data |-> 0]
+Next == \/ \E x \in {0, 1}: /\ r.mode = "idle"
+                              /\ r' = [r EXCEPT !.mode = "busy", !.data = x]
+        \/ /\ r.mode = "busy" /\ r.data >= 0
+           /\ r' = [r EXCEPT !.mode = "idle"]
+Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
+===="#;
+    for mapped in [false, true] {
+        let source = if mapped {
+            src.replace("VARIABLE r", "CONSTANT Actors\nVARIABLE r")
+                .replace("r = [mode |-> \"idle\", data |-> 0]", "r = [s \\in Actors |-> [mode |-> \"idle\", data |-> 0]]")
+                .replace("Next ==", "Next == \\E s \\in Actors:")
+                .replace("r.mode", "r[s].mode")
+                .replace("r.data", "r[s].data")
+                .replace("!.", "![s].")
+                .replace(
+                    "r \\in [mode: {\"idle\", \"busy\"}, data: {0, 1}]",
+                    "r \\in [Actors -> [mode: {\"idle\", \"busy\"}, data: {0, 1}]]",
+                )
+        } else {
+            src.to_owned()
+        };
+        let value = |mode, data| {
+            let record = Value::record(vec![
+                (tlx_value::Sym::new("mode"), Value::Str(tlx_value::Sym::new(mode))),
+                (tlx_value::Sym::new("data"), Value::Int(data)),
+            ]);
+            if mapped {
+                Value::fcn_rcd_from_pairs(["a", "b"].iter().map(|s| (Value::ModelValue(tlx_value::Sym::new(s)), record.clone())).collect())
+                    .unwrap()
+            } else {
+                record
+            }
+        };
+        let shape = Shape::of(&value("idle", 0)).join(&Shape::of(&value("busy", 1)));
+        for no_native in [true, false] {
+            let cfg = format!("INIT Init\nNEXT Next\nINVARIANT Inv\n{}", if mapped { "CONSTANT Actors = {a, b}\n" } else { "" });
+            let mut base = load(&source, &cfg);
+            assert!(base.project_state().is_some());
+            let settings = Settings::from_lookup(|key| match key {
+                "TLX_PARANOID" => Some("1".into()),
+                "TLX_NO_NATIVE" if no_native => Some("1".into()),
+                "TLX_JIT" => Some("0".into()),
+                _ => None,
+            })
+            .unwrap();
+            let model = EncModel::new(Arc::new(base), Arc::new(Layout::new(vec![shape.clone()])), vec![], &settings);
+            let Fingerprint::View(view) = &model.fp else { panic!("anonymous VIEW was not compiled") };
+            assert!(view.def.is_none());
+            assert!(view.fast.is_some() || view.native.is_some());
+            let fingerprint = |mode, data| model.encode(&VState::new(vec![value(mode, data)].into(), 1, 0)).unwrap().fp;
+            assert_eq!(fingerprint("idle", 0), fingerprint("idle", 1));
+            assert_ne!(fingerprint("busy", 0), fingerprint("busy", 1));
+            assert_ne!(fingerprint("idle", 0), fingerprint("busy", 0));
+        }
+    }
+}

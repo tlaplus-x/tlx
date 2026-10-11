@@ -1,13 +1,15 @@
-//! Rule-based optimization of a restricted transition IR.
+//! Rule-based state reduction on HIR and a restricted transition IR.
 //!
-//! Exact cleanup can feed ordinary checking before execution lowering. The
-//! export pipeline additionally permits mathematical state-space quotients.
-//! Only validated rewrites reach HIR or artifact emission. See docs/optimization.md for the fragment and trust boundary.
+//! Checking uses a proved projection of concrete states. Artifact generation
+//! cleans up the transition IR before mathematical counter saturation.
+//! See docs/optimization.md for the preservation contracts and trust boundary.
 
 mod analysis;
-mod check;
+mod phase;
+mod projection;
 
-pub use check::optimize_check;
+pub use phase::{phase_projection, FieldProjection};
+pub use projection::unobserved_variables;
 mod constant;
 mod counter;
 mod dead;

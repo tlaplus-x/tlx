@@ -114,16 +114,8 @@ pub(crate) fn load_model(a: &mut Args, seed: u64) -> Result<InterpModel, ExitCod
             return Err(ExitCode::from(EXIT_CONFIG_ERROR));
         }
     }
-    if a.optimize {
-        if a.tlc {
-            out::info(code::GENERAL, "Rule-based optimization disabled by -tlc.");
-        } else {
-            a.optimization_rules = tlx_sema::optimize::optimize_check(&mut prog, &cfg).map_err(|e| {
-                let at = e.span.map(|s| format!("{}:{}:{}: ", prog.file(s.file).path.display(), s.line, s.col)).unwrap_or_default();
-                out::error(code::GENERAL, &format!("cannot apply -optimize: {at}{}", e.message));
-                ExitCode::from(2)
-            })?;
-        }
+    if a.optimize && a.tlc {
+        out::info(code::GENERAL, "Rule-based optimization disabled by -tlc.");
     }
     // (The seed is set first: building the model may evaluate constant
     // definitions, which TLC evaluates at startup with the seeded stream.)

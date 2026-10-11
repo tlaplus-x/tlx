@@ -44,12 +44,6 @@ impl Default for Pipeline {
 }
 
 impl Pipeline {
-    /// Concrete-state-preserving rules only. Saturation requires a separate
-    /// verdict/trace transfer contract and must not enter ordinary checking.
-    pub fn exact() -> Self {
-        Self { stages: vec![vec![Box::new(ConstantState), Box::new(SimplifyPredicates), Box::new(DeadActions)]] }
-    }
-
     #[cfg(test)]
     pub fn new(passes: Vec<Box<dyn Pass>>) -> Self {
         Self { stages: vec![passes] }

@@ -29,17 +29,6 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         }
         return Ok(None);
     }
-    // Exact IR optimization only accepts scalar naturals and rejects SYMMETRY,
-    // so there are no model-value permutations to analyze on this path.
-    if !a.optimization_rules.is_empty() {
-        out::info(code::OPTIMIZATIONS_USED, &format!("Optimizations: exact IR cleanup.\n{}", a.optimization_rules.join("\n")));
-        out::set_reduced("optimization");
-        tlx_runtime::stats::set_json(
-            "optimizations",
-            r#"[{"name":"exact-ir","scope":"safety","proof":"static","preserved":["V-safe","CEX"]}]"#.into(),
-        );
-        return Ok(None);
-    }
     let mut an = autosym::analyze(model);
     // Already-proven models retain their original analysis and execution
     // path. Only a CHOOSE rejection calls for conditional obligations.
@@ -62,7 +51,25 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         return Ok(None);
     }
     let applied = apply(model, &mut an, a.noautosymmetry)?;
-    label(applied.as_ref());
+    if let Some((rule, omitted)) = a.optimize.then(|| model.project_state()).flatten() {
+        let variables = omitted.join(", ");
+        out::info(
+            code::OPTIMIZATIONS_USED,
+            &format!(
+                "Optimizations: {rule} ({variables}; proven; safety checks only).\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
+            ),
+        );
+        out::set_reduced("optimization");
+        tlx_runtime::stats::set_json(
+            "optimizations",
+            format!(
+                r#"[{{"name":"{rule}","scope":"safety","proof":"static","preserved":["V-safe","CEX"],"detail":{}}}]"#,
+                json_string(&variables)
+            ),
+        );
+    } else {
+        label(applied.as_ref());
+    }
     Ok(applied)
 }
 

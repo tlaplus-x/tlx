@@ -33,6 +33,7 @@ mod fingerprint;
 mod liveness;
 mod symmetry;
 mod view;
+mod view_shape;
 
 use super::adapt::{self, Choice, ACTION, STATE_PRED, TRANS_PRED};
 use super::mixed::{FastRegions, HostRegions};

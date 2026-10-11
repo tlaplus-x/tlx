@@ -320,7 +320,10 @@ impl EncModel {
             Err(_) if self.escape.is_some() => tlx_layout::store::digest_of_value(&val)
                 .map(|d| vec![u64::MAX, d])
                 .map_err(|x| ModelError::new(format!("escape VIEW: {x:?}"))),
-            Err(_) => Err(Self::record_miss(&self.def_miss, v.def, val)),
+            Err(_) => match v.def {
+                Some(def) => Err(Self::record_miss(&self.def_miss, def, val)),
+                None => Err(ModelError::new("internal error: anonymous VIEW value does not fit its inferred shape")),
+            },
         }
     }
 }

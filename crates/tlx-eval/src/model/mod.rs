@@ -13,6 +13,7 @@
 pub mod autosym;
 mod checkpoint;
 pub mod liveness;
+mod optimization;
 mod print_order;
 mod report;
 mod runtime_adapter;
