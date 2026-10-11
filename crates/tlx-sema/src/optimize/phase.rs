@@ -19,7 +19,8 @@ pub struct FieldProjection {
 
 /// Derive one field projection. An unknown transfer, observation, effect or
 /// exhausted analysis budget cannot authorize dropping information. The caller
-/// supplies all observations and excludes overrides, symmetry and liveness.
+/// supplies all observations, excludes overrides and liveness, and checks
+/// equivariance before composing the result with symmetry.
 pub fn phase_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
     let mut expand = normalize::Normalizer::new(program);
     let initial = branches(&expand.root(init)?)?;

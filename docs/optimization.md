@@ -157,7 +157,8 @@ The proof obligations are:
    Read-dependency scanning handles recursive definitions with a visited set. Traversal is bounded
    by 100,000 nodes and depth 128; exhaustion yields no projection.
 5. The execution boundary excludes temporal checking, configuration overrides, possible predicates,
-   postconditions and existing VIEW/SYMMETRY. Automatic symmetry runs first and takes precedence.
+   postconditions and existing VIEW. Symmetry composition additionally requires the equivariance
+   check described below.
 
 **Correctness argument.** Let `P(s)` retain every non-omitted component. Related reachable states
 have equal retained values; every stored component is fully specified. A guard or
@@ -224,7 +225,8 @@ the state key. It preserves record fields, map keys and control values. Executab
 stored states are unchanged. The current implementation applies one projection rule per run:
 whole-variable projection takes precedence, then the proved phase candidate projecting the most
 fields (ties retain source traversal order). This heuristic does not predict reachable state counts. It does
-not combine several candidate records or compose with user VIEW or symmetry.
+not combine several candidate records or compose with user VIEW. Equivariant projections can
+compose with symmetry as described below.
 
 **Correctness argument.** Forward inference establishes an inductive overapproximation of reachable
 values: it contains Init and is closed under all recognized Next alternatives. Within this domain,
@@ -242,6 +244,33 @@ independently checked proof certificate. Recursive expansion, higher-order calls
 constants, effects and exhausted analysis budgets decline the rule. Control domains are limited to
 32 mutually comparable literal or configured model values, candidate records to 32 fields, and expanded actions to 512
 alternatives. It does not infer numeric threshold partitions or remove sequence lengths or map keys.
+
+## Composing projection with symmetry
+
+An automatic projection can compose with declared symmetry or statically proved automatic
+symmetry. Forced and runtime-guarded automatic groups retain their existing path. A declared
+group remains a user assertion; composing a proved projection does not prove that declaration.
+
+Let `P` be the proved projection and `G` the applied group. Require
+`P(g(s)) = g(P(s))` for every `g` in `G`. Whole-variable projection satisfies this directly.
+Phase projection is built from record updates, map construction, fixed field names and phase
+comparisons. Those operations commute with permutation when each introduced phase constant is
+fixed by every group element. The interpreter checks that condition against the evaluated
+configuration values and declines composition if it cannot establish it.
+
+State identity is the orbit of `P(s)`: project first, then canonicalize. Canonicalizing the full
+state first would let forgotten fields choose the representative, losing potential merges.
+Equivariance makes the group action well-defined on projected classes. Since both the projection
+and the valid symmetry preserve observations and matching successors, their composed quotient
+preserves safety verdicts, enabledness and concrete replay. Existing user VIEW semantics, including
+TLC's order of combining VIEW with SYMMETRY, remain unchanged.
+
+The interpreter uses a total structural order for projected keys, since a dead-field Boolean
+sentinel and a live integer can coexist under different actor permutations. The compiled tier
+reuses permutation plans and orbit fingerprinting on the projected tuple's encoding. Unsupported
+projected shapes, value-store shapes and escape mode use the interpreter's by-value key; actions
+can still execute as compiled code. This keeps one canonicalization policy per execution path
+without treating store handles as semantic values.
 
 ## Checking boundary
 

@@ -141,3 +141,80 @@ Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
         }
     }
 }
+
+#[test]
+fn projected_orbits_match_independent_multiset_classes() {
+    let src = r#"---- MODULE Orbit ----
+EXTENDS Integers, TLC
+CONSTANT Actors
+VARIABLE r
+Init == r = [s \in Actors |-> [mode |-> "idle", data |-> 0]]
+Next == \E s \in Actors:
+          \/ \E n \in {0, 1}: /\ r[s].mode = "idle"
+                                /\ r' = [r EXCEPT ![s].mode = "busy", ![s].data = n]
+          \/ /\ r[s].mode = "busy" /\ r[s].data >= 0
+             /\ r' = [r EXCEPT ![s].mode = "idle"]
+Inv == r \in [Actors -> [mode: {"idle", "busy"}, data: {0, 1}]]
+Sym == Permutations(Actors)
+===="#;
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTANT Actors = {a, b}\nSYMMETRY Sym\n";
+    let local = |i: usize| {
+        Value::record(vec![
+            (tlx_value::Sym::new("data"), Value::Int((i % 2) as i64)),
+            (tlx_value::Sym::new("mode"), Value::Str(tlx_value::Sym::new(if i < 2 { "idle" } else { "busy" }))),
+        ])
+    };
+    let value = |i, j| {
+        Value::fcn_rcd_from_pairs(vec![
+            (Value::ModelValue(tlx_value::Sym::new("a")), local(i)),
+            (Value::ModelValue(tlx_value::Sym::new("b")), local(j)),
+        ])
+        .unwrap()
+    };
+    let shape = Shape::of(&value(0, 0)).join(&Shape::of(&value(3, 3)));
+    for (no_native, escape) in [(true, false), (false, false), (true, true)] {
+        let mut base = load(src, cfg);
+        assert!(base.project_state().is_some());
+        let fingerprints: Vec<_> = (0..4)
+            .flat_map(|i| (0..4).map(move |j| (i, j)))
+            .map(|(i, j)| base.make_state(&[Some(value(i, j))], 1, "test").unwrap().fp)
+            .collect();
+        let settings = Settings::from_lookup(|key| match key {
+            "TLX_NO_NATIVE" if no_native => Some("1".into()),
+            "TLX_ESCAPE" if escape => Some("1".into()),
+            "TLX_PARANOID" | "TLX_NATIVE_SYNC" => Some("1".into()),
+            "TLX_JIT" => Some("0".into()),
+            _ => None,
+        })
+        .unwrap();
+        let model = EncModel::new(Arc::new(base), Arc::new(Layout::new(vec![shape.clone()])), vec![], &settings);
+        if escape {
+            assert!(matches!(model.fp, Fingerprint::Values));
+        } else {
+            let Fingerprint::View(view) = &model.fp else { panic!("projection must compile") };
+            assert!(view.orbit.is_some());
+            assert_eq!(view.native.is_none(), no_native);
+        }
+        let mut compiled = Vec::new();
+        let mut classes = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut class = [if i < 2 { 0 } else { i - 1 }, if j < 2 { 0 } else { j - 1 }];
+                class.sort();
+                classes.push(class);
+                let vals = vec![value(i, j)];
+                let state = model.encode(&VState::new(vals.clone().into(), 1, 0)).unwrap();
+                compiled.push(state.fp);
+                if let Some(escape) = &model.escape {
+                    assert_eq!(state.fp, model.words_fp(&escape.codec.force_escape(&vals).unwrap(), 1).unwrap());
+                }
+            }
+        }
+        for i in 0..16 {
+            for j in 0..16 {
+                assert_eq!(fingerprints[i] == fingerprints[j], classes[i] == classes[j]);
+                assert_eq!(compiled[i] == compiled[j], classes[i] == classes[j]);
+            }
+        }
+    }
+}

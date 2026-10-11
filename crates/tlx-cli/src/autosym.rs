@@ -51,19 +51,31 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         return Ok(None);
     }
     let applied = apply(model, &mut an, a.noautosymmetry)?;
-    if let Some((rule, omitted)) = a.optimize.then(|| model.project_state()).flatten() {
+    let project = a.optimize && applied.as_ref().is_none_or(|s| !s.forced && !s.guarded);
+    if let Some((rule, omitted)) = project.then(|| model.project_state()).flatten() {
         let variables = omitted.join(", ");
+        let group = applied.as_ref().map(|s| s.group.as_str()).or(model.ip.cfg.symmetry.as_deref());
+        let combined = group.map(|g| format!(", composed with symmetry {g}")).unwrap_or_default();
         out::info(
             code::OPTIMIZATIONS_USED,
             &format!(
-                "Optimizations: {rule} ({variables}; proven; safety checks only).\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
+                "Optimizations: {rule} ({variables}; proven; safety checks only){combined}.\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
             ),
         );
         out::set_reduced("optimization");
+        let symmetry = group
+            .map(|g| {
+                format!(
+                    r#"{{"name":"symmetry","scope":"safety","proof":"{}","preserved":["V-safe","CEX"],"detail":{}}},"#,
+                    if applied.is_some() { "static" } else { "none" },
+                    json_string(g)
+                )
+            })
+            .unwrap_or_default();
         tlx_runtime::stats::set_json(
             "optimizations",
             format!(
-                r#"[{{"name":"{rule}","scope":"safety","proof":"static","preserved":["V-safe","CEX"],"detail":{}}}]"#,
+                r#"[{symmetry}{{"name":"{rule}","scope":"safety","proof":"static","preserved":["V-safe","CEX"],"detail":{}}}]"#,
                 json_string(&variables)
             ),
         );

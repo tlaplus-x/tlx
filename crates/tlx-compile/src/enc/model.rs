@@ -309,6 +309,7 @@ impl EncModel {
         };
         let has_symmetry = !base.symmetry_maps().is_empty();
         let fp = match (symmetry, view) {
+            (_, Some(view)) if base.has_projected_symmetry() => Fingerprint::View(view),
             // VIEW with SYMMETRY: TLC takes the VIEW of the orbit's least
             // state in its value order, which encodings do not preserve:
             // that state is chosen by value, then its encoding permuted.

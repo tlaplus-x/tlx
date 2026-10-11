@@ -117,7 +117,10 @@ ordering tests cover these paths under targeted Miri.
 Trusted host decoding is additionally audited in `tlx-compile/src/exec/fast/`,
 `enc/{model,mixed}.rs`, `enc/model/{checks,fingerprint,view,symmetry}.rs`, and `tlx-testkit/src/diff.rs`:
 unsafe calls use the matching layout/program and encoder-produced state,
-constant or region words, synchronized when crossing threads. Public raw
+constant or region words, synchronized when crossing threads. Generated projection orbits
+use a tuple layout with exactly the VIEW encoding's component shapes and offsets; the
+existing permutation routine receives only words produced by that matching VIEW encoder.
+Public raw
 closure-executor entry points carry this obligation in their Safety contracts.
 Runtime `queue/reader.rs` and `explore/order.rs` call trusted codec methods only for
 encoder-produced records (or validated recovered records), as described above.

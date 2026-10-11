@@ -672,7 +672,7 @@ pub fn certainly_equal(a: &Value, b: &Value) -> bool {
 /// rank: model values < booleans < integers < strings < sets < functions.
 /// Infinite built-in sets (`Nat`, `Int`, `STRING`, `Seq(S)`) sort
 /// after all finite sets. Errors only if a lazy value cannot be materialized.
-pub(crate) fn try_total_cmp(a: &Value, b: &Value) -> Result<Ordering> {
+pub fn try_total_cmp(a: &Value, b: &Value) -> Result<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => return Ok(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) | (Value::ModelValue(x), Value::ModelValue(y)) => return Ok(x.cmp(y)),

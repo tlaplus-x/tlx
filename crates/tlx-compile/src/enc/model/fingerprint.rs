@@ -294,6 +294,9 @@ impl EncModel {
             } else {
                 *out = self.view_interpreted(v, words, level)?;
             }
+            if let Some(orbit) = &v.orbit {
+                return Ok(orbit.fingerprint(out));
+            }
             Ok(match &self.sem {
                 Some(sem) => sem.fp(out, &sem.view),
                 None => fp_words(out),

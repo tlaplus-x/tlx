@@ -33,6 +33,34 @@ pub(super) struct View {
     pub(super) fast: Option<(fast::Program, fast::ExprProg)>,
     /// Words of the VIEW's value in the extended state.
     pub(super) at: std::ops::Range<usize>,
+    /// Generated projections canonicalize their result, not the full state.
+    pub(super) orbit: Option<ProjectionOrbit>,
+}
+
+pub(super) struct ProjectionOrbit {
+    group: Vec<Vec<tlx_layout::permute::PermPlan>>,
+    order: Vec<usize>,
+    layout: Layout,
+}
+
+impl ProjectionOrbit {
+    fn compile(base: &InterpModel, shape: &Shape, notes: &mut Vec<String>) -> Option<Self> {
+        let Shape::Tuple(parts) = shape else { return None };
+        let layout = Layout::new(parts.to_vec());
+        // Keep the existing by-value path for store-backed shapes. This
+        // path compares only canonical encodings, never handle identities.
+        if super::SemFp::of(&layout, None).is_some() {
+            return None;
+        }
+        let group = super::symmetry::compile_symmetry(base, &layout, notes)?;
+        let order = super::symmetry::symmetry_order(&layout);
+        Some(Self { group, order, layout })
+    }
+
+    pub(super) fn fingerprint(&self, words: &[u64]) -> u64 {
+        assert_eq!(words.len(), self.layout.words);
+        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout.offsets, words, None)
+    }
 }
 
 impl View {
@@ -43,6 +71,9 @@ impl View {
         settings: &Settings,
         notes: &mut Vec<String>,
     ) -> Option<View> {
+        if base.has_projected_symmetry() && settings.escape {
+            return None;
+        }
         let named = crate::enc::speculate::view_def(base);
         let def = named.and_then(|d| def_shapes.iter().position(|(x, _)| *x == d));
         let mut shape = match (named, def) {
@@ -65,6 +96,7 @@ impl View {
         if let Some(i) = def {
             def_shapes[i].1 = shape.clone();
         }
+        let orbit = if base.has_projected_symmetry() { Some(ProjectionOrbit::compile(base, &shape, notes)?) } else { None };
         let mut vars = layout.vars.clone();
         vars.push(shape.clone());
         let ext = Arc::new(Layout::new(vars));
@@ -83,7 +115,7 @@ impl View {
             }
             _ => None,
         };
-        Some(View { def, typing, action, native, fast, at })
+        Some(View { def, typing, action, native, fast, at, orbit })
     }
 
     /// Compute the VIEW's encoding of the extended state `ext` (the state

@@ -150,6 +150,8 @@ pub struct InterpModel {
     pub coverage: bool,
     /// VIEW: states are fingerprinted by the value of this expression.
     view: Option<Expr>,
+    /// A proved state projection is canonicalized before symmetry.
+    state_projection: bool,
     /// ALIAS: error-trace states are displayed as this record.
     alias: Option<Expr>,
     /// POSTCONDITIONs (name, definition), checked after model checking.
@@ -506,6 +508,7 @@ impl InterpModel {
             symmetry,
             fp_mode: if reduce { FpMode::Reduced } else { FpMode::Plain },
             view,
+            state_projection: false,
             alias,
             postconditions,
             possible,
@@ -868,7 +871,8 @@ impl InterpModel {
     /// Fingerprint of a state: of its VIEW value if there is one, otherwise
     /// of the fingerprints of its variable values; with SYMMETRY, like TLC,
     /// of the least state of the orbit in TLC's value order (with a VIEW:
-    /// the VIEW of that state, see `least_in_orbit`). `base` is
+    /// the VIEW of that state, see `least_in_orbit`). Proved projections
+    /// instead canonicalize the projected value. `base` is
     /// a state that `vals` may share values with (whose fingerprints are
     /// reused). (`FpMode::Plain`: neither VIEW nor SYMMETRY.)
     fn compute_fp(&self, vals: &Arc<[Value]>, level: u32, base: Option<&State>) -> EResult<u64> {
@@ -880,6 +884,11 @@ impl InterpModel {
     fn compute_fp_and_var_fps(&self, vals: &Arc<[Value]>, level: u32, base: Option<&State>) -> EResult<(u64, Option<Arc<[u64]>>)> {
         let plain = self.fp_mode == FpMode::Plain;
         if let (Some(v), false) = (&self.view, plain) {
+            if self.has_projected_symmetry() {
+                let projected = self.ip.eval(v, &Env::default(), &Ctx::state(vals, level))?.normalize()?;
+                let canonical = self.projected_orbit(projected)?;
+                return Ok((tlx_value::fingerprint::fingerprint(&canonical)?, None));
+            }
             let least = self.least_in_orbit(vals)?;
             let state: &[Value] = least.as_deref().unwrap_or(vals);
             let viewed = self.ip.eval(v, &Env::default(), &Ctx::state(state, level))?.normalize()?;
