@@ -398,8 +398,8 @@ one line `compile: no JIT and no C compiler (cc not found): checking with the in
 shortest-trace length as TLC's ([compat.md](compat.md) section 0). Without it, the default mode may
 use optimizations TLC does not have; they keep the verdicts sound (a violation is reported exactly
 when one exists, with a genuine counterexample) but may change counts, depth or the counterexample.
-Today it applies one: a symmetry of sets of model values that tlx proves, to runs that check only
-safety ([section 6.3](#63-automatic-symmetry-in-the-default-mode)). Every run in the default mode names
+Automatic symmetry currently awaits connected Lean certificates and is not applied
+([section 6.3](#63-automatic-symmetry-in-the-default-mode)). Every run in the default mode names
 the optimizations it used in an `Optimizations:` line.
 
 ---
@@ -562,12 +562,11 @@ Many models bind a constant to a set of interchangeable model values (`RM = {r1,
 do not declare the symmetry. Before the search, tlx looks for such sets (a CONSTANT whose cfg
 value is a set of at least two model values, also through a `<-` substitution of a constant
 definition) that the cfg's SYMMETRY does not cover, and tries to prove statically that every
-permutation of them is an automorphism of the checked state graph. In the default mode a proven
-group is applied to the search when the run allows it (section 6.3). Under `-tlc`, which never
-applies it, tlx prints a suggestion instead:
+permutation of them is an automorphism of the checked state graph. A candidate group is not applied automatically pending a connected Lean certificate
+(section 6.3). Under `-tlc`, tlx prints a suggestion:
 
 ```
-Symmetry: Permutations(RM) is provable for safety checking and not declared; to use it, run without -tlc, or define Perms == Permutations(RM) and add "SYMMETRY Perms" to the cfg.
+Symmetry: Permutations(RM) is provable for safety checking and not declared; to use it, define Perms == Permutations(RM) and add "SYMMETRY Perms" to the cfg.
 ```
 
 For a run that checks temporal properties the line warns instead that a reduction does not apply to
@@ -613,50 +612,19 @@ Proven symmetry: define Perms == Permutations(Key) \cup Permutations(Val) \cup P
 
 ### 6.3. Automatic symmetry in the default mode
 
-Without `-tlc`, tlx applies a proven symmetry (section 6.2) to the search, as if the cfg declared
-it, when all of these hold: the run checks only safety (no temporal property), the cfg declares no
-`SYMMETRY` and no `VIEW`, the checked parts use no builtin whose output or result depends on which
-states are explored (`Print`, `TLCSet`/`TLCGet` other than `TLCGet("level")`, randomness, IO), and
-the group has at most 720 elements (larger products leave out the sets with the largest groups).
-Before the search, a bounded check of the group runs for at most 20 ms as a cross-check of the
-proof; a witness is an internal error (exit 101). `-noautosymmetry` turns it off; `-tlc` never
-applies it.
+Automatic symmetry application is disabled until it has a compiler-generated Lean
+certificate connected to the reduction. The Rust analysis, its bounded cross-checks and
+runtime guards do not meet that proof requirement. This includes forced candidates:
+the development force setting cannot bypass the certificate gate.
 
-Projected choices such as `(CHOOSE m \in messages : P(m)).val` can also use a runtime
-obligation: whenever the expression is evaluated, all satisfying candidates must have the
-same field value. These runs are labelled `runtime guard`. If a guard fails, tlx discards the
-reduced search and restarts without automatic symmetry; the final verdict, state counts and
-counterexample come from that fresh search. Explicit checkpoint or recovery requests use
-static proofs only; runtime-guarded searches do not write automatic checkpoints. This does
-not extend automatic symmetry to VIEW or temporal properties.
+Candidate analysis and `-checksymmetry -suggest` remain available. The `auto symmetry`
+section of `-stats` explains that a connected certificate is missing. Explicit user
+`SYMMETRY` declarations keep their existing behavior and responsibility; they are not
+compiler-certified reductions. See [proof coverage](optimization.md#proof-coverage).
 
-The reduced search explores one state per orbit. Verdicts and violated names are those of `-tlc`,
-every counterexample is a genuine behavior of the spec (it is rebuilt by re-execution, as under a
-declared SYMMETRY), and the depth and the length of a safety counterexample are those of `-tlc`
-(all states of an orbit lie on the same BFS level). The state counts are those of the reduced
-search: they equal TLC's counts with the corresponding `SYMMETRY` added to the cfg.
-
-Every run in the default mode says which optimizations it used, in text and in machine-readable form:
-
-```
-Optimizations: symmetry Permutations(Key) x Permutations(Val) x Permutations(TxId) (proven; safety checks only).
-Counts refer to the reduced search; run with -tlc for TLC-identical statistics.
-...
-2419208 states generated, 146376 distinct states found, 0 states left on queue (symmetry-reduced).
-```
-
-or `Optimizations: none applicable.` The start line has message code 9100 under `-tool` (a tlx
-code, not TLC's). `-stats json` has an `optimizations` array with one object per optimization:
-`name`, `scope` (`safety`), `proof` (`static` or `runtime guard`), `preserved` (the guarantees kept: `V-safe` verdicts
-and violated names, `CEX` genuine counterexamples, `D` depth, `L` safety counterexample length) and
-`detail` (the group). The `auto symmetry` section of `-stats` lists every candidate set with the
-proven group or the reason it is not proven or not applied. A `-dump` file of a reduced search
-starts with the comment `\* reduced by symmetry; use -tlc for the full graph`; counterexample files
-(`-dumpTrace`) are unchanged.
-
-The test drivers compare counts with TLC only for runs with `-tlc`: `scripts/tlc.py` records the
-`Optimizations:` line and `contract.compare` refuses to compare the counts of a run that used
-optimizations with a TLC oracle.
+Every default-mode run still names applied optimizations (message code 9100 under `-tool`)
+and records an `optimizations` array in JSON statistics. With no certified opt-in projection,
+it reports `Optimizations: none applicable.` and explores the full graph.
 
 ---
 

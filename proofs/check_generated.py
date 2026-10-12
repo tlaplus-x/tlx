@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicitly verify generated history certificates; never called by tlx check."""
+"""Explicitly verify generated rule certificates; never called by tlx check."""
 
 import argparse
 import hashlib
@@ -30,30 +30,52 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    if "namespace TlxOptimization.GeneratedHistory" not in source:
-        raise RuntimeError(f"{path}: no generated history certificate")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge")
+                  if f"namespace TlxOptimization.{name}\n" in source]
+    if len(namespaces) != 1:
+        raise RuntimeError(f"{path}: expected one supported generated certificate")
+    namespace = namespaces[0]
     result = invoke(lean, path)
     if result.returncode:
         raise RuntimeError(f"{path}: Lean failed:\n{result.stdout}")
     axioms = {}
     for name, values in re.findall(
-        r"'TlxOptimization\.GeneratedHistory\.(\w+)' depends on axioms: \[([^]]*)\]",
+        rf"'TlxOptimization\.{namespace}\.(\w+)' depends on axioms: \[([^]]*)\]",
         result.stdout,
     ):
         actual = {v.strip() for v in values.split(",") if v.strip()}
         if actual - ALLOWED_AXIOMS:
             raise RuntimeError(f"{path}: unexpected axioms for {name}: {actual}")
         axioms[name] = sorted(actual)
-    if set(axioms) != THEOREMS:
+    for name in re.findall(
+        rf"'TlxOptimization\.{namespace}\.(\w+)' does not depend on any axioms",
+        result.stdout,
+    ):
+        axioms[name] = []
+    theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace == "GeneratedOrdered" else set())
+    if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
     mutations = []
     if negative:
-        for before, after, label in [
+        changes = ([
             ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
+        ] if namespace == "GeneratedHistory" else [
+            ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
+        ] if namespace == "GeneratedErasure" else [
+            ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
+            ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
+            ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),
+            ("h k = some n ∧ d ≤ n", "h k = some n ∧ d < n", "changed deadline strictness"),
+        ] if namespace == "GeneratedAge" else [
+            ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
+            ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
+        ])
+        changes.append(
             ("def after := (model sem).reduced",
              "def after := { (model sem).reduced with safe := fun _ => True }",
-             "changed reduced observation"),
-        ]:
+             "changed reduced observation")
+        )
+        for before, after, label in changes:
             if source.count(before) != 1:
                 raise RuntimeError(f"{path}: negative test no longer targets one expression: {label}")
             with tempfile.TemporaryDirectory(prefix="tlx-generated-proof-") as tmp:
@@ -62,15 +84,15 @@ def verify(lean, path, negative):
                 rejected = invoke(lean, bad)
             if rejected.returncode == 0 or not any(
                 marker in rejected.stdout for marker in
-                ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: unsolved goals")
+                ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal")
             ):
                 raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
             mutations.append({"change": label, "diagnostic": rejected.stdout})
-    print(f"PASS: {path} (5 theorem audits, {len(mutations)} rejected mutations)")
+    print(f"PASS: {path} ({len(theorems)} theorem audits, {len(mutations)} rejected mutations)")
     return {
         "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "axioms": axioms, "rejected_mutations": mutations,
-        "scope": "Parametric history rule IR; lowering, totality and runtime remain trusted.",
+        "scope": f"Parametric {namespace} rule IR; lowering, totality and runtime remain trusted.",
     }
 
 
@@ -78,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("files", type=Path, nargs="+")
     parser.add_argument("--lean", default="lean")
-    parser.add_argument("--negative", action="store_true", help="also require two broken proofs to fail")
+    parser.add_argument("--negative", action="store_true", help="also require deliberately broken proofs to fail")
     parser.add_argument("--report", type=Path, help="write a JSON receipt after all checks pass")
     args = parser.parse_args()
     lean = shutil.which(args.lean)

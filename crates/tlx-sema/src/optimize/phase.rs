@@ -3,6 +3,7 @@
 
 mod age;
 mod domain;
+mod erasure;
 mod history;
 mod liveness;
 mod normalize;
@@ -10,6 +11,7 @@ mod ordered;
 mod sequence;
 
 pub use age::age_projection;
+pub use erasure::unobserved_projection;
 pub use history::history_projection;
 pub use ordered::{ordered_projection, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::sequence_length_projection;

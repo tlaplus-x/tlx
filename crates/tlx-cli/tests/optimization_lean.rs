@@ -23,7 +23,7 @@ fn enabled_check_always_emits_and_preserves_previous_runs() {
         let run = tlx_testkit::tlx_default!().check("ProofOutput.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
         assert_eq!(run.code, 0, "{}", run.text());
         assert!(run.stdout.contains("Lean output:"), "{}", run.text());
-        assert!(run.stdout.contains("not verified; rule algebra only"), "{}", run.text());
+        assert!(run.stdout.contains("not verified; parametric unobserved-state rule-IR certificate"), "{}", run.text());
         let paths = artifacts(&dir);
         if let Some((path, bytes)) = &previous {
             assert_eq!(paths.len(), 2);
@@ -35,7 +35,7 @@ fn enabled_check_always_emits_and_preserves_previous_runs() {
             let text = std::fs::read_to_string(&paths[0]).unwrap();
             assert!(text.contains("def rule : String := \"unobserved-state-projection\""));
             assert!(text.contains("theorem safety_iff"));
-            assert!(text.contains("No model-level Certificate is constructed"));
+            assert!(text.contains("namespace TlxOptimization.GeneratedErasure"));
             assert!(!text.contains("sorry"));
             previous = Some((paths[0].clone(), text.into_bytes()));
         }
@@ -130,7 +130,7 @@ fn history_certificate_is_generated_from_the_actual_predicate() {
 }
 
 #[test]
-fn unsupported_certificate_scope_is_labelled_without_disabling_the_rule() {
+fn unsupported_certificate_scope_disables_the_rule() {
     for (spec, cfg) in [
         (HISTORY.replace("x' = IF x = 0 THEN 1 ELSE 0", "x' = IF h = <<>> THEN 0 ELSE IF x = 0 THEN 1 ELSE 0"), CFG.to_string()),
         (HISTORY.replace("====", "Limit == x <= 1\n===="), format!("{CFG}CONSTRAINT Limit\n")),
@@ -138,8 +138,8 @@ fn unsupported_certificate_scope_is_labelled_without_disabling_the_rule() {
         let dir = tlx_testkit::TempDir::with_spec("lean-history-scope", &spec, &cfg);
         let run = tlx_testkit::tlx_default!().check("ProofOutput.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
         assert_eq!(run.code, 0, "{}", run.text());
-        assert!(run.stdout.contains("history-summary-projection"), "{}", run.text());
-        assert!(run.stdout.contains("not verified; rule algebra only"), "{}", run.text());
+        assert!(!run.stdout.contains("history-summary-projection"), "{}", run.text());
+        assert!(run.stdout.contains("not verified; no reduction applied; rule algebra only"), "{}", run.text());
         let text = std::fs::read_to_string(&artifacts(&dir)[0]).unwrap();
         assert!(!text.contains("namespace TlxOptimization.GeneratedHistory"));
     }

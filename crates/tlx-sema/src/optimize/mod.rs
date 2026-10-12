@@ -11,8 +11,8 @@ mod projection;
 
 pub use lean::projection_lean;
 pub use phase::{
-    age_projection, history_projection, ordered_projection, phase_projection, sequence_length_projection, FieldProjection, OrderedHistory,
-    OrderedPlan, OrderedShape,
+    age_projection, history_projection, ordered_projection, phase_projection, sequence_length_projection, unobserved_projection,
+    FieldProjection, OrderedHistory, OrderedPlan, OrderedShape,
 };
 pub use projection::unobserved_variables;
 mod constant;
@@ -59,6 +59,8 @@ pub struct Artifact {
     pub module: String,
     pub config: String,
     pub report: String,
+    /// Connected pass certificates; None means an internal proposal only.
+    pub certificate: Option<String>,
 }
 
 /// Lower the complete configured observation set, run the default pass

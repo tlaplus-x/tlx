@@ -2,6 +2,7 @@
 //! versions. Applicability depends on value provenance, not schema names.
 
 mod infer;
+mod lean;
 mod shape;
 mod syntax;
 #[cfg(test)]
@@ -60,6 +61,12 @@ struct Analysis<'a> {
 }
 
 pub fn ordered_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
+    let candidate = candidate(program, cfg, init, next, observations)?;
+    candidate.certificate.as_ref()?;
+    Some(candidate)
+}
+
+fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
     let mut expand = Normalizer::new(program);
     let initial = branches(&syntax::conditionals(&expand.root(init)?))?;
     let steps = branches(&syntax::conditionals(&syntax::lift_frames(&expand.root(next)?, program, cfg)))?;
@@ -145,10 +152,10 @@ pub fn ordered_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
             return None;
         }
     }
-    let initial: Vec<_> = analysis.families.iter().map(|f| f.initial).collect();
-    let mut anchors = vec![BTreeSet::new(); initial.len()];
+    let seeds: Vec<_> = analysis.families.iter().map(|f| f.initial).collect();
+    let mut anchors = vec![BTreeSet::new(); seeds.len()];
     for shape in analysis.shapes.iter().chain(&analysis.observations) {
-        shape.anchors(&initial, &mut anchors)?;
+        shape.anchors(&seeds, &mut anchors)?;
     }
     let plan = OrderedPlan {
         variables: analysis.shapes.iter().map(plan_shape).collect(),
@@ -160,7 +167,8 @@ pub fn ordered_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
         fields.push(format!("{}.live-versions", program.vars[h.variable.idx()].name));
     }
     let values = program.vars.iter().enumerate().map(|(i, v)| Expr::new(ExprKind::Var(VarId(i as u32)), v.span)).collect();
-    Some(FieldProjection { view: Expr::new(ExprKind::Tuple(values), init.span), fields, certificate: None, ordered: Some(plan) })
+    let certificate = lean::emit(&analysis.families, &plan, &initial, &steps, &observations);
+    Some(FieldProjection { view: Expr::new(ExprKind::Tuple(values), init.span), fields, certificate, ordered: Some(plan) })
 }
 
 impl Analysis<'_> {

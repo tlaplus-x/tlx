@@ -34,15 +34,18 @@ fn projection(body: &str) -> Vec<String> {
         Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
     });
     age_projection(&p, &parse_cfg("INIT Init\nNEXT Next\nINVARIANT Inv\n").unwrap(), &roots[0], &roots[1], &roots[2..])
-        .map(|p| p.fields)
+        .map(|p| {
+            assert!(p.certificate.as_ref().unwrap().contains("GeneratedAge"));
+            p.fields
+        })
         .unwrap_or_default()
 }
 
 #[test]
-fn infers_age_and_composes_history_from_transfers() {
-    assert_eq!(projection(BODY), ["records.created.age<=2", "clock.logical-clock", "h.history"]);
+fn infers_certified_age_and_keeps_history_concrete() {
+    assert_eq!(projection(BODY), ["records.created.age<=2", "clock.logical-clock"]);
     let renamed = BODY.replace("clock", "epoch").replace("created", "born").replace("records", "slots");
-    assert_eq!(projection(&renamed), ["slots.born.age<=2", "epoch.logical-clock", "h.history"]);
+    assert_eq!(projection(&renamed), ["slots.born.age<=2", "epoch.logical-clock"]);
 }
 
 #[test]
@@ -77,6 +80,21 @@ fn refuses_observed_magnitudes_future_stamps_and_unknown_transfers() {
         BODY.replace("Inv ==", "Inv == records[1].created = 0 /\\"),
         BODY.replace("clock' = clock + 1", "clock' = clock + 1 /\\ UNCHANGED clock"),
         BODY.replace("payload |-> \"x\"", "payload |-> clock"),
+    ] {
+        assert!(projection(&body).is_empty(), "{body}");
+    }
+}
+
+#[test]
+fn certificate_rejects_age_dependent_payloads_and_map_conditions() {
+    // The applicability scan accepts these deadline reads, but the narrower
+    // certificate must not interpret them as age-independent HIR leaves.
+    for body in [
+        BODY.replace("payload |-> \"x\"", "payload |-> IF records[1].created + 2 <= clock THEN \"x\" ELSE \"y\""),
+        BODY.replace(
+            "records' = [records EXCEPT ![k] = Empty]",
+            "records' = IF records[k].created + 2 <= clock THEN [records EXCEPT ![k] = Empty] ELSE records",
+        ),
     ] {
         assert!(projection(&body).is_empty(), "{body}");
     }

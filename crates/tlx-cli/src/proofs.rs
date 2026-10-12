@@ -23,10 +23,16 @@ pub(crate) fn emit(model: &InterpModel, applied: Option<(&str, &[String])>) -> R
         out::error(code::GENERAL, &format!("Cannot write mandatory optimization Lean output: {e}"));
         std::process::ExitCode::from(2)
     })?;
-    let coverage = if model.projection_certificate().is_some() {
+    let coverage = if model.projection_certificate().is_some() && model.ordered_projection().is_some() {
+        "parametric ordered-allocation rule-IR certificate; lowering and runtime remain trusted"
+    } else if rule == Some("unobserved-state-projection") && model.projection_certificate().is_some() {
+        "parametric unobserved-state rule-IR certificate; lowering and runtime remain trusted"
+    } else if rule == Some("relative-age-projection") && model.projection_certificate().is_some() {
+        "parametric relative-age rule-IR certificate; lowering and runtime remain trusted"
+    } else if model.projection_certificate().is_some() {
         "parametric history rule-IR certificate; lowering and runtime remain trusted"
     } else {
-        "rule algebra only, model applicability remains Rust-checked"
+        "no reduction applied; rule algebra only"
     };
     out::info(code::GENERAL, &format!("Lean output: {} (not verified; {coverage}).", path.display()));
     Ok(())

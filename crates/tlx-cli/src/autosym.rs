@@ -68,7 +68,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         out::info(
             code::OPTIMIZATIONS_USED,
             &format!(
-                "Optimizations: {rule} ({variables}; proven; safety checks only{arithmetic}){combined}.\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
+                "Optimizations: {rule} ({variables}; certificate generated; safety checks only{arithmetic}){combined}.\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
             ),
         );
         out::set_reduced("optimization");
@@ -84,7 +84,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         tlx_runtime::stats::set_json(
             "optimizations",
             format!(
-                r#"[{symmetry}{{"name":"{rule}","scope":"safety","proof":"static","preserved":["V-safe","CEX"],"detail":{}}}]"#,
+                r#"[{symmetry}{{"name":"{rule}","scope":"safety","proof":"generated-lean","preserved":["V-safe","CEX"],"detail":{}}}]"#,
                 json_string(&variables)
             ),
         );
@@ -244,7 +244,7 @@ fn not_applicable(model: &InterpModel, an: &Analysis) -> Option<String> {
     if an.incomplete {
         return Some("the analysis is incomplete".into());
     }
-    None
+    Some("no connected Lean certificate for automatic symmetry".into())
 }
 
 /// A line of the `-stats` section.

@@ -1,16 +1,12 @@
 # Reductions and search modes beyond TLC
 
-This page is the developer contract behind tlx's two checking modes and the one reduction they
-differ by: what the default mode may do, which guarantee each reduction keeps, how the proof and its
-runtime obligations work, and what the test drivers do with a reduced run.
-[compat.md](compat.md) section 0 owns the tier contract a user relies on, [usage.md](usage.md) section 6 owns what a
-user sees, and [configuration.md](configuration.md) owns the options and their defaults.
-
-**Automatic symmetry is the only reduction implemented.** The other techniques this page's contract
-was designed for (sleep sets, partial-order reduction, bounded and swarm search, bitstate storage,
-incremental re-checking, 128-bit fingerprints) do not exist in the code; §5 lists them with the
-evidence. Their proposals and the measurements that ranked them are archived — [README.md](README.md)
-names the pinned revision that holds them.
+This page documents the automatic-symmetry candidate analysis and the general search
+contract. **Automatic application is currently disabled:** Rust analysis and bounded
+checks do not replace a compiler-generated Lean certificate connected to the reduction.
+The algorithms and prior evidence below describe candidates awaiting that proof.
+[optimization.md](optimization.md#proof-coverage) owns the current certificate inventory
+and enabled opt-in state projections. [compat.md](compat.md) owns compatibility,
+[usage.md](usage.md) owns user behavior, and [configuration.md](configuration.md) owns options.
 
 ## 1. Modes and the guarantee contract
 
@@ -46,7 +42,7 @@ registers, `RandomElement` at state level, IO) is not reduced, with a one-line n
 ### 1.3 Classes
 
 - **Class A, default-eligible.** Sound, exhaustive, and proven to apply. Automatic symmetry is the
-  only implemented member; `-tlc` turns it off, and each one has an explicit off switch
+  implemented candidate, currently gated off pending a connected certificate; each one has an explicit off switch
   (`-noautosymmetry`) for diagnosis.
 - **Class B, explicit.** Gives up exhaustiveness, or rests on an unproven assumption. It needs a
   flag that names what is given up, and a "no violation found" result is labelled incomplete. No
@@ -58,7 +54,7 @@ registers, `RandomElement` at state level, IO) is not reduced, with a one-line n
 
 A CONSTANT whose cfg value is a set of model values names interchangeable identities in most specs,
 but users forget to declare it. tlx looks for those sets, proves which of them the spec is invariant
-under, and applies the proven group to the safety search in the default mode. The reduction itself is
+under. Application is gated off pending a connected Lean certificate. The reduction itself is
 TLC's: the search explores one representative per orbit, and the counts of a reduced run are the
 counts of the quotient.
 

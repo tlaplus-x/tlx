@@ -83,19 +83,20 @@ fn print_only_actions_deoptimize_without_repeating_output() {
 fn anonymous_projection_compiles_and_preserves_observed_distinctions() {
     let src = r#"---- MODULE Projected ----
 EXTENDS Integers
-VARIABLE r
-Init == r = [mode |-> "idle", data |-> 0]
-Next == \/ \E x \in {0, 1}: /\ r.mode = "idle"
+VARIABLE r, tag
+Init == tag = 0 /\ r = [mode |-> "idle", data |-> 0]
+Step == \/ \E x \in {0, 1}: /\ r.mode = "idle"
                               /\ r' = [r EXCEPT !.mode = "busy", !.data = x]
         \/ /\ r.mode = "busy" /\ r.data >= 0
            /\ r' = [r EXCEPT !.mode = "idle"]
+Next == tag' = 1 /\ Step
 Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
 ===="#;
     for mapped in [false, true] {
         let source = if mapped {
             src.replace("VARIABLE r", "CONSTANT Actors\nVARIABLE r")
                 .replace("r = [mode |-> \"idle\", data |-> 0]", "r = [s \\in Actors |-> [mode |-> \"idle\", data |-> 0]]")
-                .replace("Next ==", "Next == \\E s \\in Actors:")
+                .replace("Step ==", "Step == \\E s \\in Actors:")
                 .replace("r.mode", "r[s].mode")
                 .replace("r.data", "r[s].data")
                 .replace("!.", "![s].")
@@ -130,20 +131,23 @@ Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
                 _ => None,
             })
             .unwrap();
-            let model = EncModel::new(Arc::new(base), Arc::new(Layout::new(vec![shape.clone()])), vec![], &settings);
+            let model =
+                EncModel::new(Arc::new(base), Arc::new(Layout::new(vec![shape.clone(), Shape::Int { lo: 0, hi: 1 }])), vec![], &settings);
             let Fingerprint::View(view) = &model.fp else { panic!("anonymous VIEW was not compiled") };
             assert!(view.def.is_none());
             assert!(view.fast.is_some() || view.native.is_some());
-            let fingerprint = |mode, data| model.encode(&VState::new(vec![value(mode, data)].into(), 1, 0)).unwrap().fp;
-            assert_eq!(fingerprint("idle", 0), fingerprint("idle", 1));
-            assert_ne!(fingerprint("busy", 0), fingerprint("busy", 1));
-            assert_ne!(fingerprint("idle", 0), fingerprint("busy", 0));
+            let fingerprint =
+                |mode, data, tag| model.encode(&VState::new(vec![value(mode, data), Value::Int(tag)].into(), 1, 0)).unwrap().fp;
+            assert_eq!(fingerprint("idle", 0, 0), fingerprint("idle", 0, 1));
+            assert_ne!(fingerprint("idle", 0, 0), fingerprint("idle", 1, 0));
+            assert_ne!(fingerprint("busy", 0, 0), fingerprint("busy", 1, 0));
+            assert_ne!(fingerprint("idle", 0, 0), fingerprint("busy", 0, 0));
         }
     }
 }
 
 #[test]
-fn projected_orbits_match_independent_multiset_classes() {
+fn refused_projection_retains_declared_symmetry_multiset_classes() {
     let src = r#"---- MODULE Orbit ----
 EXTENDS Integers, TLC
 CONSTANT Actors
@@ -174,7 +178,7 @@ Sym == Permutations(Actors)
     let shape = Shape::of(&value(0, 0)).join(&Shape::of(&value(3, 3)));
     for (no_native, escape) in [(true, false), (false, false), (true, true)] {
         let mut base = load(src, cfg);
-        assert!(base.project_state().is_some());
+        assert!(base.project_state().is_none());
         let fingerprints: Vec<_> = (0..4)
             .flat_map(|i| (0..4).map(move |j| (i, j)))
             .map(|(i, j)| base.make_state(&[Some(value(i, j))], 1, "test").unwrap().fp)
@@ -188,18 +192,12 @@ Sym == Permutations(Actors)
         })
         .unwrap();
         let model = EncModel::new(Arc::new(base), Arc::new(Layout::new(vec![shape.clone()])), vec![], &settings);
-        if escape {
-            assert!(matches!(model.fp, Fingerprint::Values));
-        } else {
-            let Fingerprint::View(view) = &model.fp else { panic!("projection must compile") };
-            assert!(view.orbit.is_some());
-            assert_eq!(view.native.is_none(), no_native);
-        }
+        assert!(matches!(model.fp, Fingerprint::Symmetry { .. }));
         let mut compiled = Vec::new();
         let mut classes = Vec::new();
         for i in 0..4 {
             for j in 0..4 {
-                let mut class = [if i < 2 { 0 } else { i - 1 }, if j < 2 { 0 } else { j - 1 }];
+                let mut class = [i, j];
                 class.sort();
                 classes.push(class);
                 let vals = vec![value(i, j)];

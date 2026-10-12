@@ -18,10 +18,10 @@ Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
 const CFG: &str = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
 
 #[test]
-fn phase_projection_reduces_states_in_every_tier_and_respects_tlc_mode() {
+fn unproved_phase_projection_keeps_full_counts_in_every_tier() {
     let dir = tlx_testkit::TempDir::with_spec("phase-projection", SPEC, CFG);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 3), (vec!["-optimize", "-tlc"], 4)] {
+        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 4), (vec!["-optimize", "-tlc"], 4)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Phase.tla")
                 .args(args)
@@ -34,13 +34,13 @@ fn phase_projection_reduces_states_in_every_tier_and_respects_tlc_mode() {
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
             assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-            assert_eq!(run.stdout.contains("phase-field-projection"), count == 3, "{tier}: {}", run.text());
+            assert!(!run.stdout.contains("phase-field-projection"), "{tier}: {}", run.text());
         }
     }
 }
 
 #[test]
-fn each_map_entry_has_its_own_control_phase() {
+fn unproved_map_field_projection_keeps_all_entries() {
     let spec = SPEC
         .replace("r = [mode |-> \"idle\", data |-> 0]", "r = [s \\in {1, 2} |-> [mode |-> \"idle\", data |-> 0]]")
         .replace("Start ==", "Start(s) ==")
@@ -64,11 +64,7 @@ fn each_map_entry_has_its_own_control_phase() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
-            assert!(
-                run.stdout.contains(if optimize { "9 distinct states found" } else { "16 distinct states found" }),
-                "{tier}: {}",
-                run.text()
-            );
+            assert!(run.stdout.contains("16 distinct states found"), "{tier}: {}", run.text());
         }
     }
 }
@@ -93,7 +89,7 @@ fn invariant_failure_and_evaluation_error_remain_visible() {
 }
 
 #[test]
-fn model_valued_phases_project_sequences_with_proved_element_types() {
+fn unproved_model_value_phases_keep_sequence_contents() {
     let spec = SPEC
         .replace("EXTENDS Integers", "EXTENDS Integers, Sequences\nCONSTANTS Idle, Busy")
         .replace("\"idle\"", "Idle")
@@ -105,7 +101,7 @@ fn model_valued_phases_project_sequences_with_proved_element_types() {
     let cfg = format!("{CFG}CONSTANTS Idle = Idle Busy = Busy\n");
     let dir = tlx_testkit::TempDir::with_spec("phase-model-values", &spec, &cfg);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 3), (vec!["-optimize", "-tlc"], 4)] {
+        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 4), (vec!["-optimize", "-tlc"], 4)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Phase.tla")
                 .args(args)
@@ -136,14 +132,18 @@ fn symmetric_spec() -> String {
 }
 
 #[test]
-fn projection_composes_with_declared_and_automatic_symmetry() {
+fn unproved_composition_keeps_only_explicit_symmetry() {
     for declared in [false, true] {
         let cfg = format!("{CFG}CONSTANT Actors = {{a, b}}\n{}", if declared { "SYMMETRY Sym\n" } else { "" });
         let dir = tlx_testkit::TempDir::with_spec("phase-symmetry", &symmetric_spec(), &cfg);
         for (tier, args, env) in tlx_testkit::cli::TIERS {
             // Four local states give ten multisets; projecting idle data
             // leaves three local states and six multisets of two actors.
-            for (flags, count) in [(vec![], 10), (vec!["-optimize"], 6), (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 })] {
+            for (flags, count) in [
+                (vec![], if declared { 10 } else { 16 }),
+                (vec!["-optimize"], if declared { 10 } else { 16 }),
+                (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 }),
+            ] {
                 let run = tlx_testkit::tlx_default!()
                     .check("Phase.tla")
                     .args(args)
@@ -156,15 +156,15 @@ fn projection_composes_with_declared_and_automatic_symmetry() {
                     .run();
                 assert_eq!(run.code, 0, "{tier}: {}", run.text());
                 assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-                assert_eq!(run.stdout.contains("composed with symmetry"), count == 6, "{tier}: {}", run.text());
+                assert!(!run.stdout.contains("composed with symmetry"), "{tier}: {}", run.text());
             }
         }
     }
 }
 
 #[test]
-fn composed_projection_preserves_errors_failures_and_user_views() {
-    for (spec, suffix, code, projected) in [
+fn refused_composition_preserves_errors_failures_and_user_views() {
+    for (spec, suffix, code, _projected) in [
         (symmetric_spec().replace("data: {0, 1}", "data: {0}"), "", 12, false),
         (symmetric_spec().replace("====", "Bad == \\A s \\in Actors: r[s].mode = \"idle\"\n===="), "INVARIANT Bad\n", 12, true),
         (symmetric_spec().replace("r[s].data >= 0", "1 \\div (1 - r[s].data) >= 0"), "", 255, true),
@@ -183,7 +183,7 @@ fn composed_projection_preserves_errors_failures_and_user_views() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
-            assert_eq!(run.stdout.contains("composed with symmetry"), projected, "{tier}: {}", run.text());
+            assert!(!run.stdout.contains("composed with symmetry"), "{tier}: {}", run.text());
         }
     }
 }
@@ -206,7 +206,7 @@ fn moved_phase_constants_decline_composition() {
 }
 
 #[test]
-fn whole_variable_projection_composes_and_reports_both_rules() {
+fn whole_variable_projection_declines_declared_symmetry() {
     let spec = r#"---- MODULE Phase ----
 EXTENDS TLC
 CONSTANT Actors
@@ -230,18 +230,21 @@ Sym == Permutations(Actors)
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
-            assert!(run.stdout.contains("1 distinct states found"), "{tier}: {}", run.text());
-            assert!(run.stdout.contains("unobserved-state-projection"), "{tier}: {}", run.text());
+            assert!(
+                run.stdout.contains(if declared { "3 distinct states found" } else { "2 distinct states found" }),
+                "{tier}: {}",
+                run.text()
+            );
+            assert_eq!(run.stdout.contains("unobserved-state-projection"), !declared, "{tier}: {}", run.text());
             let stats = std::fs::read_to_string(dir.join("stats.json")).unwrap();
-            let proof = if declared { "none" } else { "static" };
-            assert!(stats.contains(&format!(r#""name":"symmetry","scope":"safety","proof":"{proof}""#)), "{stats}");
-            assert!(stats.contains(r#""name":"unobserved-state-projection""#), "{stats}");
+            assert!(!stats.contains(r#""name":"symmetry""#), "{stats}");
+            assert_eq!(stats.contains(r#""name":"unobserved-state-projection""#), !declared, "{stats}");
         }
     }
 }
 
 #[test]
-fn composed_projection_replays_concrete_steps_after_merges() {
+fn refused_composition_keeps_concrete_counterexample_steps() {
     let spec = symmetric_spec()
         .replace("VARIABLE r", "VARIABLES r, k")
         .replace("Init == r", "Init == k = 0 /\\ r")
@@ -260,7 +263,7 @@ fn composed_projection_replays_concrete_steps_after_merges() {
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 12, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("composed with symmetry"), "{tier}: {}", run.text());
+        assert!(!run.stdout.contains("composed with symmetry"), "{tier}: {}", run.text());
         assert!(!run.stdout.contains("trace cannot be reconstructed"), "{tier}: {}", run.text());
         let steps: Vec<_> = run.stdout.lines().filter(|s| s.starts_with("/\\ k = ")).collect();
         assert_eq!(steps, ["/\\ k = 0", "/\\ k = 1", "/\\ k = 2", "/\\ k = 3", "/\\ k = 4"], "{tier}: {}", run.text());

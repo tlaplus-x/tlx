@@ -102,60 +102,54 @@ The key point: **the runtime is generic over the `Model` trait** (§7.1). Both m
 
 The rule-based optimizer is owned by `tlx-sema::optimize`. Its primary objective is to
 reduce the explored state graph while preserving checked verdicts and genuine counterexamples.
-Opt-in checking analyzes resolved HIR for unobserved state variables and phase-dependent dead
-fields in records or fixed-domain maps, and sequences observed only through their length.
-Append-only histories over a proved finite element domain can instead use a set of seen
-elements and Boolean prefix observations. This can turn an unbounded history into a finite
-state component without limiting the number of source operations.
-Both universal obligations and existential witnesses are supported. Existential monitors
-retain the complement of the witness predicate, reusing the universal conjunction fold
-and its parametric Lean certificate rather than introducing a separate rule engine.
-The `phase/age.rs` rule derives capped relative ages and their composition with history
-summaries. Opt-in checking selects it before standalone history projection. It uses mathematical
-natural-number clocks and may eliminate eventual machine overflow, as permitted by the
-[opt-in contract](compat.md#0-the-three-tiers); ordinary runtime arithmetic remains checked.
-`Age.lean` supplies shared algebra, not a complete model certificate;
-[optimization.md](optimization.md#relative-age-projection) describes the boundary and external evidence.
-`phase/ordered` derives allocation families from global monotone frontiers and follows
-copies through records, functions, sequences and sets. Every transfer and observation
-must preserve order and equality; local counter increments, numeric gaps and unsupported
-uses refuse the rule. For an immutable version map, it proves append-at-frontier updates
-and indexed reads, retaining versions referenced by live allocation values outside the
-map. The interpreter executes the resulting structural plan only when constructing a
-state key: collect roots, restrict the map, collect remaining IDs, then rank each family.
-Compiled transitions use the same decoded-value key path; the placeholder identity VIEW
-must never be lowered as the projection itself.
-This can bound both an ever-growing catalog and the identifiers it contains. The rule
-uses no model-specific variable, operator or field names. `Ordered.lean` supplies shared
-algebra, while generated Lean records the structural plan explicitly; neither certifies
-the provenance analysis or runtime walker. See [ordered allocation](optimization.md#ordered-allocation-and-live-versions).
-Length projection preserves exact lengths and forgets contents only after proving all uses
-compatible; it can reduce an unbounded graph without making that graph finite.
-Forward structural domains come from Init and Next;
-backward liveness determines what can be forgotten. Checked invariants remain observations,
-never assumptions. The proved projection uses the existing VIEW fingerprint and concrete replay
-machinery in `tlx-eval`.
-The executable actions and state values remain intact. Projections compose with symmetry when
-the projection commutes with every group element: project first, then canonicalize its orbit.
-User VIEWs retain precedence; TLC compatibility mode bypasses the reduction. Separately, `tlx-cli::optimization` emits finite
-models using a restricted transition IR and validated counter-saturation passes. See
-[optimization.md](optimization.md) for rule contracts, extension points and correctness arguments.
+Every automatic state-reducing application must carry a connected Lean certificate.
+`tlx-eval::model::optimization::project_state` enforces this before installing a VIEW.
+Candidates without certificates cannot preempt certified candidates. Accepted checking
+currently covers unobserved-variable erasure, relative ages, a subset of finite history
+summaries, and a restricted scalar ordered-allocation rule. Checked invariants are observations, never
+assumptions; source actions and concrete state values remain intact for replay.
 
-Opt-in checking always emits a standalone Lean file before exploration; emission never
-runs Lean. Semantic proof generation belongs in `tlx-sema`, next to the rule that
-produces its evidence. `tlx-eval` carries the accepted projection's certificate and
-`tlx-cli` only persists it and reports coverage. Supported history applications emit
-model-specific predicates, seeds, transfers, observations and a certificate instantiated
-from shared history theorems. The formal rule IR uses indexed concrete histories and
-seen-set/prefix-bit summaries. Unchanged history-free HIR leaves are universal semantic
-parameters over retained state and local bindings; proving preservation for every such
-interpretation avoids copying the execution evaluator into the optimizer.
+`phase/erasure.rs` emits each hidden variable's literal assignment or old-state copy,
+including copy cycles. Guards, retained updates and observations are interpreted over
+retained state only. `ErasureCertificate.lean` constructs initialization and successor
+correspondence from every representative, observation preservation, safety, concrete
+counterexample lifting and deadlock preservation, without preservation premises.
 
-This is a certificate for the lowered rule model. Source lowering, domain/totality
-analysis, symmetry and runtime execution remain trusted. Unsupported applications
-explicitly emit algebra and transformation records without a model certificate; the
-recorded HIR strings alone are not formal semantics. See
-[the Lean coverage description](optimization.md#lean-output-for-checking).
+`phase/history/lean.rs` emits actual seeds, append/reset transfers, prefix predicates and
+observations. `HistoryCertificate.lean` relates indexed concrete histories to seen sets
+and accumulated prefix results. Universal and existential observations reuse one fold.
+History-dependent guards or retained updates currently exclude the certificate.
+
+`phase/ordered/lean.rs` emits a scalar frontier's initial anchor, literal nonnegative
+increments, guards and observations. `OrderedCertificate.lean` additionally connects
+formal projection equality to runtime rank-key equality. Nested allocation copies,
+multiple families and immutable version collection remain uncertified candidates.
+
+`phase/age/lean.rs` lowers fixed-domain timestamp maps to explicit per-key keep/reset/erase
+updates and deadline tests, using the same inferred caps as the runtime VIEW.
+`AgeCertificate.lean` retains payloads and timestamp presence, proves capped-age ticks and
+all observed comparisons commute, then constructs successor and observation correspondence.
+Semantic leaves cannot inspect absolute time or age magnitudes. History remains concrete;
+age/history composition requires a separate certificate and is not installed.
+
+Phase-field and sequence-length analyzers remain available for developing
+proofs, but their reductions are not installed. Automatic symmetry is also gated off;
+its Rust analysis and bounded diagnostic remain available. Counter-export constructs an
+internal proposal, but the CLI refuses to publish it without a connected certificate.
+The [coverage inventory](optimization.md#proof-coverage) distinguishes proof work from
+enabled behavior. Explicit user VIEW/SYMMETRY retain their existing contract; automatic
+projections decline both. Compatibility mode bypasses automatic projection.
+
+Proof generation belongs in `tlx-sema` beside the rule. `tlx-eval` carries its certificate;
+`tlx-cli` only persists it and reports coverage. Ordinary optimized checking emits Lean
+before exploration and never invokes a verifier. New or changed reductions require
+explicit development verification, axiom audits and negative tests.
+
+These certificates concern the lowered rule model. Unchanged independent HIR leaves are
+universally interpreted over retained state and branch-local bindings, and cannot read
+forgotten information. Source lowering, domain/totality analysis, the actual key path and
+runtime execution remain trusted. Recorded HIR strings alone are not formal semantics.
+See [Lean coverage](optimization.md#lean-output-for-checking).
 The [blob case study](../proofs/blob/README.md) additionally provides a manual typed
 formalization of all concrete protocol actions and reachable lookup definedness.
 
@@ -183,7 +177,7 @@ properties and future transitions can detect. A threshold may merge many reachab
 values into one class. The same reasoning extends to elements, fields and keys of arrays,
 sequences, sets and maps, with separate obligations for structure, cardinality and definedness.
 Finite element domains alone do not bound sequence length or map domains. Length-only sequence
-projection is implemented; more general partitions within live structured values are future extensions.
+analysis is implemented but reduction awaits a connected certificate; more general partitions within live structured values are future extensions.
 [optimization.md](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics) records their proof requirements and the narrower rules currently implemented.
 
 This is a division of responsibility, not a claim that a backend could never perform semantic
@@ -340,7 +334,7 @@ fully typed, and the census with its histograms is [native-coverage.md](native-c
 
 - **Backend.** The default is the encoded-state compiled tier (`-compile`; `tlx_compile::enc::check`, at most 16 recompilations); with no possible native code, no JIT and no C compiler it falls back to the interpreter (logged). `-interp` selects the interpreter (`InterpModel`), the reference implementation of TLC semantics. Executor tiering is §6.6; the degraded enumeration semantics are cross-checked state by state by `TLX_PARANOID` (§6.5.5). The CLI completes reports, liveness and simulation for both models through the `Tier` trait.
 - **Compatibility.** Independent of the backend, `-tlc` asks for TLC-identical results (tiers 1 and 2, [compat.md](compat.md) section 0); the default mode is sound and may use optimizations TLC lacks (counts, depth and counterexample may then differ).
-- **Automatic symmetry (default mode).** After the model is built and before the search, `tlx_cli::autosym::run` asks `tlx_eval::model::autosym` which sets of model values can be proven symmetric, cross-checks the proof on a bounded sample and, in the default mode only, applies the proven group to the search, naming the optimization in the run's start line and statistics. Under `-tlc` it prints the suggestion only; `-noautosymmetry` turns it off and `-checksymmetry` runs the declared-symmetry check (`tlx_cli::symcheck`, `tlx_eval::model::symcheck`) instead. The user-facing contract is [usage.md](usage.md) sections 6.2–6.3; the proof, its runtime guards and its bounds are [reductions.md](reductions.md) section 2.
+- **Automatic symmetry (default mode).** `tlx_cli::autosym::run` analyzes candidate groups, but application is gated off until a connected Lean certificate is available. Suggestions and the bounded `-checksymmetry` diagnostic remain available; explicit `SYMMETRY` is unchanged. See [usage.md](usage.md) sections 6.2–6.3 and the candidate analysis in [reductions.md](reductions.md).
 - **`-simulate` / `-generate`**: random simulation (§7.5), combinable with `-compile`.
 - **`-dump`**: write all reachable states. Under `-compile` the search may restart, so a dedicated second search writes the file.
 
@@ -434,7 +428,7 @@ It serves as (a) the `-interp` tier, (b) the constant evaluator and pre-run obse
 - **`InterpModel`** implements `Model` (§7.1): Init and action instances, invariants, CONSTRAINT/ACTION_CONSTRAINT, action properties, implied-init, ASSUME, POSTCONDITION (evaluated after the search; `TLCGet("stats")` sees the final statistics), ALIAS (traces are shown through the ALIAS record), trace action labels (`<A(1) line 6, col 3 to ... of module M>`).
 - **SYMMETRY** (`model/symmetry.rs`): generated state projections canonicalize the projected value first ([optimization.md](optimization.md#composing-projection-with-symmetry)); user VIEWs follow TLC as below. Computes all non-identity elements of the generated permutation group (group closure). The orbit representative is the state of the orbit that is least in TLC's value order, comparing the variables one by one; the state's fingerprint is that of the representative. With a VIEW the variables are compared in TLC's order of the state's values (the print order, `print_order::tlc_var_order`), as TLC does (`TLCStateMut.fingerPrint`), since which member's VIEW is taken decides the counts; without one any canonical member will do, and they are compared from the smallest (`size_order`: sizes are the same in the whole orbit, and small variables usually decide cheaply). `Group::least_perm` finds the permutation giving it without building permuted states: a permutation is compared with the least so far variable by variable, stopping at the first that differs, and `cmp_images` compares the images of two values under two permutations component by component as `cmp_tlc` would compare the built images (the same comparisons, results and errors): tuples and records position by position, functions and sets element by element in the order of their images, which is the original order when the permutation maps the model values among the keys (`Server`-indexed functions), otherwise found by selecting the least remaining image as far as the comparison needs (`ImageOrder`; the least state's orders are kept across permutations). Permutations that act on the model values occurring in the state like the identity or an earlier one are skipped. Only the winner's changed variables are built (`FastPerm::apply`, sharing unchanged subvalues; `ops::permute_shared`).
 - **VIEW**: the fingerprint is that of the VIEW value. **VIEW + SYMMETRY** follows TLC: take the least state of the orbit as above (`least_in_orbit`), then evaluate its VIEW.
-- **Undeclared symmetry** (`model/autosym/`, `model/symcheck.rs`): the analysis behind the default mode's automatic symmetry (§2.6). For each CONSTANT whose cfg value is a set of model values, `autosym::candidates` proposes the permutations and `autosym::analyze` / `analyze_guarded` prove, under the bounds and bounded checks of [reductions.md](reductions.md) section 2.4, which of them the spec is invariant under; the CLI either prints the suggestion or applies the proven group to the search after a bounded cross-check. `symcheck` is the declared-symmetry path of `-checksymmetry`: it looks for a genuine violation of a declared `SYMMETRY` within the given state and depth bounds, so an inconclusive run is never reported as a proof. The user-facing contract is [usage.md](usage.md) sections 6.1–6.3.
+- **Undeclared symmetry** (`model/autosym/`, `model/symcheck.rs`): the analysis behind the default mode's automatic symmetry (§2.6). For each CONSTANT whose cfg value is a set of model values, `autosym::candidates` proposes the permutations and `autosym::analyze` / `analyze_guarded` prove, under the bounds and bounded checks of [reductions.md](reductions.md) section 2.4, which of them the spec is invariant under; the CLI reports suggestions but refuses automatic application without a connected Lean certificate. `symcheck` is the declared-symmetry path of `-checksymmetry`: it looks for a genuine violation of a declared `SYMMETRY` within the given state and depth bounds, so an inconclusive run is never reported as a proof. The user-facing contract is [usage.md](usage.md) sections 6.1–6.3.
 - **Variable print order** (`model/print_order.rs`): TLC prints variables in the reverse of the enumeration order of SANY's symbol table (a Java `Hashtable` keyed by name). tlx rebuilds that table (the 72 builtins, the symbols of every EXTENDS, this module's units) and replays the insertions to obtain the same order.
 - **Liveness obligations** (`model/liveness.rs`): §7.4.
 - **Native operators**: `builtins.rs` (TLA+ core and standard-module overrides, including the TLCGet/TLCSet registers, `TLCGet("level"/"config"/"stats"/"spec"/"action"/"revision")`, Assert, Print, CSV/IOUtils side effects) and `natives.rs` (CommunityModules definitions that cannot be evaluated directly, such as graph connectivity, `atoi`, `IOEnv`).

@@ -21,7 +21,7 @@ fn plan(source: &str) -> Option<FieldProjection> {
         let DefKind::Op(e) = &def.kind else { panic!() };
         e.clone()
     };
-    ordered_projection(&program, &tlx_front::cfg::parse_cfg(cfg).unwrap(), &expr("Init"), &expr("Next"), &[expr("Inv")])
+    candidate(&program, &tlx_front::cfg::parse_cfg(cfg).unwrap(), &expr("Init"), &expr("Next"), &[expr("Inv")])
 }
 
 #[test]
@@ -128,4 +128,70 @@ fn negation_keeps_unknown_integer_origins() {
         .replace("Next ==", "Next == raw' = raw - 1 /\\")
         .replace("stored.slots[1].tag <= frontier", "-raw < frontier");
     assert!(plan(&source).is_none());
+}
+
+const SCALAR: &str = r#"---- MODULE Allocation ----
+EXTENDS Naturals, FiniteSets
+VARIABLE frontier, bit
+Init == frontier = 1 /\ bit = FALSE
+Next == frontier' = frontier + 1 /\ bit' = IF Cardinality({frontier, 1}) = 2 THEN TRUE ELSE bit
+Inv == frontier \in Nat /\ ~bit
+====
+"#;
+
+#[test]
+fn intermediate_consumers_keep_anchors_and_generate_a_certificate() {
+    for expression in ["Cardinality({frontier, 1})", "Cardinality({frontier} \\cup {1})"] {
+        let source = SCALAR.replace("Cardinality({frontier, 1})", expression);
+        let p = plan(&source).unwrap();
+        assert_eq!(p.ordered.unwrap().anchors, [vec![1]]);
+        if expression == "Cardinality({frontier, 1})" {
+            let proof = p.certificate.unwrap();
+            assert!(proof.contains("Test.pairCardinalityEq 2"));
+            assert!(proof.contains("namespace TlxOptimization.GeneratedOrdered"));
+            assert!(proof.contains("theorem certificate : Certificate"));
+        } else {
+            // Analysis knows this anchor; the proof lowerer still refuses
+            // syntax it does not give explicit semantics to.
+            assert!(p.certificate.is_none());
+        }
+    }
+    assert!(plan(&SCALAR.replace("{frontier, 1}", "{frontier, 10}")).is_none());
+}
+
+#[test]
+fn uncertified_candidates_are_not_accepted_as_reductions() {
+    for source in [SPEC, SCALAR] {
+        let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
+        let dir = tlx_testkit::TempDir::with_spec("ordered-certificate-gate", source, cfg);
+        let program = Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
+        let expr = |name: &str| {
+            let def = program.defs.iter().find(|d| &*d.name == name).unwrap();
+            let DefKind::Op(e) = &def.kind else { panic!() };
+            e.clone()
+        };
+        let result = ordered_projection(&program, &tlx_front::cfg::parse_cfg(cfg).unwrap(), &expr("Init"), &expr("Next"), &[expr("Inv")]);
+        assert_eq!(result.is_some(), source == SCALAR);
+    }
+}
+
+#[test]
+fn certificates_follow_renamed_seeds_branches_and_observations() {
+    let source = SCALAR
+        .replace("frontier", "ticket")
+        .replace("ticket = 1", "ticket = 7")
+        .replace("ticket + 1", "ticket + 3")
+        .replace("{ticket, 1}", "{ticket, 7}")
+        .replace("Next ==", "Step ==")
+        .replace("Inv ==", "Next == Step \\/ UNCHANGED <<ticket, bit>>\nInv ==");
+    let p = plan(&source).unwrap();
+    assert_eq!(p.ordered.unwrap().anchors, [vec![7]]);
+    let proof = p.certificate.unwrap();
+    assert!(proof.contains("seed := 7"));
+    assert!(proof.contains("| 0 => 3"));
+    assert!(proof.contains("| 1 => 0"));
+    for condition in ["frontier # 1", "1 < frontier", "~(frontier <= 1)", "(frontier >= 1) /\\ ~(frontier = 1)"] {
+        assert!(plan(&SCALAR.replace("Cardinality({frontier, 1}) = 2", condition)).unwrap().certificate.is_some(), "{condition}");
+    }
+    assert!(plan(&SCALAR.replace("Cardinality({frontier, 1}) = 2", "frontier = frontier")).unwrap().certificate.is_none());
 }

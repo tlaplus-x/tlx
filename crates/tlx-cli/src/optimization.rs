@@ -9,7 +9,7 @@ use tlx_sema::{optimize, Program};
 
 const HELP: &str = "usage: tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...\n\
     Emit Optimized.tla, Optimized.cfg and optimization.txt into a new directory.\n\
-    Supports scalar natural counters, INIT/NEXT and state INVARIANTs.\n\
+    Export is unavailable until its reductions have connected Lean certificates.\n\
     Requires CHECK_DEADLOCK FALSE; rejects unsupported observations.\n\
     -config FILE  configuration path (default: Spec.cfg)\n\
     -output DIR   new output directory; an existing path is never overwritten\n\
@@ -70,6 +70,7 @@ fn generate() -> Result<(), String> {
         Some(span) => format!("{}:{}:{}: {}", program.file(span.file).path.display(), span.line, span.col, error.message),
         None => error.message,
     })?;
+    let certificate = artifact.certificate.take().ok_or("export reduction has no connected Lean certificate; no artifacts emitted")?;
     writeln!(artifact.report, "Source: {}\nConfiguration: {}", spec.display(), config.display()).unwrap();
     for (i, file) in program.files.iter().enumerate() {
         writeln!(artifact.report, "File {i}: {}", file.path.display()).unwrap();
@@ -77,8 +78,12 @@ fn generate() -> Result<(), String> {
     // All semantic work finishes before creating the destination. A partial
     // I/O failure is an error, and the explanatory report is written last.
     std::fs::create_dir(&output).map_err(|e| format!("cannot create new output directory {}: {e}", output.display()))?;
-    for (name, contents) in [("Optimized.tla", artifact.module), ("Optimized.cfg", artifact.config), ("optimization.txt", artifact.report)]
-    {
+    for (name, contents) in [
+        ("Optimized.tla", artifact.module),
+        ("Optimized.cfg", artifact.config),
+        ("Optimization.lean", certificate),
+        ("optimization.txt", artifact.report),
+    ] {
         let path = output.join(name);
         std::fs::write(&path, contents).map_err(|e| format!("{}: {e}", path.display()))?;
     }

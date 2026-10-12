@@ -20,35 +20,7 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
 const CFG: &str = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
 
 #[test]
-fn clock_and_history_finish_in_every_tier_and_emit_lean() {
-    for (tier, args, env) in tlx_testkit::cli::TIERS {
-        let dir = tlx_testkit::TempDir::with_spec("age-finite", SPEC, CFG);
-        let run = tlx_testkit::tlx_default!()
-            .check("Age.tla")
-            .args(args)
-            .args(["-optimize", "-noautosymmetry"])
-            .envs(env.iter().copied())
-            .env("TLX_PARANOID", "1")
-            .dir(&dir)
-            .timeout(Duration::from_secs(60))
-            .run();
-        assert_eq!(run.code, 0, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("relative-age-projection"), "{tier}: {}", run.text());
-        assert!(run.stdout.contains("8 distinct states found"), "{tier}: {}", run.text());
-        assert!(run.stdout.contains("not verified; rule algebra only"), "{tier}: {}", run.text());
-        let artifact = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
-        let lean = std::fs::read_to_string(artifact).unwrap();
-        assert!(lean.contains("namespace TlxOptimization.Age"));
-        assert!(lean.contains("theorem deadline"));
-        assert!(lean.contains("Mathematical natural-number clocks"));
-        assert!(lean.contains("relative-age-projection"));
-        assert!(lean.contains("No model-level Certificate is constructed"));
-        assert!(!lean.contains("sorry"));
-    }
-}
-
-#[test]
-fn age_reduction_preserves_a_concrete_counterexample() {
+fn certified_age_reduction_preserves_concrete_counterexamples() {
     let spec = SPEC.replace("====", "Safe == records[1] = Empty \\/ records[1].created + 2 > clock\n====");
     let cfg = format!("{CFG}INVARIANT Safe\n");
     for (tier, args, env) in tlx_testkit::cli::TIERS {
@@ -115,6 +87,85 @@ fn unrelated_evaluation_errors_are_not_suppressed() {
         let dir = tlx_testkit::TempDir::with_spec("age-error", &spec, CFG);
         let run = tlx_testkit::tlx_default!().check("Age.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
         assert_eq!(run.code, 75, "{}", run.text());
+    }
+}
+
+fn without_history() -> String {
+    SPEC.replace("clock, records, h", "clock, records")
+        .replace(" /\\ h = <<>>", "")
+        .replace("<<records, h>>", "records")
+        .replace("/\\ h' = Append(h, \"put\") ", "")
+        .replace("/\\ h' = Append(h, \"drop\") ", "")
+        .replace("       /\\ h \\in Seq({\"put\", \"drop\"})\n", "")
+}
+
+#[test]
+fn unbounded_clock_finishes_with_four_states_in_every_executor() {
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let dir = tlx_testkit::TempDir::with_spec("age-finite", &without_history(), CFG);
+        let run = tlx_testkit::tlx_default!()
+            .check("Age.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("relative-age-projection"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("4 distinct states found"), "{tier}: {}", run.text());
+        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let proof = std::fs::read_to_string(path).unwrap();
+        assert!(proof.contains("namespace TlxOptimization.GeneratedAge"));
+        assert!(proof.contains("def caps"));
+        assert!(proof.contains("Test.atLeast"));
+        assert!(proof.contains("Change.reset"));
+        assert!(proof.contains("Change.erase"));
+        assert!(!proof.contains("sorry"));
+    }
+}
+
+#[test]
+fn strict_and_exact_deadlines_retain_the_boundary_state() {
+    for (comparison, states) in [("<= clock", 4), ("< clock", 5), (">= clock", 5), ("> clock", 4), ("= clock", 5), ("# clock", 5)] {
+        let spec = without_history().replace("<= clock", comparison);
+        let dir = tlx_testkit::TempDir::with_spec("age-boundaries", &spec, CFG);
+        let run = tlx_testkit::tlx_default!().check("Age.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
+        assert_eq!(run.code, 0, "{comparison}: {}", run.text());
+        assert!(run.stdout.contains(&format!("{states} distinct states found")), "{comparison}: {}", run.text());
+    }
+}
+
+#[test]
+fn timestamp_field_reset_preserves_absent_fields() {
+    for update in [
+        "![1].created = clock",
+        "![1] = Empty, ![1].created = clock",
+        "![1] = [created |-> clock, payload |-> \"x\"], ![1].created = clock",
+    ] {
+        let spec = without_history().replace(
+            "Next == Tick \\/ Put \\/ Drop",
+            &format!("Reset == records' = [records EXCEPT {update}] /\\ UNCHANGED clock\nNext == Tick \\/ Put \\/ Drop \\/ Reset"),
+        );
+        let spec = spec
+            .replace("VARIABLE clock, records", "VARIABLE clock, records, budget")
+            .replace("Init ==", "Init == budget = 0 /\\")
+            .replace("Next == Tick", "Next == budget < 8 /\\ budget' = budget + 1 /\\ (Tick")
+            .replace("Drop \\/ Reset", "Drop \\/ Reset)");
+        let cfg = format!("{CFG}CHECK_DEADLOCK FALSE\n");
+        let dir = tlx_testkit::TempDir::with_spec("age-field-reset", &spec, &cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("Age.tla")
+            .args(["-interp", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{}", run.text());
         assert!(run.stdout.contains("relative-age-projection"), "{}", run.text());
+        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let proof = std::fs::read_to_string(path).unwrap();
+        let generated = proof.split("namespace TlxOptimization.GeneratedAge").nth(1).unwrap();
+        assert!(generated.contains("(Change.refresh"));
     }
 }

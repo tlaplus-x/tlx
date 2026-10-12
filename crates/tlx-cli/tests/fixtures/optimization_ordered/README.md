@@ -23,12 +23,13 @@ conservative than a hand-tuned VIEW that keeps only current/snapshot versions.
 The configuration differs from `Unbounded.cfg` only by `VIEW FiniteView`.
 
 TLC completed with 69,456 generated / 19,048 distinct states, depth 16, and no
-safety errors. Automatic `-optimize` checking of the original source must match
-these counts in both interpreter and compiled execution. The ignored Rust test
-`external_mongodb_incarnations_match_independent_tlc_view` enforces this when the
-pinned local external corpus is installed, with a 600-second deadline per run.
-These are correctness/count checks, not repeated performance measurements.
-TLC agreement checks execution of the quotient, not its semantic proof.
+safety errors. This independent VIEW remains a future certificate coverage target.
+The automatic ordered-allocation rule currently refuses this configuration: its
+connected certificate does not yet cover nested identifiers, multiple families,
+version collection or the selected action property. The ignored Rust test
+`external_mongodb_is_refused_until_its_reduction_has_a_certificate` checks this
+refusal without starting an unbounded search. State counts from the independent
+VIEW do not establish the soundness of the automatic reduction.
 
 To refresh the oracle, copy the pinned source beside these fixtures in a scratch
 directory, then run Java 21 with the pinned jar:
@@ -43,16 +44,9 @@ Run the automatic check from the repository root:
 cargo test -p tlx-cli --profile test-release --test optimization_ordered external_mongodb -- --ignored
 ```
 
-The generated Lean contains shared algebra and the actual structural projection
-plan. It is not a model certificate. Lean verification is not part of these tests.
-
-On 2026-10-11, freshly generated output passed Lean 4.34.1 with trust level zero
-and warnings treated as errors. An axiom audit of all 19 embedded theorems found
-only standard logical axioms. Two deliberate changes were rejected: dropping a
-retained lookup and allowing a zero offset in strict fresh allocation. This
-checks the shared algebra; source lowering, provenance analysis and the runtime
-projection remain trusted. To check a freshly emitted artifact explicitly:
-
-```sh
-lean -t0 -DwarningAsError=true -R /path/to/proof-directory /path/to/proof-directory/Optimization.lean
-```
+The accepted scalar-allocation subset generates a connected rule-model certificate.
+`HiddenAnchor.tla` is a small regression from proof review: forgetting `1` inside
+`Cardinality({clock, 1})` merged states with different successor behavior. TLC
+finds the violation at `clock = 3, bad = TRUE` (3 generated / 3 distinct states).
+The CLI test requires that same concrete failure with optimization in every tier.
+The broader MongoDB reduction remains refused until its proof is implemented.

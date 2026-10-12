@@ -91,8 +91,15 @@ def indexed (q : E → (E → Prop) → Prop) (h : History E) : Prop :=
 theorem exists_iff_not_indexed_not (q : E → (E → Prop) → Prop) (h : History E) :
     (∃ i e, At h i e ∧ q e (seenPrefix h i)) ↔
       ¬ indexed (fun e seen => ¬ q e seen) h := by
-  classical
-  simp only [indexed, not_forall, not_imp, not_not]
+  constructor
+  · rintro ⟨i, e, ha, hq⟩ hn
+    exact hn i e ha hq
+  · intro hn
+    apply Classical.byContradiction
+    intro noWitness
+    apply hn
+    intro i e ha hq
+    exact noWitness ⟨i, e, ha, hq⟩
 
 theorem indexed_append (q : E → (E → Prop) → Prop) (h : History E) (x : E) :
     indexed q (.append h x) ↔ indexed q h ∧ q x (History.seen (.append h x)) := by

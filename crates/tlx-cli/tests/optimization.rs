@@ -7,55 +7,23 @@ const SPEC: &str =
     "---- MODULE Counter ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 0\nNext == c' = c + 1 \\/ c' = 0\nInv == c < 3 \\/ c >= 3\n====\n";
 
 #[test]
-fn emits_a_finite_model_checked_by_every_execution_tier() {
+fn unproved_export_is_refused_without_creating_or_overwriting_artifacts() {
     let dir = tlx_testkit::TempDir::with_spec("optimization-cli", SPEC, CFG);
-    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(run.code, 0, "{}", run.text());
-    assert!(run.stdout.contains("no safety verdict is claimed"));
-    assert!(!run.stdout.contains("Model checking completed"));
-    let report = std::fs::read_to_string(dir.join("out/optimization.txt")).unwrap();
-    assert!(report.contains("domain 0..3"));
-    assert!(report.contains("Invariant0: Inv"));
-    for (tier, args, env) in tlx_testkit::cli::TIERS {
-        let run = tlx_testkit::tlx!()
-            .check("Optimized.tla")
-            .args(args)
-            .envs(env.iter().copied())
-            .env("TLX_PARANOID", "1")
-            .dir(dir.join("out"))
-            .timeout(Duration::from_secs(60))
-            .run();
-        assert_eq!(run.code, 0, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("4 distinct states found"), "{tier}: {}", run.text());
+    for existing in [false, true] {
+        if existing {
+            std::fs::create_dir(dir.join("out")).unwrap();
+            dir.write("out/Optimized.tla", "preserve this file");
+        }
+        let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
+        assert_eq!(run.code, 2, "{}", run.text());
+        assert!(run.stderr.contains("no connected Lean certificate"), "{}", run.text());
+        assert!(!run.stdout.contains("no safety verdict is claimed"));
+        if existing {
+            assert_eq!(std::fs::read_to_string(dir.join("out/Optimized.tla")).unwrap(), "preserve this file");
+        } else {
+            assert!(!dir.join("out").exists());
+        }
     }
-}
-
-#[test]
-fn abstract_violation_is_not_misreported_as_a_concrete_trace() {
-    let dir = tlx_testkit::TempDir::with_spec("optimization-violation", &SPEC.replace("c < 3 \\/ c >= 3", "c < 3"), CFG);
-    let generated = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(generated.code, 0, "{}", generated.text());
-    let run = tlx_testkit::tlx!().check("Optimized.tla").dir(dir.join("out")).run();
-    assert_eq!(run.code, 12, "{}", run.text());
-    assert!(run.stdout.contains("Invariant Invariant0 is violated"), "{}", run.text());
-    let report = std::fs::read_to_string(dir.join("out/optimization.txt")).unwrap();
-    assert!(report.contains("abstract representatives, not concrete counter values"));
-}
-
-#[test]
-fn refusal_leaves_no_artifacts_and_existing_outputs_are_preserved() {
-    let dir = tlx_testkit::TempDir::with_spec("optimization-refusal", &SPEC.replace("c' = c + 1", "c' = c - 1"), CFG);
-    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(run.code, 2);
-    assert!(run.stderr.contains("decrements are unsupported"), "{}", run.text());
-    assert!(!dir.join("out").exists());
-    dir.write("Counter.tla", SPEC);
-    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(run.code, 0, "{}", run.text());
-    let bytes = std::fs::read(dir.join("out/Optimized.tla")).unwrap();
-    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(run.code, 2);
-    assert_eq!(bytes, std::fs::read(dir.join("out/Optimized.tla")).unwrap());
 }
 
 #[test]
@@ -66,56 +34,7 @@ fn compatibility_flags_cannot_silently_enable_optimization() {
     }
     let run = tlx_testkit::tlx!().args(["optimize", "--help"]).run();
     assert_eq!(run.code, 0);
-    assert!(run.stdout.contains("does not check or claim safety"));
-}
-
-#[test]
-fn cleanup_and_saturation_compose_in_every_execution_tier() {
-    let spec = "---- MODULE Counter ----\nEXTENDS Naturals\nVARIABLES fixed, c\nInit == fixed = 7 /\\ c = 0\nNext == (fixed /= 7 /\\ c > 2147483647 /\\ c' = c + 1 /\\ UNCHANGED fixed) \\/ (UNCHANGED fixed /\\ c' = c + 1)\nInv == fixed = 7 /\\ (c < 3 \\/ c >= 3)\n====\n";
-    let dir = tlx_testkit::TempDir::with_spec("optimization-cleanup", spec, CFG);
-    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-    assert_eq!(run.code, 0, "{}", run.text());
-    let report = std::fs::read_to_string(dir.join("out/optimization.txt")).unwrap();
-    for pass in ["constant-state-propagation", "predicate-simplification", "dead-action-elimination", "threshold-counter-saturation"] {
-        assert!(report.contains(pass), "{report}");
-    }
-    for (tier, args, env) in tlx_testkit::cli::TIERS {
-        let run = tlx_testkit::tlx!()
-            .check("Optimized.tla")
-            .args(args)
-            .envs(env.iter().copied())
-            .env("TLX_PARANOID", "1")
-            .dir(dir.join("out"))
-            .timeout(Duration::from_secs(60))
-            .run();
-        assert_eq!(run.code, 0, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("4 distinct states found"), "{tier}: {}", run.text());
-    }
-}
-
-#[test]
-fn empty_next_still_checks_true_and_false_initial_invariants() {
-    for (inv, expected) in [("c = 5", 0), ("c /= 5", 12)] {
-        let spec = format!(
-            "---- MODULE Counter ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 5\nNext == c < 0 /\\ c' = c + 1\nInv == {inv}\n====\n"
-        );
-        let dir = tlx_testkit::TempDir::with_spec("optimization-empty", &spec, CFG);
-        let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-        assert_eq!(run.code, 0, "{}", run.text());
-        let generated = std::fs::read_to_string(dir.join("out/Optimized.tla")).unwrap();
-        assert!(generated.contains("Next == (v0 /= v0) /\\ UNCHANGED <<v0>>"));
-        for (tier, args, env) in tlx_testkit::cli::TIERS {
-            let run = tlx_testkit::tlx!()
-                .check("Optimized.tla")
-                .args(args)
-                .envs(env.iter().copied())
-                .env("TLX_PARANOID", "1")
-                .dir(dir.join("out"))
-                .timeout(Duration::from_secs(60))
-                .run();
-            assert_eq!(run.code, expected, "{tier}: {}", run.text());
-        }
-    }
+    assert!(run.stdout.contains("unavailable until its reductions have connected Lean certificates"));
 }
 
 // Cached TLC output is tied to the exact generated module/config below. An emitter
@@ -180,17 +99,17 @@ macro_rules! oracle_case {
                 assert!(original.contains("2 distinct states found"));
                 assert!(abstracted.contains("1 distinct states found"));
             }
-            let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-            assert_eq!(run.code, 0, "{}", run.text());
-            assert_eq!(
-                std::fs::read_to_string(dir.join("out/Optimized.tla")).unwrap(),
-                include_str!(concat!("fixtures/optimization/", $case, "/Optimized.tla")),
-                "emission changed; refresh and review the TLC evidence"
-            );
-            assert_eq!(
-                std::fs::read_to_string(dir.join("out/Optimized.cfg")).unwrap(),
-                include_str!(concat!("fixtures/optimization/", $case, "/Optimized.cfg"))
-            );
+            // Keep the independent TLC oracle for the internal proposal.
+            // Public export must not emit it before connected proof coverage.
+            let mut program = tlx_sema::Program::load(&dir.join("Counter.tla"), &[]).unwrap();
+            let cfg = tlx_front::cfg::parse_cfg(include_str!(concat!("fixtures/optimization/", $case, "/Counter.cfg"))).unwrap();
+            let candidate = tlx_sema::optimize::optimize_model(&mut program, &cfg).unwrap();
+            assert!(candidate.certificate.is_none());
+            assert_eq!(candidate.module, include_str!(concat!("fixtures/optimization/", $case, "/Optimized.tla")));
+            assert_eq!(candidate.config, include_str!(concat!("fixtures/optimization/", $case, "/Optimized.cfg")));
+            std::fs::create_dir(dir.join("out")).unwrap();
+            dir.write("out/Optimized.tla", &candidate.module);
+            dir.write("out/Optimized.cfg", &candidate.config);
             check_oracle(dir.as_ref(), "Counter", original, &["-tlc"]);
             check_oracle(dir.as_ref(), "Counter", original, &["-optimize"]);
             check_oracle(dir.as_ref(), "Counter", original, &["-tlc", "-optimize"]);

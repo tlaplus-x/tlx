@@ -39,6 +39,20 @@ defect: document the evidence and the intentional difference in `docs/compat.md`
 - After every implementation, review your own changes before reporting completion. Check
   correctness, architecture, failure paths, and test coverage; fix issues found, rerun the
   affected checks, and report any unresolved findings.
+- Every state-reducing optimization needs a compiler-generated Lean certificate connected
+  to the actual reduction. Do not apply uncertified reductions, including legacy rules,
+  automatic symmetry and export passes. Prove initialization correspondence, successor correspondence
+  from every equivalent representative, preservation of selected observations, and
+  concrete counterexample lifting. Include deadlock or temporal preservation when the
+  supported checking mode requires it. Shared lemmas, serialized plans, tests and matching
+  state counts do not satisfy this requirement. Do not assume the preservation obligations
+  as certificate premises or introduce placeholder proofs or custom correctness axioms.
+- For new or changed reductions, explicitly verify the generated certificate with Lean
+  before declaring the implementation complete; audit its axioms and test that relevant
+  broken transformations are rejected. State the theorem's scope and every trusted layer,
+  including source lowering and runtime execution. Existing reductions without connected
+  certificates are unfinished proof work, not exceptions to this requirement. Ordinary
+  `tlx check -optimize` still emits Lean without invoking a verifier unless requested.
 - Write code, comments, commit messages, and public documentation in English. Follow the
   [commit convention](CONTRIBUTING.md#code-and-commits). Limit commit subjects to 75
   characters and wrap commit bodies at 75 columns; keep URLs and structured trailers

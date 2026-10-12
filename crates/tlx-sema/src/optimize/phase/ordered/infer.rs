@@ -19,6 +19,18 @@ impl Analysis<'_> {
     }
 
     pub(super) fn value(&mut self, e: &Expr, locals: &Locals, depth: usize) -> Option<Shape> {
+        let shape = self.infer_value(e, locals, depth)?;
+        // A consumer can erase provenance while still observing equality or
+        // order inside its argument: Cardinality({frontier, 1}) is one case.
+        // Retain anchors at every intermediate value, not just comparisons
+        // and stored variable shapes.
+        if shape.colored() {
+            self.observations.push(shape.clone());
+        }
+        Some(shape)
+    }
+
+    fn infer_value(&mut self, e: &Expr, locals: &Locals, depth: usize) -> Option<Shape> {
         if depth > 160 {
             return None;
         }

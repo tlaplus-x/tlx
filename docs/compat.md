@@ -17,9 +17,9 @@ space and equivalent counterexamples. Command line and output format are outside
 - **Modes**: the contract below is the one of `-tlc` (TLC-compatible results). The default mode
   (without `-tlc`) may use optimizations TLC does not have that keep only tier 1 and the validity of
   counterexamples (a violation is reported exactly when one exists, with a genuine counterexample);
-  counts, depth and which counterexample may then differ. Today the default mode applies a
-  symmetry of sets of model values that tlx proves to runs that check only safety, and names it in
-  an `Optimizations:` line ([usage.md](usage.md) section 6.3). The parity tests run with `-tlc`; the
+  counts, depth and which counterexample may then differ. Automatic reductions require connected
+  generated Lean certificates; automatic symmetry is currently gated off pending this proof
+  ([usage.md](usage.md) section 6.3). Certified opt-in projections are named in an `Optimizations:` line. The parity tests run with `-tlc`; the
   default mode is compared with TLC by verdict (`--default-mode` of spectest and difftest).
   Explicit `-optimize` additionally permits proved reductions over mathematical integers to
   eliminate eventual machine-integer overflow. This exception is scoped below; `-tlc` disables it.

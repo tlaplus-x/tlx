@@ -183,33 +183,33 @@ environment variable).
 
 ## State reduction and Lean certificates
 
-Opt-in state reduction uses the specification's semantics to merge states with the same
-future observations. Rules can omit unobserved variables, erase inactive record fields,
-retain only sequence lengths, or summarize append-only histories by their seen values
-and universal or existential prefix-predicate results. With a finite event domain, a
-history summary can turn an unbounded history into a finite state component. Logical clocks
-observed through deadlines can use capped ages: for `created + 2 <= clock`, retain ages
-0, 1 and 2+ instead of absolute timestamps. These rules can compose to bound both clocks
-and histories. Allocation values observed only through order and equality can instead
-use ordered ranks. For supported immutable version maps, the compiler retains versions
-referenced by live timestamps and discards unreachable versions. This works through nested
-records, maps, sets and sequences without model-specific names. Optimized checking permits proved reductions to eliminate eventual machine
-overflow under [mathematical integer semantics](docs/compat.md#0-the-three-tiers);
-runtime arithmetic remains checked. Concrete values remain available for counterexample traces. These reductions support safety checking and are disabled in
-TLC-compatible mode. See [optimization rules and limits](docs/optimization.md).
+Automatic state reductions require a compiler-generated Lean certificate connected to
+that application. Currently enabled rules remove unobserved variables with literal/copy
+updates, summarize supported append-only histories, cap relative timestamp ages, and
+reduce a restricted scalar allocation frontier. A history summary over a finite event domain can turn unbounded
+history into a finite state component. The [relative-age example](proofs/age/README.md)
+reduces an unbounded clock model to four states. Each certificate proves initialization and
+successor correspondence, observations, counterexample lifting and deadlock preservation.
 
-Optimized checking always writes a standalone Lean file and prints its path; it does
-not run Lean or require Lean to be installed. Supported history applications generate
-certificates proving preservation of initialization, transitions, safety observations,
-counterexamples and deadlocks in a parametric rule model. Other applications explicitly
-emit shared algebra and transformation records without a model certificate.
+Proof coverage is incomplete. Phase-field, sequence-length, combined age/history, broad ordered
+allocation, automatic symmetry and counter-export reductions are unavailable until
+connected certificates cover them. Unsupported applications keep the original graph;
+export refuses without writing artifacts. Explicit user `VIEW` and `SYMMETRY` declarations
+retain their TLC behavior. Automatic projections currently decline symmetry composition.
+See [the coverage inventory](docs/optimization.md#proof-coverage).
 
-Lean verification is a separate, explicit step. The generated proof treats unchanged,
-history-free expressions as semantic parameters. TLA+/HIR lowering, domain analysis,
-symmetry composition and runtime execution remain trusted; this is not a proof of the
-input model's safety or finite cardinality. The [Lean coverage description](docs/optimization.md#lean-output-for-checking)
-explains the supported subset and verification command. The [blob case study](proofs/blob/README.md)
-also provides a manual formalization of the concrete protocol for comparison.
+Optimized checking always writes standalone Lean and prints its path; it never invokes
+Lean. If no certified rule applies, the file records that no reduction was applied.
+Development of a new or changed reduction requires explicit Lean verification, an axiom
+audit and negative tests. Verification is optional during ordinary checking.
+
+The certificates prove preservation of a parametric rule model. TLA+/HIR lowering,
+domain and totality analysis, the emitted runtime key and backend execution remain
+trusted; these are not proofs of the input model's safety or state count. Accepted
+allocation and relative-age reductions use [mathematical integer semantics](docs/compat.md#0-the-three-tiers);
+runtime arithmetic stays checked. Concrete values remain available in counterexamples.
+The [Lean coverage description](docs/optimization.md#lean-output-for-checking) explains
+verification; the [blob case study](proofs/blob/README.md) supplies a manual protocol proof.
 
 These features are separate from the frozen performance snapshot above. Generation of
 a certificate does not imply Lean acceptance or a measured speedup. Output locations,

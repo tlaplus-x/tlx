@@ -38,8 +38,8 @@ Safe == ~(witnessed /\ \E i \in 1..Len(h): h[i] = "W")
 "#;
 
 #[test]
-fn existential_prefix_history_is_finite_and_preserves_old_witnesses() {
-    for (invariants, code) in [("TypeOK", 0), ("TypeOK Safe", 12)] {
+fn unproved_history_transfer_is_refused_and_preserves_old_witnesses() {
+    for (invariants, code) in [("TypeOK Safe", 12)] {
         let cfg = format!("INIT Init\nNEXT Next\nINVARIANTS {invariants}\n");
         let dir = tlx_testkit::TempDir::with_spec("history-existential", EXISTENTIAL, &cfg);
         for (tier, args, env) in tlx_testkit::cli::TIERS {
@@ -53,7 +53,7 @@ fn existential_prefix_history_is_finite_and_preserves_old_witnesses() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
-            assert!(run.stdout.contains("history-summary-projection"), "{tier}: {}", run.text());
+            assert!(!run.stdout.contains("history-summary-projection"), "{tier}: {}", run.text());
             if code == 0 {
                 assert!(run.stdout.contains("6 distinct states found"), "{tier}: {}", run.text());
             } else {
@@ -65,13 +65,13 @@ fn existential_prefix_history_is_finite_and_preserves_old_witnesses() {
 }
 
 #[test]
-fn existential_history_reduces_a_finite_prefix_and_respects_refusal_boundaries() {
+fn unproved_history_transfer_keeps_a_finite_prefix_and_refusal_boundaries() {
     let spec = EXISTENTIAL
         .replace("VARIABLE h, witnessed", "VARIABLE h, witnessed, budget")
         .replace("witnessed = FALSE", "witnessed = FALSE /\\ budget = 0")
         .replace("Next ==", "Next == /\\ budget < 4 /\\ budget' = budget + 1 /\\");
     let cfg = "INIT Init\nNEXT Next\nINVARIANT TypeOK\nCHECK_DEADLOCK FALSE\n";
-    for (flags, count) in [(vec![], 31), (vec!["-optimize"], 15), (vec!["-optimize", "-tlc"], 31)] {
+    for (flags, count) in [(vec![], 31), (vec!["-optimize"], 31), (vec!["-optimize", "-tlc"], 31)] {
         let dir = tlx_testkit::TempDir::with_spec("history-existential-bounded", &spec, cfg);
         let run = tlx_testkit::tlx_default!()
             .check("History.tla")
@@ -82,7 +82,7 @@ fn existential_history_reduces_a_finite_prefix_and_respects_refusal_boundaries()
             .run();
         assert_eq!(run.code, 0, "{}", run.text());
         assert!(run.stdout.contains(&format!("{count} distinct states found")), "{}", run.text());
-        assert_eq!(run.stdout.contains("history-summary-projection"), count == 15, "{}", run.text());
+        assert!(!run.stdout.contains("history-summary-projection"), "{}", run.text());
     }
     for spec in [
         spec.replace("h[i] = \"R\"", "i = 1 /\\ h[i] = \"R\""),
@@ -171,7 +171,7 @@ Safe == result # "bad"
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 12, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("history-summary-projection"), "{tier}: {}", run.text());
+        assert!(!run.stdout.contains("history-summary-projection"), "{tier}: {}", run.text());
         assert!(run.stdout.contains("<<\"R\", \"W\">>"), "{tier}: {}", run.text());
     }
 }

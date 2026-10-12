@@ -1,8 +1,5 @@
-//! Automatic symmetry: the suggestion under `-tlc`, `-checksymmetry
-//! -suggest`, the application of a proven group in the default mode with its
-//! labelling, and the checks of an applied symmetry against a deliberately
-//! wrong proof (`TLX_AUTOSYM_FORCE`): the bounded cross-check before the
-//! search, and `TLX_SYMMETRY_PARANOID` at expanded states.
+//! Candidate diagnostics and refusal of uncertified automatic symmetry,
+//! including forced and guarded applications.
 
 use std::time::Duration;
 
@@ -47,7 +44,7 @@ fn a_provable_symmetry_is_suggested_under_tlc() {
     let r = run(SYMMETRIC, "INVARIANT Inv", &["-tlc"], &[]);
     assert_eq!(r.code, 0, "{}", r.text());
     assert!(
-        r.stdout.contains("Symmetry: Permutations(Proc) is provable for safety checking and not declared; to use it, run without -tlc, or define Perms == Permutations(Proc) and add \"SYMMETRY Perms\" to the cfg."),
+        r.stdout.contains("Symmetry: Permutations(Proc) is provable for safety checking and not declared; to use it, define Perms == Permutations(Proc) and add \"SYMMETRY Perms\" to the cfg."),
         "{}",
         r.text()
     );
@@ -57,12 +54,12 @@ fn a_provable_symmetry_is_suggested_under_tlc() {
 }
 
 #[test]
-fn the_default_mode_applies_a_proven_symmetry() {
+fn the_default_mode_refuses_symmetry_without_a_connected_certificate() {
     for tier in ["-interp", "-compile"] {
         let r = run(SYMMETRIC, "INVARIANT Inv", &[tier], &[]);
         assert_eq!(r.code, 0, "{}", r.text());
-        assert!(r.stdout.contains("Optimizations: symmetry Permutations(Proc) (proven; safety checks only)."), "{}", r.text());
-        assert!(r.stdout.contains("10 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
+        assert!(r.stdout.contains("Optimizations: none applicable."), "{}", r.text());
+        assert!(r.stdout.contains("27 distinct states found, 0 states left on queue."), "{}", r.text());
         assert!(!r.stdout.contains("Symmetry: "), "no suggestion in the default mode: {}", r.text());
     }
     let r = run(SYMMETRIC, "INVARIANT Inv", &["-noautosymmetry"], &[]);
@@ -72,7 +69,7 @@ fn the_default_mode_applies_a_proven_symmetry() {
 }
 
 #[test]
-fn a_violation_has_tlc_trace_length_under_the_reduction() {
+fn refused_symmetry_keeps_tlc_trace_length() {
     let inv = "INVARIANT Small\n";
     let body = format!("{SYMMETRIC}\nSmall == Cardinality({{p \\in Proc : pc[p] = 2}}) < 2");
     let tlc = run(&body, inv, &["-tlc"], &[]);
@@ -102,33 +99,6 @@ fn temporal_properties_and_output_keep_the_full_search() {
 }
 
 #[test]
-fn a_checkpoint_records_the_symmetry() {
-    let body = "VARIABLE pc\nInit == pc = [p \\in Proc |-> 0]\nNext == \\E p \\in Proc : pc[p] < 3 /\\ pc' = [pc EXCEPT ![p] = @ + 1]";
-    let dir = spec(body, "");
-    let md = dir.join("md");
-    let mdp = md.to_str().unwrap();
-    let cmd = |args: &[&str], env: &[(&str, &str)]| {
-        tlx_testkit::tlx_default!()
-            .args(["check", "Spec.tla", "-interp"])
-            .args(args)
-            .envs(env.iter().copied())
-            .dir(&dir)
-            .timeout(Duration::from_secs(60))
-            .run()
-    };
-    let r = cmd(&["-metadir", mdp], &[("TLX_CHECKPOINT_STATES", "3"), ("TLX_CHECKPOINT_ABORT", "1")]);
-    assert_ne!(r.code, 0, "{}", r.text());
-    assert!(md.join("checkpoint/MANIFEST").is_file(), "{}", r.text());
-    let r = cmd(&["-recover", mdp, "-noautosymmetry"], &[]);
-    assert_eq!(r.code, 255, "{}", r.text());
-    assert!(r.text().contains("the symmetry differs (checkpoint: Permutations(Proc), this run: none)"), "{}", r.text());
-    let r = cmd(&["-recover", mdp], &[]);
-    assert_eq!(r.code, 0, "{}", r.text());
-    // The orbits of [Proc -> 0..3]: multisets of 3 values of 0..3.
-    assert!(r.stdout.contains("20 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
-}
-
-#[test]
 fn suggest_checks_every_candidate() {
     let r = run(SYMMETRIC, "INVARIANT Inv", &["-checksymmetry", "-suggest"], &[]);
     assert_eq!(r.code, 0, "{}", r.text());
@@ -141,20 +111,16 @@ fn suggest_checks_every_candidate() {
 }
 
 #[test]
-fn an_applied_symmetry_reduces_and_passes_the_paranoid_check() {
+fn force_cannot_bypass_the_certificate_gate() {
     let r = run(SYMMETRIC, "INVARIANT Inv", &[], &[("TLX_AUTOSYM_FORCE", "Proc"), ("TLX_SYMMETRY_PARANOID", "1")]);
     assert_eq!(r.code, 0, "{}", r.text());
-    // The orbits of [Proc -> 0..2]: multisets of 3 values of 0..2.
-    assert!(r.stdout.contains("10 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
-    assert!(
-        r.stdout.contains("Optimizations: symmetry Permutations(Proc) (forced by TLX_AUTOSYM_FORCE, not proven; safety checks only)."),
-        "{}",
-        r.text()
-    );
+    // Even an explicitly forced candidate cannot bypass the proof gate.
+    assert!(r.stdout.contains("27 distinct states found, 0 states left on queue."), "{}", r.text());
+    assert!(r.stdout.contains("Optimizations: none applicable."), "{}", r.text());
 }
 
 #[test]
-fn an_applied_symmetry_is_labelled_in_dumps_and_statistics() {
+fn refused_symmetry_has_no_reduction_label_in_dumps_or_statistics() {
     let dir = tlx_testkit::TempDir::new("autosym-label");
     std::fs::write(
         dir.join("Spec.tla"),
@@ -168,40 +134,26 @@ fn an_applied_symmetry_is_labelled_in_dumps_and_statistics() {
         .timeout(Duration::from_secs(30))
         .run();
     assert_eq!(r.code, 0, "{}", r.text());
-    assert!(r.stdout.contains("@!@!@STARTMSG 9100:0 @!@!@\nOptimizations: symmetry"), "{}", r.text());
+    assert!(r.stdout.contains("@!@!@STARTMSG 9100:0 @!@!@\nOptimizations: none applicable."), "{}", r.text());
     let dump = std::fs::read_to_string(dir.join("states.dump")).unwrap();
-    assert!(dump.starts_with("\\* reduced by symmetry; use -tlc for the full graph\n"), "{dump}");
+    assert!(!dump.starts_with("\\* reduced by symmetry; use -tlc for the full graph\n"), "{dump}");
     let stats = std::fs::read_to_string(dir.join("stats.json")).unwrap();
-    assert!(
-        stats.contains(r#""optimizations":[{"name":"symmetry","scope":"safety","proof":"static","preserved":["V-safe","CEX","D","L"],"detail":"Permutations(Proc)"}]"#),
-        "{stats}"
-    );
+    assert!(stats.contains(r#""optimizations":[]"#), "{stats}");
 }
 
 #[test]
-fn the_cross_check_refuses_a_wrong_proof() {
-    let body = "VARIABLE pc\nInit == pc = [p \\in Proc |-> 0]\nNext == pc' = [pc EXCEPT ![CHOOSE p \\in Proc : pc[p] = 0] = 1]";
-    let r = run(body, "", &[], &[("TLX_AUTOSYM_FORCE", "Proc")]);
-    assert_eq!(r.code, 101, "{}", r.text());
-    assert!(r.stdout.contains("Internal error: the symmetry Permutations(Proc) that tlx proved does not hold"), "{}", r.text());
+fn forcing_a_wrong_candidate_keeps_the_full_search() {
+    for tier in ["-interp", "-compile"] {
+        let reference = run(DEEP, "", &[tier, "-noautosymmetry"], &[]);
+        let forced = run(DEEP, "", &[tier, "-stats"], &[("TLX_AUTOSYM_FORCE", "Proc"), ("TLX_SYMMETRY_PARANOID", "1")]);
+        assert_eq!(forced.code, reference.code, "{}", forced.text());
+        assert_eq!(tlx_testkit::cli::counts(&forced.stdout), tlx_testkit::cli::counts(&reference.stdout));
+        assert!(forced.text().contains("no connected Lean certificate for automatic symmetry"), "{}", forced.text());
+    }
 }
 
 #[test]
-fn the_paranoid_check_catches_a_wrong_proof_beyond_the_cross_check() {
-    let r = run(DEEP, "", &["-interp"], &[("TLX_AUTOSYM_FORCE", "Proc"), ("TLX_SYMMETRY_PARANOID", "1")]);
-    assert_eq!(r.code, 101, "{}", r.text());
-    assert!(r.text().contains("TLX_SYMMETRY_PARANOID: the symmetry applied without a declaration does not hold"), "{}", r.text());
-    // The compiled tier checks its expanded states too.
-    let r = run(DEEP, "", &["-compile"], &[("TLX_AUTOSYM_FORCE", "Proc"), ("TLX_SYMMETRY_PARANOID", "1"), ("TLX_PRERUN_REUSE", "0")]);
-    assert_eq!(r.code, 101, "{}", r.text());
-    assert!(r.text().contains("TLX_SYMMETRY_PARANOID"), "{}", r.text());
-    // Without the switch the wrong reduction goes unnoticed.
-    let r = run(DEEP, "", &[], &[("TLX_AUTOSYM_FORCE", "Proc")]);
-    assert_eq!(r.code, 0, "{}", r.text());
-}
-
-#[test]
-fn an_applied_symmetry_gives_the_same_counts_with_several_workers() {
+fn refused_symmetry_keeps_counts_across_workers() {
     // A proven group is equivariant: the orbits, and the successors of each,
     // do not depend on which representative a worker schedule picks.
     let counts = |args: &[&str]| {
@@ -217,7 +169,7 @@ fn an_applied_symmetry_gives_the_same_counts_with_several_workers() {
 }
 
 #[test]
-fn projected_choice_is_guarded_in_every_tier() {
+fn unproved_choice_symmetry_is_refused_in_every_tier() {
     for choose in ["(CHOOSE m \\in msgs : TRUE).val", "LET m == CHOOSE m \\in msgs : TRUE IN m.val"] {
         let body = format!(
             "VARIABLES pc, msgs\nInit == pc = [p \\in Proc |-> 0] /\\ msgs = {{[from |-> p, val |-> 7] : p \\in Proc}}\n\
@@ -232,14 +184,14 @@ fn projected_choice_is_guarded_in_every_tier() {
         ] {
             let r = run(&body, "INVARIANT Inv", &[tier], &env);
             assert_eq!(r.code, 0, "{}", r.text());
-            assert!(r.stdout.contains("runtime guard"), "{}", r.text());
-            assert!(r.stdout.contains("10 distinct states found"), "{}", r.text());
+            assert!(!r.stdout.contains("(runtime guard; safety"), "{}", r.text());
+            assert!(r.stdout.contains("27 distinct states found"), "{}", r.text());
         }
     }
 }
 
 #[test]
-fn a_late_choice_guard_failure_restarts_the_unreduced_search() {
+fn unproved_late_choice_keeps_the_original_search() {
     // After the bounded probe, candidate projections first disagree. The
     // chosen field then depends on the order of renamed process identities.
     let body = "VARIABLES pc, n\nInit == pc = [p \\in Proc |-> 0] /\\ n = 0\n\
@@ -250,7 +202,7 @@ fn a_late_choice_guard_failure_restarts_the_unreduced_search() {
         let guarded = run(body, "INVARIANT Inv", &[tier], &[("TLX_PARANOID", "1"), ("TLX_PRERUN", "1")]);
         assert_eq!(reference.code, 12, "{}", reference.text());
         assert_eq!(guarded.code, reference.code, "{}", guarded.text());
-        assert!(guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
+        assert!(!guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
         let counts = |s: &str| s.lines().find(|s| s.contains("states generated,")).unwrap().to_string();
         assert_eq!(counts(&guarded.stdout), counts(&reference.stdout));
         assert!(!guarded.stdout.contains("(symmetry-reduced)"), "{}", guarded.text());
@@ -258,7 +210,7 @@ fn a_late_choice_guard_failure_restarts_the_unreduced_search() {
 }
 
 #[test]
-fn an_error_only_in_an_additional_guard_candidate_restarts() {
+fn unproved_guard_candidates_are_not_evaluated() {
     let body = "VARIABLES n, msgs\n\
         Init == n = 0 /\\ msgs = {[flag |-> f, from |-> p, val |-> 7] : f \\in {0, 1}, p \\in Proc}\n\
         Next == n < 16 /\\ n' = n + 1 /\\ UNCHANGED msgs\n\
@@ -268,7 +220,7 @@ fn an_error_only_in_an_additional_guard_candidate_restarts() {
         env.extend([("TLX_PRERUN", "1"), ("TLX_PRERUN_REUSE", "0")]);
         let guarded = run(body, "INVARIANT Inv", &["-compile"], &env);
         assert_eq!(guarded.code, 0, "{}", guarded.text());
-        assert!(guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
+        assert!(!guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
         assert!(guarded.stdout.contains("17 distinct states found, 0 states left on queue."), "{}", guarded.text());
     }
 }

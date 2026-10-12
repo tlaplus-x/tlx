@@ -19,10 +19,10 @@ Observed == log
 const CFG: &str = "INIT Init\nNEXT Next\nINVARIANT TypeOK\n";
 
 #[test]
-fn length_projection_reduces_in_all_tiers_and_tlc_bypasses() {
+fn unproved_length_projection_keeps_the_full_graph_in_all_tiers() {
     let dir = tlx_testkit::TempDir::with_spec("sequence-length", SPEC, CFG);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 31), (vec!["-optimize"], 5), (vec!["-optimize", "-tlc"], 31)] {
+        for (flags, count) in [(vec![], 31), (vec!["-optimize"], 31), (vec!["-optimize", "-tlc"], 31)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Length.tla")
                 .args(args)
@@ -35,7 +35,7 @@ fn length_projection_reduces_in_all_tiers_and_tlc_bypasses() {
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
             assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-            assert_eq!(run.stdout.contains("sequence-length-projection"), count == 5, "{tier}: {}", run.text());
+            assert!(!run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
         }
     }
 }
@@ -68,7 +68,7 @@ fn content_observations_and_conflicting_bindings_refuse_projection() {
 }
 
 #[test]
-fn length_projection_preserves_failures_and_appended_expression_errors() {
+fn refused_length_projection_preserves_failures_and_errors() {
     for (spec, cfg, code, message) in [
         (SPEC.to_owned(), format!("{CFG}INVARIANT Safe\n"), 12, "Invariant Safe is violated"),
         (SPEC.replace("Next == Grow \\/ Reset", "Next == Grow"), CFG.to_owned(), 11, "Deadlock reached"),
@@ -86,7 +86,7 @@ fn length_projection_preserves_failures_and_appended_expression_errors() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
-            assert!(run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
+            assert!(!run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
             assert!(run.text().contains(message), "{tier}: {}", run.text());
             if code == 12 {
                 assert!(run.stdout.contains("<<0, 0, 0>>") || run.stdout.contains("<<1, 1, 1>>"), "{tier}: {}", run.text());
@@ -96,9 +96,9 @@ fn length_projection_preserves_failures_and_appended_expression_errors() {
 }
 
 #[test]
-fn length_projection_does_not_preempt_existing_field_reduction() {
-    // The constant log admits a length key but merging its contents saves no
-    // states. Preserve the existing field rule's priority and useful reduction.
+fn unproved_field_and_length_candidates_keep_the_full_graph() {
+    // This model still has four states: neither field erasure nor length
+    // projection has a connected certificate.
     let spec = r#"---- MODULE Length ----
 EXTENDS Naturals, Sequences
 VARIABLE r, log
@@ -119,12 +119,12 @@ TypeOK == r \in [mode: {"idle", "busy"}, data: {0, 1}] /\ log \in Seq(Nat)
         .timeout(Duration::from_secs(60))
         .run();
     assert_eq!(run.code, 0, "{}", run.text());
-    assert!(run.stdout.contains("phase-field-projection"), "{}", run.text());
-    assert!(run.stdout.contains("3 distinct states found"), "{}", run.text());
+    assert!(!run.stdout.contains("phase-field-projection"), "{}", run.text());
+    assert!(run.stdout.contains("4 distinct states found"), "{}", run.text());
 }
 
 #[test]
-fn length_keys_compose_with_symmetry_in_every_tier() {
+fn unproved_length_composition_keeps_declared_symmetry_only() {
     let spec = r#"---- MODULE Length ----
 EXTENDS Naturals, Sequences, TLC
 CONSTANT Nodes
@@ -152,7 +152,7 @@ Symmetry == Permutations(Nodes)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{tier}: {}", run.text());
-        assert!(run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
-        assert!(run.stdout.contains("5 distinct states found"), "{tier}: {}", run.text());
+        assert!(!run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("12 distinct states found"), "{tier}: {}", run.text());
     }
 }

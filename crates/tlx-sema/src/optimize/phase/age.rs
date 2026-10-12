@@ -15,6 +15,8 @@ use super::{
     variable, Branch, FieldProjection,
 };
 
+mod lean;
+
 struct Stamp {
     var: VarId,
     field: Arc<str>,
@@ -71,30 +73,11 @@ pub fn age_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr,
         {
             continue;
         }
-        // Compose only disjoint rewritten components. Both checkers prove
-        // branch-wise transfers over independent structural domains; the
-        // history summary must also be an accepted age observation. Finish
-        // collecting observation cutoffs before constructing the age key.
-        let history = super::history_projection(program, cfg, init, next, observations).filter(|history| {
-            let ExprKind::Tuple(hs) = &*history.view.kind else { return false };
-            hs.iter().enumerate().all(|(i, e)| {
-                let var = VarId(i as u32);
-                variable(e, false) == Some(var) || (var != proof.clock && !proof.stamps.iter().any(|s| s.var == var) && proof.read(e))
-            })
-        });
+        // Composition needs its own connected certificate. Keep every other
+        // component concrete until that proof is available.
+        let Some(certificate) = lean::emit(&proof, &initial, &steps, &normalized_observations) else { continue };
         let mut projection = proof.view(program);
-        if let Some(history) = history {
-            let ExprKind::Tuple(hs) = &*history.view.kind else { return None };
-            let ExprKind::Tuple(ages) = &*projection.view.kind else { return None };
-            let values = ages
-                .iter()
-                .zip(hs)
-                .enumerate()
-                .map(|(i, (age, history))| if variable(age, false) == Some(VarId(i as u32)) { history.clone() } else { age.clone() })
-                .collect();
-            projection.view = Expr::new(ExprKind::Tuple(values), init.span);
-            projection.fields.extend(history.fields);
-        }
+        projection.certificate = Some(certificate);
         return Some(projection);
     }
     None

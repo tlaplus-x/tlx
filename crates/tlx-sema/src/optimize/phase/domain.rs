@@ -450,6 +450,15 @@ fn update(domain: &mut Domain, keys: &[ExceptKey], value: &Domain) {
                 update(field, rest, value);
             }
         }
+        (ExceptKey::Field(k), Domain::Records(records)) => {
+            // EXCEPT ignores an absent field. Update each possible record
+            // shape separately, preserving optional timestamp presence.
+            for fields in records {
+                if let Some(field) = fields.get_mut(k) {
+                    update(field, rest, value);
+                }
+            }
+        }
         (_, Domain::Bottom) => {}
         _ => *domain = Domain::Top,
     }

@@ -10,8 +10,9 @@ There are two consumers:
 - Opt-in checking proves a projection of concrete state through resolved HIR. The existing VIEW
   machinery fingerprints the retained components; actions still produce full concrete states.
   Counterexamples are reconstructed by following actual initial states and successor edges.
-- Artifact generation uses a typed transition IR, cached analyses, transformation passes and
-  independent rule checkers. Cleanup exposes opportunities for threshold-counter saturation,
+- The internal artifact candidate pipeline uses a typed transition IR, cached analyses,
+  transformation passes and independent rule checkers. Public export is disabled until connected
+  certificates cover its passes. Cleanup exposes opportunities for threshold-counter saturation,
   which merges values into representatives. Generation does not transfer a verdict or trace to
   the source. Saturation remains export-only because counter-specific trace lifting and integration into
   ordinary checking are absent.
@@ -27,6 +28,37 @@ variables; an inapplicable rule leaves ordinary checking unchanged. Artifact gen
 requires its complete input to fit the restricted fragment below. Standalone constant propagation,
 predicate simplification and dead-action cleanup no longer run in ordinary checking; they remain
 in the artifact pipeline as preparation for state reduction.
+
+## Proof coverage
+
+Every automatic state reduction must have a compiler-generated certificate for its actual
+application. This is enforced before installing a projection or publishing an export.
+Shared algebra, Rust applicability checks and bounded tests do not satisfy the requirement.
+Ordinary checking emits Lean without invoking Lean; development verification is explicit.
+
+| Reduction | Connected certificate | Current behavior |
+|---|---|---|
+| Unobserved variables | Literal initializations, literal/copy/frame updates; independent retained state | Enabled within this subset |
+| Finite history summary | Independent guards, bounds, event values and retained updates; supported prefix observations | Enabled within this subset |
+| Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
+| Phase-dependent fields | Missing | Candidate analysis only |
+| Sequence length | Missing | Candidate analysis only |
+| Relative ages | Fixed-domain timestamp maps, explicit keep/reset/erase transfers and threshold tests | Enabled within this subset |
+| Combined age/history | Missing | Refused; other components stay concrete |
+| Nested ordered allocation and live versions | Missing | Candidate analysis only |
+| Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
+| Counter export and its cleanup pipeline | Missing | Internal proposal only; CLI refuses without creating artifacts |
+| Projection composed with symmetry | Missing | Automatic projection refused |
+
+All enabled projection certificates prove initialization, successor correspondence from
+every representative, preservation of state observations, concrete counterexample lifting,
+and deadlock preservation. Liveness, constraints, action/initial properties and aliases
+remain outside this certified checking subset. Explicit user VIEW/SYMMETRY declarations
+retain the TLC contract; they are not compiler-certified automatic reductions.
+
+The sections describing unsupported rules below document candidate algorithms and prior
+evidence, not enabled reductions or current performance claims. Disabling a candidate is
+not a proof of it: completing these certificates remains work.
 
 ## Overlap with execution optimization
 
@@ -113,8 +145,8 @@ before use. A candidate projection forgets these fields during every phase where
 It must propagate liveness backward through phase transitions: clearing a field only in `waiting`
 is not sufficient to establish the successor-class equation if the next phase exposes its old
 value again. Type predicates also need a preservation proof from Init and Next; they cannot simply
-be assumed true. The phase-field rule below derives this projection automatically from the
-configured source. It does not require a user-written VIEW or changes to the specification.
+be assumed true. The phase-field candidate below derives this projection from the configured source;
+application awaits a connected certificate. It does not require a user-written VIEW or changes to the specification.
 
 The checking implementation applies this reasoning through conservative projection rules. Their
 dataflow analyses are deliberately bounded. Add richer transfer summaries when an external
@@ -182,7 +214,7 @@ representatives and reuses class-aware replay, so a reported finite counterexamp
 actual source steps, including actual omitted values. Temporal
 properties remain outside the applied contract; a finite quotient lasso alone would not establish
 a genuine concrete liveness counterexample. The HIR analyzer is trusted implementation code with
-this source-level argument and regression tests, not an independently checked proof certificate.
+a generated erasure certificate for literal/copy/frame transfers. Source lowering and runtime remain trusted.
 
 CCF's external `consistency/Consistency.tla` has this pattern: `action` is initialized to `"Init"`
 and assigned labels by the actions, but guards and `TypeOK` do not read it. A bounded local wrapper
@@ -254,7 +286,7 @@ implemented below; the remaining rows are candidates, not completed model-checki
 
 | Candidate | External motivation | Required proof and remaining blockers |
 |---|---|---|
-| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Opt-in checking derives capped-age keys and composes them with history reduction under mathematical-clock semantics; see below. |
+| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Capped ages have a connected certificate, but the cleaner stores an age-filtered set in retained state, outside the current certificate subset. Age/history composition also remains uncertified. |
 | Finite tables of history witnesses | The business-logic models ask whether a particular user has a prior subscription or trial event. | Summarize existential queries for every value in a proved finite parameter domain. Current prefix monitors reject free state and local parameters. These models additionally observe exact event counts, month numbers and billing indices, so this rule alone would not bound them. |
 | Relative ticket order | The Bakery/Boulangerie models use unbounded tickets in mutual-exclusion comparisons. | Order ranks suffice for resets, copies and a globally fresh maximum ticket, but arbitrary choices from `Nat`, local `max + 1`, and successor-equality observations need more information. A rank-only key is not justified for these full models. |
 
@@ -264,6 +296,8 @@ needed to enable the next write. A sound reduction here needs a stronger simulat
 and possibly refinement, rather than independently capping the counters.
 
 ### Relative-age projection
+
+**Enabled when a connected relative-age certificate can be generated.**
 
 `phase/age.rs` analyzes one logical clock initialized to zero, advanced by one, or left
 unchanged. It recognizes fixed-domain maps of records with one timestamp field per map.
@@ -280,90 +314,103 @@ timestamp field, so a stamped value has a different domain from that literal.
 
 Clock decrements, future timestamps, observed absolute times, timestamp-to-timestamp comparisons,
 unknown transfers and ambiguous bindings refuse the candidate. Resets to a fixed timestamp
-after initialization are currently unsupported. The analyzer can combine disjoint age and
-history components after checking that the history summary is an accepted age observation.
+after initialization are currently unsupported. Certificate generation additionally requires
+age-independent map indices, payload updates and conditional map-transfer tests. Retained
+Boolean guards and invariant observations can combine deadline tests with independent predicates.
+Timestamp comparisons under unsupported consumers or quantifiers refuse the certificate.
+The current certificate emitter expands at most 256 fixed map slots.
 
-Opt-in checking selects this rule before standalone history, phase and length projections
-when whole-variable elimination does not apply. Its proof uses mathematical natural numbers:
-it may eliminate eventual machine overflow of `clock + 1` or `timestamp + delay`. This is
-permitted by the explicit optimization contract; compatibility mode bypasses the rule.
-Source actions and full concrete values remain in execution and counterexample replay.
-`Age.lean`, included in emitted Lean files, states capped-age bounds, tick/reset equations
-and threshold preservation. It does not certify HIR applicability, composition, or the complete
-external model; verification is never implicit.
+`phase/age/lean.rs` emits the map slots and caps, zero-time initialization, tick amounts,
+per-slot keep/reset/erase changes, deadline predicates, retained payload equations and
+observations. `AgeCertificate.lean` models a timestamp as an optional natural no greater
+than the clock. Projection retains its presence and caps `clock - timestamp`. It proves
+initialization, successor correspondence from every representative, observations, safety
+with stuttering, counterexample lifting and deadlocks. Independent HIR leaves range over
+retained payloads, timestamp presence and local choices; they cannot inspect forgotten
+absolute time or age magnitudes. Source lowering, domain inference, partial-read totality
+and the actual runtime VIEW remain trusted.
 
-The external cleaner has a real `ConsistentReads` violation: deletion can race with publishing
-a reference and reading the blob. A separate finite-graph diagnostic uses one server, cleaner,
-user, metadata, image and UUID, removes the length/time constraints and liveness property,
-and checks only `TypeOk` while retaining the consistency monitor in the key. The compiler-derived
-key completes at 820 distinct and 3,083 generated states, matching a manual age/history VIEW in
-both TLC and tlx. Automatic optimized CLI checks also complete at 820 states with `TypeOk`
-alone, in interpreter and native modes with paranoid cross-checking. Selecting `ConsistentReads`
-reports the genuine violation in both tiers. This is evidence of finiteness for the diagnostic
-configuration, not a claim that the original safety property passes.
-The explicit local diagnostic test is:
+This rule runs after whole-variable elimination and before standalone history projection.
+It uses mathematical natural numbers and may eliminate eventual machine overflow of
+`clock + 1` or `timestamp + delay`, as permitted by the optimization contract. Runtime
+arithmetic remains checked. Compatibility mode bypasses the rule. Concrete actions and
+values remain available for execution and counterexample replay.
 
-```sh
-cargo test -p tlx-eval --profile test-release --lib external_cleaner_mathematical_age -j 3 -- --ignored
-```
+Age/history composition is disabled until it has a connected certificate. An age-only
+model with an empty record or a timestamp tested at delay two has four reduced states:
+empty, age zero, age one, and age two-or-more. Its concrete clock is unbounded. Retaining
+an independently unbounded history can still make the full graph infinite.
+The [relative-age example](../proofs/age/README.md) includes reproducible unbounded and
+finite-budget configurations and explicit Lean verification commands.
+
+The cleaner’s age-filtered retained set currently prevents an age certificate; standalone
+history reduction can still apply, leaving its clock unbounded. Earlier experiments reported 820 distinct and 3,083 generated states using a
+combined age/history key. Those are historical diagnostic results, not current enabled
+behavior. The original cleaner also has a genuine `ConsistentReads` violation. Neither
+its full safety nor its finite state count follows from the standalone age certificate.
 
 ## Ordered allocation and live versions
 
-`ordered-allocation-projection` recognizes a scalar allocation frontier initialized to a
-positive integer literal. Every transition must retain it or advance it by a proved
-nonnegative amount. Copies of its values are tracked through nested records, maps, sets
-and sequences. Each family is renamed independently by the sorted rank of its live positive
-values; zero and negative sentinels remain exact. The allocation frontier and any observed
-fixed positive anchors participate in the key. This preserves equality, order, and fresh
-allocation above all old values. It does not permit incrementing an arbitrary old ID:
-`(1, 2)` and `(1, 100)` have the same order, but incrementing the first component can
-produce equality in only one state.
+`ordered-allocation-projection` now requires a compiler-generated, connected rule-model
+certificate before it can be applied. The current certified subset is intentionally narrow:
 
-The analysis checks normalized Init, Next and all selected safety observations. Invariants
-are observations, never assumptions. It supports literal allocation amounts and amounts
-from finite-set cardinalities, including allocation ranges starting at the frontier. Exact
-magnitudes, subtraction of IDs, arithmetic on an old ID, cross-family comparisons and
-unknown operations prevent application. Sequence operations on maps with renamed numeric
-keys also refuse: renaming must not turn a non-sequence domain into `1..n`.
+- One scalar frontier initialized to a positive literal, retained or advanced by a
+  nonnegative literal on each branch.
+- Its initial value is the sole fixed anchor; other state contains no copies of the frontier.
+- Supported frontier observations are comparisons with literals at or below the initial
+  value, natural/integer membership, Boolean combinations and conditionals, and equality
+  tests of `Cardinality({frontier, initialValue})` against a literal.
+- Other guards, updates, observations and branch domains are independent of the frontier.
+  They are universally interpreted over exactly retained state and branch-local choices.
+- Constraints, action/initial properties, trace aliases and liveness exclude application.
 
-An additional rule recognizes one immutable map whose initial entry is at the frontier,
-whose clock advances by one when a new entry is appended, and whose old entries never
-change. Reads must be indexed lookups or the recognized maximum-domain expression.
-The runtime retains entries at allocation values found outside the map, including the
-current frontier and fixed anchors. It then collects IDs in the retained entries and
-ranks all families. Whole-map observations, domain enumeration and history cardinality
-prevent collection. History payloads containing their own timestamp family are refused;
-transitive garbage collection is not implemented. Other maps can still be ranked without
-having entries removed.
+The compiler lowers the actual normalized branches into `OrderedRule.Model`: the initial
+relation, each branch's increment and guard, and the selected state observations. Its
+concrete state has an unbounded natural frontier at or above its initial value; initialization
+and nonnegative updates establish this domain without assuming an invariant. The reduced
+state retains whether the frontier still equals its initial value, plus all independent state.
+The two live numeric values are the frontier and anchor. Their ranks encode exactly this
+phase; `runtime_key_equivalent` proves equality of rank keys iff the formal projections agree.
+The predicate semantics include the duplicate-sensitive cardinality of the two-element set.
 
-The implementation is structural and independent of field and operator names. It uses a
-bounded forward provenance fixed point, followed by a complete recheck at that fixed point.
-Uncertain transfers, missing assignments and exhausted analysis budgets refuse application.
-The executable model and concrete counterexample replay are unchanged. The structural plan
-runs at the existing VIEW fingerprint boundary and before projected symmetry canonicalization.
-A user VIEW takes precedence, liveness is excluded and `-tlc` bypasses the pass.
+`OrderedCertificate.lean` constructs the certificate and proves initialization correspondence,
+successor correspondence from every representative, observation preservation, safety with
+stuttering, concrete counterexample lifting and plain-Next deadlock preservation. No
+preservation premise or correctness axiom is assumed. Source lowering, totality, runtime
+execution and symmetry composition remain trusted. Generation still does not run Lean.
 
-This can make an infinite graph finite when the remaining containers have bounded size.
-It does not itself prove finite cardinality or guarantee that every model terminates.
+The wider provenance analysis can follow families through records, maps, sets and sequences,
+and recognize immutable version histories. These candidates are **not applied** without a
+connected certificate. This currently excludes the MongoDB collection-incarnation model,
+multiple allocation families, copies of identifiers, and history garbage collection. The
+[MongoDB oracle fixture](../crates/tlx-cli/tests/fixtures/optimization_ordered/README.md)
+retains an independent TLC VIEW with 19,048 distinct states as a future coverage target;
+that count is not a current automatic optimization claim.
+
+Proof review exposed a concrete failure in the earlier analysis: an intermediate consumer
+such as `Cardinality({clock, 1})` discarded numeric provenance and lost the anchor `1`.
+Then `clock = 1` and `clock = 2` could receive the same key although their future transitions
+differed. The regression initializes `clock = 1, bad = FALSE`, increments the clock and sets
+`bad` when the old set has cardinality two. TLC finds `bad = TRUE` at `clock = 3`; the former
+optimization incorrectly reported success. Anchors are now retained at every intermediate
+colored value, not just stored values and direct comparisons. The regression generates a
+connected certificate and checks the genuine failure across execution tiers.
+The [ordered proof case study](../proofs/ordered/README.md) includes a standalone Lean
+disproof showing that no reduced relation can satisfy successor correspondence for the
+former key, and commands for auditing newly generated certificates.
+
 Mathematical integer semantics permit eliminating eventual allocation overflow; ordinary
-runtime arithmetic stays checked. The mandatory Lean output includes `Ordered.lean` algebra
-for retained lookup, order/equality and fresh allocation, plus the actual structural plan.
-It does not construct a model certificate or verify Lean automatically.
-
-The [MongoDB collection-incarnation oracle](../crates/tlx-cli/tests/fixtures/optimization_ordered/README.md)
-uses the unchanged upstream source and an unbounded configuration with its selected safety
-checks intact. The automatically derived quotient has 19,048 distinct states, matching an
-independent TLC VIEW. The fixture records pinned inputs, the mathematical argument for the
-original graph's infinity, the retained state counts and reproduction commands. This is
-correctness evidence, not a measured runtime speedup.
+runtime arithmetic remains checked. A user VIEW takes precedence and `-tlc` bypasses the pass.
 
 ## Length-only sequence projection
+
+**Candidate only: no connected certificate; this reduction is not enabled.**
 
 `phase/sequence.rs` shares the bounded normalizer, branch analysis and forward structural
 value domains with field projection. It replaces a top-level sequence by its exact length in
 the state key when its contents cannot affect any selected observation or successor class.
 Concrete sequences and executable actions remain unchanged. Existing whole-variable and field
-projections retain priority; this rule runs when they do not apply.
+projections originally retained priority; this candidate is now gated off pending proof.
 
 The rule requires a proved sequence domain from Init and every Next alternative, exactly one
 binding per alternative, and transfers made from tuples, self-copies, Append and IF expressions.
@@ -392,6 +439,8 @@ The upstream `MCReplicatedLog` configuration also selects liveness and a handwri
 that separate configuration does not establish applicability of this safety-only rule.
 
 ## Phase-dependent field projection
+
+**Candidate only: no connected certificate; this reduction is not enabled.**
 
 `phase.rs` derives a finite control field and field liveness for a record, or a fixed-domain map
 of records. Names have no special meaning. The motivating inputs are the unchanged external
@@ -430,12 +479,11 @@ For each candidate control field, backward analysis computes `Live[phase, field]
 
 The generated VIEW retains every other variable and replaces each dead field by one sentinel in
 the state key. It preserves record fields, map keys and control values. Executable HIR and concrete
-stored states are unchanged. The current implementation applies one projection rule per run:
-whole-variable projection takes precedence, then a finite history summary, then the proved phase
-candidate projecting the most
-fields (ties retain source traversal order). This heuristic does not predict reachable state counts. It does
-not combine several candidate records or compose with user VIEW. Equivariant projections can
-compose with symmetry as described below.
+stored states would remain unchanged. The candidate selects the record with the most
+projected fields (ties retain source traversal order). This heuristic does not predict
+reachable state counts. Applying it awaits a connected certificate. Currently checking
+selects at most one certified erasure, history or scalar allocation projection, in that
+order, and declines user VIEW and symmetry composition.
 
 **Correctness argument.** Forward inference establishes an inductive overapproximation of reachable
 values: it contains Init and is closed under all recognized Next alternatives. Within this domain,
@@ -455,6 +503,8 @@ constants, effects and exhausted analysis budgets decline the rule. Control doma
 alternatives. It does not infer numeric threshold partitions or remove sequence lengths or map keys.
 
 ## Composing projection with symmetry
+
+**Candidate only: no connected certificate; this reduction is not enabled.**
 
 An automatic projection can compose with declared symmetry or statically proved automatic
 symmetry. Forced and runtime-guarded automatic groups retain their existing path. A declared
@@ -496,7 +546,9 @@ more runtime when projection overhead dominates.
 
 ## Artifact input fragment
 
-Artifact generation supports one or more scalar natural-number state variables:
+**Internal candidate only: the export command currently refuses without emitting artifacts.**
+
+The candidate pipeline supports one or more scalar natural-number state variables:
 
 - Initialization is a conjunction assigning each variable one configured natural literal.
 - Next is a disjunction of actions. Each action is a conjunction of state guards and exactly one
@@ -645,7 +697,9 @@ whole state domain is a finite product. This does not promise a practically smal
 
 ## Artifacts and trust boundary
 
-The output consists of `Optimized.tla`, `Optimized.cfg`, and `optimization.txt`. Generated variables,
+The internal proposal consists of `Optimized.tla`, `Optimized.cfg`, and `optimization.txt`.
+The CLI currently refuses it because no connected certificate is available. A future
+certified export must also persist `Optimization.lean`. Generated variables,
 actions and invariants have collision-free synthetic names; the report maps them to source names
 and locations and explains every counter cap. The destination must be new. Semantic refusal
 creates no destination; an I/O failure returns an error and may leave incomplete files. The report
@@ -671,8 +725,9 @@ and failure behavior are specified in [configuration.md](configuration.md#comman
 No verifier is run during emission. Verification is an explicit, separate user action:
 `lean /path/to/Optimization.lean`. No Lake project or external Lean package is required.
 
-The compiler embeds shared `Rules.lean` and, for supported history applications,
-`HistoryCertificate.lean`. The generated section also records the actual source files,
+The compiler embeds shared `Rules.lean`, `ErasureCertificate.lean` for unobserved variables, and, for supported history applications,
+`HistoryCertificate.lean`; accepted ordered-allocation applications embed
+`OrderedCertificate.lean`; relative-age applications embed `AgeCertificate.lean`. The generated section also records the actual source files,
 parsed configuration, definition HIR and selected VIEW as escaped Lean strings.
 
 **Supported history applications now generate a parametric rule-IR certificate.**
@@ -699,15 +754,21 @@ of reads, set/index predicate lowering, source bindings, the actual VIEW impleme
 symmetry composition, backend execution and model-checking results remain outside the
 certificate. The proof does not establish the input model's safety or its state count.
 
-The current certificate subset requires history-independent branch guards, bounds,
+The history certificate subset requires history-independent branch guards, bounds,
 appended values and retained-state updates, and initial histories built from finite
 resets. Observations support Boolean combinations of prefix monitors, emptiness,
 sequence type membership and history-free predicates. Constraints, action/initial
-properties and trace aliases currently exclude certificate generation. Other HIR rules
-and unsupported history cases still emit shared algebra and a transformation record,
-explicitly labelled as having no model certificate. They retain their existing Rust
-applicability checks. The separate counter-model export command retains its artifact
-contract above. Generation does not imply Lean acceptance.
+properties and trace aliases exclude automatic reduction. Unsupported history cases and
+all other uncertified rules are refused. A no-pass run emits shared algebra and a record
+explicitly saying no reduction was applied. The export command likewise refuses its
+uncertified proposal. Generation does not imply Lean acceptance.
+
+**Unobserved-variable removal also emits a connected certificate.** `ErasureCertificate.lean`
+models concrete state as retained and hidden components. Generated hidden updates are literal
+assignments, copies (including cycles) or frames, so they are total. Retained guards and
+observations cannot access hidden variables. The reduced relation drops only the total hidden
+update, and the certificate reconstructs a successor for every concrete representative.
+Missing or conflicting bindings and unknown transfers refuse certificate generation.
 
 To audit a generated certificate explicitly, including its standard-axiom dependencies:
 
@@ -716,7 +777,10 @@ python3 proofs/check_generated.py --lean /path/to/lean --negative /path/to/Optim
 ```
 
 The optional negative checks require Lean to reject both forgetting prior failed prefix
-obligations and changing the reduced safety observation. This script is never invoked
+obligations and changing the reduced safety observation. For erasure it rejects removing reduced successors. For ordered allocation it also
+rejects forgetting the initial anchor and failing to advance the reduced phase. Relative-age
+checks reject incorrect ticks, resets, deletion, deadline strictness and reduced observations.
+This script is never invoked
 by checking or by the ordinary Rust tests. It needs only Lean 4 (tested with 4.34.1),
 not Mathlib or a network connection.
 

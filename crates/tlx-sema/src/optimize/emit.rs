@@ -79,7 +79,7 @@ pub(super) fn emit(model: &Model, remarks: &[String]) -> Artifact {
             .unwrap();
     }
     module.push_str("====\n");
-    Artifact { module, config, report }
+    Artifact { module, config, report, certificate: None }
 }
 
 fn predicate(p: &Predicate) -> String {
