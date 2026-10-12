@@ -1,6 +1,8 @@
 //! Backward liveness on (control value, record field) pairs. Reads are roots;
 //! an untouched live successor field makes its predecessor field live.
 
+mod lean;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -31,9 +33,10 @@ pub(super) fn derive(
     var: VarId,
     control: &str,
     phases: &BTreeSet<Atom>,
-    steps: &[Branch],
+    branches: (&[Branch], &[Branch]),
     observations: &[Expr],
 ) -> Option<FieldProjection> {
+    let (initial, steps) = branches;
     let (keys, fields) = match &domains.vars[var.idx()] {
         Domain::Record(fs) => (None, fs),
         Domain::Function(keys, range) => {
@@ -102,7 +105,9 @@ pub(super) fn derive(
             break;
         }
     }
-    a.view(program)
+    let mut projection = a.view(program)?;
+    projection.certificate = lean::emit(&a, initial, steps, observations);
+    Some(projection)
 }
 
 impl Analysis<'_> {

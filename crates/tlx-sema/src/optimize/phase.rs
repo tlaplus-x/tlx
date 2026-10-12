@@ -64,11 +64,15 @@ pub fn phase_projection(program: &Program, cfg: &Config, init: &Expr, next: &Exp
             {
                 continue;
             }
-            if let Some(projection) = liveness::derive(program, &domains, VarId(i as u32), control, phases, &steps, &observations) {
+            if let Some(projection) =
+                liveness::derive(program, &domains, VarId(i as u32), control, phases, (&initial, &steps), &observations)
+            {
                 // A Boolean flag can be a valid but unhelpful control field.
-                // Prefer the candidate that forgets more fields; the proof
-                // is independent of this selection heuristic.
-                if best.as_ref().is_none_or(|old| projection.fields.len() > old.fields.len()) {
+                // Prefer certified candidates, then more forgotten fields;
+                // the proof is independent of this selection heuristic.
+                if best.as_ref().is_none_or(|old| {
+                    (projection.certificate.is_some(), projection.fields.len()) > (old.certificate.is_some(), old.fields.len())
+                }) {
                     best = Some(projection);
                 }
             }

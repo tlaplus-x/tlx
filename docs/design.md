@@ -163,8 +163,15 @@ Lowering, independent-leaf interpretation and runtime VIEW execution remain trus
 append/reset/frame transfers. Semantic leaves receive only retained state and current
 lengths. `LengthCertificate.lean` proves their transfer commutation and constructs
 initialization, successor, observation, counterexample and deadlock correspondence.
-Next-state length inputs remain unsupported. Phase-field analysis still awaits its
-connected certificate. Automatic symmetry is also gated off;
+Next-state length inputs remain unsupported.
+
+`phase/liveness/lean.rs` connects inferred phase liveness to explicit record and
+fixed-map updates. `FieldCertificate.lean` proves masked reads, transfer commutation
+and the resulting certificate. Generated finite tables discharge read, frame and
+observation liveness obligations with kernel-checked `decide`; preservation is not
+assumed. Primed projected reads and nonconstant initial phases are refused. Source
+lowering, domain/totality inference, leaf interpretation and runtime remain trusted.
+Automatic symmetry is gated off;
 its Rust analysis and bounded diagnostic remain available. Counter-export constructs an
 internal proposal, but the CLI refuses to publish it without a connected certificate.
 The [coverage inventory](optimization.md#proof-coverage) distinguishes proof work from

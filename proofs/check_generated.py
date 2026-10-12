@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -75,6 +75,13 @@ def verify(lean, path, negative):
             ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (fun _ => 0)", "discarded length guard feedback"),
             ("m.transfer s.1 d w s.2 k", "m.transfer s.1 d w (fun _ => 0) k", "discarded length transfer feedback"),
         ] if namespace == "GeneratedLength" else [
+            ("if m.live (p k) f then v k f else m.missing", "if m.live (p k) f then m.missing else v k f", "erased live fields"),
+            ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
+            ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
+            ("  readsActor := readsActor", "  readsActor := fun _ _ => true", "read dead actor fields"),
+            ("  writes := writes", "  writes := fun _ _ => false", "exposed dead framed fields"),
+            ("  readsGlobal := readsGlobal", "  readsGlobal := fun _ _ => true", "read dead fields of another actor"),
+        ] if namespace == "GeneratedField" else [
             ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
             ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
             ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),

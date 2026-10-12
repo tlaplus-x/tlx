@@ -41,7 +41,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Unobserved variables | Literal initializations, literal/copy/frame updates; independent retained state | Enabled within this subset |
 | Finite history summary | Summary-dependent guards, retained updates and event values; independent bounds and initialization | Enabled within this subset |
 | Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
-| Phase-dependent fields | Missing | Candidate analysis only |
+| Phase-dependent fields | Explicit scalar/fixed-map transfers and kernel-checked finite liveness tables | Enabled within this subset |
 | Sequence length | Multiple sequences, append/reset/frame transfers and current-length feedback | Enabled within this subset |
 | Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
@@ -476,7 +476,7 @@ that separate configuration does not establish applicability of this safety-only
 
 ## Phase-dependent field projection
 
-**Candidate only: no connected certificate; this reduction is not enabled.**
+The compiler generates a connected `GeneratedField` certificate for the accepted slice.
 
 `phase.rs` derives a finite control field and field liveness for a record, or a fixed-domain map
 of records. Names have no special meaning. The motivating inputs are the unchanged external
@@ -515,11 +515,11 @@ For each candidate control field, backward analysis computes `Live[phase, field]
 
 The generated VIEW retains every other variable and replaces each dead field by one sentinel in
 the state key. It preserves record fields, map keys and control values. Executable HIR and concrete
-stored states would remain unchanged. The candidate selects the record with the most
-projected fields (ties retain source traversal order). This heuristic does not predict
-reachable state counts. Applying it awaits a connected certificate. Currently checking
-selects at most one certified erasure, history or scalar allocation projection, in that
-order, and declines user VIEW and symmetry composition.
+stored states remain unchanged. Selection prefers certified candidates, then the record
+with the most projected fields (ties retain source traversal order). This heuristic does
+not predict reachable state counts. Checking selects at most one certified projection;
+whole-variable, age and history rules have priority over fields, followed by lengths and
+ordered allocation. User VIEW and symmetry composition decline automatic projection.
 
 **Correctness argument.** Forward inference establishes an inductive overapproximation of reachable
 values: it contains Init and is closed under all recognized Next alternatives. Within this domain,
@@ -532,11 +532,20 @@ the same projected successor classes in both directions, with the same enabledne
 concrete initial representatives this proves an observation-preserving bisimulation, supporting
 safety, deadlock checking and concrete counterexample replay under the shared checking boundary.
 
-This is a trusted static analysis with a correctness argument and regression tests, not an
-independently checked proof certificate. Recursive expansion, higher-order calls, unknown operator
+`FieldCertificate.lean` proves this correspondence for explicit rule-IR transfers.
+The generated application gives Lean the actual phase/read/write tables and proves
+their finite liveness obligations with `decide`. Guards and value leaves receive only
+retained state, control phases and the recorded field reads. Initialization, updates,
+observations, counterexamples and deadlocks connect through the same projection.
+Source lowering, domain/totality inference, leaf interpretation and runtime execution
+remain trusted. See the [field proof example](../proofs/field/README.md).
+
+Recursive expansion, higher-order calls, unknown operator
 constants, effects and exhausted analysis budgets decline the rule. Control domains are limited to
 32 mutually comparable literal or configured model values, candidate records to 32 fields, and expanded actions to 512
-alternatives. It does not infer numeric threshold partitions or remove sequence lengths or map keys.
+alternatives. Certificate emission additionally limits phase-expanded cases to 128
+and map keys to 256, requires constant initial phases, and rejects primed projected
+reads. It does not infer numeric threshold partitions or remove sequence lengths or map keys.
 
 ## Composing projection with symmetry
 

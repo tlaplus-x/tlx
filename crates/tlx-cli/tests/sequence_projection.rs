@@ -98,9 +98,8 @@ fn certified_length_projection_preserves_failures_and_errors() {
 }
 
 #[test]
-fn unproved_field_and_length_candidates_keep_the_full_graph() {
-    // This model still has four states: neither field erasure nor length
-    // projection has a connected certificate.
+fn certified_field_projection_has_priority_over_length() {
+    // Field erasure removes the duplicate idle state; exact length is constant.
     let spec = r#"---- MODULE Length ----
 EXTENDS Naturals, Sequences
 VARIABLE r, log
@@ -121,8 +120,8 @@ TypeOK == r \in [mode: {"idle", "busy"}, data: {0, 1}] /\ log \in Seq(Nat)
         .timeout(Duration::from_secs(60))
         .run();
     assert_eq!(run.code, 0, "{}", run.text());
-    assert!(!run.stdout.contains("phase-field-projection"), "{}", run.text());
-    assert!(run.stdout.contains("4 distinct states found"), "{}", run.text());
+    assert!(run.stdout.contains("phase-field-projection"), "{}", run.text());
+    assert!(run.stdout.contains("3 distinct states found"), "{}", run.text());
 }
 
 #[test]

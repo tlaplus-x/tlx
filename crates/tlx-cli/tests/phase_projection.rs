@@ -18,10 +18,10 @@ Inv == r \in [mode: {"idle", "busy"}, data: {0, 1}]
 const CFG: &str = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
 
 #[test]
-fn unproved_phase_projection_keeps_full_counts_in_every_tier() {
+fn certified_phase_projection_reduces_states_in_every_tier() {
     let dir = tlx_testkit::TempDir::with_spec("phase-projection", SPEC, CFG);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 4), (vec!["-optimize", "-tlc"], 4)] {
+        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 3), (vec!["-optimize", "-tlc"], 4)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Phase.tla")
                 .args(args)
@@ -34,13 +34,13 @@ fn unproved_phase_projection_keeps_full_counts_in_every_tier() {
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
             assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-            assert!(!run.stdout.contains("phase-field-projection"), "{tier}: {}", run.text());
+            assert_eq!(run.stdout.contains("phase-field-projection"), count == 3, "{tier}: {}", run.text());
         }
     }
 }
 
 #[test]
-fn unproved_map_field_projection_keeps_all_entries() {
+fn certified_map_field_projection_reduces_each_entry() {
     let spec = SPEC
         .replace("r = [mode |-> \"idle\", data |-> 0]", "r = [s \\in {1, 2} |-> [mode |-> \"idle\", data |-> 0]]")
         .replace("Start ==", "Start(s) ==")
@@ -64,7 +64,11 @@ fn unproved_map_field_projection_keeps_all_entries() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
-            assert!(run.stdout.contains("16 distinct states found"), "{tier}: {}", run.text());
+            assert!(
+                run.stdout.contains(if optimize { "9 distinct states found" } else { "16 distinct states found" }),
+                "{tier}: {}",
+                run.text()
+            );
         }
     }
 }
@@ -89,7 +93,7 @@ fn invariant_failure_and_evaluation_error_remain_visible() {
 }
 
 #[test]
-fn unproved_model_value_phases_keep_sequence_contents() {
+fn certified_model_value_phases_erase_dead_sequence_contents() {
     let spec = SPEC
         .replace("EXTENDS Integers", "EXTENDS Integers, Sequences\nCONSTANTS Idle, Busy")
         .replace("\"idle\"", "Idle")
@@ -101,7 +105,7 @@ fn unproved_model_value_phases_keep_sequence_contents() {
     let cfg = format!("{CFG}CONSTANTS Idle = Idle Busy = Busy\n");
     let dir = tlx_testkit::TempDir::with_spec("phase-model-values", &spec, &cfg);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 4), (vec!["-optimize", "-tlc"], 4)] {
+        for (flags, count) in [(vec![], 4), (vec!["-optimize"], 3), (vec!["-optimize", "-tlc"], 4)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Phase.tla")
                 .args(args)
@@ -141,7 +145,7 @@ fn unproved_composition_keeps_only_explicit_symmetry() {
             // leaves three local states and six multisets of two actors.
             for (flags, count) in [
                 (vec![], if declared { 10 } else { 16 }),
-                (vec!["-optimize"], if declared { 10 } else { 16 }),
+                (vec!["-optimize"], if declared { 10 } else { 9 }),
                 (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 }),
             ] {
                 let run = tlx_testkit::tlx_default!()

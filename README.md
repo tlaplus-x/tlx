@@ -188,7 +188,9 @@ that application. Currently enabled rules remove unobserved variables with liter
 updates, summarize supported append-only histories, cap relative timestamp ages (including
 finite age-filtered sets), combine supported age and history reductions, and reduce a
 restricted scalar allocation frontier. A connected sequence-length certificate can
-merge different sequence contents when every use depends only on current lengths. A history
+merge different sequence contents when every use depends only on current lengths.
+[Phase-field certificates](proofs/field/README.md) erase record fields in phases where
+they are overwritten before their next use. Lean checks the generated liveness tables. A history
 summary over a finite event domain can turn unbounded history into a finite state component,
 including when prefix predicates control guards, retained updates or later events.
 The [history feedback example](proofs/history/README.md) finishes with six states.

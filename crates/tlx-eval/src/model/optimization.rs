@@ -51,6 +51,9 @@ impl InterpModel {
             ("history-summary-projection", opt::history_projection(&self.ip.prog, cfg, &self.init, &next, observations))
         }))
         .chain(std::iter::once_with(|| {
+            ("phase-field-projection", opt::phase_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+        }))
+        .chain(std::iter::once_with(|| {
             ("sequence-length-projection", opt::sequence_length_projection(&self.ip.prog, cfg, &self.init, &next, observations))
         }))
         .chain(std::iter::once_with(|| {

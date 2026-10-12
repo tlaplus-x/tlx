@@ -28,7 +28,12 @@ fn configured_projection(body: &str, constants: &str) -> Vec<String> {
         Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
     });
     let cfg = parse_cfg(&format!("INIT Init\nNEXT Next\nINVARIANT Inv\n{constants}")).unwrap();
-    phase_projection(&p, &cfg, &roots[0], &roots[1], &roots[2..]).map(|a| a.fields).unwrap_or_default()
+    phase_projection(&p, &cfg, &roots[0], &roots[1], &roots[2..])
+        .map(|a| {
+            assert!(a.certificate.as_ref().is_some_and(|s| s.contains("namespace TlxOptimization.GeneratedField")), "missing certificate");
+            a.fields
+        })
+        .unwrap_or_default()
 }
 
 #[test]
@@ -166,4 +171,14 @@ fn fixed_maps_require_valid_keys_and_keep_cross_actor_reads() {
     assert_eq!(projection(&body), ["r[*].data"]);
     assert!(projection(&body.replace("Next == \\E s \\in {1, 2}", "Next == \\E s \\in {1, 2, 3}")).is_empty());
     assert!(projection(&body.replace("r[s].data >= 0", "\\A t \\in {1, 2}: r[t].data >= 0")).is_empty());
+}
+
+#[test]
+fn certificate_keeps_global_observations_and_noop_branches() {
+    let body = BODY
+        .replace("mode |->", "always |-> 7, mode |->")
+        .replace("mode:", "always: {7}, mode:")
+        .replace("Inv ==", "Inv == r.always = 7 /\\")
+        .replace("Start \\/ Finish", "Start \\/ Finish \\/ UNCHANGED r");
+    assert_eq!(projection(&body), ["r.data"]);
 }
