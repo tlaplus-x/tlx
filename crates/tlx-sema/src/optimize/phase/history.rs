@@ -7,7 +7,7 @@
 //! Existential monitors use the dual: retain the absence of any witness, so
 //! the same conjunction fold applies to the negated event predicate.
 
-mod lean;
+pub(super) mod lean;
 
 use std::collections::BTreeSet;
 
@@ -31,39 +31,10 @@ pub fn history_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
     let observations: Vec<_> = observations.iter().map(|e| expand.root(e)).collect::<Option<_>>()?;
     let domains = Domains::infer(program, cfg, &initial, &steps)?;
     for (i, domain) in domains.vars.iter().enumerate() {
-        let Domain::Seq(element) = domain else { continue };
-        if !finite(element) {
-            continue;
-        }
-        let mut proof = Proof { var: VarId(i as u32), domains: &domains, element, monitors: vec![], appends: false };
-        if !initial.iter().all(|b| proof.branch(b, false))
-            || !steps.iter().all(|b| proof.branch(b, true))
-            || !observations.iter().all(|e| proof.read(e))
-            || !proof.appends
-        {
-            continue;
-        }
+        let Some(candidate) = candidate(program, &domains, i, domain, &initial, &steps, &observations) else { continue };
+        let certificate = lean::emit(candidate.var, &initial, &steps, &observations, &candidate.monitors);
+        let summary = candidate.summary;
         let span = program.vars[i].span;
-        let history = Expr::new(ExprKind::Var(proof.var), span);
-        let local = LocalId(program.locals.len() as u32);
-        let index = Expr::new(ExprKind::Local(local), span);
-        let set = Expr::new(ExprKind::Builtin { op: B::Domain, args: vec![history.clone()] }, span);
-        let elements = Expr::new(
-            ExprKind::SetMap {
-                expr: Expr::new(ExprKind::FnApp { func: history, args: vec![index] }, span),
-                bounds: vec![Bound { vars: BoundVars::Many(vec![local]), set }],
-            },
-            span,
-        );
-        let certificate = lean::emit(proof.var, &initial, &steps, &observations, &proof.monitors);
-        let monitors = proof.monitors.into_iter().map(|e| {
-            if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) {
-                Expr::new(ExprKind::Builtin { op: B::Not, args: vec![e] }, span)
-            } else {
-                e
-            }
-        });
-        let summary = Expr::new(ExprKind::Tuple(std::iter::once(elements).chain(monitors).collect()), span);
         let values = program
             .vars
             .iter()
@@ -78,6 +49,56 @@ pub fn history_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
         });
     }
     None
+}
+
+pub(super) struct Candidate {
+    pub var: VarId,
+    pub monitors: Vec<Expr>,
+    pub summary: Expr,
+}
+
+pub(super) fn candidate(
+    program: &Program,
+    domains: &Domains,
+    i: usize,
+    domain: &Domain,
+    initial: &[Branch],
+    steps: &[Branch],
+    observations: &[Expr],
+) -> Option<Candidate> {
+    let Domain::Seq(element) = domain else { return None };
+    if !finite(element) {
+        return None;
+    }
+    let mut proof = Proof { var: VarId(i as u32), domains, element, monitors: vec![], appends: false };
+    if !initial.iter().all(|b| proof.branch(b, false))
+        || !steps.iter().all(|b| proof.branch(b, true))
+        || !observations.iter().all(|e| proof.read(e))
+        || !proof.appends
+    {
+        return None;
+    }
+    let span = program.vars[i].span;
+    let history = Expr::new(ExprKind::Var(proof.var), span);
+    let local = LocalId(program.locals.len() as u32);
+    let index = Expr::new(ExprKind::Local(local), span);
+    let set = Expr::new(ExprKind::Builtin { op: B::Domain, args: vec![history.clone()] }, span);
+    let elements = Expr::new(
+        ExprKind::SetMap {
+            expr: Expr::new(ExprKind::FnApp { func: history, args: vec![index] }, span),
+            bounds: vec![Bound { vars: BoundVars::Many(vec![local]), set }],
+        },
+        span,
+    );
+    let monitors = proof.monitors.iter().cloned().map(|e| {
+        if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) {
+            Expr::new(ExprKind::Builtin { op: B::Not, args: vec![e] }, span)
+        } else {
+            e
+        }
+    });
+    let summary = Expr::new(ExprKind::Tuple(std::iter::once(elements).chain(monitors).collect()), span);
+    Some(Candidate { var: proof.var, monitors: proof.monitors, summary })
 }
 
 fn finite(d: &Domain) -> bool {

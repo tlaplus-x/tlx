@@ -1,7 +1,7 @@
 //! Finite filters and quantified deadline observations. Filter predicates stay
 //! explicit in Lean; only consumers of their exact selected sets are leaves.
 use super::{fold, Emitter};
-use crate::{hir::*, visit};
+use crate::{builtins::Builtin as B, hir::*, visit};
 
 struct Filter {
     local: LocalId,
@@ -105,7 +105,9 @@ impl Emitter<'_, '_> {
             | ExprKind::SetMap { .. }
             | ExprKind::Choose { .. }
             | ExprKind::Lambda { .. }
-            | ExprKind::TemporalQuant { .. } => None,
+            | ExprKind::TemporalQuant { .. }
+            // Test.select inspects current stamps, not next-state stamps.
+            | ExprKind::Builtin { op: B::Prime, .. } => None,
             _ => {
                 let mut result = e.clone();
                 let mut valid = true;

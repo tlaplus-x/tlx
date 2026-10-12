@@ -73,10 +73,21 @@ pub fn age_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr,
         {
             continue;
         }
-        // Composition needs its own connected certificate. Keep every other
-        // component concrete until that proof is available.
-        let Some(certificate) = lean::emit(&proof, &initial, &steps, &normalized_observations) else { continue };
         let mut projection = proof.view(program);
+        let mut combined = None;
+        for (j, domain) in domains.vars.iter().enumerate() {
+            let Some(history) = super::history::candidate(program, &domains, j, domain, &initial, &steps, &normalized_observations) else {
+                continue;
+            };
+            if let Some(certificate) = lean::emit(&proof, &initial, &steps, &normalized_observations, Some(&history)) {
+                let ExprKind::Tuple(values) = std::sync::Arc::make_mut(&mut projection.view.kind) else { unreachable!() };
+                values[j] = history.summary;
+                projection.fields.push(format!("{}.history", program.vars[j].name));
+                combined = Some(certificate);
+                break;
+            }
+        }
+        let Some(certificate) = combined.or_else(|| lean::emit(&proof, &initial, &steps, &normalized_observations, None)) else { continue };
         projection.certificate = Some(certificate);
         return Some(projection);
     }

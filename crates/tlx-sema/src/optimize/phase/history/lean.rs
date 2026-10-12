@@ -9,36 +9,15 @@ use super::{interval_end, one_local};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 
 pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observations: &[Expr], monitors: &[Expr]) -> Option<String> {
-    let mut emitter = Emitter { var, monitors, atoms: vec![] };
-    let predicates = monitors
-        .iter()
-        .map(|m| {
-            let ExprKind::Quant { kind, bounds, body } = &*m.kind else { return None };
-            let outer = one_local(&bounds[0])?;
-            let predicate = emitter.predicate(body, outer, &[outer])?;
-            Some(if *kind == QuantKind::Exists { format!("(¬ {predicate})") } else { predicate })
-        })
-        .collect::<Option<Vec<_>>>()?;
+    let mut emitter = Emitter::new(var, monitors);
+    let predicates = emitter.predicates()?;
     let (initial_guards, seeds) = emitter.branches(initial, false)?;
     let (step_guards, transfers) = emitter.branches(steps, true)?;
     let observations = observations.iter().map(|e| emitter.observe(e)).collect::<Option<Vec<_>>>()?;
     let count = monitors.len();
     let mut out = String::from(include_str!("../../HistoryCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedHistory\nopen TlxOptimization HistoryRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
-    out.push_str(
-        "\n-- These are universal semantic parameters, not correctness axioms.\n\
-         -- C contains retained variables; W contains branch-local bindings.\n\
-         structure Semantics (C V W : Type) where\n\
-         \x20 test : Nat → C → C → W → Prop\n\
-         \x20 value : Nat → C → C → W → V\n\
-         \x20 observe : Nat → C → Prop\n\
-         \x20 member : Nat → V → Prop\n\
-         \x20 field : V → String → V\n\
-         \x20 constant : Nat → V\n\
-         \x20 number : Int → V\n\
-         \x20 string : String → V\n\
-         \x20 boolean : Bool → V\n\n",
-    );
+    out.push_str(SEMANTICS);
     for (i, atom) in emitter.atoms.iter().enumerate() {
         writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
     }
@@ -99,14 +78,43 @@ pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observation
     Some(out)
 }
 
-struct Emitter<'a> {
-    var: VarId,
+pub(in super::super) const SEMANTICS: &str = "\n-- These are universal semantic parameters, not correctness axioms.\n\
+         -- C contains retained variables; W contains branch-local bindings.\n\
+         structure Semantics (C V W : Type) where\n\
+         \x20 test : Nat → C → C → W → Prop\n\
+         \x20 value : Nat → C → C → W → V\n\
+         \x20 observe : Nat → C → Prop\n\
+         \x20 member : Nat → V → Prop\n\
+         \x20 field : V → String → V\n\
+         \x20 constant : Nat → V\n\
+         \x20 number : Int → V\n\
+         \x20 string : String → V\n\
+         \x20 boolean : Bool → V\n\n";
+
+pub(in super::super) struct Emitter<'a> {
+    pub(in super::super) var: VarId,
     monitors: &'a [Expr],
-    atoms: Vec<String>,
+    pub(in super::super) atoms: Vec<String>,
 }
 
-impl Emitter<'_> {
-    fn independent(&self, e: &Expr) -> bool {
+impl<'a> Emitter<'a> {
+    pub(in super::super) fn new(var: VarId, monitors: &'a [Expr]) -> Self {
+        Self { var, monitors, atoms: vec![] }
+    }
+
+    pub(in super::super) fn predicates(&self) -> Option<Vec<String>> {
+        self.monitors
+            .iter()
+            .map(|m| {
+                let ExprKind::Quant { kind, bounds, body } = &*m.kind else { return None };
+                let outer = one_local(&bounds[0])?;
+                let predicate = self.predicate(body, outer, &[outer])?;
+                Some(if *kind == QuantKind::Exists { format!("(¬ {predicate})") } else { predicate })
+            })
+            .collect::<Option<Vec<_>>>()
+    }
+
+    pub(in super::super) fn independent(&self, e: &Expr) -> bool {
         if matches!(&*e.kind, ExprKind::Var(v) if *v == self.var) {
             return false;
         }
@@ -165,7 +173,7 @@ impl Emitter<'_> {
         Some(Expr::new(kind, e.span))
     }
 
-    fn transfer(&mut self, e: &Expr, primed: bool) -> Option<String> {
+    pub(in super::super) fn transfer(&mut self, e: &Expr, primed: bool) -> Option<String> {
         let next = if primed { "d" } else { "c" };
         Some(match &*e.kind {
             ExprKind::Var(v) if primed && *v == self.var => "Transfer.keep".into(),
@@ -242,7 +250,7 @@ impl Emitter<'_> {
         })
     }
 
-    fn observe(&mut self, e: &Expr) -> Option<String> {
+    pub(in super::super) fn observe(&mut self, e: &Expr) -> Option<String> {
         if self.independent(e) {
             return Some(format!("(sem.observe {} c)", self.atom(e)?));
         }

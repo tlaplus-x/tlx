@@ -3,11 +3,18 @@
 use std::fmt::Write;
 
 mod filters;
+mod history;
 
 use super::{binding, clock_transfer, variable, Atom, Branch, Domain, Proof};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 
-pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], observations: &[Expr]) -> Option<String> {
+pub(super) fn emit(
+    proof: &Proof<'_>,
+    initial: &[Branch],
+    steps: &[Branch],
+    observations: &[Expr],
+    history: Option<&super::super::history::Candidate>,
+) -> Option<String> {
     let mut slots = vec![];
     for (i, stamp) in proof.stamps.iter().enumerate() {
         let Domain::Function(keys, _) = &proof.domains.vars[stamp.var.idx()] else { return None };
@@ -18,11 +25,23 @@ pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], obse
     if slots.is_empty() || slots.len() > 256 {
         return None;
     }
-    let mut e = Emitter { proof, slots, atoms: vec![], scope: vec![], remaining: 100_000 };
+    let mut e = Emitter {
+        proof,
+        slots,
+        atoms: vec![],
+        scope: vec![],
+        history: history.map(|h| super::super::history::lean::Emitter::new(h.var, &h.monitors)),
+        remaining: 100_000,
+    };
+    let history_code = e.history_code(initial, steps)?;
     let initial = initial.iter().map(|b| e.branch(b, false)).collect::<Option<Vec<_>>>()?;
     let steps = steps.iter().map(|b| e.branch(b, true)).collect::<Option<Vec<_>>>()?;
     let observations = observations.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
     let mut out = String::from(include_str!("../../AgeCertificate.lean"));
+    if history.is_some() {
+        out.push_str(include_str!("../../HistoryCertificate.lean"));
+        out.push_str(include_str!("../../AgeHistoryCertificate.lean"));
+    }
     out.push_str("\nnamespace TlxOptimization.GeneratedAge\nopen TlxOptimization AgeRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
     writeln!(out, "abbrev Key := Fin {}\ndef caps (k : Key) : Nat :=\n  match k.val with", e.slots.len()).unwrap();
     for (k, (i, key)) in e.slots.iter().enumerate() {
@@ -30,15 +49,18 @@ pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], obse
         e.atoms.push(format!("slot {k}: map {:?}, field {:?}, key {key:#?}", proof.stamps[*i].var, proof.stamps[*i].field));
     }
     out.push_str("  | _ => 0\n\n-- C retains payloads with timestamp fields removed; p retains their presence.\n-- W supplies branch-local choices. HIR leaf interpretation/lowering is trusted.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → (Key → Bool) → W → Prop\n  observe : Nat → C → (Key → Bool) → Prop\n  filterTest : Nat → C → C → (Key → Bool) → W → List (List Nat) → Prop\n  filterObserve : Nat → C → (Key → Bool) → List (List Nat) → Prop\n");
+    if history.is_some() {
+        out = out.replace("namespace TlxOptimization.GeneratedAge\n", "namespace TlxOptimization.GeneratedAgeHistory\n");
+        out = out.replace("structure Semantics (C W : Type) where", &format!(
+            "namespace HistoryLeaves\n{}\nend HistoryLeaves\nstructure Semantics (C V W : Type) where\n  history : HistoryLeaves.Semantics (C × (Key → Bool)) V W",
+            super::super::history::lean::SEMANTICS));
+        out.push_str("open HistoryRule\n");
+    }
     for (i, atom) in e.atoms.iter().enumerate() {
         writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
     }
-    let params = "{C W : Type} (sem : Semantics C W)";
-    writeln!(
-        out,
-        "\nvariable {{C W : Type}} (sem : Semantics C W)\ndef seed (choice : Nat × W) (k : Key) : Bool :=\n  match choice.1 with"
-    )
-    .unwrap();
+    let params = if history.is_some() { "{C V W : Type} (sem : Semantics C V W)" } else { "{C W : Type} (sem : Semantics C W)" };
+    writeln!(out, "\nvariable {params}\ndef seed (choice : Nat × W) (k : Key) : Bool :=\n  match choice.1 with").unwrap();
     for (i, (_, changes, _)) in initial.iter().enumerate() {
         writeln!(out, "  | {i} => match k.val with").unwrap();
         for (k, change) in changes.iter().enumerate() {
@@ -72,9 +94,13 @@ pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], obse
         out.push_str("    | _ => Change.keep\n");
     }
     out.push_str("  | _ => Change.keep\n");
-    writeln!(out, "def observe {params} (c : C) (p : Key → Bool) : Test caps := {}", fold(observations, "conj", "True")).unwrap();
-    out.push_str("def model : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := guard sem\n  change := change sem\n  observe := observe sem\n");
-    out.push_str(include_str!("certificate.lean"));
+    if let Some(code) = history_code {
+        e.emit_history(&mut out, params, code, observations);
+    } else {
+        writeln!(out, "def observe {params} (c : C) (p : Key → Bool) : Test caps := {}", fold(observations, "conj", "True")).unwrap();
+        out.push_str("def model : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := guard sem\n  change := change sem\n  observe := observe sem\n");
+        out.push_str(include_str!("certificate.lean"));
+    }
     Some(out)
 }
 
@@ -83,15 +109,21 @@ struct Emitter<'a, 'd> {
     slots: Vec<(usize, Atom)>,
     atoms: Vec<String>,
     scope: Vec<(LocalId, Atom)>,
+    history: Option<super::super::history::lean::Emitter<'a>>,
     remaining: usize,
 }
 impl Emitter<'_, '_> {
     fn independent(&self, e: &Expr) -> bool {
+        self.history.as_ref().is_none_or(|h| h.independent(e)) && self.age_independent(e)
+    }
+
+    fn age_independent(&self, e: &Expr) -> bool {
         match &*e.kind {
             ExprKind::Var(v) if *v == self.proof.clock || self.proof.stamps.iter().any(|s| s.var == *v) => return false,
+            ExprKind::Builtin { op: B::Prime, args } if args.iter().any(|e| self.mentions_age_state(e)) => return false,
             ExprKind::Field { record, field } => {
                 if let Some((i, index)) = self.proof.entry(record) {
-                    return *field != self.proof.stamps[i].field && self.independent(index);
+                    return *field != self.proof.stamps[i].field && self.age_independent(index);
                 }
             }
             ExprKind::Builtin { op: B::Domain, args } if args.len() == 1 => {
@@ -99,7 +131,7 @@ impl Emitter<'_, '_> {
                     return true;
                 }
                 if let Some((_, index)) = self.proof.entry(&args[0]) {
-                    return self.independent(index);
+                    return self.age_independent(index);
                 }
             }
             ExprKind::Builtin { op: B::In, args } if args.len() == 2 => {
@@ -113,7 +145,7 @@ impl Emitter<'_, '_> {
                 for (entry, literal) in [(&args[0], &args[1]), (&args[1], &args[0])] {
                     if let Some((i, index)) = self.proof.entry(entry) {
                         if matches!(&*literal.kind, ExprKind::Record(fs) if fs.iter().all(|(f, _)| *f != self.proof.stamps[i].field)) {
-                            return self.independent(index) && self.independent(literal);
+                            return self.age_independent(index) && self.age_independent(literal);
                         }
                     }
                 }
@@ -121,8 +153,19 @@ impl Emitter<'_, '_> {
             _ => {}
         }
         let mut valid = true;
-        visit::children(e, &mut |child| valid &= self.independent(child));
+        visit::children(e, &mut |child| valid &= self.age_independent(child));
         valid
+    }
+
+    // Leaves receive old timestamp presence only. Even a primed DOMAIN read
+    // needs the new presence bits; do not hide that dependency in a pure leaf.
+    fn mentions_age_state(&self, e: &Expr) -> bool {
+        if matches!(&*e.kind, ExprKind::Var(v) if *v == self.proof.clock || self.proof.stamps.iter().any(|s| s.var == *v)) {
+            return true;
+        }
+        let mut found = false;
+        visit::children(e, &mut |e| found |= self.mentions_age_state(e));
+        found
     }
 
     fn atom(&mut self, e: &Expr, observation: bool, payload: bool) -> Option<String> {
@@ -183,6 +226,11 @@ impl Emitter<'_, '_> {
             }
         }
         for term in &b.terms {
+            if self.history.as_ref().is_some_and(
+                |h| matches!(&*term.kind, ExprKind::Builtin {op:B::Eq,args} if args.len()==2 && variable(&args[0],primed)==Some(h.var)),
+            ) {
+                continue;
+            }
             if matches!(&*term.kind, ExprKind::Builtin {op:B::Eq,args} if args.len()==2 && variable(&args[0],primed).is_some_and(|v| v==self.proof.clock || self.proof.stamps.iter().any(|s|s.var==v)))
             {
                 continue;
@@ -209,7 +257,10 @@ impl Emitter<'_, '_> {
     fn frames(&self, e: &Expr, out: &mut Vec<Expr>) -> Option<()> {
         match &*e.kind {
             ExprKind::Var(v) => {
-                if *v != self.proof.clock && !self.proof.stamps.iter().any(|s| s.var == *v) {
+                if *v != self.proof.clock
+                    && !self.proof.stamps.iter().any(|s| s.var == *v)
+                    && self.history.as_ref().is_none_or(|h| h.var != *v)
+                {
                     out.push(e.clone());
                 }
             }
@@ -308,6 +359,18 @@ impl Emitter<'_, '_> {
 
     fn test(&mut self, e: &Expr, observation: bool) -> Option<String> {
         self.remaining = self.remaining.checked_sub(1)?;
+        if observation && self.age_independent(e) {
+            if let Some(h) = &mut self.history {
+                if !h.independent(e) {
+                    let start = h.atoms.len();
+                    let term = h.observe(e)?;
+                    for atom in &mut h.atoms[start..] {
+                        write!(atom, "\nBound atoms: {:?}", self.scope).unwrap();
+                    }
+                    return Some(format!("(Test.pure (let sem := sem.history; let c := (c, p); {term}))"));
+                }
+            }
+        }
         if self.independent(e) {
             return Some(format!("(Test.pure ({}))", self.atom(e, observation, false)?));
         }

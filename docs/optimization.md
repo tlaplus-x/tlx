@@ -44,7 +44,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Phase-dependent fields | Missing | Candidate analysis only |
 | Sequence length | Missing | Candidate analysis only |
 | Relative ages | Fixed-domain timestamp maps, keep/reset/erase transfers, threshold tests, finite filters and quantifiers | Enabled within this subset |
-| Combined age/history | Missing | Refused; other components stay concrete |
+| Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
 | Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
 | Counter export and its cleanup pipeline | Missing | Internal proposal only; CLI refuses without creating artifacts |
@@ -286,7 +286,7 @@ implemented below; the remaining rows are candidates, not completed model-checki
 
 | Candidate | External motivation | Required proof and remaining blockers |
 |---|---|---|
-| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Capped ages and finite age-filtered retained sets have connected certificates. The cleaner still retains an unbounded operation history; age/history composition remains uncertified. |
+| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Capped ages and finite age-filtered retained sets have connected certificates. A connected combined certificate also summarizes the operation history when its event values and transfer conditions are age-independent. |
 | Finite tables of history witnesses | The business-logic models ask whether a particular user has a prior subscription or trial event. | Summarize existential queries for every value in a proved finite parameter domain. Current prefix monitors reject free state and local parameters. These models additionally observe exact event counts, month numbers and billing indices, so this rule alone would not bound them. |
 | Relative ticket order | The Bakery/Boulangerie models use unbounded tickets in mutual-exclusion comparisons. | Order ranks suffice for resets, copies and a globally fresh maximum ticket, but arbitrary choices from `Nat`, local `max + 1`, and successor-equality observations need more information. A rank-only key is not justified for these full models. |
 
@@ -345,18 +345,36 @@ It uses mathematical natural numbers and may eliminate eventual machine overflow
 arithmetic remains checked. Compatibility mode bypasses the rule. Concrete actions and
 values remain available for execution and counterexample replay.
 
-Age/history composition is disabled until it has a connected certificate. An age-only
+Age/history composition has a connected certificate for one clock and one history. An age-only
 model with an empty record or a timestamp tested at delay two has four reduced states:
 empty, age zero, age one, and age two-or-more. Its concrete clock is unbounded. Retaining
-an independently unbounded history can still make the full graph infinite.
+an independently unbounded history can still make the full graph infinite when composition
+is inapplicable.
 The [relative-age example](../proofs/age/README.md) includes reproducible unbounded and
 finite-budget configurations and explicit Lean verification commands.
 
-The cleaner’s age-filtered retained set is now covered by the age certificate, but its
-operation history stays concrete and unbounded. Earlier experiments reported 820 distinct and 3,083 generated states using a
-combined age/history key. Those are historical diagnostic results, not current enabled
-behavior. The original cleaner also has a genuine `ConsistentReads` violation. Neither
-its full safety nor its finite state count follows from the standalone age certificate.
+`AgeHistoryCertificate.lean` connects both transfers through the same retained core and
+branch witness. The compiler emits their actual seeds, tick/reset/delete changes, history
+append/reset transfers, deadline tests and prefix observations into one `GeneratedAgeHistory`
+model. The combined theorem constructs initialization and successor correspondence from
+every representative, preserves observations, lifts counterexamples and preserves deadlocks.
+It reuses the proved age and history transfer lemmas, rather than assuming preservation of
+either generated transformation.
+
+History event values and transfer conditions must be independent of forgotten time and ages.
+History-dependent guards or retained updates still refuse composition. Next-state reads of
+age-map fields, domains or age-filtered sets also refuse the age certificate: semantic leaves currently receive
+old timestamp presence only. One history is summarized; other components remain concrete.
+Inapplicable composition falls back to a certified standalone reduction when available.
+Source/HIR lowering, leaf interpretation, totality/domain analysis and runtime VIEW evaluation
+remain trusted, as for standalone reductions.
+
+The original cleaner, with singleton constants and only `TypeOk` selected, now completes
+without a transition budget: 820 distinct states and 3,083 generated states. This checks
+`TypeOk`, not all safety properties. Selecting `ConsistentReads` still produces its genuine
+counterexample. The configuration and reproduction command are in the
+[relative-age example](../proofs/age/README.md). A bounded diagnostic is still required for
+completed A/B timings against the unreduced model.
 
 ## Ordered allocation and live versions
 
@@ -790,7 +808,9 @@ obligations and changing the reduced safety observation. For erasure it rejects 
 rejects forgetting the initial anchor and failing to advance the reduced phase. Relative-age
 checks reject incorrect ticks, resets, deletion, deadline strictness, reduced observations,
 inverted filter decisions and incorrect selected-key membership. Filter certificates also
-audit the concrete and reduced selection lemmas.
+audit the concrete and reduced selection lemmas. Combined age/history checks additionally
+reject forgetting prior prefix failures, dropping the shared branch’s history transfer and
+discarding observed history.
 This script is never invoked
 by checking or by the ordinary Rust tests. It needs only Lean 4 (tested with 4.34.1),
 not Mathlib or a network connection.

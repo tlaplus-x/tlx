@@ -42,10 +42,10 @@ fn projection(body: &str) -> Vec<String> {
 }
 
 #[test]
-fn infers_certified_age_and_keeps_history_concrete() {
-    assert_eq!(projection(BODY), ["records.created.age<=2", "clock.logical-clock"]);
+fn infers_certified_age_and_history_composition() {
+    assert_eq!(projection(BODY), ["records.created.age<=2", "clock.logical-clock", "h.history"]);
     let renamed = BODY.replace("clock", "epoch").replace("created", "born").replace("records", "slots");
-    assert_eq!(projection(&renamed), ["slots.born.age<=2", "epoch.logical-clock"]);
+    assert_eq!(projection(&renamed), ["slots.born.age<=2", "epoch.logical-clock", "h.history"]);
 }
 
 #[test]
@@ -108,6 +108,21 @@ fn finite_filters_and_quantifiers_are_certified_but_dynamic_domains_are_not() {
     assert!(!projection(&body).is_empty());
     let dynamic = body.replace("k \\in {1}: records[k] # Empty", "k \\in selected: records[k] # Empty");
     assert!(projection(&dynamic).is_empty());
+    let filter = r#"{k \in {1}: records[k] # Empty /\ records[k].created + 2 <= clock}"#;
+    assert!(projection(&body.replace(filter, &format!("({filter})'"))).is_empty());
     let observed = body.replace("Inv ==", "Inv == (\\A k \\in {1}: records[k] = Empty \\/ records[k].created <= clock) /\\");
     assert!(!projection(&observed).is_empty());
+}
+
+#[test]
+fn composition_refuses_history_feedback_and_age_dependent_events() {
+    for body in [
+        BODY.replace("Tick ==", "Tick == h = <<>> /\\"),
+        BODY.replace("Append(h, \"put\")", "IF h = <<>> THEN Append(h, \"put\") ELSE h"),
+        BODY.replace("Append(h, \"drop\")", "Append(h, IF records[k].created + 2 <= clock THEN \"drop\" ELSE \"put\")"),
+        BODY.replace("Append(h, \"put\")", "Append(h, clock)"),
+        BODY.replace("Append(h, \"put\")", "Append(h, IF (\"created\" \\in DOMAIN records[k])' THEN \"put\" ELSE \"drop\")"),
+    ] {
+        assert!(!projection(&body).contains(&"h.history".to_owned()), "{body}");
+    }
 }

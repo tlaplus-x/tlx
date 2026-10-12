@@ -223,3 +223,63 @@ fn filtered_consumers_preserve_set_operations_and_counterexamples() {
         }
     }
 }
+
+#[test]
+fn age_and_history_composition_finishes_in_every_executor() {
+    let spec = include_str!("../../../proofs/age/AgeHistory.tla");
+    let cfg = include_str!("../../../proofs/age/AgeHistory.cfg");
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let dir = tlx_testkit::TempDir::with_spec("age-history", spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("AgeHistory.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("15 distinct states found, 0 states left on queue"), "{tier}: {}", run.text());
+        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let proof = std::fs::read_to_string(path).unwrap();
+        assert!(proof.contains("namespace TlxOptimization.GeneratedAgeHistory\n"));
+        assert!(proof.contains("Test.select [0]"));
+        assert!(proof.contains("Transfer.append"));
+    }
+}
+
+#[test]
+fn combined_history_monitors_keep_violations_and_reset_semantics() {
+    let base = include_str!("../../../proofs/age/AgeHistory.tla");
+    let cfg = include_str!("../../../proofs/age/AgeHistory.cfg");
+    for (spec, code) in [
+        (base.replace("history[i] = \"drop\" =>", "history[i] = \"put\" =>").replace("history[j] = \"put\"", "history[j] = \"drop\""), 12),
+        (base.replace("history' = Append(history, \"put\")", "history' = Append(<<>>, \"put\")"), 0),
+        (base.replace("Ordered == \\A", "Ordered == history = <<>> \\/ \\E"), 0),
+        (base.replace("Past ==", "Past == history = <<>> \\/"), 0),
+        (base.replace("Next == Tick \\/ Put \\/ Drop \\/ Scan", "Next == selected = {1} /\\ (Tick \\/ Put \\/ Drop)"), 11),
+        (
+            base.replace(
+                "history' = Append(history, \"put\")",
+                "history' = (IF selected = {} THEN Append(history, \"put\") ELSE <<\"put\">>)",
+            ),
+            0,
+        ),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec("age-history-observation", &spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("AgeHistory.tla")
+            .args(["-interp", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, code, "{}", run.text());
+        assert!(run.stdout.contains("history.history"), "{}", run.text());
+        if code == 12 {
+            assert!(run.stdout.contains("Invariant Ordered is violated"), "{}", run.text());
+            assert!(run.stdout.contains("history = <<\"put\">>"), "{}", run.text());
+        }
+    }
+}

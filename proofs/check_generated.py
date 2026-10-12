@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -39,7 +39,7 @@ def verify(lean, path, negative):
     if result.returncode:
         raise RuntimeError(f"{path}: Lean failed:\n{result.stdout}")
     axioms = {}
-    scope = rf"(?:{namespace}|AgeRule\.Test)" if namespace == "GeneratedAge" else namespace
+    scope = rf"(?:{namespace}|AgeRule\.Test)" if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else namespace
     for name, values in re.findall(
         rf"'TlxOptimization\.{scope}\.(\w+)' depends on axioms: \[([^]]*)\]",
         result.stdout,
@@ -54,7 +54,7 @@ def verify(lean, path, negative):
     ):
         axioms[name] = []
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace == "GeneratedOrdered" else set())
-    if namespace == "GeneratedAge" and "def Test.select" in source:
+    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
         theorems |= {"select_concrete", "select_reduced"}
     if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
@@ -69,14 +69,20 @@ def verify(lean, path, negative):
             ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
             ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),
             ("h k = some n ∧ d ≤ n", "h k = some n ∧ d < n", "changed deadline strictness"),
-        ] if namespace == "GeneratedAge" else [
+        ] if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else [
             ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
             ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
         ])
-        if namespace == "GeneratedAge" and "def Test.select" in source:
+        if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
             changes.extend([
                 ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
                 ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
+            ])
+        if namespace == "GeneratedAgeHistory":
+            changes.extend([
+                ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
+                ("(m.historyTransfer s.1.1 d w (presence s.1.2)).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
+                ("(m.age.project s.1, History.summary m.predicate s.2)", "(m.age.project s.1, History.summary m.predicate History.empty)", "discarded observed history"),
             ])
         changes.append(
             ("def after := (model sem).reduced",

@@ -125,17 +125,15 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
 "#;
 
     #[test]
-    fn age_installs_a_connected_certificate_without_history_composition() {
+    fn age_installs_a_connected_composition_certificate() {
         let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
         let dir = tlx_testkit::TempDir::with_spec("age-eval", AGE, cfg);
         let p = Program::load(&dir.join("Age.tla"), &[]).unwrap();
         let ip = Interp::new(p, tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
         let mut m = InterpModel::new(ip).unwrap();
-        // Age is bounded but history remains concrete. Do not explore this
-        // still-infinite graph: composition needs a separate certificate.
         let (rule, _) = m.project_state().unwrap();
         assert_eq!(rule, "relative-age-projection");
-        assert!(m.projection_certificate().unwrap().contains("GeneratedAge"));
+        assert!(m.projection_certificate().unwrap().contains("GeneratedAgeHistory"));
     }
 
     #[test]
@@ -152,5 +150,6 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
         let (rule, _) = model.project_state().expect("certified relative-age filtering");
         assert_eq!(rule, "relative-age-projection");
         assert!(model.projection_certificate().unwrap().contains("Test.select"));
+        assert!(model.projection_certificate().unwrap().contains("GeneratedAgeHistory"));
     }
 }

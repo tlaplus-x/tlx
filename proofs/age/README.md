@@ -32,8 +32,8 @@ The proof concerns the lowered rule model. Source/HIR translation, domain and
 partial-read analysis, runtime VIEW construction and execution remain trusted.
 Payloads and timestamp presence stay exact. Semantic leaves cannot access absolute
 time or uncapped ages. Finite age-filtered sets and constant-domain quantified
-deadline checks are supported. Dynamic filter domains and age/history
-composition remain outside the certified subset.
+deadline checks are supported. Dynamic filter domains and next-state age
+consumers remain outside the certified subset.
 
 `Bounded.tla` adds a retained budget of 120 transitions so both modes terminate.
 It is a finite diagnostic wrapper, not the unbounded model's configuration. Its
@@ -63,3 +63,32 @@ additional selection lemmas and negative tests cover this filter boundary.
 ```sh
 ./target/release/tlx check proofs/age/FilteredAge.tla -interp -optimize -noautosymmetry
 ```
+
+`AgeHistory.tla` combines an unbounded clock, an append-only log, a finite
+age-filtered set and a prefix-order invariant. Its combined certificate uses
+the same branch witness for age and history updates. Optimized checking finishes
+with 15 states; both unbounded components are reduced:
+
+```sh
+./target/release/tlx check proofs/age/AgeHistory.tla -interp -optimize -noautosymmetry
+```
+
+The generated `GeneratedAgeHistory` certificate proves initialization, successor
+correspondence, selected observations, counterexample lifting and deadlocks.
+The verifier audits seven theorems and rejects ten broken variants, including
+forgetting prior prefix failures and dropping the history transfer. Source
+lowering, leaf interpretation, domain/totality analysis and runtime execution
+remain trusted. History events and transfer conditions cannot depend on forgotten
+ages; history-dependent guards/retained updates and multiple-history composition
+remain unsupported.
+
+For the separately fetched external cleaner, `Cleaner.cfg` selects singleton
+constants and `TypeOk`. The original specification completes without a transition
+budget at 820 distinct / 3,083 generated states:
+
+```sh
+./target/release/tlx check third_party/external/pragmatic/database-blob/storage-cleaner-improved/storagecleanerimproved.tla -config proofs/age/Cleaner.cfg -interp -optimize -noautosymmetry
+```
+
+Adding `ConsistentReads` still reports the model's genuine invariant violation.
+The successful `TypeOk` check does not establish that property.

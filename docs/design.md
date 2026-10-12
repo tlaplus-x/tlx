@@ -134,8 +134,12 @@ The Lean `Test.select` continuation receives the exact selected source positions
 retained record updates, unions, and other consumers see the same set after projection.
 Filter predicates remain explicit proof terms; consumer HIR contains set placeholders
 with recorded atom mappings. Semantic leaves cannot inspect absolute time or age magnitudes.
-History remains concrete; age/history composition requires a separate certificate and is
-not installed.
+`phase/age/lean/history.rs` connects one history to the same retained core and branch witness.
+`AgeHistoryCertificate.lean` proves the product transfer and observation correspondence;
+the generated `GeneratedAgeHistory` model contains both actual transfers. Event values and
+history transfer conditions cannot inspect forgotten time or ages, and history cannot feed
+back into guards or retained updates. Unsupported compositions retain a standalone fallback.
+Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
 
 Phase-field and sequence-length analyzers remain available for developing
 proofs, but their reductions are not installed. Automatic symmetry is also gated off;
