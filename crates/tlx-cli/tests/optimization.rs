@@ -7,22 +7,21 @@ const SPEC: &str =
     "---- MODULE Counter ----\nEXTENDS Naturals\nVARIABLE c\nInit == c = 0\nNext == c' = c + 1 \\/ c' = 0\nInv == c < 3 \\/ c >= 3\n====\n";
 
 #[test]
-fn unproved_export_is_refused_without_creating_or_overwriting_artifacts() {
+fn certified_export_emits_proof_and_never_overwrites_artifacts() {
     let dir = tlx_testkit::TempDir::with_spec("optimization-cli", SPEC, CFG);
-    for existing in [false, true] {
-        if existing {
-            std::fs::create_dir(dir.join("out")).unwrap();
-            dir.write("out/Optimized.tla", "preserve this file");
-        }
-        let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
-        assert_eq!(run.code, 2, "{}", run.text());
-        assert!(run.stderr.contains("no connected Lean certificate"), "{}", run.text());
-        assert!(!run.stdout.contains("no safety verdict is claimed"));
-        if existing {
-            assert_eq!(std::fs::read_to_string(dir.join("out/Optimized.tla")).unwrap(), "preserve this file");
-        } else {
-            assert!(!dir.join("out").exists());
-        }
+    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
+    assert_eq!(run.code, 0, "{}", run.text());
+    assert!(run.stdout.contains("no safety verdict is claimed"));
+    let files = ["Optimized.tla", "Optimized.cfg", "Optimization.lean", "optimization.txt"];
+    let original: Vec<_> = files.iter().map(|f| std::fs::read_to_string(dir.join("out").join(f)).unwrap()).collect();
+    assert!(original[2].contains("namespace TlxOptimization.GeneratedPipeline"));
+    assert!(original[2].contains("theorem certificate : Certificate before after project"));
+    assert!(original[3].contains("Lean was NOT run"));
+    let run = tlx_testkit::tlx!().args(["optimize", "Counter.tla", "-output", "out"]).dir(&dir).run();
+    assert_eq!(run.code, 2, "{}", run.text());
+    assert!(run.stderr.contains("cannot create new output directory"));
+    for (file, expected) in files.iter().zip(original) {
+        assert_eq!(std::fs::read_to_string(dir.join("out").join(file)).unwrap(), expected);
     }
 }
 
@@ -34,7 +33,7 @@ fn compatibility_flags_cannot_silently_enable_optimization() {
     }
     let run = tlx_testkit::tlx!().args(["optimize", "--help"]).run();
     assert_eq!(run.code, 0);
-    assert!(run.stdout.contains("unavailable until its reductions have connected Lean certificates"));
+    assert!(run.stdout.contains("Each applied pass has a connected Lean certificate"));
 }
 
 // Cached TLC output is tied to the exact generated module/config below. An emitter
@@ -99,12 +98,11 @@ macro_rules! oracle_case {
                 assert!(original.contains("2 distinct states found"));
                 assert!(abstracted.contains("1 distinct states found"));
             }
-            // Keep the independent TLC oracle for the internal proposal.
-            // Public export must not emit it before connected proof coverage.
+            // Keep the independent TLC oracle tied to the exact emitted module.
             let mut program = tlx_sema::Program::load(&dir.join("Counter.tla"), &[]).unwrap();
             let cfg = tlx_front::cfg::parse_cfg(include_str!(concat!("fixtures/optimization/", $case, "/Counter.cfg"))).unwrap();
             let candidate = tlx_sema::optimize::optimize_model(&mut program, &cfg).unwrap();
-            assert!(candidate.certificate.is_none());
+            assert!(candidate.certificate.as_ref().unwrap().contains("GeneratedPipeline"));
             assert_eq!(candidate.module, include_str!(concat!("fixtures/optimization/", $case, "/Optimized.tla")));
             assert_eq!(candidate.config, include_str!(concat!("fixtures/optimization/", $case, "/Optimized.cfg")));
             std::fs::create_dir(dir.join("out")).unwrap();

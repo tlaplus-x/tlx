@@ -8,8 +8,8 @@ use std::process::ExitCode;
 use tlx_sema::{optimize, Program};
 
 const HELP: &str = "usage: tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...\n\
-    Emit Optimized.tla, Optimized.cfg and optimization.txt into a new directory.\n\
-    Export is unavailable until its reductions have connected Lean certificates.\n\
+    Emit Optimized.tla, Optimized.cfg, Optimization.lean and optimization.txt.\n\
+    Each applied pass has a connected Lean certificate; Lean is not run.\n\
     Requires CHECK_DEADLOCK FALSE; rejects unsupported observations.\n\
     -config FILE  configuration path (default: Spec.cfg)\n\
     -output DIR   new output directory; an existing path is never overwritten\n\

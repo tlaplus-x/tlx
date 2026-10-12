@@ -172,8 +172,13 @@ observation liveness obligations with kernel-checked `decide`; preservation is n
 assumed. Primed projected reads and nonconstant initial phases are refused. Source
 lowering, domain/totality inference, leaf interpretation and runtime remain trusted.
 Automatic symmetry is gated off;
-its Rust analysis and bounded diagnostic remain available. Counter-export constructs an
-internal proposal, but the CLI refuses to publish it without a connected certificate.
+its Rust analysis and bounded diagnostic remain available. Counter-export emits closed
+per-pass certificates through `certify.rs` and `PipelineCertificate.lean`. Each proof
+uses the actual before/after guards, updates, initial values and invariants. Constant
+propagation first proves its required domain inductive; comparison and transfer
+obligations are discharged with Lean arithmetic, then certificates compose over
+reachable systems. The final theorem concerns the unrestricted source and result
+IR safety predicates. Source lowering and TLA+ emission/runtime remain trusted.
 The [coverage inventory](optimization.md#proof-coverage) distinguishes proof work from
 enabled behavior. Explicit user VIEW/SYMMETRY retain their existing contract; automatic
 projections decline both. Compatibility mode bypasses automatic projection.

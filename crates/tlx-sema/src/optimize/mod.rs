@@ -15,6 +15,7 @@ pub use phase::{
     FieldProjection, OrderedHistory, OrderedPlan, OrderedShape,
 };
 pub use projection::unobserved_variables;
+mod certify;
 mod constant;
 mod counter;
 mod dead;
@@ -68,7 +69,9 @@ pub struct Artifact {
 /// claim safety. Unsupported inputs never produce a partial optimization.
 pub fn optimize_model(program: &mut Program, config: &Config) -> Result<Artifact, Diagnostic> {
     let model = lower::lower(program, config)?;
-    let (model, remarks) = passes::Pipeline::default().run(model)?;
+    let (model, remarks, certificate) = passes::Pipeline::default().run(model)?;
     verify::finite(&model)?;
-    Ok(emit::emit(&model, &remarks))
+    let mut artifact = emit::emit(&model, &remarks);
+    artifact.certificate = Some(certificate);
+    Ok(artifact)
 }

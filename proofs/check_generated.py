@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -64,32 +64,71 @@ def verify(lean, path, negative):
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
     mutations = []
     if negative:
-        changes = ([
-            ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
-        ] if namespace == "GeneratedHistory" else [
-            ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
-        ] if namespace == "GeneratedErasure" else [
-            ("| .keep => n", "| .keep => 0", "discarded preserved length"),
-            ("| .reset values => values.length", "| .reset values => 0", "discarded reset contents length"),
-            ("previous.reduced n + 1", "previous.reduced n + 2", "appended the wrong length"),
-            ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (fun _ => 0)", "discarded length guard feedback"),
-            ("m.transfer s.1 d w s.2 k", "m.transfer s.1 d w (fun _ => 0) k", "discarded length transfer feedback"),
-        ] if namespace == "GeneratedLength" else [
-            ("if m.live (p k) f then v k f else m.missing", "if m.live (p k) f then m.missing else v k f", "erased live fields"),
-            ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
-            ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
-            ("  readsActor := readsActor", "  readsActor := fun _ _ => true", "read dead actor fields"),
-            ("  writes := writes", "  writes := fun _ _ => false", "exposed dead framed fields"),
-            ("  readsGlobal := readsGlobal", "  readsGlobal := fun _ _ => true", "read dead fields of another actor"),
-        ] if namespace == "GeneratedField" else [
-            ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
-            ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
-            ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),
-            ("h k = some n ∧ d ≤ n", "h k = some n ∧ d < n", "changed deadline strictness"),
-        ] if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else [
-            ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
-            ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
-        ])
+        if namespace == "GeneratedPipeline":
+            final = re.search(r"def rawAfter := (M\d+)\.system", source)[1]
+            block = source.split(f"namespace {final}\n", 1)[1].split(f"end {final}\n", 1)[0]
+            initial = re.search(r"def initial[^\n]*\n  \| 0 => (\d+)", block)
+            prefix = f"namespace {final}\n" + block[:initial.end()]
+            changes = [
+                (prefix, prefix[:-len(initial[1])] + str(int(initial[1]) + 1), "changed final initial value"),
+                (f"def rawAfter := {final}.system", f"def rawAfter := {{ {final}.system with safe := fun s => ¬ {final}.system.safe s }}", "negated exported observation"),
+            ]
+            saturated = re.search(r"def update\d+.*?\n(?:  \| [^\n]*\n)*?  \| \d+ => if s \d+ < (\d+) then s \d+ \+ 1 else (\d+)", block)
+            if saturated:
+                prefix = f"namespace {final}\n" + block[:saturated.end()]
+                changes.append((prefix, prefix[:-len(saturated[2])] + str(int(saturated[2]) + 1), "incremented past the certified cap"))
+            for step, rule in re.findall(r'namespace Step(\d+)\ndef rule : String := "([^"\n]+)"', source):
+                model = f"M{int(step) + 1}"
+                target = source.split(f"namespace {model}\n", 1)[1].split(f"end {model}\n", 1)[0]
+                if rule == "constant-state-propagation/v1":
+                    step_block = source.split(f"namespace Step{step}\n", 1)[1].split(f"end Step{step}\n", 1)[0]
+                    constraint = re.search(r"def valid[^\n]*?s \d+ = (\d+)", step_block)
+                    if constraint:
+                        prefix = f"namespace Step{step}\n" + step_block[:constraint.end()]
+                        changes.append((prefix, prefix[:-len(constraint[1])] + str(int(constraint[1]) + 1), "assumed an incorrect inductive constant"))
+                elif rule == "predicate-simplification/v1":
+                    guard = re.search(r"def guard0 \(s : State\) : Prop := ([^\n]+)", target)
+                    if guard:
+                        prefix = f"namespace {model}\n" + target[:guard.end()]
+                        changes.append((prefix, prefix[:-len(guard[1])] + f"(¬ {guard[1]})", "negated a simplified guard"))
+                elif rule == "dead-action-elimination/v1":
+                    prefix = f"namespace {model}\n" + target
+                    # Alter Init as well when the result has no live action: an
+                    # empty relation cannot lose another successor.
+                    initial = re.search(r"def initial[^\n]*\n  \| 0 => (\d+)", target)
+                    if "def guard0" in target:
+                        changed = re.sub(r"next s t := ([^\n]+)", lambda m: f"next s t := False ∧ ({m[1]})", prefix)
+                    else:
+                        start = len(f"namespace {model}\n") + initial.start(1)
+                        changed = prefix[:start] + str(int(initial[1]) + 1) + prefix[start + len(initial[1]):]
+                    changes.append((prefix, changed, "changed the dead-action result"))
+        else:
+            changes = ([
+                ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
+            ] if namespace == "GeneratedHistory" else [
+                ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
+            ] if namespace == "GeneratedErasure" else [
+                ("| .keep => n", "| .keep => 0", "discarded preserved length"),
+                ("| .reset values => values.length", "| .reset values => 0", "discarded reset contents length"),
+                ("previous.reduced n + 1", "previous.reduced n + 2", "appended the wrong length"),
+                ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (fun _ => 0)", "discarded length guard feedback"),
+                ("m.transfer s.1 d w s.2 k", "m.transfer s.1 d w (fun _ => 0) k", "discarded length transfer feedback"),
+            ] if namespace == "GeneratedLength" else [
+                ("if m.live (p k) f then v k f else m.missing", "if m.live (p k) f then m.missing else v k f", "erased live fields"),
+                ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
+                ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
+                ("  readsActor := readsActor", "  readsActor := fun _ _ => true", "read dead actor fields"),
+                ("  writes := writes", "  writes := fun _ _ => false", "exposed dead framed fields"),
+                ("  readsGlobal := readsGlobal", "  readsGlobal := fun _ _ => true", "read dead fields of another actor"),
+            ] if namespace == "GeneratedField" else [
+                ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
+                ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
+                ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),
+                ("h k = some n ∧ d ≤ n", "h k = some n ∧ d < n", "changed deadline strictness"),
+            ] if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else [
+                ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
+                ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
+            ])
         if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
             changes.extend([
                 ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
@@ -117,11 +156,12 @@ def verify(lean, path, negative):
             ])
         if namespace == "GeneratedAgeHistory" and "theorem Decision.commutes" in source:
             changes.append(("m.change s.1.1 d w (presence s.1.2) s.2 k", "m.change s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty) k", "discarded timestamp history feedback"))
-        changes.append(
-            ("def after := (model sem).reduced",
-             "def after := { (model sem).reduced with safe := fun _ => True }",
-             "changed reduced observation")
-        )
+        if namespace != "GeneratedPipeline":
+            changes.append(
+                ("def after := (model sem).reduced",
+                 "def after := { (model sem).reduced with safe := fun _ => True }",
+                 "changed reduced observation")
+            )
         for before, after, label in changes:
             if source.count(before) != 1:
                 raise RuntimeError(f"{path}: negative test no longer targets one expression: {label}")
@@ -139,7 +179,9 @@ def verify(lean, path, negative):
     return {
         "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "axioms": axioms, "rejected_mutations": mutations,
-        "scope": f"Parametric {namespace} rule IR; lowering, totality and runtime remain trusted.",
+        "scope": ("Closed counter-pipeline IR; source lowering, TLA+ emission and runtime remain trusted."
+                  if namespace == "GeneratedPipeline" else
+                  f"Parametric {namespace} rule IR; lowering, totality and runtime remain trusted."),
     }
 
 

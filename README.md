@@ -203,10 +203,13 @@ history-dependent timestamp choices and payloads, and age-dependent events; it f
 with 135 states. Each certificate proves initialization,
 successor correspondence, observations, counterexample lifting and deadlock preservation.
 
-Proof coverage is incomplete. Phase-field, broader age/history compositions, broad ordered
-allocation, automatic symmetry and counter-export reductions are unavailable until
-connected certificates cover them. Unsupported applications keep the original graph;
-export refuses without writing artifacts. Explicit user `VIEW` and `SYMMETRY` declarations
+[Counter export](proofs/counter/README.md) emits closed Lean proofs for each actual
+cleanup and saturation pass, plus their composition. The generated finite model
+can be checked separately; export does not itself check safety.
+
+Proof coverage is incomplete. Broader age/history compositions, broad ordered
+allocation and automatic symmetry remain unavailable without connected certificates.
+Unsupported checking applications keep the original graph. Explicit user `VIEW` and `SYMMETRY` declarations
 retain their TLC behavior. Automatic projections currently decline symmetry composition.
 See [the coverage inventory](docs/optimization.md#proof-coverage).
 

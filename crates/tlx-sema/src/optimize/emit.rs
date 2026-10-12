@@ -15,8 +15,8 @@ pub(super) fn emit(model: &Model, remarks: &[String]) -> Artifact {
         "Finite optimization generated; model checking has NOT been performed.\n\
          Scope: configured scalar natural counters and named state invariants.\n\
          Semantics: mathematical naturals, not concrete backend overflow behavior.\n\
-         Trust: HIR frontend, restricted lowering, Rust rule checker and TLA+ emitter.\n\
-         No Lean/kernel certificate, cached proof authorization, or configuration-family claim.\n\
+         Trust: HIR frontend, restricted lowering and TLA+ emitter.\n\
+         Connected pass-by-pass Lean certificate emitted; Lean was NOT run.\n\
          Generated traces contain abstract representatives, not concrete counter values.\n\
          Re-run optimization after any source, configuration, property or tool change.\n",
     );

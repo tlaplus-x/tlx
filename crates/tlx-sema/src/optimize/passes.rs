@@ -49,8 +49,9 @@ impl Pipeline {
         Self { stages: vec![passes] }
     }
 
-    pub fn run(&self, mut model: Model) -> Result<(Model, Vec<String>), Diagnostic> {
+    pub fn run(&self, mut model: Model) -> Result<(Model, Vec<String>, String), Diagnostic> {
         verify::well_formed(&model)?;
+        let mut certificate = super::certify::Builder::new(&model);
         let mut analyses = AnalysisManager::default();
         let mut remarks = Vec::new();
         // Cleanup can expose another constant after deleting an impossible
@@ -63,6 +64,7 @@ impl Pipeline {
                     if let Some(proposal) = pass.run(&model, &mut analyses)? {
                         verify::transformation(&model, &proposal)?;
                         if proposal.model != model {
+                            certificate.append(&model, &proposal.model, &proposal.evidence, pass.name());
                             model = proposal.model;
                             analyses.invalidate();
                             changed = true;
@@ -79,6 +81,6 @@ impl Pipeline {
                 return Err(Diagnostic::new("optimization stage did not converge within 64 rounds"));
             }
         }
-        Ok((model, remarks))
+        Ok((model, remarks, certificate.finish()))
     }
 }

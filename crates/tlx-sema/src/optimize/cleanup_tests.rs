@@ -172,7 +172,7 @@ fn cleanup_reaches_a_fixed_point_before_saturation_and_invalidates_facts() {
     source.actions[0].guard = Predicate::Compare { var: 0, op: Comparison::Lt, value: 0 };
     let mut cache = AnalysisManager::default();
     assert!(cache.constants(&source).is_empty());
-    let (result, remarks) = Pipeline::default().run(source.clone()).unwrap();
+    let (result, remarks, _) = Pipeline::default().run(source.clone()).unwrap();
     assert_eq!(result.variables[0].domain, Domain::Constant(0));
     assert_eq!(result.properties[0].predicate, Predicate::Bool(true));
     assert!(remarks.iter().any(|r| r.starts_with("dead-action-elimination/")));
@@ -201,7 +201,7 @@ fn cascading_constants_converge_or_refuse_at_the_stage_budget() {
             .collect();
         let result = Pipeline::default().run(source);
         if count == 3 {
-            let (model, _) = result.unwrap();
+            let (model, _, _) = result.unwrap();
             assert!(model.variables.iter().all(|v| v.domain == Domain::Constant(0)));
             assert!(model.actions.is_empty());
         } else {

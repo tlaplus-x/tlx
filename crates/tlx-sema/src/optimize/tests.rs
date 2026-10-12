@@ -81,10 +81,10 @@ fn analysis_invalidation_recomputes_changed_observations() {
 fn pipeline_is_idempotent_and_requires_finite_closure() {
     let original = model();
     assert!(verify::finite(&original).is_err());
-    let (once, remarks) = Pipeline::default().run(original).unwrap();
+    let (once, remarks, _) = Pipeline::default().run(original).unwrap();
     assert_eq!(remarks.iter().filter(|r| r.starts_with("threshold-counter-saturation/")).count(), 1);
     verify::finite(&once).unwrap();
-    let (twice, remarks) = Pipeline::default().run(once.clone()).unwrap();
+    let (twice, remarks, _) = Pipeline::default().run(once.clone()).unwrap();
     assert!(remarks.is_empty());
     assert_eq!(once, twice);
 }
@@ -104,7 +104,7 @@ fn pass_manager_composes_passes_and_refuses_a_bad_proposal() {
     }
     let original = model();
     assert!(Pipeline::new(vec![Box::new(BadPass)]).run(original.clone()).is_err());
-    let (finite, remarks) = Pipeline::new(vec![Box::new(CounterSaturation), Box::new(CounterSaturation)]).run(original).unwrap();
+    let (finite, remarks, _) = Pipeline::new(vec![Box::new(CounterSaturation), Box::new(CounterSaturation)]).run(original).unwrap();
     verify::finite(&finite).unwrap();
     assert_eq!(remarks.len(), 1);
 }

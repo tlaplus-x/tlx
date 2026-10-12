@@ -10,9 +10,9 @@ There are two consumers:
 - Opt-in checking proves a projection of concrete state through resolved HIR. The existing VIEW
   machinery fingerprints the retained components; actions still produce full concrete states.
   Counterexamples are reconstructed by following actual initial states and successor edges.
-- The internal artifact candidate pipeline uses a typed transition IR, cached analyses,
-  transformation passes and independent rule checkers. Public export is disabled until connected
-  certificates cover its passes. Cleanup exposes opportunities for threshold-counter saturation,
+- The artifact pipeline uses a typed transition IR, cached analyses, transformation
+  passes and independent rule checkers. It emits a connected Lean certificate for
+  every committed pass and composes those certificates for the exported model. Cleanup exposes opportunities for threshold-counter saturation,
   which merges values into representatives. Generation does not transfer a verdict or trace to
   the source. Saturation remains export-only because counter-specific trace lifting and integration into
   ordinary checking are absent.
@@ -47,7 +47,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
 | Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
-| Counter export and its cleanup pipeline | Missing | Internal proposal only; CLI refuses without creating artifacts |
+| Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
 | Projection composed with symmetry | Missing | Automatic projection refused |
 
 All enabled projection certificates prove initialization, successor correspondence from
@@ -591,9 +591,7 @@ more runtime when projection overhead dominates.
 
 ## Artifact input fragment
 
-**Internal candidate only: the export command currently refuses without emitting artifacts.**
-
-The candidate pipeline supports one or more scalar natural-number state variables:
+The certified export pipeline supports one or more scalar natural-number state variables:
 
 - Initialization is a conjunction assigning each variable one configured natural literal.
 - Next is a disjunction of actions. Each action is a conjunction of state guards and exactly one
@@ -627,7 +625,8 @@ The implementation lives in `crates/tlx-sema/src/optimize/`, above execution-spe
 | `lower.rs` | Bind the supported configuration and normalize resolved HIR into the closed verification IR; refuse unknown effects/uses |
 | `ir.rs` | Natural/finite domains, complete action updates, state predicates and source locations |
 | `analysis.rs` | Lazily compute thresholds from all guards and properties; own cached analysis results |
-| `passes.rs` | Schedule passes; validate proposals before commit; invalidate analyses after every committed rewrite |
+| `passes.rs` | Schedule passes; validate and certify proposals before commit; invalidate analyses after every committed rewrite |
+| `certify.rs`, `PipelineCertificate.lean` | Emit actual per-pass IR, prove inductive domains and correspondence, and compose certificates |
 | `counter.rs` | Propose threshold-counter saturation and its rule parameters |
 | `constant.rs` | Propagate state values proved constant by initialization and every remaining update |
 | `simplify.rs` | Fold domain-implied comparisons and Boolean identities |
@@ -658,7 +657,9 @@ To add an artifact rule:
    candidate selection in this module.
 2. Add its evidence variant and an exhaustive checker dispatch in `verify.rs`. Check actual IR
    correspondence as well as applicability; a rule name alone never authorizes a rewrite.
-3. Register the pass in `Pipeline::default`. Add acceptance, refusal, corrupted-evidence and
+3. Extend certificate generation for its actual before/after IR and prove every obligation;
+   a new evidence variant must not reuse an unrelated certificate.
+4. Register the pass in `Pipeline::default`. Add acceptance, refusal, corrupted-evidence and
    composition tests. If the rule extends the input language, extend typed IR, lowering,
    verification and emission together, retaining whole-model finite-domain closure.
 
@@ -742,9 +743,8 @@ whole state domain is a finite product. This does not promise a practically smal
 
 ## Artifacts and trust boundary
 
-The internal proposal consists of `Optimized.tla`, `Optimized.cfg`, and `optimization.txt`.
-The CLI currently refuses it because no connected certificate is available. A future
-certified export must also persist `Optimization.lean`. Generated variables,
+Export consists of `Optimized.tla`, `Optimized.cfg`, `Optimization.lean` and
+`optimization.txt`. Lean is not invoked during generation. Generated variables,
 actions and invariants have collision-free synthetic names; the report maps them to source names
 and locations and explains every counter cap. The destination must be new. Semantic refusal
 creates no destination; an I/O failure returns an error and may leave incomplete files. The report
@@ -755,9 +755,23 @@ the concrete checker's eventual integer-overflow error on an unbounded counter. 
 saturating increments test the cap before adding, so they do not overflow at the maximum supported
 cap. Counts, depth and trace values describe the generated graph, not the original graph.
 
-The trusted components are the existing semantic frontend, restricted lowering, Rust rule checker
-and emitter. The rule argument above is not a Lean or other proof-kernel certificate. Checking
-the generated artifact additionally trusts the selected model checker and its execution settings.
+`certify.rs` emits each actual before/after IR as explicit natural-valued state
+functions. Every committed pass proves initialization, guards, transfers, observations
+and inductive domain closure. Constant propagation may rely on a singleton only
+after proving that Init establishes it and every source action preserves it. These
+closed proofs use Lean arithmetic; no preservation assumption or semantic leaf is
+supplied by the caller. Forward/backward correspondence holds for every state in
+the proved domain, including every reachable representative.
+
+`PipelineCertificate.lean` lifts those results to reachable systems and composes
+the passes. The final safety theorem concerns the unrestricted before/after IR;
+it also proves stuttering safety, concrete counterexample existence and reachable
+plain-Next deadlock correspondence. The CLI still requires deadlock checking off.
+The [counter example](../proofs/counter/README.md) includes explicit verification.
+
+The trusted components are the semantic frontend, restricted lowering and TLA+
+emitter. Checking the generated artifact additionally trusts the selected model
+checker and its execution settings.
 The text report is not a reusable proof authorization: there is no evidence cache, automatic
 verdict transfer or persisted-certificate acceptance API. Regenerate after any source,
 configuration, property or tool change. Treat generated violation traces as abstract until
