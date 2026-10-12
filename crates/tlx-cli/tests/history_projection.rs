@@ -22,6 +22,85 @@ Spec == Init /\ [][Next]_<<h, value>>
 "#;
 const CFG: &str = "SPECIFICATION Spec\nINVARIANTS TypeOK Consistent\n";
 
+// A witness is permanent even though appending W makes the same predicate
+// false when evaluated against the *final* element set instead of its prefix.
+const EXISTENTIAL: &str = r#"---- MODULE History ----
+EXTENDS Naturals, Sequences
+VARIABLE h, witnessed
+Seen == \E i \in 1..Len(h):
+          h[i] = "R" /\ \A j \in 1..i: h[j] # "W"
+Init == /\ h = <<>> /\ witnessed = FALSE
+Next == \E event \in {"R", "W"}:
+          /\ h' = Append(h, event) /\ witnessed' = Seen
+TypeOK == /\ h \in Seq({"R", "W"}) /\ witnessed \in BOOLEAN
+Safe == ~(witnessed /\ \E i \in 1..Len(h): h[i] = "W")
+====
+"#;
+
+#[test]
+fn existential_prefix_history_is_finite_and_preserves_old_witnesses() {
+    for (invariants, code) in [("TypeOK", 0), ("TypeOK Safe", 12)] {
+        let cfg = format!("INIT Init\nNEXT Next\nINVARIANTS {invariants}\n");
+        let dir = tlx_testkit::TempDir::with_spec("history-existential", EXISTENTIAL, &cfg);
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            let run = tlx_testkit::tlx_default!()
+                .check("History.tla")
+                .args(args)
+                .args(["-optimize", "-noautosymmetry"])
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .dir(&dir)
+                .timeout(Duration::from_secs(60))
+                .run();
+            assert_eq!(run.code, code, "{tier}: {}", run.text());
+            assert!(run.stdout.contains("history-summary-projection"), "{tier}: {}", run.text());
+            if code == 0 {
+                assert!(run.stdout.contains("6 distinct states found"), "{tier}: {}", run.text());
+            } else {
+                assert!(run.stdout.contains("Invariant Safe is violated"), "{tier}: {}", run.text());
+                assert!(run.stdout.contains("<<\"R\", \"W\">>"), "{tier}: {}", run.text());
+            }
+        }
+    }
+}
+
+#[test]
+fn existential_history_reduces_a_finite_prefix_and_respects_refusal_boundaries() {
+    let spec = EXISTENTIAL
+        .replace("VARIABLE h, witnessed", "VARIABLE h, witnessed, budget")
+        .replace("witnessed = FALSE", "witnessed = FALSE /\\ budget = 0")
+        .replace("Next ==", "Next == /\\ budget < 4 /\\ budget' = budget + 1 /\\");
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT TypeOK\nCHECK_DEADLOCK FALSE\n";
+    for (flags, count) in [(vec![], 31), (vec!["-optimize"], 15), (vec!["-optimize", "-tlc"], 31)] {
+        let dir = tlx_testkit::TempDir::with_spec("history-existential-bounded", &spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("History.tla")
+            .args(["-interp", "-noautosymmetry"])
+            .args(flags)
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{}", run.text());
+        assert!(run.stdout.contains(&format!("{count} distinct states found")), "{}", run.text());
+        assert_eq!(run.stdout.contains("history-summary-projection"), count == 15, "{}", run.text());
+    }
+    for spec in [
+        spec.replace("h[i] = \"R\"", "i = 1 /\\ h[i] = \"R\""),
+        spec.replace("h[i] = \"R\"", "~witnessed /\\ h[i] = \"R\""),
+        spec.replace("1..i:", "i..Len(h):"),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec("history-existential-refusal", &spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("History.tla")
+            .args(["-interp", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{}", run.text());
+        assert!(!run.stdout.contains("history-summary-projection"), "{}", run.text());
+    }
+}
+
 #[test]
 fn unbounded_history_finishes_in_all_tiers() {
     let dir = tlx_testkit::TempDir::with_spec("history-finite", SPEC, CFG);

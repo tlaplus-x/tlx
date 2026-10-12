@@ -86,6 +86,14 @@ theorem prefix_last (h : History E) (x : E) :
 def indexed (q : E → (E → Prop) → Prop) (h : History E) : Prop :=
   ∀ i e, At h i e → q e (seenPrefix h i)
 
+-- The existential monitor is the complement of a universal monitor over ¬q.
+-- Its witness belongs to its original prefix, not the final element set.
+theorem exists_iff_not_indexed_not (q : E → (E → Prop) → Prop) (h : History E) :
+    (∃ i e, At h i e ∧ q e (seenPrefix h i)) ↔
+      ¬ indexed (fun e seen => ¬ q e seen) h := by
+  classical
+  simp only [indexed, not_forall, not_imp, not_not]
+
 theorem indexed_append (q : E → (E → Prop) → Prop) (h : History E) (x : E) :
     indexed q (.append h x) ↔ indexed q h ∧ q x (History.seen (.append h x)) := by
   constructor

@@ -58,12 +58,13 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     if let Some((rule, omitted)) = project.then(|| model.project_state()).flatten() {
         crate::proofs::emit(model, Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
+        let arithmetic = if rule == "relative-age-projection" { "; mathematical clock arithmetic" } else { "" };
         let group = applied.as_ref().map(|s| s.group.as_str()).or(model.ip.cfg.symmetry.as_deref());
         let combined = group.map(|g| format!(", composed with symmetry {g}")).unwrap_or_default();
         out::info(
             code::OPTIMIZATIONS_USED,
             &format!(
-                "Optimizations: {rule} ({variables}; proven; safety checks only){combined}.\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
+                "Optimizations: {rule} ({variables}; proven; safety checks only{arithmetic}){combined}.\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics."
             ),
         );
         out::set_reduced("optimization");

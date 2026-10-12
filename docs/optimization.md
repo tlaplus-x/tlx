@@ -13,8 +13,14 @@ There are two consumers:
 - Artifact generation uses a typed transition IR, cached analyses, transformation passes and
   independent rule checkers. Cleanup exposes opportunities for threshold-counter saturation,
   which merges values into representatives. Generation does not transfer a verdict or trace to
-  the source. Saturation remains export-only: its mathematical contract does not preserve eventual
-  machine overflow, and counter-specific trace lifting is absent.
+  the source. Saturation remains export-only because counter-specific trace lifting and integration into
+  ordinary checking are absent.
+
+Opt-in checking permits proved reductions over mathematical integers to eliminate eventual
+machine overflow, as specified in [compat.md section 0](compat.md#0-the-three-tiers).
+Concrete expressions still use checked arithmetic; this does not suppress encountered errors
+or enable arbitrary-precision evaluation. Safety verdicts and counterexamples must remain valid
+under the rule's mathematical semantics.
 
 TLC compatibility mode bypasses opt-in reductions. Unknown expressions retain their referenced
 variables; an inapplicable rule leaves ordinary checking unchanged. Artifact generation still
@@ -201,8 +207,14 @@ predicates of this form:
         history[j].kind = "WRITE" /\ history[j].value = history[i].value
 ```
 
-The key retains the set of history elements and the Boolean value of every recognized outer
-universal predicate. The inner predicate can use total scalar equality/inequality, Boolean
+The outer quantifier may also be existential. For example, `\E i \in 1..Len(history):
+history[i] = "READ" /\ \A j \in 1..i: history[j] # "WRITE"` asks whether a read ever
+occurred before any write. Once found, that witness survives later writes.
+
+The key retains the set of history elements and one Boolean per recognized outer predicate.
+Universal predicates retain their truth value; existential predicates retain its complement,
+using `~(\E i: Q(i)) = (\A i: ~Q(i))` to reuse the same conjunction fold and certificate.
+The inner predicate can use total scalar equality/inequality, Boolean
 connectives and prefix quantification. Indices may only select history elements: their numeric
 values, counts and order are not observable. Prefix predicates cannot depend on other state
 variables or free locals, and the structural domain must justify every field access and scalar
@@ -217,6 +229,9 @@ and `P(Append(h,x))`. Copy preserves this summary; a reset derives it from the r
 Accepted guards, observations and successor summaries therefore agree for equal keys. Keeping
 `P(h)` is essential: `<<"WRITE", "READ">>` and `<<"READ", "WRITE">>` have equal element sets,
 but may disagree on whether every read has an earlier write.
+For an existential predicate `E`, the dual recurrence is
+`E(Append(h,x)) = E(h) \/ Q(x, S(h) \cup {x})`. Re-evaluating old events against the
+final element set would be unsound for predicates containing negation.
 
 For an alphabet of size `A` and `k` Boolean monitors, this history component has at most
 `2^(A+k)` summary values, regardless of concrete history length. The complete quotient is finite
@@ -231,6 +246,66 @@ checks earlier matching writes in `operations`. Their operation-count constraint
 length, so those bounded configurations deliberately decline this history reduction. A separate
 configuration without that constraint can exercise the unbounded history while retaining the
 original safety invariants. This distinction must accompany measurements.
+
+### External unbounded-model opportunities
+
+Source inspection identifies the following opportunities and limits. Relative ages are
+implemented below; the remaining rows are candidates, not completed model-checking results:
+
+| Candidate | External motivation | Required proof and remaining blockers |
+|---|---|---|
+| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Opt-in checking derives capped-age keys and composes them with history reduction under mathematical-clock semantics; see below. |
+| Finite tables of history witnesses | The business-logic models ask whether a particular user has a prior subscription or trial event. | Summarize existential queries for every value in a proved finite parameter domain. Current prefix monitors reject free state and local parameters. These models additionally observe exact event counts, month numbers and billing indices, so this rule alone would not bound them. |
+| Relative ticket order | The Bakery/Boulangerie models use unbounded tickets in mutual-exclusion comparisons. | Order ranks suffice for resets, copies and a globally fresh maximum ticket, but arbitrary choices from `Nat`, local `max + 1`, and successor-equality observations need more information. A rank-only key is not justified for these full models. |
+
+The replicated-log model illustrates another limit: forgetting log contents still retains
+unbounded execution lag. Merging all positive lags would lose how many catch-up steps are
+needed to enable the next write. A sound reduction here needs a stronger simulation argument
+and possibly refinement, rather than independently capping the counters.
+
+### Relative-age projection
+
+`phase/age.rs` analyzes one logical clock initialized to zero, advanced by one, or left
+unchanged. It recognizes fixed-domain maps of records with one timestamp field per map.
+A timestamp starts at zero or is reset to the current clock on a non-ticking transition.
+These transfer checks establish `0 <= timestamp <= clock`; type invariants are not assumptions.
+
+Comparisons between `timestamp + delay` and the clock determine each map's cutoff. Delays
+must resolve to nonnegative constants no larger than 1,000,000. For
+`timestamp + 2 <= clock`, ages 0, 1 and 2+ suffice. Strict and exact tests can require an
+additional class. The key retains the capped age, other record fields and record domains;
+an unstamped sentinel remains unchanged. Distinct record shapes are tracked separately in
+forward analysis. Whole-record comparisons are accepted only against literals lacking the
+timestamp field, so a stamped value has a different domain from that literal.
+
+Clock decrements, future timestamps, observed absolute times, timestamp-to-timestamp comparisons,
+unknown transfers and ambiguous bindings refuse the candidate. Resets to a fixed timestamp
+after initialization are currently unsupported. The analyzer can combine disjoint age and
+history components after checking that the history summary is an accepted age observation.
+
+Opt-in checking selects this rule before standalone history, phase and length projections
+when whole-variable elimination does not apply. Its proof uses mathematical natural numbers:
+it may eliminate eventual machine overflow of `clock + 1` or `timestamp + delay`. This is
+permitted by the explicit optimization contract; compatibility mode bypasses the rule.
+Source actions and full concrete values remain in execution and counterexample replay.
+`Age.lean`, included in emitted Lean files, states capped-age bounds, tick/reset equations
+and threshold preservation. It does not certify HIR applicability, composition, or the complete
+external model; verification is never implicit.
+
+The external cleaner has a real `ConsistentReads` violation: deletion can race with publishing
+a reference and reading the blob. A separate finite-graph diagnostic uses one server, cleaner,
+user, metadata, image and UUID, removes the length/time constraints and liveness property,
+and checks only `TypeOk` while retaining the consistency monitor in the key. The compiler-derived
+key completes at 820 distinct and 3,083 generated states, matching a manual age/history VIEW in
+both TLC and tlx. Automatic optimized CLI checks also complete at 820 states with `TypeOk`
+alone, in interpreter and native modes with paranoid cross-checking. Selecting `ConsistentReads`
+reports the genuine violation in both tiers. This is evidence of finiteness for the diagnostic
+configuration, not a claim that the original safety property passes.
+The explicit local diagnostic test is:
+
+```sh
+cargo test -p tlx-eval --profile test-release --lib external_cleaner_mathematical_age -j 3 -- --ignored
+```
 
 ## Length-only sequence projection
 

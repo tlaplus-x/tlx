@@ -52,6 +52,9 @@ pub(super) enum Domain {
     Set(Box<Domain>),
     Seq(Box<Domain>),
     Record(BTreeMap<Arc<str>, Domain>),
+    // Distinct record shapes, kept separate so optional fields are not
+    // mistaken for fields present in every value. Bounded to eight shapes.
+    Records(Vec<BTreeMap<Arc<str>, Domain>>),
     Function(BTreeSet<Atom>, Box<Domain>),
     Mapping(Box<Domain>),
 }
@@ -74,6 +77,23 @@ impl Domain {
             (Self::Record(a), Self::Record(b)) if a.keys().eq(b.keys()) => {
                 Self::Record(a.iter().map(|(k, v)| (k.clone(), v.join(&b[k]))).collect())
             }
+            (Self::Record(_) | Self::Records(_), Self::Record(_) | Self::Records(_)) => {
+                let mut records = self.records().unwrap();
+                for other in other.records().unwrap() {
+                    if let Some(old) = records.iter_mut().find(|r| r.keys().eq(other.keys())) {
+                        for (k, v) in old {
+                            *v = v.join(&other[k]);
+                        }
+                    } else {
+                        records.push(other);
+                    }
+                }
+                if records.len() > 8 {
+                    return Self::Top;
+                }
+                records.sort_by(|a, b| a.keys().cmp(b.keys()));
+                Self::Records(records)
+            }
             (Self::Function(a, x), Self::Function(b, y)) if a == b => Self::Function(a.clone(), Box::new(x.join(y))),
             (a, b) if a.range().is_some() && b.range().is_some() => Self::Mapping(Box::new(a.range().unwrap().join(b.range().unwrap()))),
             _ => Self::Top,
@@ -82,6 +102,24 @@ impl Domain {
 
     fn atom(a: Atom) -> Self {
         Self::Atoms(BTreeSet::from([a]))
+    }
+
+    pub fn records(&self) -> Option<Vec<BTreeMap<Arc<str>, Domain>>> {
+        match self {
+            Self::Record(r) => Some(vec![r.clone()]),
+            Self::Records(rs) => Some(rs.clone()),
+            _ => None,
+        }
+    }
+
+    // Upper bound on successful reads only; missing fields may still fail.
+    fn field(&self, key: &str) -> Self {
+        match self {
+            Self::Record(fs) => fs.get(key).cloned().unwrap_or(Self::Bottom),
+            Self::Records(rs) => rs.iter().filter_map(|fs| fs.get(key)).fold(Self::Bottom, |d, v| d.join(v)),
+            Self::Bottom => Self::Bottom,
+            _ => Self::Top,
+        }
     }
 
     pub fn atoms(&self) -> Option<&BTreeSet<Atom>> {
@@ -221,11 +259,7 @@ impl Domains {
                 D::Bottom => D::Bottom,
                 _ => D::Top,
             },
-            ExprKind::Field { record, field } => match val(record) {
-                D::Record(fs) => fs.get(field).cloned().unwrap_or(D::Top),
-                D::Bottom => D::Bottom,
-                _ => D::Top,
-            },
+            ExprKind::Field { record, field } => val(record).field(field),
             ExprKind::Except { base, updates } => {
                 let mut result = val(base);
                 for (keys, e) in updates {
@@ -273,6 +307,9 @@ impl Domains {
         if matches!(value, Domain::Bottom) {
             return false;
         }
+        if let Domain::Records(records) = value {
+            return records.iter().all(|r| self.belongs(&Domain::Record(r.clone()), set));
+        }
         match (&*set.kind, value) {
             (ExprKind::Builtin { op: B::Nat, args }, _) if args.is_empty() => value.integer_min().is_some_and(|n| n >= 0),
             (ExprKind::Builtin { op: B::Int, args }, _) if args.is_empty() => value.integer_min().is_some(),
@@ -287,6 +324,11 @@ impl Domains {
                     || value
                         .atoms()
                         .is_some_and(|values| self.exact_set(set).is_some_and(|allowed| compatible(&allowed) && values.is_subset(&allowed)))
+                    || self.record_union(set).is_some_and(|shapes| {
+                        matches!(value, Domain::Record(r) if shapes.iter().any(|(keys, s)| {
+                            r.keys().cloned().collect::<Vec<_>>() == *keys && self.belongs(value, s)
+                        }))
+                    })
             }
             (ExprKind::Builtin { op: B::Seq, args }, Domain::Seq(element)) if args.len() == 1 => {
                 self.type_set(&args[0]) && (matches!(**element, Domain::Bottom) || self.belongs(element, &args[0]))
@@ -299,8 +341,42 @@ impl Domains {
                     && fs.iter().map(|(k, _)| k).collect::<BTreeSet<_>>().len() == values.len()
                     && fs.iter().all(|(k, s)| values.get(k).is_some_and(|v| self.belongs(v, s)))
             }
+            (ExprKind::SetEnum(es), Domain::Record(values)) if es.len() == 1 => es.iter().any(|e| {
+                let ExprKind::Record(fs) = &*e.kind else { return false };
+                fs.len() == values.len()
+                    && fs.iter().map(|(k, _)| k).collect::<BTreeSet<_>>().len() == values.len()
+                    && fs.iter().all(|(k, e)| {
+                        self.atom_value(e).is_some_and(|a| values.get(k).and_then(Domain::atoms) == Some(&BTreeSet::from([a])))
+                    })
+            }),
             (_, Domain::Atoms(values)) => self.exact_set(set).is_some_and(|allowed| compatible(&allowed) && values.is_subset(&allowed)),
             _ => false,
+        }
+    }
+
+    // Disjoint record shapes make membership total across union alternatives.
+    // Refuse overlapping shapes rather than assuming field comparisons agree.
+    fn record_union<'a>(&self, set: &'a Expr) -> Option<Vec<(Vec<Arc<str>>, &'a Expr)>> {
+        let shape = |fields: &[(Arc<str>, Expr)]| {
+            let keys: BTreeSet<_> = fields.iter().map(|(k, _)| k.clone()).collect();
+            (keys.len() == fields.len()).then(|| keys.into_iter().collect::<Vec<_>>())
+        };
+        match &*set.kind {
+            ExprKind::Builtin { op: B::Cup, args } if args.len() == 2 => {
+                let mut a = self.record_union(&args[0])?;
+                let b = self.record_union(&args[1])?;
+                if a.iter().any(|(k, _)| b.iter().any(|(j, _)| k == j)) {
+                    return None;
+                }
+                a.extend(b);
+                Some(a)
+            }
+            ExprKind::RecordSet(fs) if fs.iter().all(|(_, e)| self.type_set(e)) => Some(vec![(shape(fs)?, set)]),
+            ExprKind::SetEnum(es) if es.len() == 1 => {
+                let ExprKind::Record(fs) = &*es[0].kind else { return None };
+                fs.iter().all(|(_, e)| self.atom_value(e).is_some()).then(|| Some(vec![(shape(fs)?, set)]))?
+            }
+            _ => None,
         }
     }
 

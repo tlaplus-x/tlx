@@ -1,12 +1,14 @@
 //! Structural state projections: field liveness, sequence length and finite
 //! history summaries. These reuse normalized branches and forward domains.
 
+mod age;
 mod domain;
 mod history;
 mod liveness;
 mod normalize;
 mod sequence;
 
+pub use age::age_projection;
 pub use history::history_projection;
 pub use sequence::sequence_length_projection;
 

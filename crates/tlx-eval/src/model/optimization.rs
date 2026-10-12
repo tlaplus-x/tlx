@@ -11,6 +11,7 @@ use super::{behavior, Behavior, InterpModel};
 impl InterpModel {
     /// Forget proved irrelevant values in fingerprints, retaining concrete
     /// values and original actions for execution and counterexample replay.
+    /// Opt-in mathematical clock semantics may eliminate eventual overflow.
     /// Safety only. Existing VIEWs take precedence. Symmetry composes only
     /// when every constant introduced by the projection is fixed by it.
     pub fn project_state(&mut self) -> Option<(&'static str, Vec<String>)> {
@@ -40,7 +41,9 @@ impl InterpModel {
         let omitted = tlx_sema::optimize::unobserved_variables(&self.ip.prog, &self.init, &next, &observations);
         if omitted.is_empty() {
             let (rule, projection) =
-                if let Some(p) = tlx_sema::optimize::history_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                if let Some(p) = tlx_sema::optimize::age_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                    ("relative-age-projection", p)
+                } else if let Some(p) = tlx_sema::optimize::history_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
                     ("history-summary-projection", p)
                 } else if let Some(p) = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
                     ("phase-field-projection", p)
@@ -115,5 +118,75 @@ impl InterpModel {
             }
         }
         Ok(least)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Interp;
+    use tlx_runtime::{explore, Options, Outcome};
+    use tlx_sema::Program;
+
+    const AGE: &str = r#"---- MODULE Age ----
+EXTENDS Naturals, Sequences
+VARIABLE clock, records, h
+Empty == [status |-> "empty", payload |-> ""]
+Init == /\ clock = 0 /\ records = [k \in {1} |-> Empty] /\ h = <<>>
+Tick == /\ clock' = clock + 1 /\ UNCHANGED <<records, h>>
+Put == /\ records' = [records EXCEPT ![1] = [created |-> clock, payload |-> "x"]]
+       /\ h' = Append(h, "put") /\ UNCHANGED clock
+Drop == /\ records[1] # Empty /\ records[1].created + 2 <= clock
+        /\ records' = [records EXCEPT ![1] = Empty]
+        /\ h' = Append(h, "drop") /\ UNCHANGED clock
+Next == Tick \/ Put \/ Drop
+Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \cup {Empty}]
+       /\ h \in Seq({"put", "drop"})
+====
+"#;
+
+    #[test]
+    fn mathematical_age_finishes_an_unbounded_clock_and_history() {
+        let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
+        let dir = tlx_testkit::TempDir::with_spec("age-eval", AGE, cfg);
+        let p = Program::load(&dir.join("Age.tla"), &[]).unwrap();
+        let ip = Interp::new(p, tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
+        let mut m = InterpModel::new(ip).unwrap();
+        let (rule, fields) = m.project_state().unwrap();
+        assert_eq!(rule, "relative-age-projection");
+        assert!(fields.contains(&"h.history".into()));
+        let report = explore(&m, &Options { workers: 1, fp: tlx_runtime::FpConfig::fixed(4096), ..Default::default() });
+        assert_eq!(report.outcome, Outcome::Ok);
+        assert_eq!(report.stats.distinct, 8);
+    }
+
+    #[test]
+    #[ignore = "requires the local external pragmatic corpus"]
+    fn external_cleaner_mathematical_age() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../third_party/external/pragmatic/database-blob/storage-cleaner-improved/storagecleanerimproved.tla");
+        let cfg = "SPECIFICATION Spec\nCONSTANTS SERVERS = {s1} CLEANERS = {c1}\n\
+            METADATAS = {m1} USERIDS = {u1} IMAGES = {i1} UUIDS = {ui1}\nINVARIANTS TypeOk ConsistentReads\n";
+        for check_consistency in [true, false] {
+            let ip = Interp::new(Program::load(&path, &[]).unwrap(), tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
+            let mut m = InterpModel::new(ip).unwrap();
+            let (rule, fields) = m.project_state().unwrap();
+            assert_eq!(rule, "relative-age-projection");
+            assert!(fields.contains(&"blobStoreState.created.age<=2".into()));
+            assert!(fields.contains(&"operations.history".into()));
+            if !check_consistency {
+                // Explore the entire quotient separately from the known
+                // failing property. Keep its monitor in the generated key.
+                m.invariants.truncate(1);
+            }
+            let report = explore(&m, &Options { workers: 1, fp: tlx_runtime::FpConfig::fixed(4096), ..Default::default() });
+            if check_consistency {
+                assert_eq!(report.outcome, Outcome::InvariantViolated("ConsistentReads".into()));
+                assert!(!report.trace.is_empty());
+            } else {
+                assert_eq!(report.outcome, Outcome::Ok);
+                assert_eq!((report.stats.generated, report.stats.distinct, report.stats.depth), (3083, 820, 27));
+            }
+        }
     }
 }

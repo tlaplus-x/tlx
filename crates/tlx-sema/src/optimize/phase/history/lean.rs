@@ -13,9 +13,10 @@ pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observation
     let predicates = monitors
         .iter()
         .map(|m| {
-            let ExprKind::Quant { bounds, body, .. } = &*m.kind else { return None };
+            let ExprKind::Quant { kind, bounds, body } = &*m.kind else { return None };
             let outer = one_local(&bounds[0])?;
-            emitter.predicate(body, outer, &[outer])
+            let predicate = emitter.predicate(body, outer, &[outer])?;
+            Some(if *kind == QuantKind::Exists { format!("(¬ {predicate})") } else { predicate })
         })
         .collect::<Option<Vec<_>>>()?;
     let (initial_guards, seeds) = emitter.branches(initial, false)?;
@@ -246,7 +247,8 @@ impl Emitter<'_> {
             return Some(format!("(sem.observe {} c)", self.atom(e)?));
         }
         if let Some(i) = self.monitors.iter().position(|m| Arc::ptr_eq(&m.kind, &e.kind)) {
-            return Some(format!("(s.2 ⟨{i}, by decide⟩)"));
+            let bit = format!("(s.2 ⟨{i}, by decide⟩)");
+            return Some(if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) { format!("(¬ {bit})") } else { bit });
         }
         if let Some(p) = boolean(e, |e| self.observe(e)) {
             return Some(p);

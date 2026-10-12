@@ -107,7 +107,9 @@ Inv == /\ h \in Seq({0, 1}) /\ x \in {0, 1}
 
 #[test]
 fn history_certificate_is_generated_from_the_actual_predicate() {
-    for (spec, quantifier) in [(HISTORY.to_string(), "∃ l"), (HISTORY.replace("\\E j", "\\A j"), "∀ l")] {
+    for (spec, quantifier) in
+        [(HISTORY.to_string(), "∃ l"), (HISTORY.replace("\\E j", "\\A j"), "∀ l"), (HISTORY.replace("\\A i", "\\E i"), "(¬ (s.2")]
+    {
         let dir = tlx_testkit::TempDir::with_spec("lean-history", &spec, CFG);
         let run = tlx_testkit::tlx_default!().check("ProofOutput.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
         assert!([0, 12].contains(&run.code), "{}", run.text());

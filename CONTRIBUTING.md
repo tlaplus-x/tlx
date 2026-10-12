@@ -45,7 +45,8 @@ point `TLX_JAVA` at its `java` binary if it is not at the default path. See
 
 TLC is the semantic oracle ([docs/compat.md](docs/compat.md) section 0): the contract below is the
 one of `-tlc` mode, which is where the parity tests run; the default mode keeps only tier 1 and the
-validity of counterexamples.
+validity of counterexamples, with the explicit opt-in mathematical-arithmetic exception
+documented in [compat.md section 0](docs/compat.md#0-the-three-tiers).
 
 - In `-tlc` mode, verdicts, violated names, state counts, depth, shortest safety-trace length and
   language semantics must match TLC exactly, at `-workers 1` (model checking is defined there).

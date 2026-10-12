@@ -4,6 +4,8 @@
 //! preserves every old obligation and adds Q(x, elements(h) union {x}).
 //! Thus elements(h) and P(h), together, determine every future observation.
 //! Prefix quantifiers may inspect values, but never positions or multiplicity.
+//! Existential monitors use the dual: retain the absence of any witness, so
+//! the same conjunction fold applies to the negated event predicate.
 
 mod lean;
 
@@ -54,7 +56,14 @@ pub fn history_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
             span,
         );
         let certificate = lean::emit(proof.var, &initial, &steps, &observations, &proof.monitors);
-        let summary = Expr::new(ExprKind::Tuple(std::iter::once(elements).chain(proof.monitors).collect()), span);
+        let monitors = proof.monitors.into_iter().map(|e| {
+            if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) {
+                Expr::new(ExprKind::Builtin { op: B::Not, args: vec![e] }, span)
+            } else {
+                e
+            }
+        });
+        let summary = Expr::new(ExprKind::Tuple(std::iter::once(elements).chain(monitors).collect()), span);
         let values = program
             .vars
             .iter()
@@ -134,7 +143,7 @@ impl Proof<'_> {
                     return true;
                 }
             }
-            ExprKind::Quant { kind: QuantKind::Forall, bounds, body } if bounds.len() == 1 => {
+            ExprKind::Quant { bounds, body, .. } if bounds.len() == 1 => {
                 let b = &bounds[0];
                 if let Some(i) = one_local(b) {
                     if interval_end(&b.set).is_some_and(|end| {

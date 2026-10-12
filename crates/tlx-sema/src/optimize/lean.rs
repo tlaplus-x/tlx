@@ -30,10 +30,20 @@ pub fn projection_lean(
         );
     }
     out.push_str(include_str!("Rules.lean"));
+    out.push_str(include_str!("Age.lean"));
     out.push_str("\nnamespace TlxOptimization.Generated\n");
     for (name, value) in [
         ("rule", rule.unwrap_or("none").to_string()),
         ("fields", fields.join(", ")),
+        (
+            "arithmeticSemantics",
+            if rule == Some("relative-age-projection") {
+                "Mathematical natural-number clocks; eventual machine overflow need not be preserved."
+            } else {
+                "Checked machine arithmetic."
+            }
+            .to_string(),
+        ),
         ("configuration", format!("{cfg:#?}")),
         ("variables", format!("{:#?}", program.vars)),
         ("constants", format!("{:#?}", program.consts)),

@@ -186,9 +186,13 @@ environment variable).
 Opt-in state reduction uses the specification's semantics to merge states with the same
 future observations. Rules can omit unobserved variables, erase inactive record fields,
 retain only sequence lengths, or summarize append-only histories by their seen values
-and prefix-predicate results. With a finite event domain, a history summary can turn an
-unbounded history into a finite state component. Concrete values remain available for
-counterexample traces. These reductions support safety checking and are disabled in
+and universal or existential prefix-predicate results. With a finite event domain, a
+history summary can turn an unbounded history into a finite state component. Logical clocks
+observed through deadlines can use capped ages: for `created + 2 <= clock`, retain ages
+0, 1 and 2+ instead of absolute timestamps. These rules can compose to bound both clocks
+and histories. Optimized checking permits proved reductions to eliminate eventual machine
+overflow under [mathematical integer semantics](docs/compat.md#0-the-three-tiers);
+runtime arithmetic remains checked. Concrete values remain available for counterexample traces. These reductions support safety checking and are disabled in
 TLC-compatible mode. See [optimization rules and limits](docs/optimization.md).
 
 Optimized checking always writes a standalone Lean file and prints its path; it does
@@ -221,7 +225,8 @@ The contract has three tiers ([docs/compat.md](docs/compat.md) section 0):
    must not affect tiers 1 and 2.
 
 Tiers 1 and 2 are promised in `-tlc` mode at `-workers 1`, subject to the documented differences
-in [docs/compat.md](docs/compat.md). The default mode preserves verdicts and counterexample validity.
+in [docs/compat.md](docs/compat.md). The default mode preserves verdicts and counterexample validity;
+explicit optimization permits the mathematical-arithmetic exception described above.
 With several workers, the choice of a valid safety violation at the same BFS level and the
 counts, depth and trace length at an early stop are tier 3. Liveness-failure counts and depth
 are timing-dependent even with one worker. Section 0 of that document owns these boundaries.

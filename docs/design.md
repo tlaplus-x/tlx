@@ -107,6 +107,15 @@ fields in records or fixed-domain maps, and sequences observed only through thei
 Append-only histories over a proved finite element domain can instead use a set of seen
 elements and Boolean prefix observations. This can turn an unbounded history into a finite
 state component without limiting the number of source operations.
+Both universal obligations and existential witnesses are supported. Existential monitors
+retain the complement of the witness predicate, reusing the universal conjunction fold
+and its parametric Lean certificate rather than introducing a separate rule engine.
+The `phase/age.rs` rule derives capped relative ages and their composition with history
+summaries. Opt-in checking selects it before standalone history projection. It uses mathematical
+natural-number clocks and may eliminate eventual machine overflow, as permitted by the
+[opt-in contract](compat.md#0-the-three-tiers); ordinary runtime arithmetic remains checked.
+`Age.lean` supplies shared algebra, not a complete model certificate;
+[optimization.md](optimization.md#relative-age-projection) describes the boundary and external evidence.
 Length projection preserves exact lengths and forgets contents only after proving all uses
 compatible; it can reduce an unbounded graph without making that graph finite.
 Forward structural domains come from Init and Next;

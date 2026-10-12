@@ -21,6 +21,8 @@ space and equivalent counterexamples. Command line and output format are outside
   symmetry of sets of model values that tlx proves to runs that check only safety, and names it in
   an `Optimizations:` line ([usage.md](usage.md) section 6.3). The parity tests run with `-tlc`; the
   default mode is compared with TLC by verdict (`--default-mode` of spectest and difftest).
+  Explicit `-optimize` additionally permits proved reductions over mathematical integers to
+  eliminate eventual machine-integer overflow. This exception is scoped below; `-tlc` disables it.
 - **Must match**: sections 0 and 1. A difference is a bug and fails the tests (unless it is a
   documented difference D-n, marked `xfail` in the test).
 - **Outside the contract**: section 2. tlx keeps its current output format (its own test scripts parse
@@ -31,6 +33,20 @@ space and equivalent counterexamples. Command line and output format are outside
 - **Known limitations**: section 5. How all of this is tested: section 4.
 
 ## 0. The three tiers
+
+**Opt-in mathematical arithmetic.** With `-optimize` and without `-tlc`, a proved state
+reduction may use mathematical integer semantics and omit overflow that would arise only
+as concrete magnitudes grow beyond the machine range. Relative-age projection uses this
+permission for logical-clock increments and timestamp-plus-delay comparisons: it preserves
+safety and concrete counterexamples under mathematical natural-number semantics, rather than
+the eventual overflow verdict of an unreduced machine-integer execution. For example, if only
+`created + 2 <= clock` is observed, ages 0, 1 and 2+ suffice even though `clock` can grow forever.
+
+This is a reduction contract, not an arbitrary-precision runtime or a global error suppression
+switch. Executed expressions still use checked machine arithmetic; overflow actually encountered
+during exploration remains an error. Unknown uses prevent the reduction, and other evaluation
+errors remain observable. Ordinary checking without `-optimize` and compatibility mode retain
+the existing machine arithmetic contract. The table below describes compatibility mode.
 
 | Tier | Content | Requirement | How tests compare |
 |---|---|---|---|
