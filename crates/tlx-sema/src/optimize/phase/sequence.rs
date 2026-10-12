@@ -1,6 +1,8 @@
 //! Forget sequence contents when every use depends only on length. Shares the
 //! structural domain proof and bounded normalization with field projection.
 
+mod lean;
+
 use tlx_front::cfg::Config;
 
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
@@ -60,7 +62,7 @@ pub fn sequence_length_projection(
     Some(FieldProjection {
         ordered: None,
         view: Expr::new(ExprKind::Tuple(values), init.span),
-        certificate: None,
+        certificate: lean::emit(&projected, &domains, &initial, &steps, &observations),
         fields: projected.iter().map(|v| format!("{}.contents", program.vars[v.idx()].name)).collect(),
     })
 }

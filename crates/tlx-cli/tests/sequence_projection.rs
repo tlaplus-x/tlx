@@ -19,10 +19,10 @@ Observed == log
 const CFG: &str = "INIT Init\nNEXT Next\nINVARIANT TypeOK\n";
 
 #[test]
-fn unproved_length_projection_keeps_the_full_graph_in_all_tiers() {
+fn certified_length_projection_reduces_the_graph_in_all_tiers() {
     let dir = tlx_testkit::TempDir::with_spec("sequence-length", SPEC, CFG);
     for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for (flags, count) in [(vec![], 31), (vec!["-optimize"], 31), (vec!["-optimize", "-tlc"], 31)] {
+        for (flags, count) in [(vec![], 31), (vec!["-optimize"], 5), (vec!["-optimize", "-tlc"], 31)] {
             let run = tlx_testkit::tlx_default!()
                 .check("Length.tla")
                 .args(args)
@@ -35,7 +35,7 @@ fn unproved_length_projection_keeps_the_full_graph_in_all_tiers() {
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
             assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-            assert!(!run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
+            assert_eq!(run.stdout.contains("sequence-length-projection"), count == 5, "{tier}: {}", run.text());
         }
     }
 }
@@ -68,7 +68,7 @@ fn content_observations_and_conflicting_bindings_refuse_projection() {
 }
 
 #[test]
-fn refused_length_projection_preserves_failures_and_errors() {
+fn certified_length_projection_preserves_failures_and_errors() {
     for (spec, cfg, code, message) in [
         (SPEC.to_owned(), format!("{CFG}INVARIANT Safe\n"), 12, "Invariant Safe is violated"),
         (SPEC.replace("Next == Grow \\/ Reset", "Next == Grow"), CFG.to_owned(), 11, "Deadlock reached"),
@@ -86,7 +86,9 @@ fn refused_length_projection_preserves_failures_and_errors() {
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
-            assert!(!run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
+            if code != 255 {
+                assert!(run.stdout.contains("sequence-length-projection"), "{tier}: {}", run.text());
+            }
             assert!(run.text().contains(message), "{tier}: {}", run.text());
             if code == 12 {
                 assert!(run.stdout.contains("<<0, 0, 0>>") || run.stdout.contains("<<1, 1, 1>>"), "{tier}: {}", run.text());

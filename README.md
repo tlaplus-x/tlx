@@ -187,7 +187,8 @@ Automatic state reductions require a compiler-generated Lean certificate connect
 that application. Currently enabled rules remove unobserved variables with literal/copy
 updates, summarize supported append-only histories, cap relative timestamp ages (including
 finite age-filtered sets), combine supported age and history reductions, and reduce a
-restricted scalar allocation frontier. A history
+restricted scalar allocation frontier. A connected sequence-length certificate can
+merge different sequence contents when every use depends only on current lengths. A history
 summary over a finite event domain can turn unbounded history into a finite state component,
 including when prefix predicates control guards, retained updates or later events.
 The [history feedback example](proofs/history/README.md) finishes with six states.
@@ -200,7 +201,7 @@ history-dependent timestamp choices and payloads, and age-dependent events; it f
 with 135 states. Each certificate proves initialization,
 successor correspondence, observations, counterexample lifting and deadlock preservation.
 
-Proof coverage is incomplete. Phase-field, sequence-length, broader age/history compositions, broad ordered
+Proof coverage is incomplete. Phase-field, broader age/history compositions, broad ordered
 allocation, automatic symmetry and counter-export reductions are unavailable until
 connected certificates cover them. Unsupported applications keep the original graph;
 export refuses without writing artifacts. Explicit user `VIEW` and `SYMMETRY` declarations

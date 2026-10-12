@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -69,6 +69,12 @@ def verify(lean, path, negative):
         ] if namespace == "GeneratedHistory" else [
             ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
         ] if namespace == "GeneratedErasure" else [
+            ("| .keep => n", "| .keep => 0", "discarded preserved length"),
+            ("| .reset values => values.length", "| .reset values => 0", "discarded reset contents length"),
+            ("previous.reduced n + 1", "previous.reduced n + 2", "appended the wrong length"),
+            ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (fun _ => 0)", "discarded length guard feedback"),
+            ("m.transfer s.1 d w s.2 k", "m.transfer s.1 d w (fun _ => 0) k", "discarded length transfer feedback"),
+        ] if namespace == "GeneratedLength" else [
             ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
             ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
             ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),

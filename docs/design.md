@@ -159,8 +159,12 @@ selected invariants. Next-state inputs, unenumerable dependent binders and multi
 histories still refuse composition. Unsupported compositions retain a standalone fallback.
 Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
 
-Phase-field and sequence-length analyzers remain available for developing
-proofs, but their reductions are not installed. Automatic symmetry is also gated off;
+`phase/sequence/lean.rs` connects multiple sequence-length projections to explicit
+append/reset/frame transfers. Semantic leaves receive only retained state and current
+lengths. `LengthCertificate.lean` proves their transfer commutation and constructs
+initialization, successor, observation, counterexample and deadlock correspondence.
+Next-state length inputs remain unsupported. Phase-field analysis still awaits its
+connected certificate. Automatic symmetry is also gated off;
 its Rust analysis and bounded diagnostic remain available. Counter-export constructs an
 internal proposal, but the CLI refuses to publish it without a connected certificate.
 The [coverage inventory](optimization.md#proof-coverage) distinguishes proof work from

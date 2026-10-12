@@ -42,7 +42,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Finite history summary | Summary-dependent guards, retained updates and event values; independent bounds and initialization | Enabled within this subset |
 | Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
 | Phase-dependent fields | Missing | Candidate analysis only |
-| Sequence length | Missing | Candidate analysis only |
+| Sequence length | Multiple sequences, append/reset/frame transfers and current-length feedback | Enabled within this subset |
 | Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
@@ -438,13 +438,12 @@ runtime arithmetic remains checked. A user VIEW takes precedence and `-tlc` bypa
 
 ## Length-only sequence projection
 
-**Candidate only: no connected certificate; this reduction is not enabled.**
+The compiler generates a connected `GeneratedLength` certificate for the accepted slice.
 
 `phase/sequence.rs` shares the bounded normalizer, branch analysis and forward structural
 value domains with field projection. It replaces a top-level sequence by its exact length in
 the state key when its contents cannot affect any selected observation or successor class.
-Concrete sequences and executable actions remain unchanged. Existing whole-variable and field
-projections originally retained priority; this candidate is now gated off pending proof.
+Concrete sequences and executable actions remain unchanged. Whole-variable, age and finite-history projections retain priority.
 
 The rule requires a proved sequence domain from Init and every Next alternative, exactly one
 binding per alternative, and transfers made from tuples, self-copies, Append and IF expressions.
@@ -457,11 +456,14 @@ duplicate bindings and unresolved normalization decline the affected projection.
 For related states, the retained variables and sequence lengths agree. Each accepted transfer
 has the same resulting length, each guard and remaining expression has the same inputs, and
 proved membership predicates have the same truth value without type errors. Thus successor
-classes, safety observations and deadlocks agree. Primed reads receive the same checks.
+classes, safety observations and deadlocks agree. Primed length reads remain outside the current certificate; they cannot be interpreted
+as current-length semantic inputs.
 Initialization supplies actual concrete representatives, and existing replay reconstructs
 concrete counterexamples. Exact lengths retain length-dependent arithmetic and overflow
-behavior; the rule does not saturate counters. The existing safety-only boundary and symmetry
-composition requirements apply.
+behavior; the rule does not saturate counters. The existing safety-only boundary applies, and composition with symmetry remains gated.
+The [length proof example](../proofs/length/README.md) provides reproduction and explicit
+Lean verification commands. Source lowering, domain/totality analysis and runtime execution
+remain trusted.
 
 The external `Examples/specifications/FiniteMonotonic/ReplicatedLog.tla` motivates this rule.
 Its actions and `Safety` use `Len(log)`; `TypeOK` additionally checks `log \in Seq(Transaction)`.

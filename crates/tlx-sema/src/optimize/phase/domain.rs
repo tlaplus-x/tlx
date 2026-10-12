@@ -285,6 +285,7 @@ impl Domains {
             return D::Bottom;
         }
         match (op, args) {
+            (B::Len, [D::Seq(_)]) => D::Integer(0),
             (B::Cup, [D::Set(a), D::Set(b)]) => D::Set(Box::new(a.join(b))),
             (B::Append, [D::Seq(a), b]) => D::Seq(Box::new(a.join(b))),
             (B::ColonGt, [_, b]) => D::Mapping(Box::new(b.clone())),
