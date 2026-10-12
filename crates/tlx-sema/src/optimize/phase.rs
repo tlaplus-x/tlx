@@ -1,9 +1,12 @@
-//! Phase-dependent field liveness on records and fixed-domain maps of records.
-//! The rule derives its control values and fields from structure, never names.
+//! Structural state projections: phase-dependent field liveness and sequence
+//! length observations. Both reuse normalized branches and forward domains.
 
 mod domain;
 mod liveness;
 mod normalize;
+mod sequence;
+
+pub use sequence::sequence_length_projection;
 
 use tlx_front::cfg::Config;
 
@@ -11,7 +14,7 @@ use crate::{builtins::Builtin as B, hir::*, Program};
 
 use domain::{Domain, Domains};
 
-/// A proved state-key expression and the fields it forgets in some phases.
+/// A proved state-key expression and labels for the information it forgets.
 pub struct FieldProjection {
     pub view: Expr,
     pub fields: Vec<String>,

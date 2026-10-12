@@ -103,7 +103,10 @@ The key point: **the runtime is generic over the `Model` trait** (§7.1). Both m
 The rule-based optimizer is owned by `tlx-sema::optimize`. Its primary objective is to
 reduce the explored state graph while preserving checked verdicts and genuine counterexamples.
 Opt-in checking analyzes resolved HIR for unobserved state variables and phase-dependent dead
-fields in records or fixed-domain maps. Forward structural domains come from Init and Next;
+fields in records or fixed-domain maps, and sequences observed only through their length.
+Length projection preserves exact lengths and forgets contents only after proving all uses
+compatible; it can reduce an unbounded graph without making that graph finite.
+Forward structural domains come from Init and Next;
 backward liveness determines what can be forgotten. Checked invariants remain observations,
 never assumptions. The proved projection uses the existing VIEW fingerprint and concrete replay
 machinery in `tlx-eval`.
@@ -136,9 +139,9 @@ The domain analysis direction is observational: retain distinctions that guards,
 properties and future transitions can detect. A threshold may merge many reachable numeric
 values into one class. The same reasoning extends to elements, fields and keys of arrays,
 sequences, sets and maps, with separate obligations for structure, cardinality and definedness.
-Finite element domains alone do not bound sequence length or map domains. Finer partitions within
-live structured values are future extensions; [optimization.md](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics)
-records their proof requirements and the narrower rules currently implemented.
+Finite element domains alone do not bound sequence length or map domains. Length-only sequence
+projection is implemented; more general partitions within live structured values are future extensions.
+[optimization.md](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics) records their proof requirements and the narrower rules currently implemented.
 
 This is a division of responsibility, not a claim that a backend could never perform semantic
 analysis. The current execution IR does not expose the transition-system proof obligations as

@@ -8,7 +8,7 @@ mod analysis;
 mod phase;
 mod projection;
 
-pub use phase::{phase_projection, FieldProjection};
+pub use phase::{phase_projection, sequence_length_projection, FieldProjection};
 pub use projection::unobserved_variables;
 mod constant;
 mod counter;

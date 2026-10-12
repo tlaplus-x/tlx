@@ -39,13 +39,21 @@ impl InterpModel {
             .collect();
         let omitted = tlx_sema::optimize::unobserved_variables(&self.ip.prog, &self.init, &next, &observations);
         if omitted.is_empty() {
-            let projection = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations)?;
+            let (rule, projection) =
+                if let Some(p) = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                    ("phase-field-projection", p)
+                } else {
+                    (
+                        "sequence-length-projection",
+                        tlx_sema::optimize::sequence_length_projection(&self.ip.prog, cfg, &self.init, &next, &observations)?,
+                    )
+                };
             if !self.projection_equivariant(&projection.view) {
                 return None;
             }
             self.view = Some(projection.view);
             self.state_projection = true;
-            return Some(("phase-field-projection", projection.fields));
+            return Some((rule, projection.fields));
         }
         let retained = self
             .ip

@@ -183,6 +183,40 @@ and assigned labels by the actions, but guards and `TypeOK` do not read it. A bo
 around the unchanged source demonstrates an actual reduction; it is not the upstream unbounded
 configuration. Bounds and measurements belong with reproducible benchmark evidence.
 
+## Length-only sequence projection
+
+`phase/sequence.rs` shares the bounded normalizer, branch analysis and forward structural
+value domains with field projection. It replaces a top-level sequence by its exact length in
+the state key when its contents cannot affect any selected observation or successor class.
+Concrete sequences and executable actions remain unchanged. Existing whole-variable and field
+projections retain priority; this rule runs when they do not apply.
+
+The rule requires a proved sequence domain from Init and every Next alternative, exactly one
+binding per alternative, and transfers made from tuples, self-copies, Append and IF expressions.
+Every tuple element, appended expression and IF condition is checked for content reads; errors
+in those expressions remain observable. Other uses must read the sequence through Len, or a
+structural membership predicate that the inferred domain proves always true. A checked type
+invariant is never assumed. Head, indexing, sequence equality, unknown transfers, effects,
+duplicate bindings and unresolved normalization decline the affected projection.
+
+For related states, the retained variables and sequence lengths agree. Each accepted transfer
+has the same resulting length, each guard and remaining expression has the same inputs, and
+proved membership predicates have the same truth value without type errors. Thus successor
+classes, safety observations and deadlocks agree. Primed reads receive the same checks.
+Initialization supplies actual concrete representatives, and existing replay reconstructs
+concrete counterexamples. Exact lengths retain length-dependent arithmetic and overflow
+behavior; the rule does not saturate counters. The existing safety-only boundary and symmetry
+composition requirements apply.
+
+The external `Examples/specifications/FiniteMonotonic/ReplicatedLog.tla` motivates this rule.
+Its actions and `Safety` use `Len(log)`; `TypeOK` additionally checks `log \in Seq(Transaction)`.
+With two transaction values there are `2^k` concrete log contents of length `k`, but only one
+length class for each retained `executed` map. The mathematical model remains unbounded after
+projection: log length and execution counters can still increase. Measurements of a finite
+length prefix are diagnostics of this reduction, not a completed check of the unbounded model.
+The upstream `MCReplicatedLog` configuration also selects liveness and a handwritten reduction;
+that separate configuration does not establish applicability of this safety-only rule.
+
 ## Phase-dependent field projection
 
 `phase.rs` derives a finite control field and field liveness for a record, or a fixed-domain map
