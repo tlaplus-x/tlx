@@ -283,3 +283,27 @@ fn combined_history_monitors_keep_violations_and_reset_semantics() {
         }
     }
 }
+
+#[test]
+fn combined_history_feedback_finishes_in_every_executor() {
+    let spec = include_str!("../../../proofs/age/HistoryFeedback.tla");
+    let cfg = include_str!("../../../proofs/age/HistoryFeedback.cfg");
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let dir = tlx_testkit::TempDir::with_spec("age-feedback", spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("HistoryFeedback.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
+        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let proof = std::fs::read_to_string(path).unwrap();
+        assert!(proof.contains("namespace TlxOptimization.GeneratedAgeHistory"));
+        assert!(proof.contains("sem.feedbackValue"));
+    }
+}

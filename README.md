@@ -188,13 +188,15 @@ that application. Currently enabled rules remove unobserved variables with liter
 updates, summarize supported append-only histories, cap relative timestamp ages (including
 finite age-filtered sets), combine supported age and history reductions, and reduce a
 restricted scalar allocation frontier. A history
-summary over a finite event domain can turn unbounded history into a finite state component.
+summary over a finite event domain can turn unbounded history into a finite state component,
+including when prefix predicates control guards, retained updates or later events.
+The [history feedback example](proofs/history/README.md) finishes with six states.
 The [relative-age example](proofs/age/README.md)
 reduces an unbounded clock model to four states, and a model with both an unbounded clock
 and history to 15 states. Each certificate proves initialization and
 successor correspondence, observations, counterexample lifting and deadlock preservation.
 
-Proof coverage is incomplete. Phase-field, sequence-length, combined age/history, broad ordered
+Proof coverage is incomplete. Phase-field, sequence-length, broader age/history compositions, broad ordered
 allocation, automatic symmetry and counter-export reductions are unavailable until
 connected certificates cover them. Unsupported applications keep the original graph;
 export refuses without writing artifacts. Explicit user `VIEW` and `SYMMETRY` declarations

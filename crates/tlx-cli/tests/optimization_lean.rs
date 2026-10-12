@@ -131,10 +131,13 @@ fn history_certificate_is_generated_from_the_actual_predicate() {
 
 #[test]
 fn unsupported_certificate_scope_disables_the_rule() {
-    for (spec, cfg) in [
-        (HISTORY.replace("x' = IF x = 0 THEN 1 ELSE 0", "x' = IF h = <<>> THEN 0 ELSE IF x = 0 THEN 1 ELSE 0"), CFG.to_string()),
-        (HISTORY.replace("====", "Limit == x <= 1\n===="), format!("{CFG}CONSTRAINT Limit\n")),
-    ] {
+    let primed = HISTORY.replace(
+        r#"Next == /\ x' = IF x = 0 THEN 1 ELSE 0
+        /\ h' = IF x = 0 THEN Append(h, x) ELSE <<x>>"#,
+        r#"Next == /\ h' = IF x = 0 THEN Append(h, x) ELSE <<x>>
+        /\ x' = IF (h = <<>>)' THEN 0 ELSE IF x = 0 THEN 1 ELSE 0"#,
+    );
+    for (spec, cfg) in [(primed, CFG.to_string()), (HISTORY.replace("====", "Limit == x <= 1\n===="), format!("{CFG}CONSTRAINT Limit\n"))] {
         let dir = tlx_testkit::TempDir::with_spec("lean-history-scope", &spec, &cfg);
         let run = tlx_testkit::tlx_default!().check("ProofOutput.tla").args(["-interp", "-optimize", "-noautosymmetry"]).dir(&dir).run();
         assert_eq!(run.code, 0, "{}", run.text());

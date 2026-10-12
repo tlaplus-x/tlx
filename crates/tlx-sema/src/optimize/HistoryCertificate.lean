@@ -150,7 +150,7 @@ theorem empty_iff_no_seen (h : History E) : h = .empty ↔ ¬ ∃ e, h.seen e :=
     · intro noSeen; exact False.elim (noSeen ⟨e, Or.inr rfl⟩)
 
 -- All finite resets and append chains, including branches selected by a
--- history-free condition, have the same transfer on summary-equivalent logs.
+-- summary-dependent condition, have the same transfer on summary-equivalent logs.
 inductive Transfer (E : Type) where
   | keep
   | reset (history : History E)
@@ -183,8 +183,8 @@ structure Model (C E I W : Type) where
   predicate : I → E → (E → Prop) → Prop
   initial : C → W → Prop
   seed : C → W → History E
-  step : C → C → W → Prop
-  transfer : C → C → W → Transfer E
+  step : C → C → W → Summary E I → Prop
+  transfer : C → C → W → Summary E I → Transfer E
   observe : C → Summary E I → Prop
 
 namespace Model
@@ -192,12 +192,13 @@ variable {C E I W : Type} (m : Model C E I W)
 
 def concrete : System (C × History E) where
   initial s := ∃ w, m.initial s.1 w ∧ s.2 = m.seed s.1 w
-  next s t := ∃ w, m.step s.1 t.1 w ∧ t.2 = (m.transfer s.1 t.1 w).concrete s.2
+  next s t := ∃ w, m.step s.1 t.1 w (indexedSummary m.predicate s.2) ∧
+    t.2 = (m.transfer s.1 t.1 w (indexedSummary m.predicate s.2)).concrete s.2
   safe s := m.observe s.1 (indexedSummary m.predicate s.2)
 
 def reduced : System (C × Summary E I) where
   initial s := ∃ w, m.initial s.1 w ∧ s.2 = History.summary m.predicate (m.seed s.1 w)
-  next s t := ∃ w, m.step s.1 t.1 w ∧ t.2 = (m.transfer s.1 t.1 w).reduced m.predicate s.2
+  next s t := ∃ w, m.step s.1 t.1 w s.2 ∧ t.2 = (m.transfer s.1 t.1 w s.2).reduced m.predicate s.2
   safe s := m.observe s.1 s.2
 
 def project (s : C × History E) : C × Summary E I :=
@@ -214,9 +215,10 @@ theorem certificate : Certificate m.concrete m.reduced m.project := by
       subst a
       exact ⟨w, hw, congrArg (History.summary m.predicate) hs⟩
   · intro s a
+    simp only [concrete, reduced, project, indexedSummary_eq]
     constructor
     · rintro ⟨w, hw, ha⟩
-      refine ⟨(a.1, (m.transfer s.1 a.1 w).concrete s.2), ⟨w, hw, rfl⟩, ?_⟩
+      refine ⟨(a.1, (m.transfer s.1 a.1 w (History.summary m.predicate s.2)).concrete s.2), ⟨w, hw, rfl⟩, ?_⟩
       apply Prod.ext
       · rfl
       · exact (Transfer.commutes _ _ _).trans ha.symm
@@ -225,7 +227,6 @@ theorem certificate : Certificate m.concrete m.reduced m.project := by
       refine ⟨w, hw, ?_⟩
       change History.summary m.predicate t.2 = _
       rw [ht, Transfer.commutes]
-      rfl
   · intro s
     change m.observe s.1 (indexedSummary m.predicate s.2) ↔ _
     rw [indexedSummary_eq]; rfl

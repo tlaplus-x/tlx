@@ -79,7 +79,9 @@ pub(super) fn emit(
         writeln!(out, "  | {i} => {}", usize::from(*tick)).unwrap();
     }
     out.push_str("  | _ => 0\n");
-    writeln!(out, "def guard {params} (c d : C) (choice : Nat × W) (p : Key → Bool) : Test caps :=\n  match choice.1 with").unwrap();
+    let summary = history.map(|h| format!(" (s : Summary V (Fin {}))", h.monitors.len())).unwrap_or_default();
+    writeln!(out, "def guard {params} (c d : C) (choice : Nat × W) (p : Key → Bool){summary} : Test caps :=\n  match choice.1 with")
+        .unwrap();
     for (i, (guard, _, _)) in steps.iter().enumerate() {
         writeln!(out, "  | {i} => {guard}").unwrap();
     }
@@ -359,15 +361,16 @@ impl Emitter<'_, '_> {
 
     fn test(&mut self, e: &Expr, observation: bool) -> Option<String> {
         self.remaining = self.remaining.checked_sub(1)?;
-        if observation && self.age_independent(e) {
+        if self.age_independent(e) {
             if let Some(h) = &mut self.history {
                 if !h.independent(e) {
                     let start = h.atoms.len();
-                    let term = h.observe(e)?;
+                    let term = h.test(e, observation)?;
                     for atom in &mut h.atoms[start..] {
                         write!(atom, "\nBound atoms: {:?}", self.scope).unwrap();
                     }
-                    return Some(format!("(Test.pure (let sem := sem.history; let c := (c, p); {term}))"));
+                    let next = if observation { "" } else { "let d := (d, p); " };
+                    return Some(format!("(Test.pure (let sem := sem.history; let c := (c, p); {next}{term}))"));
                 }
             }
         }

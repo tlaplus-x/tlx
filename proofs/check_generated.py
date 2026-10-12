@@ -78,10 +78,17 @@ def verify(lean, path, negative):
                 ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
                 ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
             ])
+        if namespace == "GeneratedHistory":
+            changes.extend([
+                ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (History.summary m.predicate History.empty)", "discarded guard feedback"),
+                ("m.transfer s.1 t.1 w s.2", "m.transfer s.1 t.1 w (History.summary m.predicate History.empty)", "discarded transfer feedback"),
+            ])
         if namespace == "GeneratedAgeHistory":
             changes.extend([
                 ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
-                ("(m.historyTransfer s.1.1 d w (presence s.1.2)).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
+                ("m.guard s.1.1 t.1.1 w (presence s.1.2) s.2", "m.guard s.1.1 t.1.1 w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded guard feedback"),
+                ("m.historyTransfer s.1.1 d w (presence s.1.2) s.2", "m.historyTransfer s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded transfer feedback"),
+                ("(m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
                 ("(m.age.project s.1, History.summary m.predicate s.2)", "(m.age.project s.1, History.summary m.predicate History.empty)", "discarded observed history"),
             ])
         changes.append(

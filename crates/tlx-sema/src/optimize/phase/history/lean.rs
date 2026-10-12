@@ -2,6 +2,8 @@
 //! Unchanged, history-free HIR leaves are recorded and universally interpreted;
 //! they cannot access the forgotten history. No source-model names are special.
 
+mod feedback;
+
 use std::{fmt::Write, sync::Arc};
 
 use super::super::{binding, unchanged, variable, Branch};
@@ -30,11 +32,12 @@ pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observation
         writeln!(out, "  | {i} => {p}").unwrap();
     }
     out.push_str("  | _ => True\n");
+    let summary = format!("(c d : C) (choice : Nat × W) (s : Summary V (Fin {count}))");
     for (name, args, typ, values, default) in [
         ("initial", "(c : C) (choice : Nat × W)", "Prop", initial_guards, "False"),
         ("seed", "(c : C) (choice : Nat × W)", "History V", seeds, "History.empty"),
-        ("step", "(c d : C) (choice : Nat × W)", "Prop", step_guards, "False"),
-        ("transfer", "(c d : C) (choice : Nat × W)", "Transfer V", transfers, "Transfer.keep"),
+        ("step", summary.as_str(), "Prop", step_guards, "False"),
+        ("transfer", summary.as_str(), "Transfer V", transfers, "Transfer.keep"),
     ] {
         writeln!(out, "\ndef {name} {params} {args} : {typ} :=\n  match choice.1 with").unwrap();
         for (i, v) in values.iter().enumerate() {
@@ -84,6 +87,9 @@ pub(in super::super) const SEMANTICS: &str = "\n-- These are universal semantic 
          \x20 test : Nat → C → C → W → Prop\n\
          \x20 value : Nat → C → C → W → V\n\
          \x20 observe : Nat → C → Prop\n\
+         \x20 feedbackTest : Nat → C → C → W → List Bool → Prop\n\
+         \x20 feedbackObserve : Nat → C → List Bool → Prop\n\
+         \x20 feedbackValue : Nat → C → C → W → List Bool → V\n\
          \x20 member : Nat → V → Prop\n\
          \x20 field : V → String → V\n\
          \x20 constant : Nat → V\n\
@@ -150,13 +156,18 @@ impl<'a> Emitter<'a> {
             }
             // Keep local bounds in the leaf record. Its semantic witness is
             // the same environment used to evaluate the appended event.
-            if !b.bounds.iter().all(|b| self.independent(&b.set)) || !terms.iter().all(|e| self.independent(e)) {
+            if !b.bounds.iter().all(|b| self.independent(&b.set)) || (!primed && !terms.iter().all(|e| self.independent(e))) {
                 return None;
             }
             let id = self.atoms.len();
-            self.atoms.push(format!("bounds: {:#?}\nterms: {terms:#?}", b.bounds));
+            self.atoms.push(format!("bounds: {:#?}", b.bounds));
             let next = if primed { "d" } else { "c" };
-            guards.push(format!("sem.test {id} c {next} choice.2"));
+            let mut tests = vec![format!("sem.test {id} c {next} choice.2")];
+            for term in &terms {
+                let test = self.test(term, false)?;
+                tests.push(if primed { test } else { format!("(let d := c; {test})") });
+            }
+            guards.push(combine(&tests, "∧", "True"));
             let transfer = self.transfer(&rhs, primed)?;
             transfers.push(if primed { transfer } else { format!("({transfer}).concrete History.empty") });
         }
@@ -174,27 +185,30 @@ impl<'a> Emitter<'a> {
     }
 
     pub(in super::super) fn transfer(&mut self, e: &Expr, primed: bool) -> Option<String> {
-        let next = if primed { "d" } else { "c" };
+        if !primed && !self.independent(e) {
+            return None;
+        }
         Some(match &*e.kind {
             ExprKind::Var(v) if primed && *v == self.var => "Transfer.keep".into(),
             ExprKind::Tuple(es) => {
                 let mut h = "History.empty".to_string();
                 for e in es {
-                    let id = self.atom(e)?;
-                    h = format!("(History.append {h} (sem.value {id} c {next} choice.2))");
+                    let value = self.value(e, primed)?;
+                    h = format!("(History.append {h} {value})");
                 }
                 format!("(Transfer.reset {h})")
             }
             ExprKind::Builtin { op: B::Append, args } if args.len() == 2 => {
                 let t = self.transfer(&args[0], primed)?;
-                let id = self.atom(&args[1])?;
-                format!("(Transfer.append {t} (sem.value {id} c {next} choice.2))")
+                let value = self.value(&args[1], primed)?;
+                format!("(Transfer.append {t} {value})")
             }
             ExprKind::If { cond, then, els } => {
-                let id = self.atom(cond)?;
+                let cond = self.test(cond, false)?;
+                let cond = if primed { cond } else { format!("(let d := c; {cond})") };
                 let then = self.transfer(then, primed)?;
                 let els = self.transfer(els, primed)?;
-                format!("(if sem.test {id} c {next} choice.2 then {then} else {els})")
+                format!("(if {cond} then {then} else {els})")
             }
             _ => return None,
         })
@@ -251,15 +265,23 @@ impl<'a> Emitter<'a> {
     }
 
     pub(in super::super) fn observe(&mut self, e: &Expr) -> Option<String> {
+        self.test(e, true)
+    }
+
+    pub(in super::super) fn test(&mut self, e: &Expr, observation: bool) -> Option<String> {
         if self.independent(e) {
-            return Some(format!("(sem.observe {} c)", self.atom(e)?));
+            let id = self.atom(e)?;
+            return Some(if observation { format!("(sem.observe {id} c)") } else { format!("sem.test {id} c d choice.2") });
         }
+        self.summary_read(e)
+            .or_else(|| boolean(e, |e| self.test(e, observation)))
+            .or_else(|| self.feedback(e, if observation { "Observe" } else { "Test" }))
+    }
+
+    fn summary_read(&mut self, e: &Expr) -> Option<String> {
         if let Some(i) = self.monitors.iter().position(|m| Arc::ptr_eq(&m.kind, &e.kind)) {
             let bit = format!("(s.2 ⟨{i}, by decide⟩)");
             return Some(if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) { format!("(¬ {bit})") } else { bit });
-        }
-        if let Some(p) = boolean(e, |e| self.observe(e)) {
-            return Some(p);
         }
         match &*e.kind {
             ExprKind::Builtin { op: B::Eq | B::Neq, args } if args.len() == 2 => {

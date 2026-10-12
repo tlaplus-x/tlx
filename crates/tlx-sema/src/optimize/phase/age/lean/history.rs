@@ -22,7 +22,7 @@ impl Emitter<'_, '_> {
                 .map(|b| {
                     let rhs = binding(b, var, primed)?;
                     // Event values and transfer conditions cannot inspect time or
-                    // uncapped ages. History's emitter separately rejects history reads.
+                    // uncapped ages. History reads must lower to proved summary predicates.
                     if !self.age_independent(&rhs) {
                         return None;
                     }
@@ -50,7 +50,7 @@ impl Emitter<'_, '_> {
             writeln!(out, "  | {i} => ({seed}).concrete History.empty").unwrap();
         }
         out.push_str("  | _ => History.empty\n");
-        writeln!(out, "def historyTransfer {params} (c d : C) (choice : Nat × W) (p : Key → Bool) : Transfer V :=\n  let c := (c, p)\n  let d := (d, p)\n  let sem := sem.history\n  match choice.1 with").unwrap();
+        writeln!(out, "def historyTransfer {params} (c d : C) (choice : Nat × W) (p : Key → Bool) (s : Summary V (Fin {count})) : Transfer V :=\n  let c := (c, p)\n  let d := (d, p)\n  let sem := sem.history\n  match choice.1 with").unwrap();
         for (i, transfer) in code.transfers.iter().enumerate() {
             writeln!(out, "  | {i} => {transfer}").unwrap();
         }
@@ -61,8 +61,8 @@ impl Emitter<'_, '_> {
             fold(observations, "conj", "True")
         )
         .unwrap();
-        out.push_str("def ageModel : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := guard sem\n  change := change sem\n  observe := fun _ _ => Test.pure True\n");
-        writeln!(out, "def model : AgeHistoryRule.Model C Key V (Fin {count}) (Nat × W) where\n  age := ageModel sem\n  predicate := historyPredicate sem\n  historySeed := historySeed sem\n  historyTransfer := historyTransfer sem\n  observe := observe sem").unwrap();
+        out.push_str("def ageModel : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := fun _ _ _ _ => Test.pure True\n  change := change sem\n  observe := fun _ _ => Test.pure True\n");
+        writeln!(out, "def model : AgeHistoryRule.Model C Key V (Fin {count}) (Nat × W) where\n  age := ageModel sem\n  predicate := historyPredicate sem\n  historySeed := historySeed sem\n  historyTransfer := historyTransfer sem\n  guard := guard sem\n  observe := observe sem").unwrap();
         out.push_str(
             &include_str!("../certificate.lean")
                 .replace("State C Key", "(State C Key × History V)")

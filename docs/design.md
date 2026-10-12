@@ -118,7 +118,12 @@ counterexample lifting and deadlock preservation, without preservation premises.
 `phase/history/lean.rs` emits actual seeds, append/reset transfers, prefix predicates and
 observations. `HistoryCertificate.lean` relates indexed concrete histories to seen sets
 and accumulated prefix results. Universal and existential observations reuse one fold.
-History-dependent guards or retained updates currently exclude the certificate.
+`phase/history/lean/feedback.rs` replaces supported history predicates in retained
+consumers with explicit Boolean holes. Guards, retained updates, event values and
+conditional transfers receive these results. The concrete relation uses indexed
+prefixes and the reduced relation uses summary bits; the shared proof equates them
+before establishing successor correspondence. Branch bounds and initialization
+remain history-independent. Dependent binders and next-state history reads refuse.
 
 `phase/ordered/lean.rs` emits a scalar frontier's initial anchor, literal nonnegative
 increments, guards and observations. `OrderedCertificate.lean` additionally connects
@@ -137,8 +142,10 @@ with recorded atom mappings. Semantic leaves cannot inspect absolute time or age
 `phase/age/lean/history.rs` connects one history to the same retained core and branch witness.
 `AgeHistoryCertificate.lean` proves the product transfer and observation correspondence;
 the generated `GeneratedAgeHistory` model contains both actual transfers. Event values and
-history transfer conditions cannot inspect forgotten time or ages, and history cannot feed
-back into guards or retained updates. Unsupported compositions retain a standalone fallback.
+history transfer conditions cannot inspect forgotten time or ages. Summary feedback
+is supported in guards and retained updates, while timestamp-map transfers must stay
+history-independent. Mixed age-filter/history consumers and multiple histories still
+refuse composition. Unsupported compositions retain a standalone fallback.
 Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
 
 Phase-field and sequence-length analyzers remain available for developing

@@ -39,7 +39,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Reduction | Connected certificate | Current behavior |
 |---|---|---|
 | Unobserved variables | Literal initializations, literal/copy/frame updates; independent retained state | Enabled within this subset |
-| Finite history summary | Independent guards, bounds, event values and retained updates; supported prefix observations | Enabled within this subset |
+| Finite history summary | Summary-dependent guards, retained updates and event values; independent bounds and initialization | Enabled within this subset |
 | Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
 | Phase-dependent fields | Missing | Candidate analysis only |
 | Sequence length | Missing | Candidate analysis only |
@@ -781,10 +781,20 @@ of reads, set/index predicate lowering, source bindings, the actual VIEW impleme
 symmetry composition, backend execution and model-checking results remain outside the
 certificate. The proof does not establish the input model's safety or its state count.
 
-The history certificate subset requires history-independent branch guards, bounds,
-appended values and retained-state updates, and initial histories built from finite
-resets. Observations support Boolean combinations of prefix monitors, emptiness,
-sequence type membership and history-free predicates. Constraints, action/initial
+History predicates can feed back into branch guards, retained-state updates, appended
+values and conditional append/reset transfers. The emitter replaces each supported
+predicate with a Boolean hole and records its exact HIR mapping. Semantic consumers
+receive these explicit predicate results, never the raw history. The concrete system
+computes them from indexed prefixes; the reduced system reads the summary. Their
+proved equality preserves both decisions and resulting transfers.
+
+Branch bounds and initialization must remain history-independent; initial histories
+use finite resets. Supported predicates include prefix monitors, emptiness, sequence
+type membership and their Boolean combinations. Dependent binders, next-state history
+reads, exact lengths and unsupported index patterns still refuse reduction. Combined
+age/history certificates also require history-independent timestamp-map transfers and
+age-independent history events. A single retained expression mixing age-filtered sets
+with history feedback remains outside the emitted subset. Constraints, action/initial
 properties and trace aliases exclude automatic reduction. Unsupported history cases and
 all other uncertified rules are refused. A no-pass run emits shared algebra and a record
 explicitly saying no reduction was applied. The export command likewise refuses its
@@ -810,7 +820,8 @@ checks reject incorrect ticks, resets, deletion, deadline strictness, reduced ob
 inverted filter decisions and incorrect selected-key membership. Filter certificates also
 audit the concrete and reduced selection lemmas. Combined age/history checks additionally
 reject forgetting prior prefix failures, dropping the shared branch’s history transfer and
-discarding observed history.
+discarding observed history. History and combined certificates also reject discarding
+summary feedback in guards and transfers.
 This script is never invoked
 by checking or by the ordinary Rust tests. It needs only Lean 4 (tested with 4.34.1),
 not Mathlib or a network connection.

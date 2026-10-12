@@ -115,14 +115,42 @@ fn finite_filters_and_quantifiers_are_certified_but_dynamic_domains_are_not() {
 }
 
 #[test]
-fn composition_refuses_history_feedback_and_age_dependent_events() {
+fn composition_refuses_age_dependent_events() {
     for body in [
-        BODY.replace("Tick ==", "Tick == h = <<>> /\\"),
-        BODY.replace("Append(h, \"put\")", "IF h = <<>> THEN Append(h, \"put\") ELSE h"),
         BODY.replace("Append(h, \"drop\")", "Append(h, IF records[k].created + 2 <= clock THEN \"drop\" ELSE \"put\")"),
         BODY.replace("Append(h, \"put\")", "Append(h, clock)"),
         BODY.replace("Append(h, \"put\")", "Append(h, IF (\"created\" \\in DOMAIN records[k])' THEN \"put\" ELSE \"drop\")"),
     ] {
         assert!(!projection(&body).contains(&"h.history".to_owned()), "{body}");
     }
+}
+
+#[test]
+fn composition_certifies_history_feedback() {
+    for body in [
+        BODY.replace("Tick ==", "Tick == h = <<>> /\\"),
+        BODY.replace("Append(h, \"put\")", "(IF h = <<>> THEN Append(h, \"put\") ELSE h)"),
+    ] {
+        assert!(projection(&body).contains(&"h.history".to_owned()), "{body}");
+    }
+}
+
+#[test]
+fn composition_keeps_uncertified_feedback_boundaries() {
+    for body in [
+        BODY.replace("Tick ==", "Tick == (h = <<>>)' /\\"),
+        BODY.replace("k \\in {1, 2}:", "k \\in (IF h = <<>> THEN {1} ELSE {2}):"),
+        BODY.replace(
+            "records' = [records EXCEPT ![k] = Empty]",
+            "records' = (IF h = <<>> THEN [records EXCEPT ![k] = Empty] ELSE records)",
+        ),
+    ] {
+        assert!(!projection(&body).contains(&"h.history".to_owned()), "{body}");
+    }
+    let source = include_str!("../../../proofs/age/AgeHistory.tla");
+    let body = source.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
+    let body = format!("VARIABLE{body}")
+        .replace("selected' = {k", "selected' = (IF history = <<>> THEN {} ELSE {k")
+        .replace("created + 2 <= clock}", "created + 2 <= clock})");
+    assert!(!projection(&body).contains(&"history.history".to_owned()));
 }

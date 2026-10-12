@@ -75,12 +75,19 @@ with 15 states; both unbounded components are reduced:
 
 The generated `GeneratedAgeHistory` certificate proves initialization, successor
 correspondence, selected observations, counterexample lifting and deadlocks.
-The verifier audits seven theorems and rejects ten broken variants, including
+The verifier audits seven theorems and rejects twelve broken variants, including
 forgetting prior prefix failures and dropping the history transfer. Source
 lowering, leaf interpretation, domain/totality analysis and runtime execution
 remain trusted. History events and transfer conditions cannot depend on forgotten
-ages; history-dependent guards/retained updates and multiple-history composition
-remain unsupported.
+ages. Supported summary predicates can control guards, retained updates and history
+transfers. `HistoryFeedback.tla` exercises all three with an unbounded clock and log:
+
+```sh
+./target/release/tlx check proofs/age/HistoryFeedback.tla -interp -optimize -noautosymmetry
+```
+
+History-dependent timestamp-map transfers, a single consumer mixing age-filtered sets
+with history feedback, and multiple-history composition remain unsupported.
 
 For the separately fetched external cleaner, `Cleaner.cfg` selects singleton
 constants and `TypeOk`. The original specification completes without a transition
