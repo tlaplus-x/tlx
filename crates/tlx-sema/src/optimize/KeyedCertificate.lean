@@ -210,14 +210,16 @@ theorem project_rename {C M K V : Type} (p : Permutation K) (s : State C M K V) 
   have h : project s = project (rename p s) := Quotient.sound (show Orbit s (rename p s) from ⟨p, rfl⟩)
   exact h.symm
 
-structure Model (C M K V B W : Type) where
-  initial : State C M K V → Prop
+structure Operations (C M K V B W : Type) where
   guard : B → Test M
   test : B → C → C → W → Nat → List V → Prop
   writes : B → List (Write M)
   value : B → C → C → W → Nat → List V → V
   observation : Test M
   observe : C → Nat → List V → Prop
+
+structure Model (C M K V B W : Type) extends Operations C M K V B W where
+  initial : State C M K V → Prop
 
 namespace Model
 variable {C M K V B W : Type} (m : Model C M K V B W)

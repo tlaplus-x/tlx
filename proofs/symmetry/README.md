@@ -33,7 +33,7 @@ leaf interpretation, totality, group closure and runtime representative selectio
 remain trusted. Formal orbit equality is not a proof of the Rust minimum-key
 implementation. Unsupported shapes, including identifiers stored in payloads,
 primed map inputs and multiple potentially aliasing writers to one map, refuse.
-Projection composition still requires its own connected certificate.
+Other projection/symmetry combinations remain disabled; variable erasure is covered below.
 
 The unchanged external transaction-commit specification in the TLA+ Examples
 corpus is also covered:
@@ -52,3 +52,32 @@ correctness coverage, not a timing claim for this small model.
 states become 52,360 permutation classes. To compare the same release binary,
 run with this configuration both normally and with `-noautosymmetry`; use
 repeated, interleaved runs after warming both configurations.
+
+## Erasure followed by symmetry
+
+[Erased.tla](Erased.tla) keeps two unobserved snapshots of a keyed map. Snapshots can
+copy each other, save the old map or reset to literals. They can contain moved keys,
+so they must be erased before the retained map chooses its orbit representative.
+With [Erased.cfg](Erased.cfg), TLC and compatibility-mode tlx find 2,796 generated /
+811 distinct states. Erasure alone gives 109 / 27; composition gives 41 / 10:
+
+```sh
+./target/release/tlx check proofs/symmetry/Erased.tla -tlc -interp
+./target/release/tlx check proofs/symmetry/Erased.tla -optimize -noautosymmetry -interp
+TLX_PARANOID=1 TLX_SYMMETRY_PARANOID=1 ./target/release/tlx check proofs/symmetry/Erased.tla -optimize -compile
+```
+
+The combined generated certificate includes the full source initialization, the
+actual hidden transfers, keyed guards and map writes with one common branch choice.
+Its intermediate erasure and final orbit certificates describe the same model.
+Seven audits cover both certificates, safety, stuttering, concrete counterexamples,
+deadlocks and formal orbit-key equivalence. Six mutations reject broken key/map
+renaming, missing quotient initialization/successors, removed concrete hidden
+successors and changed reduced observations. Runtime tests retain concrete snapshot
+values in failing and deadlocking traces across execution tiers.
+
+The installed projection must be the exact retained-variable tuple. Unknown or
+partial hidden updates, reads of omitted variables, unsupported keyed shapes and
+other projection kinds refuse composition. Existing user VIEW/SYMMETRY declarations
+retain the TLC path. Source lowering, domain/totality inference, independent semantic
+leaves, group closure and runtime projection/canonicalization remain trusted.

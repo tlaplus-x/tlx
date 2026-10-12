@@ -213,10 +213,13 @@ can be checked separately; export does not itself check safety.
 for fixed-domain maps with identifier-free payloads. It runs in default mode and
 merges states differing only by a permutation of their map keys.
 
-Proof coverage is incomplete. Broader age/history compositions, broad ordered
-allocation and other symmetry shapes remain unavailable without connected certificates.
-Unsupported checking applications keep the original graph. Explicit user `VIEW` and `SYMMETRY` declarations
-retain their TLC behavior. Automatic projections currently decline symmetry composition.
+Every implemented reduction family now has connected rule-IR certificates for its
+enabled subset. [Variable erasure can compose with keyed symmetry](proofs/symmetry/README.md)
+through one shared source model. Broader age/history combinations, dynamic allocation
+containers, identifier-containing version payloads and other symmetry combinations remain
+unavailable without connected certificates.
+Unsupported candidates stay unapplied; another certified rule may still apply. Explicit user `VIEW` and `SYMMETRY` declarations
+retain their TLC behavior.
 See [the coverage inventory](docs/optimization.md#proof-coverage).
 
 Optimized checking always writes standalone Lean and prints its path; it never invokes

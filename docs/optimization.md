@@ -49,7 +49,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Immutable live versions | Singleton seed, fresh append/frame transfers, explicit live-root payload feedback and retained-table key equivalence | Enabled within this subset |
 | Automatic keyed symmetry | Fixed-domain maps; explicit key equality, quantifiers, reads and writes; permutation quotient | Enabled for one full group; other shapes and runtime-guarded claims remain uncertified |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
-| Projection composed with symmetry | Missing | Automatic projection refused |
+| Projection composed with symmetry | Unobserved-variable transfers and keyed operations share one source IR; erasure and orbit certificates compose | Enabled for certified variable erasure plus one keyed group |
 
 All enabled projection certificates prove initialization, successor correspondence from
 every representative, preservation of state observations, concrete counterexample lifting,
@@ -89,10 +89,10 @@ trusted; the orbit theorem does not claim to verify their Rust implementation.
 Automatic application requires the connected certificate even for a forced
 candidate. Runtime guards and bounded checks cannot substitute for it. The CLI
 writes mandatory Lean before exploration, including without opt-in projection.
-An explicitly requested certified projection takes priority over automatic
-symmetry until composition has a certificate. Constraints, action/initial
-properties, aliases, temporal checking, declared VIEW/SYMMETRY and projection
-composition remain excluded. See the
+An explicitly requested certified projection takes priority. A keyed group can join
+unobserved-variable erasure only with a connected composition certificate.
+Constraints, action/initial properties, aliases, temporal checking, declared
+VIEW/SYMMETRY and other projection/symmetry combinations remain excluded. See the
 [reproduction example](../proofs/symmetry/README.md).
 
 ## Overlap with execution optimization
@@ -230,8 +230,8 @@ The proof obligations are:
    Read-dependency scanning handles recursive definitions with a visited set. Traversal is bounded
    by 100,000 nodes and depth 128; exhaustion yields no projection.
 5. The execution boundary excludes temporal checking, configuration overrides, possible predicates,
-   postconditions and existing VIEW. Symmetry composition additionally requires the equivariance
-   check described below.
+   postconditions and existing VIEW. Automatic symmetry additionally requires the connected
+   composition certificate described below.
 
 **Correctness argument.** Let `P(s)` retain every non-omitted component. Related reachable states
 have equal retained values; every stored component is fully specified. A guard or
@@ -612,32 +612,36 @@ reads. It does not infer numeric threshold partitions or remove sequence lengths
 
 ## Composing projection with symmetry
 
-**Candidate only: no connected certificate; this reduction is not enabled.**
+Unobserved-variable erasure can compose with one certified automatic keyed-symmetry
+group. The compiler checks the **actual installed projection** is the retained-variable
+tuple, with source order preserved. It lowers every omitted variable's literal, old-value
+copy or frame transfer, together with the actual keyed guards and map writes. Retained
+semantic leaves cannot read omitted variables. The full source initial relation is kept;
+its projected image supplies the intermediate model's initial relation.
 
-An automatic projection can compose with declared symmetry or statically proved automatic
-symmetry. Forced and runtime-guarded automatic groups retain their existing path. A declared
-group remains a user assertion; composing a proved projection does not prove that declaration.
+`ErasedKeyedCertificate.lean` gives the source relation one shared branch, key environment
+and map transfer. It constructs the erasure certificate from every hidden representative,
+then composes it with the keyed certificate for that exact intermediate system. The
+shared composition lemma in `Rules.lean` is also used by the counter export pipeline.
+Two independently generated certificates for unrelated models cannot authorize application.
+Seven generated theorem audits include the intermediate erasure certificate, the final
+certificate, safety with and without stuttering, counterexample lifting, deadlocks and
+formal orbit-key equivalence. No preservation or commutation premise is assumed.
 
-Let `P` be the proved projection and `G` the applied group. Require
-`P(g(s)) = g(P(s))` for every `g` in `G`. Whole-variable projection satisfies this directly.
-Phase projection is built from record updates, map construction, fixed field names and phase
-comparisons. Those operations commute with permutation when each introduced phase constant is
-fixed by every group element. The interpreter checks that condition against the evaluated
-configuration values and declines composition if it cannot establish it.
+State identity is the orbit of the retained tuple: project first, then canonicalize.
+Forgotten snapshots may themselves contain moved keys; they cannot choose the orbit
+representative. The interpreter uses a total structural order for projected keys, and
+compiled checking uses the same projection contract. Source lowering, domain/totality
+inference, independent leaf interpretation, runtime projection, group closure and
+canonicalization remain trusted. The key theorem characterizes the formal orbit, not
+the Rust minimum-selection implementation.
 
-State identity is the orbit of `P(s)`: project first, then canonicalize. Canonicalizing the full
-state first would let forgotten fields choose the representative, losing potential merges.
-Equivariance makes the group action well-defined on projected classes. Since both the projection
-and the valid symmetry preserve observations and matching successors, their composed quotient
-preserves safety verdicts, enabledness and concrete replay. Existing user VIEW semantics, including
-TLC's order of combining VIEW with SYMMETRY, remain unchanged.
-
-The interpreter uses a total structural order for projected keys, since a dead-field Boolean
-sentinel and a live integer can coexist under different actor permutations. The compiled tier
-reuses permutation plans and orbit fingerprinting on the projected tuple's encoding. Unsupported
-projected shapes, value-store shapes and escape mode use the interpreter's by-value key; actions
-can still execute as compiled code. This keeps one canonicalization policy per execution path
-without treating store handles as semantic values.
+The [composition example](../proofs/symmetry/README.md) has 811 source states, 27 after
+erasure alone and 10 with both reductions. Both execution tiers preserve concrete safety
+failures and deadlocks. Other projection kinds, unsupported hidden updates and keyed
+shapes stay uncomposed. Disabling automatic symmetry retains the erasure certificate.
+Declared user VIEW/SYMMETRY semantics retain their TLC behavior and remain excluded
+from automatic projection.
 
 ## Checking boundary
 

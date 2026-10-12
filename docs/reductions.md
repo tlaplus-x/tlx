@@ -116,8 +116,8 @@ mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, 
 unchanged except for that line. A group is not applied when the specification has a declared
 `SYMMETRY`, a `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis — each
 reason is reported under `-stats`. Connected certificate coverage further excludes
-constraints, action/initial properties, aliases, unsupported key operations and
-projection composition. Mandatory Lean is written before exploration; it is not
+constraints, action/initial properties, aliases and unsupported key operations.
+Only certified unobserved-variable erasure can compose with an automatic keyed group. Mandatory Lean is written before exploration; it is not
 verified automatically. `-noautosymmetry` turns the whole reduction off.
 
 `-checksymmetry` is the separate declared-symmetry diagnostic: it looks for a genuine violation of a

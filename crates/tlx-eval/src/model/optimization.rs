@@ -75,7 +75,8 @@ impl InterpModel {
     pub fn symmetry_certificate(&self, keys: &[String]) -> Option<String> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
-            || self.has_view()
+            || (self.has_view() && !self.state_projection)
+            || self.ordered_projection.is_some()
             || !self.symmetry.is_empty()
             || cfg.symmetry.is_some()
             || !self.possible.is_empty()
@@ -93,7 +94,19 @@ impl InterpModel {
             return None;
         }
         let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
-        tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, keys)
+        if self.state_projection {
+            tlx_sema::optimize::symmetry_projection_certificate(
+                &self.ip.prog,
+                cfg,
+                &self.init,
+                &next,
+                &self.invariants,
+                keys,
+                self.view.as_ref()?,
+            )
+        } else {
+            tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, keys)
+        }
     }
 
     /// Retain the proof of the automatic group actually installed by the caller.
@@ -116,6 +129,11 @@ impl InterpModel {
         } else {
             Ok(self.ip.eval(view, &Env::default(), &Ctx::state(values, level))?.normalize()?)
         }
+    }
+
+    /// An automatically certified projection, distinct from a declared VIEW.
+    pub fn has_automatic_projection(&self) -> bool {
+        self.state_projection
     }
 
     pub fn has_projected_symmetry(&self) -> bool {

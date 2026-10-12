@@ -23,7 +23,9 @@ pub(crate) fn emit(model: &InterpModel, applied: Option<(&str, &[String])>) -> R
         out::error(code::GENERAL, &format!("Cannot write mandatory optimization Lean output: {e}"));
         std::process::ExitCode::from(2)
     })?;
-    let coverage = if model.projection_certificate().is_some() && model.ordered_projection().is_some() {
+    let coverage = if model.has_projected_symmetry() && model.projection_certificate().is_some() {
+        "parametric erasure/keyed-symmetry composition certificate; lowering, group closure and runtime remain trusted"
+    } else if model.projection_certificate().is_some() && model.ordered_projection().is_some() {
         "parametric ordered-allocation rule-IR certificate; lowering and runtime remain trusted"
     } else if rule == Some("unobserved-state-projection") && model.projection_certificate().is_some() {
         "parametric unobserved-state rule-IR certificate; lowering and runtime remain trusted"

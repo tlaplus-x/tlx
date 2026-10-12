@@ -117,7 +117,11 @@ certificate with successor lifting from every representative. Candidate shape
 analysis cannot authorize application alone: `autosym` requires this certificate
 before installing one full group and emits Lean before the search. Source lowering,
 domains, semantic leaves, permutation closure and runtime canonicalization remain
-trusted. Other symmetry shapes and composition with projection stay gated.
+trusted. `keyed/erasure.rs` additionally connects the actual installed retained-variable
+tuple to explicit hidden literal/copy/frame transfers. `ErasedKeyedCertificate.lean`
+shares branch choices with the keyed operations, proves erasure, and composes that
+certificate with the orbit certificate for the same intermediate system. Runtime
+canonicalization applies after erasure. Other projection/symmetry combinations stay gated.
 
 `phase/erasure.rs` emits each hidden variable's literal assignment or old-state copy,
 including copy cycles. Guards, retained updates and observations are interpreted over
@@ -395,7 +399,7 @@ fully typed, and the census with its histograms is [native-coverage.md](native-c
 
 - **Backend.** The default is the encoded-state compiled tier (`-compile`; `tlx_compile::enc::check`, at most 16 recompilations); with no possible native code, no JIT and no C compiler it falls back to the interpreter (logged). `-interp` selects the interpreter (`InterpModel`), the reference implementation of TLC semantics. Executor tiering is §6.6; the degraded enumeration semantics are cross-checked state by state by `TLX_PARANOID` (§6.5.5). The CLI completes reports, liveness and simulation for both models through the `Tier` trait.
 - **Compatibility.** Independent of the backend, `-tlc` asks for TLC-identical results (tiers 1 and 2, [compat.md](compat.md) section 0); the default mode is sound and may use optimizations TLC lacks (counts, depth and counterexample may then differ).
-- **Automatic symmetry (default mode).** `tlx_cli::autosym::run` analyzes candidate groups, but application is gated off until a connected Lean certificate is available. Suggestions and the bounded `-checksymmetry` diagnostic remain available; explicit `SYMMETRY` is unchanged. See [usage.md](usage.md) sections 6.2–6.3 and the candidate analysis in [reductions.md](reductions.md).
+- **Automatic symmetry (default mode).** `tlx_cli::autosym::run` analyzes candidate groups, but application requires a connected Lean certificate for fixed-domain keyed maps, optionally composed with certified variable erasure. Suggestions and the bounded `-checksymmetry` diagnostic remain available; explicit `SYMMETRY` is unchanged. See [usage.md](usage.md) sections 6.2–6.3 and the candidate analysis in [reductions.md](reductions.md).
 - **`-simulate` / `-generate`**: random simulation (§7.5), combinable with `-compile`.
 - **`-dump`**: write all reachable states. Under `-compile` the search may restart, so a dedicated second search writes the file.
 

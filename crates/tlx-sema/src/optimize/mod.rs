@@ -12,7 +12,7 @@ mod projection;
 pub use lean::projection_lean;
 pub use phase::{
     age_projection, history_projection, ordered_projection, phase_projection, sequence_length_projection, symmetry_certificate,
-    unobserved_projection, FieldProjection, OrderedHistory, OrderedPlan, OrderedShape,
+    symmetry_projection_certificate, unobserved_projection, FieldProjection, OrderedHistory, OrderedPlan, OrderedShape,
 };
 pub use projection::unobserved_variables;
 mod certify;

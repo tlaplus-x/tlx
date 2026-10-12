@@ -14,7 +14,7 @@ mod sequence;
 pub use age::age_projection;
 pub use erasure::unobserved_projection;
 pub use history::history_projection;
-pub use keyed::symmetry_certificate;
+pub use keyed::{symmetry_certificate, symmetry_projection_certificate};
 pub use ordered::{ordered_projection, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::sequence_length_projection;
 

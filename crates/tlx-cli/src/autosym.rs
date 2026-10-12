@@ -57,10 +57,10 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         }
         return Ok(None);
     }
-    // Keep explicitly requested projection priority until composition has its
-    // own certificate. Automatic symmetry must not preempt an enabled pass.
+    // Projection keeps priority. A group can join it only when a connected
+    // certificate proves their composition for the exact installed projection.
     let projection = a.optimize.then(|| model.project_state()).flatten();
-    let applied = if projection.is_some() { None } else { apply(model, &mut an, a.noautosymmetry)? };
+    let applied = apply(model, &mut an, a.noautosymmetry)?;
     if let Some((rule, omitted)) = projection {
         crate::proofs::emit(model, Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
@@ -82,7 +82,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
             .map(|g| {
                 format!(
                     r#"{{"name":"symmetry","scope":"safety","proof":"{}","preserved":["V-safe","CEX"],"detail":{}}},"#,
-                    if applied.is_some() { "static" } else { "none" },
+                    if applied.is_some() { "generated-lean" } else { "none" },
                     json_string(g)
                 )
             })
@@ -256,7 +256,7 @@ fn not_applicable(model: &InterpModel, an: &Analysis) -> Option<String> {
     if !model.symmetry_maps().is_empty() || model.ip.cfg.symmetry.is_some() {
         return Some("the cfg declares a SYMMETRY".into());
     }
-    if model.has_view() {
+    if model.has_view() && !model.has_automatic_projection() {
         return Some("the cfg has a VIEW".into());
     }
     if !model.live.is_empty() {

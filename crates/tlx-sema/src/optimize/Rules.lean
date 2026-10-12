@@ -24,6 +24,29 @@ structure Certificate {S A : Type}
     ∃ t, before.next s t ∧ project t = a
   observe : ∀ s, before.safe s ↔ after.safe (project s)
 
+theorem compose {S A T : Type} {b : System S} {a : System A} {t : System T}
+    {p : S → A} {q : A → T} (first : Certificate b a p) (second : Certificate a t q) :
+    Certificate b t (fun s => q (p s)) := by
+  constructor
+  · intro y
+    constructor
+    · intro hy
+      obtain ⟨x, hx, he⟩ := (second.initial y).mp hy
+      obtain ⟨s, hs, hp⟩ := (first.initial x).mp hx
+      exact ⟨s, hs, (congrArg q hp).trans he⟩
+    · rintro ⟨s, hs, rfl⟩
+      exact (second.initial _).mpr ⟨p s, (first.initial _).mpr ⟨s, hs, rfl⟩, rfl⟩
+  · intro s y
+    constructor
+    · intro hy
+      obtain ⟨x, hx, he⟩ := (second.next (p s) y).mp hy
+      obtain ⟨u, hu, hp⟩ := (first.next s x).mp hx
+      exact ⟨u, hu, (congrArg q hp).trans he⟩
+    · rintro ⟨u, hu, rfl⟩
+      exact (second.next _ _).mpr ⟨p u, (first.next _ _).mpr ⟨u, hu, rfl⟩, rfl⟩
+  · intro s
+    exact (first.observe s).trans (second.observe (p s))
+
 theorem reachable_forward {S A : Type} {b : System S} {a : System A}
     {p : S → A} (c : Certificate b a p) {s} (h : Reachable b s) :
     Reachable a (p s) := by

@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedNested", "GeneratedLive")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedNested", "GeneratedLive", "GeneratedErasedSymmetry")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -54,8 +54,10 @@ def verify(lean, path, negative):
     ):
         axioms[name] = []
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
-    if namespace == "GeneratedSymmetry":
+    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry"}:
         theorems |= {"orbit_key_equivalent"}
+    if namespace == "GeneratedErasedSymmetry":
+        theorems |= {"erasure_certificate"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
         theorems |= {"select_concrete", "select_reduced"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
@@ -127,7 +129,7 @@ def verify(lean, path, negative):
                 ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
                 ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
-            ] if namespace == "GeneratedSymmetry" else [
+            ] if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry"} else [
                 ("slots := fun i => ((transfers i).eval layout s).eval layout s", "slots := fun _ => 0", "discarded nested slot transfers"),
                 ("(∀ i, sentinel (read layout s i) = sentinel (read layout t i))", "True", "forgot exact nonpositive sentinels"),
                 ("next a b := ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "next a b := False ∧ ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "discarded quotient successors"),
@@ -147,6 +149,8 @@ def verify(lean, path, negative):
                 ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
                 ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
             ])
+        if namespace == "GeneratedErasedSymmetry":
+            changes.append(("t.2 = m.hiddenUpdate b s.1 w keys s.2", "False ∧ t.2 = m.hiddenUpdate b s.1 w keys s.2", "removed concrete hidden successors"))
         if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
             changes.extend([
                 ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),

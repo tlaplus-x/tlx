@@ -1,5 +1,6 @@
 //! Full symmetry of fixed-domain maps with key-free payloads.
 //! Key operations are explicit rule IR; leaves never receive renamed keys.
+mod erasure;
 mod expressions;
 mod output;
 
@@ -23,6 +24,40 @@ pub fn symmetry_certificate(
     observations: &[Expr],
     keys: &[String],
 ) -> Option<String> {
+    emit(program, cfg, init, next, observations, keys, vec![])
+}
+
+/// Certify erasure followed by symmetry for the exact installed variable tuple.
+pub fn symmetry_projection_certificate(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    observations: &[Expr],
+    keys: &[String],
+    view: &Expr,
+) -> Option<String> {
+    let ExprKind::Tuple(values) = &*view.kind else { return None };
+    let retained = values.iter().map(|e| variable(e, false)).collect::<Option<Vec<_>>>()?;
+    if retained.windows(2).any(|pair| pair[0].0 >= pair[1].0) || retained.iter().any(|v| v.idx() >= program.vars.len()) {
+        return None;
+    }
+    let omitted: Vec<_> = (0..program.vars.len()).map(|i| VarId(i as u32)).filter(|v| !retained.contains(v)).collect();
+    if omitted.is_empty() {
+        return None;
+    }
+    emit(program, cfg, init, next, observations, keys, omitted)
+}
+
+fn emit(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    observations: &[Expr],
+    keys: &[String],
+    omitted: Vec<VarId>,
+) -> Option<String> {
     if !(2..=6).contains(&keys.len()) {
         return None;
     }
@@ -34,6 +69,9 @@ pub fn symmetry_certificate(
     let domains = Domains::infer(program, cfg, &branches(&initial)?, &steps)?;
     let mut maps = vec![];
     for (i, d) in domains.vars.iter().enumerate() {
+        if omitted.contains(&VarId(i as u32)) {
+            continue;
+        }
         if let Domain::Function(ks, payload) = d {
             if *ks == keys && independent(payload, &keys) && comparable(payload) {
                 maps.push(VarId(i as u32));
@@ -47,7 +85,7 @@ pub fn symmetry_certificate(
     if maps.is_empty() || steps.is_empty() {
         return None;
     }
-    let mut e = Emitter { domains: &domains, keys: &keys, maps, atoms: vec![] };
+    let mut e = Emitter { domains: &domains, keys: &keys, maps, omitted, atoms: vec![] };
     let cases = steps.iter().map(|b| e.case(b)).collect::<Option<Vec<_>>>()?;
     let observation = e.tests(&observations, &[])?;
     Some(e.output(&initial, &cases, &observation))
@@ -57,9 +95,11 @@ struct Emitter<'a> {
     domains: &'a Domains,
     keys: &'a BTreeSet<Atom>,
     maps: Vec<VarId>,
+    omitted: Vec<VarId>,
     atoms: Vec<String>,
 }
 struct Case {
+    hidden: Vec<String>,
     guard: String,
     writes: Vec<String>,
     keys: Vec<LocalId>,
@@ -93,6 +133,7 @@ fn comparable(d: &Domain) -> bool {
 
 impl Emitter<'_> {
     fn case(&mut self, b: &Branch) -> Option<Case> {
+        let hidden = self.hidden_updates(b)?;
         let locals = self.domains.locals(&b.bounds);
         let mut keys = vec![];
         let mut guards = vec![];
@@ -145,7 +186,7 @@ impl Emitter<'_> {
             writes.push(format!("⟨⟨{slot}, by decide⟩, {}, {value}⟩", actor?));
         }
         for term in &b.terms {
-            if matches!(&*term.kind, ExprKind::Builtin { op: B::Eq, args } if args.len()==2 && variable(&args[0],true).is_some_and(|v| self.maps.contains(&v)))
+            if matches!(&*term.kind, ExprKind::Builtin { op: B::Eq, args } if args.len()==2 && variable(&args[0],true).is_some_and(|v| self.maps.contains(&v) || self.omitted.contains(&v)))
             {
                 continue;
             }
@@ -157,13 +198,13 @@ impl Emitter<'_> {
             };
             guards.push(term);
         }
-        Some(Case { guard: self.tests(&guards, &keys)?, writes, keys })
+        Some(Case { hidden, guard: self.tests(&guards, &keys)?, writes, keys })
     }
 
     fn frames(&self, e: &Expr) -> Option<Expr> {
         Some(Expr::new(
             match &*e.kind {
-                ExprKind::Var(v) if self.maps.contains(v) => ExprKind::Tuple(vec![]),
+                ExprKind::Var(v) if self.maps.contains(v) || self.omitted.contains(v) => ExprKind::Tuple(vec![]),
                 ExprKind::Var(_) => return Some(e.clone()),
                 ExprKind::Tuple(es) => ExprKind::Tuple(es.iter().map(|e| self.frames(e)).collect::<Option<_>>()?),
                 _ => return None,

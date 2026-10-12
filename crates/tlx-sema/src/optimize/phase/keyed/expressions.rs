@@ -119,7 +119,7 @@ impl Emitter<'_> {
             }
         }
         match &*e.kind {
-            ExprKind::Var(v) if self.maps.contains(v) => return None,
+            ExprKind::Var(v) if self.maps.contains(v) || self.omitted.contains(v) => return None,
             ExprKind::Local(id) if keys.contains(id) => return None,
             ExprKind::Const(_) if !independent(&self.domains.value(e, &Locals::new()), self.keys) => return None,
             ExprKind::Builtin { op: B::Prime, .. } if mentions_map(e, &self.maps) => return None,
