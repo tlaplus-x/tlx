@@ -17,6 +17,8 @@ theorem counterexample_lifts {a} (ha : Reachable (after sem) a) (bad : ¬ (after
 theorem deadlock_preserved (s : State C Key) :
 (¬ ∃ t, (before sem).next s t) ↔ (¬ ∃ a, (after sem).next (project sem s) a) :=
 (model sem).deadlock_preserved s
+#print axioms TlxOptimization.AgeRule.Test.select_concrete
+#print axioms TlxOptimization.AgeRule.Test.select_reduced
 #print axioms certificate
 #print axioms optimization_correct
 #print axioms specification_correct

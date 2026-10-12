@@ -2,6 +2,8 @@
 //! retained payloads and field presence, never absolute time or timestamp ages.
 use std::fmt::Write;
 
+mod filters;
+
 use super::{binding, clock_transfer, variable, Atom, Branch, Domain, Proof};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 
@@ -16,7 +18,7 @@ pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], obse
     if slots.is_empty() || slots.len() > 256 {
         return None;
     }
-    let mut e = Emitter { proof, slots, atoms: vec![], remaining: 100_000 };
+    let mut e = Emitter { proof, slots, atoms: vec![], scope: vec![], remaining: 100_000 };
     let initial = initial.iter().map(|b| e.branch(b, false)).collect::<Option<Vec<_>>>()?;
     let steps = steps.iter().map(|b| e.branch(b, true)).collect::<Option<Vec<_>>>()?;
     let observations = observations.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
@@ -27,7 +29,7 @@ pub(super) fn emit(proof: &Proof<'_>, initial: &[Branch], steps: &[Branch], obse
         writeln!(out, "  | {k} => {}", proof.stamps[*i].cap).unwrap();
         e.atoms.push(format!("slot {k}: map {:?}, field {:?}, key {key:#?}", proof.stamps[*i].var, proof.stamps[*i].field));
     }
-    out.push_str("  | _ => 0\n\n-- C retains payloads with timestamp fields removed; p retains their presence.\n-- W supplies branch-local choices. HIR leaf interpretation/lowering is trusted.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → (Key → Bool) → W → Prop\n  observe : Nat → C → (Key → Bool) → Prop\n");
+    out.push_str("  | _ => 0\n\n-- C retains payloads with timestamp fields removed; p retains their presence.\n-- W supplies branch-local choices. HIR leaf interpretation/lowering is trusted.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → (Key → Bool) → W → Prop\n  observe : Nat → C → (Key → Bool) → Prop\n  filterTest : Nat → C → C → (Key → Bool) → W → List (List Nat) → Prop\n  filterObserve : Nat → C → (Key → Bool) → List (List Nat) → Prop\n");
     for (i, atom) in e.atoms.iter().enumerate() {
         writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
     }
@@ -80,6 +82,7 @@ struct Emitter<'a, 'd> {
     proof: &'a Proof<'d>,
     slots: Vec<(usize, Atom)>,
     atoms: Vec<String>,
+    scope: Vec<(LocalId, Atom)>,
     remaining: usize,
 }
 impl Emitter<'_, '_> {
@@ -127,7 +130,11 @@ impl Emitter<'_, '_> {
             return None;
         }
         let id = self.atoms.len();
-        self.atoms.push(format!("{} {e:#?}", if payload { "Retained-payload equation:" } else { "Independent predicate:" }));
+        self.atoms.push(format!(
+            "{} {e:#?}\nBound atoms: {:?}",
+            if payload { "Retained-payload equation:" } else { "Independent predicate:" },
+            self.scope
+        ));
         Some(if observation { format!("sem.observe {id} c p") } else { format!("sem.test {id} c d p choice.2") })
     }
 
@@ -139,7 +146,7 @@ impl Emitter<'_, '_> {
             return None;
         }
         let id = self.atoms.len();
-        self.atoms.push(format!("Slot equality: index {index:#?} = configured atom {:?}", self.slots[k].1));
+        self.atoms.push(format!("Slot equality: index {index:#?} = configured atom {:?}\nBound atoms: {:?}", self.slots[k].1, self.scope));
         Some(if observation { format!("sem.observe {id} c p") } else { format!("sem.test {id} c d p choice.2") })
     }
 
@@ -305,6 +312,7 @@ impl Emitter<'_, '_> {
             return Some(format!("(Test.pure ({}))", self.atom(e, observation, false)?));
         }
         let result = match &*e.kind {
+            ExprKind::Quant { .. } => return self.quantified(e, observation),
             ExprKind::And(es) | ExprKind::Or(es) => {
                 let and = matches!(&*e.kind, ExprKind::And(_));
                 fold(
@@ -330,10 +338,12 @@ impl Emitter<'_, '_> {
                 {
                     "(Test.pure True)".into()
                 }
-                (B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge, [a, b]) => self.comparison(*op, a, b, observation)?,
-                _ => return None,
+                (B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge, [a, b]) => {
+                    return self.comparison(*op, a, b, observation).or_else(|| self.filtered_consumer(e, observation));
+                }
+                _ => return self.filtered_consumer(e, observation),
             },
-            _ => return None,
+            _ => return self.filtered_consumer(e, observation),
         };
         Some(result)
     }

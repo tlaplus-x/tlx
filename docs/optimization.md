@@ -43,7 +43,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
 | Phase-dependent fields | Missing | Candidate analysis only |
 | Sequence length | Missing | Candidate analysis only |
-| Relative ages | Fixed-domain timestamp maps, explicit keep/reset/erase transfers and threshold tests | Enabled within this subset |
+| Relative ages | Fixed-domain timestamp maps, keep/reset/erase transfers, threshold tests, finite filters and quantifiers | Enabled within this subset |
 | Combined age/history | Missing | Refused; other components stay concrete |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
 | Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
@@ -286,7 +286,7 @@ implemented below; the remaining rows are candidates, not completed model-checki
 
 | Candidate | External motivation | Required proof and remaining blockers |
 |---|---|---|
-| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Capped ages have a connected certificate, but the cleaner stores an age-filtered set in retained state, outside the current certificate subset. Age/history composition also remains uncertified. |
+| Capped relative ages | Pragmatic Formal Modeling's `storage-cleaner-improved/storagecleanerimproved.tla` stores creation times, increments a global clock, and tests `created + 2 <= time`. | Capped ages and finite age-filtered retained sets have connected certificates. The cleaner still retains an unbounded operation history; age/history composition remains uncertified. |
 | Finite tables of history witnesses | The business-logic models ask whether a particular user has a prior subscription or trial event. | Summarize existential queries for every value in a proved finite parameter domain. Current prefix monitors reject free state and local parameters. These models additionally observe exact event counts, month numbers and billing indices, so this rule alone would not bound them. |
 | Relative ticket order | The Bakery/Boulangerie models use unbounded tickets in mutual-exclusion comparisons. | Order ranks suffice for resets, copies and a globally fresh maximum ticket, but arbitrary choices from `Nat`, local `max + 1`, and successor-equality observations need more information. A rank-only key is not justified for these full models. |
 
@@ -317,8 +317,17 @@ unknown transfers and ambiguous bindings refuse the candidate. Resets to a fixed
 after initialization are currently unsupported. Certificate generation additionally requires
 age-independent map indices, payload updates and conditional map-transfer tests. Retained
 Boolean guards and invariant observations can combine deadline tests with independent predicates.
-Timestamp comparisons under unsupported consumers or quantifiers refuse the certificate.
-The current certificate emitter expands at most 256 fixed map slots.
+Finite filters over configured constant sets can feed retained-state assignments, record
+updates, set operations, and invariant observations. Single-variable universal and existential
+quantifiers over such domains are also supported, including nested constant-domain binders.
+The emitter instantiates each filter predicate with its bound source atom and proves that
+`Test.select` supplies exactly the selected positions. The consumer receives exact sets;
+it cannot inspect forgotten timestamps. Multiple filters use distinct placeholders.
+
+Dynamic filter domains, dependent binders that have not been expanded, and age-dependent
+updates to timestamp-map payloads still refuse the certificate. The current emitter expands
+at most 256 fixed map slots and 256 filter positions per consumer, with a shared generation
+budget. Unknown uses and budget exhaustion leave checking unreduced.
 
 `phase/age/lean.rs` emits the map slots and caps, zero-time initialization, tick amounts,
 per-slot keep/reset/erase changes, deadline predicates, retained payload equations and
@@ -343,8 +352,8 @@ an independently unbounded history can still make the full graph infinite.
 The [relative-age example](../proofs/age/README.md) includes reproducible unbounded and
 finite-budget configurations and explicit Lean verification commands.
 
-The cleaner’s age-filtered retained set currently prevents an age certificate; standalone
-history reduction can still apply, leaving its clock unbounded. Earlier experiments reported 820 distinct and 3,083 generated states using a
+The cleaner’s age-filtered retained set is now covered by the age certificate, but its
+operation history stays concrete and unbounded. Earlier experiments reported 820 distinct and 3,083 generated states using a
 combined age/history key. Those are historical diagnostic results, not current enabled
 behavior. The original cleaner also has a genuine `ConsistentReads` violation. Neither
 its full safety nor its finite state count follows from the standalone age certificate.
@@ -779,7 +788,9 @@ python3 proofs/check_generated.py --lean /path/to/lean --negative /path/to/Optim
 The optional negative checks require Lean to reject both forgetting prior failed prefix
 obligations and changing the reduced safety observation. For erasure it rejects removing reduced successors. For ordered allocation it also
 rejects forgetting the initial anchor and failing to advance the reduced phase. Relative-age
-checks reject incorrect ticks, resets, deletion, deadline strictness and reduced observations.
+checks reject incorrect ticks, resets, deletion, deadline strictness, reduced observations,
+inverted filter decisions and incorrect selected-key membership. Filter certificates also
+audit the concrete and reduced selection lemmas.
 This script is never invoked
 by checking or by the ordinary Rust tests. It needs only Lean 4 (tested with 4.34.1),
 not Mathlib or a network connection.

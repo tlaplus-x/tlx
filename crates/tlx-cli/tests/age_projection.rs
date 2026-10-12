@@ -169,3 +169,57 @@ fn timestamp_field_reset_preserves_absent_fields() {
         assert!(generated.contains("(Change.refresh"));
     }
 }
+
+#[test]
+fn filtered_sets_and_quantified_deadlines_finish_in_every_executor() {
+    let spec = include_str!("../../../proofs/age/FilteredAge.tla");
+    let cfg = include_str!("../../../proofs/age/FilteredAge.cfg");
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let dir = tlx_testkit::TempDir::with_spec("age-filter", spec, cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("FilteredAge.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("8 distinct states found"), "{tier}: {}", run.text());
+        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let proof = std::fs::read_to_string(path).unwrap();
+        let generated = proof.split("namespace TlxOptimization.GeneratedAge").nth(1).unwrap();
+        assert!(generated.contains("Test.select [0]"));
+        assert!(generated.contains("sem.filterTest"));
+    }
+}
+
+#[test]
+fn filtered_consumers_preserve_set_operations_and_counterexamples() {
+    let base = include_str!("../../../proofs/age/FilteredAge.tla");
+    let cfg = include_str!("../../../proofs/age/FilteredAge.cfg");
+    let filter = r#"{k \in {1}: records[k] # Empty /\ records[k].created + 2 <= clock}"#;
+    for (spec, config, code) in [
+        (base.replace(filter, &format!("({filter} \\cup {filter})")), cfg.to_owned(), 0),
+        (base.replace("\\A k", "\\E k"), cfg.to_owned(), 0),
+        (base.replace("====", &format!("Computed == {filter} \\subseteq {{1}}\n====")), format!("{cfg}INVARIANT Computed\n"), 0),
+        (base.replace("====", "Safe == selected = {}\n===="), format!("{cfg}INVARIANT Safe\n"), 12),
+        (base.replace("records[k] # Empty /\\ ", ""), cfg.to_owned(), 75),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec("age-filter-consumer", &spec, &config);
+        let run = tlx_testkit::tlx_default!()
+            .check("FilteredAge.tla")
+            .args(["-interp", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, code, "{}", run.text());
+        assert!(run.stdout.contains("relative-age-projection"), "{}", run.text());
+        if code == 12 {
+            assert!(run.stdout.contains("Invariant Safe is violated"), "{}", run.text());
+            assert!(run.stdout.contains("clock = 2"), "{}", run.text());
+            assert!(run.stdout.contains("created |-> 0"), "{}", run.text());
+        }
+    }
+}

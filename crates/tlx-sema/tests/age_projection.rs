@@ -99,3 +99,15 @@ fn certificate_rejects_age_dependent_payloads_and_map_conditions() {
         assert!(projection(&body).is_empty(), "{body}");
     }
 }
+
+#[test]
+fn finite_filters_and_quantifiers_are_certified_but_dynamic_domains_are_not() {
+    let spec = include_str!("../../../proofs/age/FilteredAge.tla");
+    let body = spec.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
+    let body = format!("VARIABLE{body}");
+    assert!(!projection(&body).is_empty());
+    let dynamic = body.replace("k \\in {1}: records[k] # Empty", "k \\in selected: records[k] # Empty");
+    assert!(projection(&dynamic).is_empty());
+    let observed = body.replace("Inv ==", "Inv == (\\A k \\in {1}: records[k] = Empty \\/ records[k].created <= clock) /\\");
+    assert!(!projection(&observed).is_empty());
+}

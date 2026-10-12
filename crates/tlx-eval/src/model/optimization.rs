@@ -140,7 +140,7 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
 
     #[test]
     #[ignore = "requires the local external pragmatic corpus; analysis only"]
-    fn external_cleaner_age_dependent_filter_remains_uncertified() {
+    fn external_cleaner_age_filter_has_a_connected_certificate() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../third_party/external/pragmatic/database-blob/storage-cleaner-improved/storagecleanerimproved.tla");
         let cfg = "SPECIFICATION Spec\nCONSTANTS SERVERS = {s1} CLEANERS = {c1}\n\
@@ -148,9 +148,9 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
         let ip = Interp::new(Program::load(&path, &[]).unwrap(), tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
         let mut model = InterpModel::new(ip).unwrap();
         // CleanerStartGetBlobKeys stores a set filtered by timestamp age.
-        // That retained update is outside the current relative-age Test IR.
-        let (rule, _) = model.project_state().expect("certified history fallback");
-        assert_eq!(rule, "history-summary-projection");
-        assert!(model.projection_certificate().unwrap().contains("GeneratedHistory"));
+        // Its predicate and selected keys are explicit in the certificate.
+        let (rule, _) = model.project_state().expect("certified relative-age filtering");
+        assert_eq!(rule, "relative-age-projection");
+        assert!(model.projection_certificate().unwrap().contains("Test.select"));
     }
 }

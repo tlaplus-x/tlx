@@ -39,8 +39,9 @@ def verify(lean, path, negative):
     if result.returncode:
         raise RuntimeError(f"{path}: Lean failed:\n{result.stdout}")
     axioms = {}
+    scope = rf"(?:{namespace}|AgeRule\.Test)" if namespace == "GeneratedAge" else namespace
     for name, values in re.findall(
-        rf"'TlxOptimization\.{namespace}\.(\w+)' depends on axioms: \[([^]]*)\]",
+        rf"'TlxOptimization\.{scope}\.(\w+)' depends on axioms: \[([^]]*)\]",
         result.stdout,
     ):
         actual = {v.strip() for v in values.split(",") if v.strip()}
@@ -48,11 +49,13 @@ def verify(lean, path, negative):
             raise RuntimeError(f"{path}: unexpected axioms for {name}: {actual}")
         axioms[name] = sorted(actual)
     for name in re.findall(
-        rf"'TlxOptimization\.{namespace}\.(\w+)' does not depend on any axioms",
+        rf"'TlxOptimization\.{scope}\.(\w+)' does not depend on any axioms",
         result.stdout,
     ):
         axioms[name] = []
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace == "GeneratedOrdered" else set())
+    if namespace == "GeneratedAge" and "def Test.select" in source:
+        theorems |= {"select_concrete", "select_reduced"}
     if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
     mutations = []
@@ -70,6 +73,11 @@ def verify(lean, path, negative):
             ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
             ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
         ])
+        if namespace == "GeneratedAge" and "def Test.select" in source:
+            changes.extend([
+                ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
+                ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
+            ])
         changes.append(
             ("def after := (model sem).reduced",
              "def after := { (model sem).reduced with safe := fun _ => True }",

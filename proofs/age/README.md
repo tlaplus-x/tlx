@@ -21,16 +21,19 @@ python3 proofs/check_generated.py --lean /path/to/lean --negative /path/to/Optim
 
 The generated `GeneratedAge` namespace instantiates `AgeCertificate.lean` with
 actual map slots, caps, seeds, ticks, reset/delete updates, deadline guards and
-observations. Five theorems cover the certificate, safety, safety with stuttering,
-counterexample lifting and deadlocks. No preservation premises or custom
-correctness axioms are supplied. Negative checks break ticks, resets, deletion,
-deadline strictness and the reduced safety predicate; Lean must reject them.
+observations. Five preservation theorems cover the certificate, safety, safety
+with stuttering, counterexample lifting and deadlocks. Two selection lemmas
+connect finite filtering to its exact selected keys. No preservation premises
+or custom correctness axioms are supplied. Negative checks break ticks, resets,
+deletion, deadline strictness, filter decisions, selected keys and the reduced
+safety predicate; Lean must reject them.
 
 The proof concerns the lowered rule model. Source/HIR translation, domain and
 partial-read analysis, runtime VIEW construction and execution remain trusted.
 Payloads and timestamp presence stay exact. Semantic leaves cannot access absolute
-time or uncapped ages. Age/history composition and retained updates containing
-age-filtered sets remain outside the certified subset.
+time or uncapped ages. Finite age-filtered sets and constant-domain quantified
+deadline checks are supported. Dynamic filter domains and age/history
+composition remain outside the certified subset.
 
 `Bounded.tla` adds a retained budget of 120 transitions so both modes terminate.
 It is a finite diagnostic wrapper, not the unbounded model's configuration. Its
@@ -50,3 +53,13 @@ java -cp third_party/tla2tools.jar tlc2.TLC -workers 1 proofs/age/Bounded.tla
 Use release binaries and repeated interleaved runs for timing. Include proof
 emission in optimized timing, keep warm-ups separate, and retain raw logs. A
 finite-wrapper speedup does not establish completion of an external model.
+
+`FilteredAge.tla` additionally stores the set of expired entries and checks a
+quantified deadline observation. Its clock is unbounded; optimized checking
+completes with eight states. Generated `Test.select` terms explicitly construct
+the selected key positions before the retained update consumes them. The
+additional selection lemmas and negative tests cover this filter boundary.
+
+```sh
+./target/release/tlx check proofs/age/FilteredAge.tla -interp -optimize -noautosymmetry
+```

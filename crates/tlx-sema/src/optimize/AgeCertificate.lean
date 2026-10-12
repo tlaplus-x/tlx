@@ -58,6 +58,7 @@ inductive Test {K : Type} (caps : K → Nat) where
   | neg (p : Test caps)
   | conj (p q : Test caps)
   | disj (p q : Test caps)
+  | bind (p : Test caps) (next : Bool → Test caps)
 
 def Test.concrete {K : Type} {caps : K → Nat} (now : Nat) (h : Stamps K now) : Test caps → Prop
   | .pure p => p
@@ -65,6 +66,7 @@ def Test.concrete {K : Type} {caps : K → Nat} (now : Nat) (h : Stamps K now) :
   | .neg p => ¬ p.concrete now h
   | .conj p q => p.concrete now h ∧ q.concrete now h
   | .disj p q => p.concrete now h ∨ q.concrete now h
+  | .bind p next => ∃ b : Bool, (b = true ↔ p.concrete now h) ∧ (next b).concrete now h
 
 def Test.reduced {K : Type} {caps : K → Nat} (h : Ages K) : Test caps → Prop
   | .pure p => p
@@ -72,6 +74,7 @@ def Test.reduced {K : Type} {caps : K → Nat} (h : Ages K) : Test caps → Prop
   | .neg p => ¬ p.reduced h
   | .conj p q => p.reduced h ∧ q.reduced h
   | .disj p q => p.reduced h ∨ q.reduced h
+  | .bind p next => ∃ b : Bool, (b = true ↔ p.reduced h) ∧ (next b).reduced h
 
 theorem Test.commutes {K : Type} {caps : K → Nat} (p : Test caps) (now : Nat) (h : Stamps K now) :
     p.concrete now h ↔ p.reduced (summarize caps now h) := by
@@ -94,6 +97,38 @@ theorem Test.commutes {K : Type} {caps : K → Nat} (p : Test caps) (now : Nat) 
   | neg p ih => simp only [Test.concrete, Test.reduced, ih]
   | conj p q ih₁ ih₂ => simp only [Test.concrete, Test.reduced, ih₁, ih₂]
   | disj p q ih₁ ih₂ => simp only [Test.concrete, Test.reduced, ih₁, ih₂]
+  | bind p next ih ihNext => simp only [Test.concrete, Test.reduced, ih, ihNext]
+
+-- Explicit finite filtering. The continuation receives the selected source
+-- positions, so an arbitrary retained consumer sees the same exact set.
+def Test.select {K I : Type} {caps : K → Nat} (keys : List I)
+    (predicate : I → Test caps) (consume : List I → Test caps) : Test caps :=
+  match keys with
+  | [] => consume []
+  | k :: ks => .bind (predicate k) (fun b =>
+      Test.select ks predicate (fun selected => consume (if b then k :: selected else selected)))
+
+theorem Test.select_concrete {K I : Type} {caps : K → Nat} (keys : List I)
+    (predicate : I → Test caps) (consume : List I → Test caps) (now : Nat) (h : Stamps K now) :
+    (Test.select keys predicate consume).concrete now h ↔
+      (consume (keys.filter (fun k => @decide ((predicate k).concrete now h) (Classical.propDecidable _)))).concrete now h := by
+  induction keys generalizing consume with
+  | nil => rfl
+  | cons k ks ih =>
+    simp only [Test.select, Test.concrete, ih]
+    classical
+    by_cases hp : (predicate k).concrete now h <;> simp [hp]
+
+theorem Test.select_reduced {K I : Type} {caps : K → Nat} (keys : List I)
+    (predicate : I → Test caps) (consume : List I → Test caps) (h : Ages K) :
+    (Test.select keys predicate consume).reduced h ↔
+      (consume (keys.filter (fun k => @decide ((predicate k).reduced h) (Classical.propDecidable _)))).reduced h := by
+  induction keys generalizing consume with
+  | nil => rfl
+  | cons k ks ih =>
+    simp only [Test.select, Test.reduced, ih]
+    classical
+    by_cases hp : (predicate k).reduced h <;> simp [hp]
 
 structure State (C K : Type) where
   core : C

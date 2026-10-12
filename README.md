@@ -185,9 +185,10 @@ environment variable).
 
 Automatic state reductions require a compiler-generated Lean certificate connected to
 that application. Currently enabled rules remove unobserved variables with literal/copy
-updates, summarize supported append-only histories, cap relative timestamp ages, and
-reduce a restricted scalar allocation frontier. A history summary over a finite event domain can turn unbounded
-history into a finite state component. The [relative-age example](proofs/age/README.md)
+updates, summarize supported append-only histories, cap relative timestamp ages (including
+finite age-filtered sets), and reduce a restricted scalar allocation frontier. A history
+summary over a finite event domain can turn unbounded history into a finite state component.
+The [relative-age example](proofs/age/README.md)
 reduces an unbounded clock model to four states. Each certificate proves initialization and
 successor correspondence, observations, counterexample lifting and deadlock preservation.
 
