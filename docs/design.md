@@ -116,6 +116,19 @@ natural-number clocks and may eliminate eventual machine overflow, as permitted 
 [opt-in contract](compat.md#0-the-three-tiers); ordinary runtime arithmetic remains checked.
 `Age.lean` supplies shared algebra, not a complete model certificate;
 [optimization.md](optimization.md#relative-age-projection) describes the boundary and external evidence.
+`phase/ordered` derives allocation families from global monotone frontiers and follows
+copies through records, functions, sequences and sets. Every transfer and observation
+must preserve order and equality; local counter increments, numeric gaps and unsupported
+uses refuse the rule. For an immutable version map, it proves append-at-frontier updates
+and indexed reads, retaining versions referenced by live allocation values outside the
+map. The interpreter executes the resulting structural plan only when constructing a
+state key: collect roots, restrict the map, collect remaining IDs, then rank each family.
+Compiled transitions use the same decoded-value key path; the placeholder identity VIEW
+must never be lowered as the projection itself.
+This can bound both an ever-growing catalog and the identifiers it contains. The rule
+uses no model-specific variable, operator or field names. `Ordered.lean` supplies shared
+algebra, while generated Lean records the structural plan explicitly; neither certifies
+the provenance analysis or runtime walker. See [ordered allocation](optimization.md#ordered-allocation-and-live-versions).
 Length projection preserves exact lengths and forgets contents only after proving all uses
 compatible; it can reduce an unbounded graph without making that graph finite.
 Forward structural domains come from Init and Next;

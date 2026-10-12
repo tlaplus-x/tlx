@@ -190,7 +190,10 @@ and universal or existential prefix-predicate results. With a finite event domai
 history summary can turn an unbounded history into a finite state component. Logical clocks
 observed through deadlines can use capped ages: for `created + 2 <= clock`, retain ages
 0, 1 and 2+ instead of absolute timestamps. These rules can compose to bound both clocks
-and histories. Optimized checking permits proved reductions to eliminate eventual machine
+and histories. Allocation values observed only through order and equality can instead
+use ordered ranks. For supported immutable version maps, the compiler retains versions
+referenced by live timestamps and discards unreachable versions. This works through nested
+records, maps, sets and sequences without model-specific names. Optimized checking permits proved reductions to eliminate eventual machine
 overflow under [mathematical integer semantics](docs/compat.md#0-the-three-tiers);
 runtime arithmetic remains checked. Concrete values remain available for counterexample traces. These reductions support safety checking and are disabled in
 TLC-compatible mode. See [optimization rules and limits](docs/optimization.md).

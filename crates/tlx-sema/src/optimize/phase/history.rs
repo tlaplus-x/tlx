@@ -71,6 +71,7 @@ pub fn history_projection(program: &Program, cfg: &Config, init: &Expr, next: &E
             .map(|(j, v)| if i == j { summary.clone() } else { Expr::new(ExprKind::Var(VarId(j as u32)), v.span) })
             .collect();
         return Some(FieldProjection {
+            ordered: None,
             view: Expr::new(ExprKind::Tuple(values), span),
             fields: vec![format!("{}.history", program.vars[i].name)],
             certificate,

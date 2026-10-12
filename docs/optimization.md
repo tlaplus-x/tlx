@@ -307,6 +307,56 @@ The explicit local diagnostic test is:
 cargo test -p tlx-eval --profile test-release --lib external_cleaner_mathematical_age -j 3 -- --ignored
 ```
 
+## Ordered allocation and live versions
+
+`ordered-allocation-projection` recognizes a scalar allocation frontier initialized to a
+positive integer literal. Every transition must retain it or advance it by a proved
+nonnegative amount. Copies of its values are tracked through nested records, maps, sets
+and sequences. Each family is renamed independently by the sorted rank of its live positive
+values; zero and negative sentinels remain exact. The allocation frontier and any observed
+fixed positive anchors participate in the key. This preserves equality, order, and fresh
+allocation above all old values. It does not permit incrementing an arbitrary old ID:
+`(1, 2)` and `(1, 100)` have the same order, but incrementing the first component can
+produce equality in only one state.
+
+The analysis checks normalized Init, Next and all selected safety observations. Invariants
+are observations, never assumptions. It supports literal allocation amounts and amounts
+from finite-set cardinalities, including allocation ranges starting at the frontier. Exact
+magnitudes, subtraction of IDs, arithmetic on an old ID, cross-family comparisons and
+unknown operations prevent application. Sequence operations on maps with renamed numeric
+keys also refuse: renaming must not turn a non-sequence domain into `1..n`.
+
+An additional rule recognizes one immutable map whose initial entry is at the frontier,
+whose clock advances by one when a new entry is appended, and whose old entries never
+change. Reads must be indexed lookups or the recognized maximum-domain expression.
+The runtime retains entries at allocation values found outside the map, including the
+current frontier and fixed anchors. It then collects IDs in the retained entries and
+ranks all families. Whole-map observations, domain enumeration and history cardinality
+prevent collection. History payloads containing their own timestamp family are refused;
+transitive garbage collection is not implemented. Other maps can still be ranked without
+having entries removed.
+
+The implementation is structural and independent of field and operator names. It uses a
+bounded forward provenance fixed point, followed by a complete recheck at that fixed point.
+Uncertain transfers, missing assignments and exhausted analysis budgets refuse application.
+The executable model and concrete counterexample replay are unchanged. The structural plan
+runs at the existing VIEW fingerprint boundary and before projected symmetry canonicalization.
+A user VIEW takes precedence, liveness is excluded and `-tlc` bypasses the pass.
+
+This can make an infinite graph finite when the remaining containers have bounded size.
+It does not itself prove finite cardinality or guarantee that every model terminates.
+Mathematical integer semantics permit eliminating eventual allocation overflow; ordinary
+runtime arithmetic stays checked. The mandatory Lean output includes `Ordered.lean` algebra
+for retained lookup, order/equality and fresh allocation, plus the actual structural plan.
+It does not construct a model certificate or verify Lean automatically.
+
+The [MongoDB collection-incarnation oracle](../crates/tlx-cli/tests/fixtures/optimization_ordered/README.md)
+uses the unchanged upstream source and an unbounded configuration with its selected safety
+checks intact. The automatically derived quotient has 19,048 distinct states, matching an
+independent TLC VIEW. The fixture records pinned inputs, the mathematical argument for the
+original graph's infinity, the retained state counts and reproduction commands. This is
+correctness evidence, not a measured runtime speedup.
+
 ## Length-only sequence projection
 
 `phase/sequence.rs` shares the bounded normalizer, branch analysis and forward structural

@@ -6,10 +6,12 @@ mod domain;
 mod history;
 mod liveness;
 mod normalize;
+mod ordered;
 mod sequence;
 
 pub use age::age_projection;
 pub use history::history_projection;
+pub use ordered::{ordered_projection, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::sequence_length_projection;
 
 use tlx_front::cfg::Config;
@@ -18,12 +20,14 @@ use crate::{builtins::Builtin as B, hir::*, Program};
 
 use domain::{Domain, Domains};
 
-/// A proved state-key expression and labels for the information it forgets.
+/// A checked state-key projection and labels for the information it forgets.
 pub struct FieldProjection {
     pub view: Expr,
     pub fields: Vec<String>,
     /// Generated certificate for the supported rule IR, never implicitly verified.
     pub certificate: Option<String>,
+    /// When present, replaces the identity VIEW with a structural runtime key.
+    pub ordered: Option<OrderedPlan>,
 }
 
 /// Derive one field projection. An unknown transfer, observation, effect or

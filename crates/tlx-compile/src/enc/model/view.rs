@@ -71,6 +71,13 @@ impl View {
         settings: &Settings,
         notes: &mut Vec<String>,
     ) -> Option<View> {
+        // A structural order plan replaces its identity VIEW at the value
+        // fingerprint boundary. Lowering that placeholder would silently
+        // restore the full graph. Use the existing decoded-value path.
+        if base.ordered_projection().is_some() {
+            notes.push("view: structural order projection on decoded values".into());
+            return None;
+        }
         if base.has_projected_symmetry() && settings.escape {
             return None;
         }

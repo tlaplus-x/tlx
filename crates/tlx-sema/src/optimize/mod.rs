@@ -10,7 +10,10 @@ mod phase;
 mod projection;
 
 pub use lean::projection_lean;
-pub use phase::{age_projection, history_projection, phase_projection, sequence_length_projection, FieldProjection};
+pub use phase::{
+    age_projection, history_projection, ordered_projection, phase_projection, sequence_length_projection, FieldProjection, OrderedHistory,
+    OrderedPlan, OrderedShape,
+};
 pub use projection::unobserved_variables;
 mod constant;
 mod counter;

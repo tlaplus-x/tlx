@@ -45,6 +45,8 @@ impl InterpModel {
                     ("relative-age-projection", p)
                 } else if let Some(p) = tlx_sema::optimize::history_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
                     ("history-summary-projection", p)
+                } else if let Some(p) = tlx_sema::optimize::ordered_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                    ("ordered-allocation-projection", p)
                 } else if let Some(p) = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
                     ("phase-field-projection", p)
                 } else {
@@ -66,6 +68,7 @@ impl InterpModel {
             {
                 self.projection_certificate = projection.certificate.map(Into::into);
             }
+            self.ordered_projection = projection.ordered.map(Into::into);
             self.view = Some(projection.view);
             self.state_projection = true;
             return Some((rule, projection.fields));
@@ -87,6 +90,18 @@ impl InterpModel {
     /// The accepted pass's generated proof; generation never invokes Lean.
     pub fn projection_certificate(&self) -> Option<&str> {
         self.projection_certificate.as_deref()
+    }
+
+    pub fn ordered_projection(&self) -> Option<&tlx_sema::optimize::OrderedPlan> {
+        self.ordered_projection.as_deref()
+    }
+
+    pub(super) fn projected_value(&self, view: &Expr, values: &[Value], level: u32) -> EResult<Value> {
+        if let Some(plan) = &self.ordered_projection {
+            super::ordered::project(plan, values)
+        } else {
+            Ok(self.ip.eval(view, &Env::default(), &Ctx::state(values, level))?.normalize()?)
+        }
     }
 
     pub fn has_projected_symmetry(&self) -> bool {

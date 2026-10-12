@@ -302,6 +302,7 @@ impl Proof<'_> {
             });
         }
         FieldProjection {
+            ordered: None,
             view: make(ExprKind::Tuple(values)),
             fields: self
                 .stamps

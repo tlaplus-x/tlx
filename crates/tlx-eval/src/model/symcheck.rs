@@ -216,9 +216,9 @@ fn state_difference(m: &InterpModel, s: &State, ps: &State, p: &symmetry::FastPe
         }
     }
     if let Some(v) = &m.view {
-        let view = eval(v, s)?;
+        let view = m.projected_value(v, &s.vals, s.level).map_err(|e| m.error(e))?;
         let image = p.apply(&view).map_err(|e| ModelError::new(e.to_string()))?.unwrap_or(view);
-        if image != eval(v, ps)? {
+        if image != m.projected_value(v, &ps.vals, ps.level).map_err(|e| m.error(e))? {
             return Ok(Some("VIEW does not commute with the permutation: V(p(s)) != p(V(s))".into()));
         }
     }

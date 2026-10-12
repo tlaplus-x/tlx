@@ -14,6 +14,7 @@ pub mod autosym;
 mod checkpoint;
 pub mod liveness;
 mod optimization;
+mod ordered;
 mod print_order;
 mod report;
 mod runtime_adapter;
@@ -152,6 +153,7 @@ pub struct InterpModel {
     view: Option<Expr>,
     /// A proved state projection is canonicalized before symmetry.
     state_projection: bool,
+    ordered_projection: Option<Arc<tlx_sema::optimize::OrderedPlan>>,
     /// Optional Lean certificate emitted with the accepted projection.
     projection_certificate: Option<Arc<str>>,
     /// ALIAS: error-trace states are displayed as this record.
@@ -511,6 +513,7 @@ impl InterpModel {
             fp_mode: if reduce { FpMode::Reduced } else { FpMode::Plain },
             view,
             state_projection: false,
+            ordered_projection: None,
             projection_certificate: None,
             alias,
             postconditions,
@@ -888,13 +891,13 @@ impl InterpModel {
         let plain = self.fp_mode == FpMode::Plain;
         if let (Some(v), false) = (&self.view, plain) {
             if self.has_projected_symmetry() {
-                let projected = self.ip.eval(v, &Env::default(), &Ctx::state(vals, level))?.normalize()?;
+                let projected = self.projected_value(v, vals, level)?;
                 let canonical = self.projected_orbit(projected)?;
                 return Ok((tlx_value::fingerprint::fingerprint(&canonical)?, None));
             }
             let least = self.least_in_orbit(vals)?;
             let state: &[Value] = least.as_deref().unwrap_or(vals);
-            let viewed = self.ip.eval(v, &Env::default(), &Ctx::state(state, level))?.normalize()?;
+            let viewed = self.projected_value(v, state, level)?;
             return Ok((tlx_value::fingerprint::fingerprint(&viewed)?, None));
         }
         let fps = self.var_fps(vals, base)?;

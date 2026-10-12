@@ -58,7 +58,11 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     if let Some((rule, omitted)) = project.then(|| model.project_state()).flatten() {
         crate::proofs::emit(model, Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
-        let arithmetic = if rule == "relative-age-projection" { "; mathematical clock arithmetic" } else { "" };
+        let arithmetic = match rule {
+            "relative-age-projection" => "; mathematical clock arithmetic",
+            "ordered-allocation-projection" => "; mathematical allocation arithmetic",
+            _ => "",
+        };
         let group = applied.as_ref().map(|s| s.group.as_str()).or(model.ip.cfg.symmetry.as_deref());
         let combined = group.map(|g| format!(", composed with symmetry {g}")).unwrap_or_default();
         out::info(

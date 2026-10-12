@@ -10,8 +10,15 @@ use crate::out::{self, code};
 
 pub(crate) fn emit(model: &InterpModel, applied: Option<(&str, &[String])>) -> Result<(), std::process::ExitCode> {
     let (rule, fields) = applied.map_or((None, &[][..]), |(rule, fields)| (Some(rule), fields));
-    let contents =
-        tlx_sema::optimize::projection_lean(&model.ip.prog, &model.ip.cfg, rule, fields, model.view_expr(), model.projection_certificate());
+    let contents = tlx_sema::optimize::projection_lean(
+        &model.ip.prog,
+        &model.ip.cfg,
+        rule,
+        fields,
+        model.view_expr(),
+        model.projection_certificate(),
+        model.ordered_projection(),
+    );
     let path = write(&contents).map_err(|e| {
         out::error(code::GENERAL, &format!("Cannot write mandatory optimization Lean output: {e}"));
         std::process::ExitCode::from(2)

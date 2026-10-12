@@ -1,0 +1,5 @@
+# exit 0
+TLC2 Version 2026.10.02.163556 (rev: 1813307)
+Model checking completed. No error has been found.
+69456 states generated, 19048 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 16.
