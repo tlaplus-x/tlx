@@ -147,10 +147,28 @@ fn composition_keeps_uncertified_feedback_boundaries() {
     ] {
         assert!(!projection(&body).contains(&"h.history".to_owned()), "{body}");
     }
+}
+
+#[test]
+fn composition_certifies_mixed_history_and_age_consumers() {
     let source = include_str!("../../../proofs/age/AgeHistory.tla");
     let body = source.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
     let body = format!("VARIABLE{body}")
         .replace("selected' = {k", "selected' = (IF history = <<>> THEN {} ELSE {k")
         .replace("created + 2 <= clock}", "created + 2 <= clock})");
-    assert!(!projection(&body).contains(&"history.history".to_owned()));
+    assert!(projection(&body).contains(&"history.history".to_owned()));
+}
+
+#[test]
+fn mixed_consumers_refuse_dynamic_domains_and_primed_inputs() {
+    let source = include_str!("../../../proofs/age/MixedHistory.tla");
+    let body = source.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
+    let body = format!("VARIABLE{body}");
+    for body in [
+        body.replace("IF Ready /\\", "IF Ready' /\\"),
+        body.replace("THEN Expired ELSE", "THEN Expired' ELSE"),
+        body.replace("{k \\in Keys:", "{k \\in (IF history = <<>> THEN {1} ELSE Keys):"),
+    ] {
+        assert!(!projection(&body).contains(&"history.history".to_owned()), "{body}");
+    }
 }

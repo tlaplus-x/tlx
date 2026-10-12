@@ -23,10 +23,11 @@ The generated `GeneratedAge` namespace instantiates `AgeCertificate.lean` with
 actual map slots, caps, seeds, ticks, reset/delete updates, deadline guards and
 observations. Five preservation theorems cover the certificate, safety, safety
 with stuttering, counterexample lifting and deadlocks. Two selection lemmas
-connect finite filtering to its exact selected keys. No preservation premises
-or custom correctness axioms are supplied. Negative checks break ticks, resets,
-deletion, deadline strictness, filter decisions, selected keys and the reduced
-safety predicate; Lean must reject them.
+connect finite filtering to its exact selected keys; two binding lemmas connect
+Boolean predicates to the exact decisions received by dependent consumers. No
+preservation premises or custom correctness axioms are supplied. Negative checks break ticks, resets,
+deletion, deadline strictness, filter decisions, selected keys, Boolean arguments
+and the reduced safety predicate; Lean must reject them.
 
 The proof concerns the lowered rule model. Source/HIR translation, domain and
 partial-read analysis, runtime VIEW construction and execution remain trusted.
@@ -75,7 +76,7 @@ with 15 states; both unbounded components are reduced:
 
 The generated `GeneratedAgeHistory` certificate proves initialization, successor
 correspondence, selected observations, counterexample lifting and deadlocks.
-The verifier audits seven theorems and rejects twelve broken variants, including
+The verifier audits nine theorems and rejects thirteen broken variants, including
 forgetting prior prefix failures and dropping the history transfer. Source
 lowering, leaf interpretation, domain/totality analysis and runtime execution
 remain trusted. History events and transfer conditions cannot depend on forgotten
@@ -86,8 +87,26 @@ transfers. `HistoryFeedback.tla` exercises all three with an unbounded clock and
 ./target/release/tlx check proofs/age/HistoryFeedback.tla -interp -optimize -noautosymmetry
 ```
 
-History-dependent timestamp-map transfers, a single consumer mixing age-filtered sets
-with history feedback, and multiple-history composition remain unsupported.
+`MixedHistory.tla` has two timestamp slots and computes a retained set with a
+history-dependent conditional:
+
+```tla
+Chosen == IF Ready /\ history # <<>> THEN Expired ELSE {}
+```
+
+`Expired` filters the slots by age. Both its selected set and the history
+predicates' Boolean values are explicit arguments to the emitted consumer.
+The original clock and history are unbounded; combined reduction finishes with
+113 states. The same lowering handles observations, multiple filtered sets,
+and fixed-domain filters whose predicates inspect history summaries.
+
+```sh
+./target/release/tlx check proofs/age/MixedHistory.tla -interp -optimize -noautosymmetry
+```
+
+History-dependent timestamp-map transfers, dynamic filter domains, next-state
+inputs and multiple-history composition remain unsupported. Source/HIR lowering,
+leaf interpretation and runtime execution are still trusted.
 
 For the separately fetched external cleaner, `Cleaner.cfg` selects singleton
 constants and `TypeOk`. The original specification completes without a transition

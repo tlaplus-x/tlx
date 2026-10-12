@@ -307,3 +307,78 @@ fn combined_history_feedback_finishes_in_every_executor() {
         assert!(proof.contains("sem.feedbackValue"));
     }
 }
+
+#[test]
+fn mixed_age_filters_and_history_predicates_are_certified_in_every_executor() {
+    let base = include_str!("../../../proofs/age/MixedHistory.tla");
+    let cfg = include_str!("../../../proofs/age/MixedHistory.cfg");
+    for (spec, config, code) in [
+        (base.to_owned(), cfg.to_owned(), 0),
+        (base.replace("records[k] # Empty /\\ records[k].created + 2 <= clock}", "Ready /\\ k = 1}"), cfg.to_owned(), 0),
+        (base.replace("IF Ready /\\", "IF ~Ready /\\").replace("Append(history, \"put\")", "Append(history, \"drop\")"), cfg.to_owned(), 0),
+        (
+            base.replace(
+                "IF Ready /\\ history # <<>> THEN Expired ELSE {}",
+                "(IF Ready THEN Expired ELSE {}) \\cup (IF history = <<>> THEN Expired ELSE {})",
+            ),
+            cfg.to_owned(),
+            0,
+        ),
+        (base.replace("====", "Safe == selected = {}\n===="), format!("{cfg}INVARIANT Safe\n"), 12),
+    ] {
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            let dir = tlx_testkit::TempDir::with_spec("age-mixed-history", &spec, &config);
+            let run = tlx_testkit::tlx_default!()
+                .check("MixedHistory.tla")
+                .args(args)
+                .args(["-optimize", "-noautosymmetry"])
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .dir(&dir)
+                .timeout(Duration::from_secs(60))
+                .run();
+            assert_eq!(run.code, code, "{tier}: {}", run.text());
+            assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
+            let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+            let proof = std::fs::read_to_string(path).unwrap();
+            let generated = proof.split("namespace TlxOptimization.GeneratedAgeHistory").nth(1).unwrap();
+            assert!(generated.contains("Boolean hole"));
+            assert!(generated.contains("Test.select [0, 1]"));
+            assert!(generated.contains("fun decision0 =>"));
+            if code == 12 {
+                assert!(run.stdout.contains("Invariant Safe is violated"));
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_mixed_consumers_reduce_states_and_compatibility_bypasses() {
+    let spec = include_str!("../../../proofs/age/MixedHistory.tla")
+        .replace("VARIABLE clock, records, selected, history", "VARIABLE clock, records, selected, history, budget")
+        .replace("Init ==", "Init == budget = 0 /\\")
+        .replace(
+            "Next == Tick \\/ Put \\/ Drop \\/ Scan",
+            "Next == budget < 6 /\\ budget' = budget + 1 /\\ (Tick \\/ Put \\/ Drop \\/ Scan)",
+        );
+    let cfg = format!("{}CHECK_DEADLOCK FALSE\n", include_str!("../../../proofs/age/MixedHistory.cfg"));
+    let mut counts = vec![];
+    for flags in [vec![], vec!["-optimize"], vec!["-optimize", "-tlc"]] {
+        let dir = tlx_testkit::TempDir::with_spec("bounded-mixed-history", &spec, &cfg);
+        let run = tlx_testkit::tlx_default!()
+            .check("MixedHistory.tla")
+            .args(["-interp", "-noautosymmetry"])
+            .args(flags.clone())
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{}", run.text());
+        assert_eq!(run.stdout.contains("history.history"), flags == ["-optimize"], "{}", run.text());
+        let line = run.stdout.lines().find(|l| l.contains("distinct states found")).unwrap();
+        let count: u64 =
+            line.split("distinct states found").next().unwrap().split_whitespace().last().unwrap().replace(',', "").parse().unwrap();
+        counts.push(count);
+    }
+    assert!(counts[1] < counts[0], "{counts:?}");
+    assert_eq!(counts[0], counts[2]);
+}

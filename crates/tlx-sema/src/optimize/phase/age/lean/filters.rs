@@ -9,6 +9,12 @@ struct Filter {
     predicates: Vec<String>,
 }
 
+#[derive(Default)]
+struct Inputs {
+    filters: Vec<Filter>,
+    predicates: Vec<(LocalId, String)>,
+}
+
 impl Emitter<'_, '_> {
     fn finite_predicates(&mut self, bound: &Bound, pred: &Expr, observation: bool) -> Option<(Vec<super::Atom>, Vec<String>)> {
         let BoundVars::Many(ids) = &bound.vars else { return None };
@@ -49,26 +55,35 @@ impl Emitter<'_, '_> {
         let mut local = self.scope.iter().map(|(l, _)| l.0).max().unwrap_or(0);
         max_local(e, &mut local);
         let mut next_local = local.checked_add(1)?;
-        let mut filters = vec![];
-        let masked = self.mask_filters(e, observation, &mut next_local, &mut filters)?;
-        if filters.is_empty() || !self.independent(&masked) {
+        let mut inputs = Inputs::default();
+        let masked = self.mask_filters(e, observation, &mut next_local, &mut inputs)?;
+        if inputs.filters.is_empty() || !self.independent(&masked) {
             return None;
         }
         let id = self.atoms.len();
         let mut description = format!("Filtered consumer HIR: {masked:#?}\nBound atoms: {:?}\n", self.scope);
-        for (i, filter) in filters.iter().enumerate() {
+        for (i, filter) in inputs.filters.iter().enumerate() {
             use std::fmt::Write;
             writeln!(description, "Hole {:?} = source atoms {:?} at selected positions in argument {i}.", filter.local, filter.keys)
                 .unwrap();
         }
+        for (i, (local, predicate)) in inputs.predicates.iter().enumerate() {
+            use std::fmt::Write;
+            writeln!(description, "Boolean hole {local:?} = {predicate} in predicate argument {i}.").unwrap();
+        }
         self.atoms.push(description);
-        let args = (0..filters.len()).map(|i| format!("selected{i}")).collect::<Vec<_>>().join(", ");
+        let args = (0..inputs.filters.len()).map(|i| format!("selected{i}")).collect::<Vec<_>>().join(", ");
+        let bits = (0..inputs.predicates.len()).map(|i| format!("decision{i}")).collect::<Vec<_>>().join(", ");
         let mut test = if observation {
-            format!("(Test.pure (sem.filterObserve {id} c p [{args}]))")
+            format!("(Test.pure (sem.filterObserve {id} c p [{args}] [{bits}]))")
         } else {
-            format!("(Test.pure (sem.filterTest {id} c d p choice.2 [{args}]))")
+            format!("(Test.pure (sem.filterTest {id} c d p choice.2 [{args}] [{bits}]))")
         };
-        for (i, filter) in filters.into_iter().enumerate().rev() {
+        for (i, (_, predicate)) in inputs.predicates.into_iter().enumerate().rev() {
+            self.remaining = self.remaining.checked_sub(test.len() + predicate.len())?;
+            test = format!("(Test.bind {predicate} (fun decision{i} => {test}))");
+        }
+        for (i, filter) in inputs.filters.into_iter().enumerate().rev() {
             let keys = (0..filter.keys.len()).map(|k| k.to_string()).collect::<Vec<_>>().join(", ");
             let mut predicate = "fun index : Nat => match index with".to_owned();
             for (k, p) in filter.predicates.iter().enumerate() {
@@ -81,20 +96,35 @@ impl Emitter<'_, '_> {
         Some(test)
     }
 
-    fn mask_filters(&mut self, e: &Expr, observation: bool, next_local: &mut u32, filters: &mut Vec<Filter>) -> Option<Expr> {
+    fn mask_filters(&mut self, e: &Expr, observation: bool, next_local: &mut u32, inputs: &mut Inputs) -> Option<Expr> {
         self.remaining = self.remaining.checked_sub(1)?;
         if self.independent(e) {
             return Some(e.clone());
         }
+        // Only recognized summary predicates can become Boolean holes. An
+        // arbitrary history-dependent expression might be a set or a value.
+        if self.age_independent(e) {
+            if let Some(history) = &mut self.history {
+                if let Some(predicate) = history.summary_read(e) {
+                    if inputs.predicates.len() >= 256 {
+                        return None;
+                    }
+                    let local = LocalId(*next_local);
+                    *next_local = next_local.checked_add(1)?;
+                    inputs.predicates.push((local, format!("(Test.pure (let sem := sem.history; {predicate}))")));
+                    return Some(Expr::new(ExprKind::Local(local), e.span));
+                }
+            }
+        }
         match &*e.kind {
             ExprKind::SetFilter { bound, pred } => {
                 let (keys, predicates) = self.finite_predicates(bound, pred, observation)?;
-                if filters.iter().map(|f| f.keys.len()).sum::<usize>() + keys.len() > 256 {
+                if inputs.filters.iter().map(|f| f.keys.len()).sum::<usize>() + keys.len() > 256 {
                     return None;
                 }
                 let local = LocalId(*next_local);
                 *next_local = next_local.checked_add(1)?;
-                filters.push(Filter { local, keys, predicates });
+                inputs.filters.push(Filter { local, keys, predicates });
                 Some(Expr::new(ExprKind::Local(local), e.span))
             }
             // Enumerated filters own their predicate binders. Other dependent
@@ -112,7 +142,7 @@ impl Emitter<'_, '_> {
                 let mut result = e.clone();
                 let mut valid = true;
                 visit::children_mut(&mut result, &mut |child| {
-                    if let Some(masked) = self.mask_filters(child, observation, next_local, filters) {
+                    if let Some(masked) = self.mask_filters(child, observation, next_local, inputs) {
                         *child = masked;
                     } else {
                         valid = false;

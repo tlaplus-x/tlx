@@ -99,6 +99,24 @@ theorem Test.commutes {K : Type} {caps : K → Nat} (p : Test caps) (now : Nat) 
   | disj p q ih₁ ih₂ => simp only [Test.concrete, Test.reduced, ih₁, ih₂]
   | bind p next ih ihNext => simp only [Test.concrete, Test.reduced, ih, ihNext]
 
+-- A dependent consumer receives the exact truth value, just as finite
+-- filtering below supplies the exact selected positions.
+theorem Test.bind_concrete {K : Type} {caps : K → Nat} (p : Test caps)
+    (consume : Bool → Test caps) (now : Nat) (h : Stamps K now) :
+    (Test.bind p consume).concrete now h ↔
+      (consume (@decide (p.concrete now h) (Classical.propDecidable _))).concrete now h := by
+  classical
+  simp only [Test.concrete]
+  by_cases hp : p.concrete now h <;> simp [hp]
+
+theorem Test.bind_reduced {K : Type} {caps : K → Nat} (p : Test caps)
+    (consume : Bool → Test caps) (h : Ages K) :
+    (Test.bind p consume).reduced h ↔
+      (consume (@decide (p.reduced h) (Classical.propDecidable _))).reduced h := by
+  classical
+  simp only [Test.reduced]
+  by_cases hp : p.reduced h <;> simp [hp]
+
 -- Explicit finite filtering. The continuation receives the selected source
 -- positions, so an arbitrary retained consumer sees the same exact set.
 def Test.select {K I : Type} {caps : K → Nat} (keys : List I)

@@ -790,12 +790,16 @@ proved equality preserves both decisions and resulting transfers.
 
 Branch bounds and initialization must remain history-independent; initial histories
 use finite resets. Supported predicates include prefix monitors, emptiness, sequence
-type membership and their Boolean combinations. Dependent binders, next-state history
-reads, exact lengths and unsupported index patterns still refuse reduction. Combined
+type membership and their Boolean combinations. Standalone history lowering still
+refuses dependent binders, next-state history reads, exact lengths and unsupported
+index patterns. Combined
 age/history certificates also require history-independent timestamp-map transfers and
-age-independent history events. A single retained expression mixing age-filtered sets
-with history feedback remains outside the emitted subset. Constraints, action/initial
-properties and trace aliases exclude automatic reduction. Unsupported history cases and
+age-independent history events. A single retained expression may mix age-filtered
+sets with history predicates.
+Its emitted consumer receives exact selected source positions and explicit Boolean
+results, with both mappings recorded in HIR metadata. Fixed-domain filters can also
+contain history predicates. Dynamic domains, next-state inputs and non-enumerated
+binders remain unsupported. Constraints, action/initial properties and trace aliases exclude automatic reduction. Unsupported history cases and
 all other uncertified rules are refused. A no-pass run emits shared algebra and a record
 explicitly saying no reduction was applied. The export command likewise refuses its
 uncertified proposal. Generation does not imply Lean acceptance.
@@ -818,7 +822,8 @@ obligations and changing the reduced safety observation. For erasure it rejects 
 rejects forgetting the initial anchor and failing to advance the reduced phase. Relative-age
 checks reject incorrect ticks, resets, deletion, deadline strictness, reduced observations,
 inverted filter decisions and incorrect selected-key membership. Filter certificates also
-audit the concrete and reduced selection lemmas. Combined age/history checks additionally
+audit the concrete and reduced selection and Boolean-binding lemmas, and reject
+passing the wrong Boolean to a dependent consumer. Combined age/history checks additionally
 reject forgetting prior prefix failures, dropping the shared branch’s history transfer and
 discarding observed history. History and combined certificates also reject discarding
 summary feedback in guards and transfers.

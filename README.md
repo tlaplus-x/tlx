@@ -193,7 +193,8 @@ including when prefix predicates control guards, retained updates or later event
 The [history feedback example](proofs/history/README.md) finishes with six states.
 The [relative-age example](proofs/age/README.md)
 reduces an unbounded clock model to four states, and a model with both an unbounded clock
-and history to 15 states. Each certificate proves initialization and
+and history to 15 states. A two-slot model that combines history predicates with
+age-filtered set values finishes with 113 states. Each certificate proves initialization,
 successor correspondence, observations, counterexample lifting and deadlock preservation.
 
 Proof coverage is incomplete. Phase-field, sequence-length, broader age/history compositions, broad ordered

@@ -56,6 +56,8 @@ def verify(lean, path, negative):
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace == "GeneratedOrdered" else set())
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
         theorems |= {"select_concrete", "select_reduced"}
+    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
+        theorems |= {"bind_concrete", "bind_reduced"}
     if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
     mutations = []
@@ -78,6 +80,8 @@ def verify(lean, path, negative):
                 ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
                 ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
             ])
+        if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
+            changes.append(("(next b).reduced h", "(next (!b)).reduced h", "passed the wrong Boolean to the consumer"))
         if namespace == "GeneratedHistory":
             changes.extend([
                 ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (History.summary m.predicate History.empty)", "discarded guard feedback"),

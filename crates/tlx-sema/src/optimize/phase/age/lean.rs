@@ -48,7 +48,7 @@ pub(super) fn emit(
         writeln!(out, "  | {k} => {}", proof.stamps[*i].cap).unwrap();
         e.atoms.push(format!("slot {k}: map {:?}, field {:?}, key {key:#?}", proof.stamps[*i].var, proof.stamps[*i].field));
     }
-    out.push_str("  | _ => 0\n\n-- C retains payloads with timestamp fields removed; p retains their presence.\n-- W supplies branch-local choices. HIR leaf interpretation/lowering is trusted.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → (Key → Bool) → W → Prop\n  observe : Nat → C → (Key → Bool) → Prop\n  filterTest : Nat → C → C → (Key → Bool) → W → List (List Nat) → Prop\n  filterObserve : Nat → C → (Key → Bool) → List (List Nat) → Prop\n");
+    out.push_str("  | _ => 0\n\n-- C retains payloads with timestamp fields removed; p retains their presence.\n-- W supplies branch-local choices. HIR leaf interpretation/lowering is trusted.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → (Key → Bool) → W → Prop\n  observe : Nat → C → (Key → Bool) → Prop\n  filterTest : Nat → C → C → (Key → Bool) → W → List (List Nat) → List Bool → Prop\n  filterObserve : Nat → C → (Key → Bool) → List (List Nat) → List Bool → Prop\n");
     if history.is_some() {
         out = out.replace("namespace TlxOptimization.GeneratedAge\n", "namespace TlxOptimization.GeneratedAgeHistory\n");
         out = out.replace("structure Semantics (C W : Type) where", &format!(
@@ -365,12 +365,16 @@ impl Emitter<'_, '_> {
             if let Some(h) = &mut self.history {
                 if !h.independent(e) {
                     let start = h.atoms.len();
-                    let term = h.test(e, observation)?;
-                    for atom in &mut h.atoms[start..] {
-                        write!(atom, "\nBound atoms: {:?}", self.scope).unwrap();
+                    if let Some(term) = h.test(e, observation) {
+                        for atom in &mut h.atoms[start..] {
+                            write!(atom, "\nBound atoms: {:?}", self.scope).unwrap();
+                        }
+                        let next = if observation { "" } else { "let d := (d, p); " };
+                        return Some(format!("(Test.pure (let sem := sem.history; let c := (c, p); {next}{term}))"));
                     }
-                    let next = if observation { "" } else { "let d := (d, p); " };
-                    return Some(format!("(Test.pure (let sem := sem.history; let c := (c, p); {next}{term}))"));
+                    // A finite filter can bind history predicates even when
+                    // the standalone history consumer rejects its binder.
+                    h.atoms.truncate(start);
                 }
             }
         }

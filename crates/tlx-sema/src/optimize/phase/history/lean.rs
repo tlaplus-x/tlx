@@ -278,7 +278,7 @@ impl<'a> Emitter<'a> {
             .or_else(|| self.feedback(e, if observation { "Observe" } else { "Test" }))
     }
 
-    fn summary_read(&mut self, e: &Expr) -> Option<String> {
+    pub(in super::super) fn summary_read(&mut self, e: &Expr) -> Option<String> {
         if let Some(i) = self.monitors.iter().position(|m| Arc::ptr_eq(&m.kind, &e.kind)) {
             let bit = format!("(s.2 ⟨{i}, by decide⟩)");
             return Some(if matches!(&*e.kind, ExprKind::Quant { kind: QuantKind::Exists, .. }) { format!("(¬ {bit})") } else { bit });

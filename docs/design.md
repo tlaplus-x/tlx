@@ -138,14 +138,19 @@ all observed comparisons commute, then constructs successor and observation corr
 The Lean `Test.select` continuation receives the exact selected source positions, so
 retained record updates, unions, and other consumers see the same set after projection.
 Filter predicates remain explicit proof terms; consumer HIR contains set placeholders
-with recorded atom mappings. Semantic leaves cannot inspect absolute time or age magnitudes.
+with recorded atom mappings. A consumer can also contain history-summary predicates:
+`Test.bind` passes their exact Boolean decisions alongside the selected sets. Boolean
+and set placeholders share fresh local IDs and have separate, ordered argument mappings.
+The concrete/reduced bind and selection lemmas connect those arguments to the original
+predicates. Semantic leaves cannot inspect absolute time, age magnitudes or raw history.
 `phase/age/lean/history.rs` connects one history to the same retained core and branch witness.
 `AgeHistoryCertificate.lean` proves the product transfer and observation correspondence;
 the generated `GeneratedAgeHistory` model contains both actual transfers. Event values and
 history transfer conditions cannot inspect forgotten time or ages. Summary feedback
 is supported in guards and retained updates, while timestamp-map transfers must stay
-history-independent. Mixed age-filter/history consumers and multiple histories still
-refuse composition. Unsupported compositions retain a standalone fallback.
+history-independent. Mixed age-filter/history consumers now compose; dynamic filter
+domains, next-state inputs and multiple histories still refuse composition. Unsupported
+compositions retain a standalone fallback.
 Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
 
 Phase-field and sequence-length analyzers remain available for developing
