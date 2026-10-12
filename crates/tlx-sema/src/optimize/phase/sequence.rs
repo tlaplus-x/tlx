@@ -59,6 +59,7 @@ pub fn sequence_length_projection(
         .collect();
     Some(FieldProjection {
         view: Expr::new(ExprKind::Tuple(values), init.span),
+        certificate: None,
         fields: projected.iter().map(|v| format!("{}.contents", program.vars[v.idx()].name)).collect(),
     })
 }

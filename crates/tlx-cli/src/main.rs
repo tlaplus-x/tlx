@@ -36,6 +36,7 @@ mod load;
 mod optimization;
 mod out;
 mod process;
+mod proofs;
 mod recovery;
 mod report;
 mod settings;

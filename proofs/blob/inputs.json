@@ -1,0 +1,8 @@
+{
+  "source": "third_party/external/pragmatic/database-blob/working/working.tla",
+  "source_sha256": "f56c9c82389da598440a7bf928d91a6289023475cb2a5bcb9362a1132c6c6792",
+  "upstream": "https://github.com/ElliotSwart/pragmaticformalmodeling/blob/ea86b1b5852d49d60d82d944e4807774392e1414/database-blob/working/working.tla",
+  "config": "proofs/blob/Unbounded.cfg",
+  "config_sha256": "ff9e5fd1762e423558b73e00b6b3c50db3f855c25c143c9cfef9192e4a1d0ce5",
+  "lean_version": "4.34.1"
+}

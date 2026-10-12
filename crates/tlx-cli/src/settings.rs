@@ -113,7 +113,7 @@ tlx options:
                        a symmetry of sets of model values that tlx proves
                        (safety checks only; the Optimizations line names
                        it)
-  -optimize            apply proven state reductions (disabled by -tlc)
+  -optimize            apply proven state reductions; emit Lean, never run it (disabled by -tlc)
   -noautosymmetry      apply no symmetry tlx proves (default mode)
   -stats [json[=FILE]] report where the time and work went (phases, search
                        work, worker utilization, native/IR/interpreter runs

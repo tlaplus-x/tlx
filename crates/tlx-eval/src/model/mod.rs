@@ -152,6 +152,8 @@ pub struct InterpModel {
     view: Option<Expr>,
     /// A proved state projection is canonicalized before symmetry.
     state_projection: bool,
+    /// Optional Lean certificate emitted with the accepted projection.
+    projection_certificate: Option<Arc<str>>,
     /// ALIAS: error-trace states are displayed as this record.
     alias: Option<Expr>,
     /// POSTCONDITIONs (name, definition), checked after model checking.
@@ -509,6 +511,7 @@ impl InterpModel {
             fp_mode: if reduce { FpMode::Reduced } else { FpMode::Plain },
             view,
             state_projection: false,
+            projection_certificate: None,
             alias,
             postconditions,
             possible,

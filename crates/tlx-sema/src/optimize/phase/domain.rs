@@ -308,6 +308,9 @@ impl Domains {
     // This prevents a vacuous membership proof hiding an invalid type set.
     fn type_set(&self, set: &Expr) -> bool {
         match &*set.kind {
+            ExprKind::RecordSet(fs) => {
+                fs.iter().map(|(k, _)| k).collect::<BTreeSet<_>>().len() == fs.len() && fs.iter().all(|(_, s)| self.type_set(s))
+            }
             ExprKind::Builtin { op: B::Nat | B::Int | B::Boolean, args } => args.is_empty(),
             ExprKind::Builtin { op: B::Cup, .. } => {
                 self.integer_floor(set).is_some() || self.exact_set(set).is_some_and(|s| compatible(&s))

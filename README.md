@@ -162,6 +162,7 @@ tlx check Counter.tla -config Counter-spec.cfg # another configuration file (use
 tlx check Spec.tla -workers auto               # level-synchronous parallel BFS on all cores
 tlx check Spec.tla -interp                     # the interpreter only (tlx's semantic reference)
 tlx check Spec.tla -tlc                        # TLC-compatible results (counts, depth, traces)
+tlx check Spec.tla -optimize                   # opt-in state reduction and Lean output
 tlx check Spec.tla -simulate num=100 -depth 50 -seed 1   # random simulation
 tlx check Spec.tla -checkpoint 10 -metadir DIR           # checkpoint every 10 minutes
 tlx check Spec.tla -recover DIR                          # continue an interrupted run
@@ -179,6 +180,33 @@ Full references: [docs/usage.md](docs/usage.md) (user guide: a self-contained fi
 tutorial, compiled mode, output and exit codes, troubleshooting) and
 [docs/configuration.md](docs/configuration.md) (every command-line option and `TLX_*`
 environment variable).
+
+## State reduction and Lean certificates
+
+Opt-in state reduction uses the specification's semantics to merge states with the same
+future observations. Rules can omit unobserved variables, erase inactive record fields,
+retain only sequence lengths, or summarize append-only histories by their seen values
+and prefix-predicate results. With a finite event domain, a history summary can turn an
+unbounded history into a finite state component. Concrete values remain available for
+counterexample traces. These reductions support safety checking and are disabled in
+TLC-compatible mode. See [optimization rules and limits](docs/optimization.md).
+
+Optimized checking always writes a standalone Lean file and prints its path; it does
+not run Lean or require Lean to be installed. Supported history applications generate
+certificates proving preservation of initialization, transitions, safety observations,
+counterexamples and deadlocks in a parametric rule model. Other applications explicitly
+emit shared algebra and transformation records without a model certificate.
+
+Lean verification is a separate, explicit step. The generated proof treats unchanged,
+history-free expressions as semantic parameters. TLA+/HIR lowering, domain analysis,
+symmetry composition and runtime execution remain trusted; this is not a proof of the
+input model's safety or finite cardinality. The [Lean coverage description](docs/optimization.md#lean-output-for-checking)
+explains the supported subset and verification command. The [blob case study](proofs/blob/README.md)
+also provides a manual formalization of the concrete protocol for comparison.
+
+These features are separate from the frozen performance snapshot above. Generation of
+a certificate does not imply Lean acceptance or a measured speedup. Output locations,
+failure behavior and option interactions are specified in [configuration.md](docs/configuration.md).
 
 ## Compatibility with TLC
 

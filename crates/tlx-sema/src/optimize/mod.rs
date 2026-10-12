@@ -5,10 +5,12 @@
 //! See docs/optimization.md for the preservation contracts and trust boundary.
 
 mod analysis;
+mod lean;
 mod phase;
 mod projection;
 
-pub use phase::{phase_projection, sequence_length_projection, FieldProjection};
+pub use lean::projection_lean;
+pub use phase::{history_projection, phase_projection, sequence_length_projection, FieldProjection};
 pub use projection::unobserved_variables;
 mod constant;
 mod counter;

@@ -104,6 +104,9 @@ The rule-based optimizer is owned by `tlx-sema::optimize`. Its primary objective
 reduce the explored state graph while preserving checked verdicts and genuine counterexamples.
 Opt-in checking analyzes resolved HIR for unobserved state variables and phase-dependent dead
 fields in records or fixed-domain maps, and sequences observed only through their length.
+Append-only histories over a proved finite element domain can instead use a set of seen
+elements and Boolean prefix observations. This can turn an unbounded history into a finite
+state component without limiting the number of source operations.
 Length projection preserves exact lengths and forgets contents only after proving all uses
 compatible; it can reduce an unbounded graph without making that graph finite.
 Forward structural domains come from Init and Next;
@@ -115,6 +118,24 @@ the projection commutes with every group element: project first, then canonicali
 User VIEWs retain precedence; TLC compatibility mode bypasses the reduction. Separately, `tlx-cli::optimization` emits finite
 models using a restricted transition IR and validated counter-saturation passes. See
 [optimization.md](optimization.md) for rule contracts, extension points and correctness arguments.
+
+Opt-in checking always emits a standalone Lean file before exploration; emission never
+runs Lean. Semantic proof generation belongs in `tlx-sema`, next to the rule that
+produces its evidence. `tlx-eval` carries the accepted projection's certificate and
+`tlx-cli` only persists it and reports coverage. Supported history applications emit
+model-specific predicates, seeds, transfers, observations and a certificate instantiated
+from shared history theorems. The formal rule IR uses indexed concrete histories and
+seen-set/prefix-bit summaries. Unchanged history-free HIR leaves are universal semantic
+parameters over retained state and local bindings; proving preservation for every such
+interpretation avoids copying the execution evaluator into the optimizer.
+
+This is a certificate for the lowered rule model. Source lowering, domain/totality
+analysis, symmetry and runtime execution remain trusted. Unsupported applications
+explicitly emit algebra and transformation records without a model certificate; the
+recorded HIR strings alone are not formal semantics. See
+[the Lean coverage description](optimization.md#lean-output-for-checking).
+The [blob case study](../proofs/blob/README.md) additionally provides a manual typed
+formalization of all concrete protocol actions and reachable lookup definedness.
 
 A frontend rule should justify its cost with actual state reduction on a real specification.
 Expression cleanup alone is not evidence of that goal. Retain local cleanup here when it

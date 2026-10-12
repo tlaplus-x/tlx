@@ -25,6 +25,9 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     }
     if a.simulate.is_some() || !model.has_behavior {
         if !a.tlc {
+            if a.optimize {
+                crate::proofs::emit(model, None)?;
+            }
             label(None);
         }
         return Ok(None);
@@ -53,6 +56,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     let applied = apply(model, &mut an, a.noautosymmetry)?;
     let project = a.optimize && applied.as_ref().is_none_or(|s| !s.forced && !s.guarded);
     if let Some((rule, omitted)) = project.then(|| model.project_state()).flatten() {
+        crate::proofs::emit(model, Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
         let group = applied.as_ref().map(|s| s.group.as_str()).or(model.ip.cfg.symmetry.as_deref());
         let combined = group.map(|g| format!(", composed with symmetry {g}")).unwrap_or_default();
@@ -80,6 +84,9 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
             ),
         );
     } else {
+        if a.optimize {
+            crate::proofs::emit(model, None)?;
+        }
         label(applied.as_ref());
     }
     Ok(applied)

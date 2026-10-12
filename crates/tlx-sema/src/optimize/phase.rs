@@ -1,11 +1,13 @@
-//! Structural state projections: phase-dependent field liveness and sequence
-//! length observations. Both reuse normalized branches and forward domains.
+//! Structural state projections: field liveness, sequence length and finite
+//! history summaries. These reuse normalized branches and forward domains.
 
 mod domain;
+mod history;
 mod liveness;
 mod normalize;
 mod sequence;
 
+pub use history::history_projection;
 pub use sequence::sequence_length_projection;
 
 use tlx_front::cfg::Config;
@@ -18,6 +20,8 @@ use domain::{Domain, Domains};
 pub struct FieldProjection {
     pub view: Expr,
     pub fields: Vec<String>,
+    /// Generated certificate for the supported rule IR, never implicitly verified.
+    pub certificate: Option<String>,
 }
 
 /// Derive one field projection. An unknown transfer, observation, effect or

@@ -183,6 +183,55 @@ and assigned labels by the actions, but guards and `TypeOK` do not read it. A bo
 around the unchanged source demonstrates an actual reduction; it is not the upstream unbounded
 configuration. Bounds and measurements belong with reproducible benchmark evidence.
 
+## Finite history projection
+
+`phase/history.rs` recognizes append-only histories whose observations admit finite summaries.
+The element domain must be proved finite from Init and Next. Each action alternative must bind
+the history exactly once using Append, self-copy, a tuple reset, or an IF of these transfers.
+Appended values and conditions are scanned for history dependencies; their errors remain
+observable. Concrete histories and actions are unchanged.
+
+Supported observations include emptiness, independently proved structural type membership, and
+predicates of this form:
+
+```tla
+\A i \in 1..Len(history):
+    history[i].kind = "WRITE" \/
+    \E j \in 1..i:
+        history[j].kind = "WRITE" /\ history[j].value = history[i].value
+```
+
+The key retains the set of history elements and the Boolean value of every recognized outer
+universal predicate. The inner predicate can use total scalar equality/inequality, Boolean
+connectives and prefix quantification. Indices may only select history elements: their numeric
+values, counts and order are not observable. Prefix predicates cannot depend on other state
+variables or free locals, and the structural domain must justify every field access and scalar
+comparison. Unknown operations, future-looking bounds, missing fields, heterogeneous comparisons,
+raw length observations, Tail and duplicate bindings refuse the candidate.
+
+For a history `h`, let `S(h)` be its element set and let `P(h)` be one recognized predicate.
+Appending `x` leaves all previous prefix obligations unchanged. Its new obligation depends only
+on `x` and `S(h) \cup {x}`; quantification over that set is equivalent to prefix quantification
+because indices and multiplicities are unobserved. Thus `S(h)` and `P(h)` determine `S(Append(h,x))`
+and `P(Append(h,x))`. Copy preserves this summary; a reset derives it from the retained inputs.
+Accepted guards, observations and successor summaries therefore agree for equal keys. Keeping
+`P(h)` is essential: `<<"WRITE", "READ">>` and `<<"READ", "WRITE">>` have equal element sets,
+but may disagree on whether every read has an earlier write.
+
+For an alphabet of size `A` and `k` Boolean monitors, this history component has at most
+`2^(A+k)` summary values, regardless of concrete history length. The complete quotient is finite
+when every other retained component is finite too. This does not impose an operation limit,
+saturate arithmetic, assume a checked invariant, or establish a liveness result. Concrete
+representatives and replay preserve genuine safety counterexamples and deadlocks under the
+shared checking boundary. Element sets and scalar equality commute with valid symmetry
+permutations; the existing equivariance check also requires referenced constants to be fixed.
+
+The external database/blob specifications motivate this rule: their `ConsistentReads` predicate
+checks earlier matching writes in `operations`. Their operation-count constraints observe exact
+length, so those bounded configurations deliberately decline this history reduction. A separate
+configuration without that constraint can exercise the unbounded history while retaining the
+original safety invariants. This distinction must accompany measurements.
+
 ## Length-only sequence projection
 
 `phase/sequence.rs` shares the bounded normalizer, branch analysis and forward structural
@@ -257,7 +306,8 @@ For each candidate control field, backward analysis computes `Live[phase, field]
 The generated VIEW retains every other variable and replaces each dead field by one sentinel in
 the state key. It preserves record fields, map keys and control values. Executable HIR and concrete
 stored states are unchanged. The current implementation applies one projection rule per run:
-whole-variable projection takes precedence, then the proved phase candidate projecting the most
+whole-variable projection takes precedence, then a finite history summary, then the proved phase
+candidate projecting the most
 fields (ties retain source traversal order). This heuristic does not predict reachable state counts. It does
 not combine several candidate records or compose with user VIEW. Equivariant projections can
 compose with symmetry as described below.
@@ -363,7 +413,7 @@ The implementation lives in `crates/tlx-sema/src/optimize/`, above execution-spe
 | `verify.rs` | Check IR structure, the actual before/after correspondence, rule obligations and whole-model finite-domain closure |
 | `verify_cleanup.rs` | Independently check constant propagation, predicate equivalence and dead-action evidence |
 | `projection.rs` | Prove unobserved state projection from resolved HIR for ordinary checking |
-| `phase.rs`, `phase/` | Infer structural domains and phase-dependent field liveness for checking |
+| `phase.rs`, `phase/` | Infer structural domains and prove field, length and finite-history projections for checking |
 | `emit.rs` | Emit standalone TLA+, configuration and explanatory mappings from validated finite IR |
 
 The pass interface receives immutable IR and the analysis manager and returns either no change,
@@ -488,6 +538,71 @@ The text report is not a reusable proof authorization: there is no evidence cach
 verdict transfer or persisted-certificate acceptance API. Regenerate after any source,
 configuration, property or tool change. Treat generated violation traces as abstract until
 concrete reconstruction and validation are implemented.
+
+### Lean output for checking
+
+Opt-in checking emits standalone Lean 4 source before exploring states. The output location
+and failure behavior are specified in [configuration.md](configuration.md#command-line-options-tlx-check-spectla-options).
+No verifier is run during emission. Verification is an explicit, separate user action:
+`lean /path/to/Optimization.lean`. No Lake project or external Lean package is required.
+
+The compiler embeds shared `Rules.lean` and, for supported history applications,
+`HistoryCertificate.lean`. The generated section also records the actual source files,
+parsed configuration, definition HIR and selected VIEW as escaped Lean strings.
+
+**Supported history applications now generate a parametric rule-IR certificate.**
+The generator consumes the same normalized branches and prefix predicates as the rule.
+It emits the model's initial history seeds, append/copy/reset transfers, conditional
+transfers, prefix predicates and observations. The concrete system uses indexed prefix
+observations; the reduced system uses seen sets and accumulated predicate results.
+Shared proofs establish their equivalence and construct all certificate fields:
+initialization, successor correspondence from every representative, and observations.
+Generated theorems cover safety (also with stuttering), counterexample lifting and
+plain-Next deadlock preservation. No certificate premise, placeholder proof or custom
+correctness axiom is introduced.
+
+Unchanged, history-free expressions are recorded as HIR leaves and interpreted by
+universal semantic parameters over retained state and branch-local bindings. For
+example, the blob model's database lookup remains such a leaf, while its READ/WRITE
+prefix predicate is emitted as a Lean expression. These parameters cannot read the
+forgotten history. The theorem holds for every interpretation of those parameters;
+this avoids duplicating the entire TLA+ evaluator just to prove a history quotient.
+
+**The trust boundary is still the lowering.** Lean checks preservation of the generated
+rule model, not that Rust translated TLA+/HIR faithfully. Domain inference and totality
+of reads, set/index predicate lowering, source bindings, the actual VIEW implementation,
+symmetry composition, backend execution and model-checking results remain outside the
+certificate. The proof does not establish the input model's safety or its state count.
+
+The current certificate subset requires history-independent branch guards, bounds,
+appended values and retained-state updates, and initial histories built from finite
+resets. Observations support Boolean combinations of prefix monitors, emptiness,
+sequence type membership and history-free predicates. Constraints, action/initial
+properties and trace aliases currently exclude certificate generation. Other HIR rules
+and unsupported history cases still emit shared algebra and a transformation record,
+explicitly labelled as having no model certificate. They retain their existing Rust
+applicability checks. The separate counter-model export command retains its artifact
+contract above. Generation does not imply Lean acceptance.
+
+To audit a generated certificate explicitly, including its standard-axiom dependencies:
+
+```sh
+python3 proofs/check_generated.py --lean /path/to/lean --negative /path/to/Optimization.lean
+```
+
+The optional negative checks require Lean to reject both forgetting prior failed prefix
+obligations and changing the reduced safety observation. This script is never invoked
+by checking or by the ordinary Rust tests. It needs only Lean 4 (tested with 4.34.1),
+not Mathlib or a network connection.
+
+The [blob proof case study](../proofs/blob/README.md) constructs and checks a
+model-specific certificate for the unbounded database/blob history configuration.
+It formalizes all eight actions and the indexed consistency observation, proves
+successor correspondence and deadlock preservation, and checks that partial
+lookups are defined on reachable states. Its negative test rejects a summary
+that forgets old consistency failures. This is a manually reviewed TLA+-to-Lean
+formalization that separately checks concrete protocol actions and reachable lookup
+definedness. The automatic certificate uses the general parametric rule model instead.
 
 ## Validation
 

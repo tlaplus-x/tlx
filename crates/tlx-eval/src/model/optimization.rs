@@ -40,7 +40,9 @@ impl InterpModel {
         let omitted = tlx_sema::optimize::unobserved_variables(&self.ip.prog, &self.init, &next, &observations);
         if omitted.is_empty() {
             let (rule, projection) =
-                if let Some(p) = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                if let Some(p) = tlx_sema::optimize::history_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
+                    ("history-summary-projection", p)
+                } else if let Some(p) = tlx_sema::optimize::phase_projection(&self.ip.prog, cfg, &self.init, &next, &observations) {
                     ("phase-field-projection", p)
                 } else {
                     (
@@ -50,6 +52,16 @@ impl InterpModel {
                 };
             if !self.projection_equivariant(&projection.view) {
                 return None;
+            }
+            // The generated rule model currently represents state invariants,
+            // not constraints, action properties or trace aliases.
+            if self.constraints.is_empty()
+                && self.action_constraints.is_empty()
+                && self.action_props.is_empty()
+                && self.init_props.is_empty()
+                && self.alias.is_none()
+            {
+                self.projection_certificate = projection.certificate.map(Into::into);
             }
             self.view = Some(projection.view);
             self.state_projection = true;
@@ -67,6 +79,11 @@ impl InterpModel {
         self.view = Some(Expr::new(ExprKind::Tuple(retained), self.init.span));
         self.state_projection = true;
         Some(("unobserved-state-projection", omitted.iter().map(|v| self.ip.prog.vars[v.idx()].name.to_string()).collect()))
+    }
+
+    /// The accepted pass's generated proof; generation never invokes Lean.
+    pub fn projection_certificate(&self) -> Option<&str> {
+        self.projection_certificate.as_deref()
     }
 
     pub fn has_projected_symmetry(&self) -> bool {
