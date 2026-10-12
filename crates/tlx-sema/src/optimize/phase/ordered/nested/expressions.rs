@@ -44,8 +44,10 @@ impl Emitter<'_, '_> {
                 }
             }
         }
-        if self.independent(e) {
-            return Some(self.leaf(e, mode));
+        if let Some(lowered) = self.history_reads(e, mode) {
+            if self.independent(&lowered) {
+                return Some(self.leaf(&lowered, mode));
+            }
         }
         match &*e.kind {
             ExprKind::And(es) => return self.tests(es, mode),
@@ -118,7 +120,7 @@ impl Emitter<'_, '_> {
             _ => None,
         }
     }
-    fn reference(&self, e: &Expr) -> Option<(usize, String)> {
+    pub(super) fn reference(&self, e: &Expr) -> Option<(usize, String)> {
         let path = self.context.path(e)?;
         if path.keys.is_empty() {
             if let Some(f) = self.families.iter().position(|f| f.variable == path.var) {
@@ -128,7 +130,7 @@ impl Emitter<'_, '_> {
         let slot = self.slots.iter().find(|s| s.path == path)?;
         Some((slot.family, format!("(Reference.slot ⟨{}, by decide +revert⟩)", slot.index)))
     }
-    fn anchor(&mut self, f: usize, n: i128) -> Option<String> {
+    pub(super) fn anchor(&mut self, f: usize, n: i128) -> Option<String> {
         if n > self.families[f].initial || (n > 0 && !self.plan.anchors[f].contains(&n)) {
             return None;
         }
@@ -140,7 +142,7 @@ impl Emitter<'_, '_> {
         };
         Some(format!("(Reference.anchor ⟨{i}, by decide +revert⟩)"))
     }
-    fn independent(&self, e: &Expr) -> bool {
+    pub(super) fn independent(&self, e: &Expr) -> bool {
         if let Some(path) = self.context.path(e) {
             return matches!(self.context.at_path(&path), Some(Schema::Plain));
         }
@@ -156,7 +158,8 @@ impl Emitter<'_, '_> {
             Mode::Observe => format!("sem.observe {i} c"),
             Mode::Step | Mode::Transfer(_) => format!("sem.test {i} c d choice.2"),
         };
-        format!("({}.pure ({value}))", mode.ty())
+        let reads = if self.plan.history.is_some() && !matches!(mode, Mode::Initial) { " reads" } else { "" };
+        format!("({}.pure ({value}{reads}))", mode.ty())
     }
     pub(super) fn transfer(&mut self, e: &Expr, f: usize, delta: i128) -> Option<String> {
         if let ExprKind::If { cond, then, els } = &*e.kind {

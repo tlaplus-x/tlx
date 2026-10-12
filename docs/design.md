@@ -142,8 +142,11 @@ fixed records, tuples and maps into explicit numeric paths, retained leaves, fin
 choices and conditional transfers for multiple independent families. `NestedCertificate.lean`
 proves the order-pattern quotient; `NestedRank.lean` connects positive ranks and exact
 nonpositive sentinels to that quotient. Fixed shapes, lowering, domain inference and the
-runtime structural walker remain trusted. Dynamic shapes and immutable version collection
-remain uncertified candidates.
+runtime structural walker remain trusted. `nested/live.rs` adds one immutable version table
+with singleton initialization and fresh append/frame updates. Only explicit live-root payloads
+reach guards, transfers, observations and new payload construction. `LiveCertificate.lean`
+proves this feedback commutes and connects the retained table graph to the quotient key.
+Dynamic shapes and identifier-containing history payloads remain uncertified candidates.
 
 `phase/age/lean.rs` lowers fixed-domain timestamp maps to explicit per-key keep/reset/erase
 updates and deadline tests, using the same inferred caps as the runtime VIEW.

@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedNested")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedNested", "GeneratedLive")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -53,7 +53,7 @@ def verify(lean, path, negative):
         result.stdout,
     ):
         axioms[name] = []
-    theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested"} else set())
+    theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
     if namespace == "GeneratedSymmetry":
         theorems |= {"orbit_key_equivalent"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
@@ -133,6 +133,12 @@ def verify(lean, path, negative):
                 ("next a b := ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "next a b := False ∧ ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ m.project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ m.project s = a", "discarded quotient initialization"),
             ] if namespace == "GeneratedNested" else [
+                ("then some v else h.values k", "then some v else none", "discarded still-live old versions"),
+                ("k = ((clock + 1 : Nat) : Int)", "k = ((clock + 2 : Nat) : Int)", "inserted at the wrong fresh key"),
+                ("(s.core, m.numericKey refs s, m.retainedTable refs s)", "(s.core, m.numericKey refs s, fun (_ : Int) (_ : V) => False)", "discarded retained payloads from the key"),
+                ("def after := (model sem).reduced", "def after := { (model sem).reduced with next := fun _ _ => False }", "discarded live-version successors"),
+                ("def after := (model sem).reduced", "def after := { (model sem).reduced with initial := fun _ => False }", "discarded live-version initialization"),
+            ] if namespace == "GeneratedLive" else [
                 ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
                 ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
                 ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),

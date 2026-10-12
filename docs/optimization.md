@@ -46,7 +46,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation | Fixed record/tuple/map paths, multiple independent families, conditional copy/fresh/reset transfers and rank-key equivalence | Enabled within this subset |
-| Immutable live versions | Missing | Candidate analysis only |
+| Immutable live versions | Singleton seed, fresh append/frame transfers, explicit live-root payload feedback and retained-table key equivalence | Enabled within this subset |
 | Automatic keyed symmetry | Fixed-domain maps; explicit key equality, quantifiers, reads and writes; permutation quotient | Enabled for one full group; other shapes and runtime-guarded claims remain uncertified |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
 | Projection composed with symmetry | Missing | Automatic projection refused |
@@ -464,8 +464,21 @@ connects this vector to the quotient. Source lowering, fixed-shape representatio
 domains, independent leaf interpretation and the Rust structural key walker remain trusted.
 The unbounded [nested example](../proofs/ordered/Nested.tla) completes with 13 states.
 
+A third connected emitter collects obsolete entries from one immutable version table.
+The table starts at the positive initial frontier and either stays unchanged or receives one
+new entry when the frontier advances by one. Payloads contain no allocation-family identifiers.
+Guards, retained updates, conditional identifier transfers and new payloads may read entries
+through explicit current live references. The compiler replaces those lookups with typed
+root-value inputs; it never passes the full source table to an independent semantic leaf.
+`LiveCertificate.lean` proves old live reads survive append, fresh reads obtain the inserted
+payload, and transferred roots preserve their payloads. It then constructs the quotient and
+connects its key to the graph of the retained, ranked version table. The unbounded
+[version example](../proofs/ordered/LiveVersions.tla) completes with 89 states.
+
 Dynamic container shapes, identifier-valued keys and sets, cross-family comparisons,
-unsupported arithmetic and immutable history collection remain uncertified candidates.
+unsupported arithmetic, table enumeration, arbitrary old-version lookup, primed table reads,
+allocation identifiers in history payloads and numeric-dependent payload construction remain
+uncertified candidates.
 This still excludes the MongoDB collection-incarnation model. The
 [MongoDB oracle fixture](../crates/tlx-cli/tests/fixtures/optimization_ordered/README.md)
 retains an independent TLC VIEW with 19,048 distinct states as a future coverage target;

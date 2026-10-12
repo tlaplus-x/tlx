@@ -1,5 +1,6 @@
 //! Connect fixed nested numeric occurrences to explicit allocation transfers.
 mod expressions;
+mod live;
 mod output;
 mod schema;
 
@@ -22,8 +23,13 @@ pub(super) fn emit(
     steps: &[Branch],
     observations: &[Expr],
 ) -> Option<String> {
-    if plan.history.is_some() || initial.is_empty() || steps.is_empty() {
+    if initial.is_empty() || steps.is_empty() {
         return None;
+    }
+    if let Some(h) = &plan.history {
+        if plan.variables[h.variable].value.as_deref().is_some_and(schema::colored) {
+            return None;
+        }
     }
     let domains = Domains::infer(program, cfg, initial, steps)?;
     let mut fresh = program.locals.len() as u32;
@@ -45,7 +51,11 @@ pub(super) fn emit(
     let initial = context.expand(initial)?;
     let mut schemas = vec![];
     for (i, shape) in plan.variables.iter().enumerate() {
-        schemas.push(context.schema(&binding(&initial[0], VarId(i as u32), false)?, shape)?);
+        schemas.push(if plan.history.as_ref().is_some_and(|h| h.variable == i) {
+            Schema::History
+        } else {
+            context.schema(&binding(&initial[0], VarId(i as u32), false)?, shape)?
+        });
     }
     context.schemas = schemas;
     let steps = context.expand(steps)?;
@@ -164,10 +174,12 @@ enum Mode {
     Transfer(usize),
 }
 struct Seed {
+    payload: Option<String>,
     guard: String,
     values: Vec<Vec<i128>>,
 }
 struct Case {
+    payload: Option<String>,
     guard: String,
     deltas: Vec<i128>,
     values: Vec<Vec<String>>,
@@ -185,7 +197,9 @@ struct Emitter<'a, 'd> {
 impl Emitter<'_, '_> {
     fn validate_shapes(&mut self, b: &Branch, primed: bool) -> Option<()> {
         for (i, schema) in self.context.schemas.clone().iter().enumerate() {
-            self.context.shape_matches(&binding(b, VarId(i as u32), primed)?, schema)?;
+            if !matches!(schema, Schema::History) {
+                self.context.shape_matches(&binding(b, VarId(i as u32), primed)?, schema)?;
+            }
         }
         Some(())
     }
@@ -206,7 +220,7 @@ impl Emitter<'_, '_> {
             }
             values[slot.family].push(n);
         }
-        Some(Seed { guard: self.guard(b, false)?, values })
+        Some(Seed { payload: self.history_payload(b, false)?, guard: self.guard(b, false)?, values })
     }
     fn case(&mut self, b: &Branch) -> Option<Case> {
         self.validate_shapes(b, true)?;
@@ -225,7 +239,7 @@ impl Emitter<'_, '_> {
             let value = self.context.select(&rhs, &slot.path.keys)?;
             values[slot.family].push(self.transfer(&value, slot.family, deltas[slot.family])?);
         }
-        Some(Case { guard: self.guard(b, true)?, deltas, values })
+        Some(Case { payload: self.history_payload(b, true)?, guard: self.guard(b, true)?, deltas, values })
     }
     fn guard(&mut self, b: &Branch, primed: bool) -> Option<String> {
         let mode = if primed { Mode::Step } else { Mode::Initial };

@@ -12,8 +12,10 @@ The scalar subset has one frontier, one initial anchor, literal nonnegative incr
 and independent remaining state. The nested subset supports several independent families,
 fixed records/tuples/maps, conditional transfers, copying old identifiers and fresh offsets
 within a branch's increment. Positive values use relative ranks; nonpositive sentinels remain
-exact. Dynamic shapes, colored keys/sets, cross-family comparisons and version collection
-are refused, including the MongoDB incarnation model. Symmetry composition is excluded.
+exact. One immutable table can be collected when its payloads contain no allocation
+identifiers and all reads use current live roots. Dynamic shapes, colored keys/sets,
+cross-family comparisons and broader version uses are refused, including the MongoDB
+incarnation model. Symmetry composition is excluded.
 Source lowering, fixed representations, inferred domains, independent leaf semantics,
 totality and runtime execution remain trusted.
 See [the rule's scope](../../docs/optimization.md#ordered-allocation-and-live-versions).
@@ -51,6 +53,41 @@ A diagnostic variant that retains a reservation counter and stops allocating aft
 reservations has 187 generated / 54 distinct states in TLC and unreduced tlx, versus 111 / 29
 with optimization. This bounded variant is oracle evidence, not the unbounded source model.
 Runtime regressions also check concrete safety failures and deadlocks across execution tiers.
+
+## Immutable version collection
+
+[LiveVersions.tla](LiveVersions.tla) publishes an unbounded sequence of immutable versions.
+Two actors hold old version identifiers. Their reads affect guards, retained state and the
+next published payload. The compiler keeps the entries reachable through those identifiers,
+the current frontier and fixed anchors, then ranks their keys. With
+[LiveVersions.cfg](LiveVersions.cfg), interpreted and paranoid compiled checks complete
+with 552 generated / 89 distinct states:
+
+```sh
+target/release/tlx check proofs/ordered/LiveVersions.tla -optimize -noautosymmetry -interp
+TLX_PARANOID=1 target/release/tlx check proofs/ordered/LiveVersions.tla -optimize -noautosymmetry -compile
+```
+
+The generated `LiveRule.Model` contains actual initial payloads, branch deltas, numeric
+transfers, lookup feedback, appended payloads and observations. The source table grows;
+the fingerprint keeps only its live graph. Future actions can copy current roots or allocate
+a fresh key, so they cannot resurrect an unretained entry. The shared proof establishes this
+property rather than assuming that garbage collection preserves transitions. Its six theorem
+audits include equality of the retained-table/rank key iff the quotient agrees. Six mutations
+reject losing live old values, inserting at the wrong key, omitting payloads from the key,
+dropping initialization or successors, and changing observations.
+
+Table initialization is a singleton at the positive frontier. Its frontier changes by zero
+or one, and entries are immutable. Payloads are allocation-identifier-free and can depend on
+retained state and explicit current-root reads; source lowering and lookup totality remain
+trusted. Raw table escapes, enumeration, primed reads, arbitrary computed old keys, dynamic
+colored shapes and identifier-containing payloads refuse. The Rust table filter and structural
+key implementation also remain trusted. The theorem covers state observations and deadlocks,
+not temporal properties or composition with symmetry.
+
+A bounded diagnostic retaining a publication counter with limit four matches TLC and plain
+tlx at 603 generated / 108 distinct states; optimized interpreted/paranoid execution uses
+559 / 98. This is a bounded oracle check, separate from the unbounded source above.
 
 ## Why the broader rule was restricted
 

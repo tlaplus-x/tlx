@@ -161,9 +161,13 @@ fn intermediate_consumers_keep_anchors_and_generate_a_certificate() {
 
 #[test]
 fn uncertified_candidates_are_not_accepted_as_reductions() {
-    for source in [SPEC, SCALAR] {
+    for (source, namespace) in [
+        (SPEC.to_owned(), Some("GeneratedLive")),
+        (SCALAR.to_owned(), Some("GeneratedOrdered")),
+        (SCALAR.replace("{frontier, 1}", "{frontier} \\cup {1}"), None),
+    ] {
         let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
-        let dir = tlx_testkit::TempDir::with_spec("ordered-certificate-gate", source, cfg);
+        let dir = tlx_testkit::TempDir::with_spec("ordered-certificate-gate", &source, cfg);
         let program = Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
         let expr = |name: &str| {
             let def = program.defs.iter().find(|d| &*d.name == name).unwrap();
@@ -171,7 +175,10 @@ fn uncertified_candidates_are_not_accepted_as_reductions() {
             e.clone()
         };
         let result = ordered_projection(&program, &tlx_front::cfg::parse_cfg(cfg).unwrap(), &expr("Init"), &expr("Next"), &[expr("Inv")]);
-        assert_eq!(result.is_some(), source == SCALAR);
+        assert_eq!(result.is_some(), namespace.is_some());
+        if let Some(namespace) = namespace {
+            assert!(result.unwrap().certificate.unwrap().contains(namespace));
+        }
     }
 }
 

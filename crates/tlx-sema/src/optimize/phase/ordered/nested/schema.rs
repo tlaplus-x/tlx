@@ -20,6 +20,7 @@ impl Path {
 }
 #[derive(Clone)]
 pub(super) enum Schema {
+    History,
     Plain,
     Number(usize),
     Record(BTreeMap<String, Schema>),
@@ -172,6 +173,7 @@ impl Context<'_> {
     /// Container domains/shapes are part of the source representation invariant.
     pub(super) fn shape_matches(&mut self, e: &Expr, schema: &Schema) -> Option<()> {
         match schema {
+            Schema::History => None,
             Schema::Plain | Schema::Number(_) => Some(()),
             _ => {
                 if let ExprKind::If { then, els, .. } = &*e.kind {
@@ -254,6 +256,7 @@ impl Schema {
     }
     pub fn leaves(&self, path: Path, numeric: &mut Vec<Slot>, plain: &mut Vec<Path>, families: &[Family]) {
         match self {
+            Self::History => {}
             Self::Plain => plain.push(path),
             Self::Number(f) => {
                 if families[*f].variable == path.var && path.keys.is_empty() {
