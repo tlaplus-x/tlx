@@ -3,6 +3,7 @@
 
 mod infer;
 mod lean;
+mod nested;
 mod shape;
 mod syntax;
 #[cfg(test)]
@@ -167,7 +168,8 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observat
         fields.push(format!("{}.live-versions", program.vars[h.variable.idx()].name));
     }
     let values = program.vars.iter().enumerate().map(|(i, v)| Expr::new(ExprKind::Var(VarId(i as u32)), v.span)).collect();
-    let certificate = lean::emit(&analysis.families, &plan, &initial, &steps, &observations);
+    let certificate = lean::emit(&analysis.families, &plan, &initial, &steps, &observations)
+        .or_else(|| nested::emit(program, cfg, &analysis.families, &plan, &initial, &steps, &observations));
     Some(FieldProjection { view: Expr::new(ExprKind::Tuple(values), init.span), fields, certificate, ordered: Some(plan) })
 }
 

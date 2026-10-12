@@ -45,7 +45,8 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Sequence length | Multiple sequences, append/reset/frame transfers and current-length feedback | Enabled within this subset |
 | Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
-| Nested ordered allocation and live versions | Missing | Candidate analysis only |
+| Nested ordered allocation | Fixed record/tuple/map paths, multiple independent families, conditional copy/fresh/reset transfers and rank-key equivalence | Enabled within this subset |
+| Immutable live versions | Missing | Candidate analysis only |
 | Automatic keyed symmetry | Fixed-domain maps; explicit key equality, quantifiers, reads and writes; permutation quotient | Enabled for one full group; other shapes and runtime-guarded claims remain uncertified |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
 | Projection composed with symmetry | Missing | Automatic projection refused |
@@ -420,7 +421,7 @@ completed A/B timings against the unreduced model.
 ## Ordered allocation and live versions
 
 `ordered-allocation-projection` now requires a compiler-generated, connected rule-model
-certificate before it can be applied. The current certified subset is intentionally narrow:
+certificate before it can be applied. The scalar certificate supports:
 
 - One scalar frontier initialized to a positive literal, retained or advanced by a
   nonnegative literal on each branch.
@@ -447,10 +448,25 @@ stuttering, concrete counterexample lifting and plain-Next deadlock preservation
 preservation premise or correctness axiom is assumed. Source lowering, totality and
 runtime execution remain trusted. Symmetry composition is excluded. Generation does not run Lean.
 
-The wider provenance analysis can follow families through records, maps, sets and sequences,
-and recognize immutable version histories. These candidates are **not applied** without a
-connected certificate. This currently excludes the MongoDB collection-incarnation model,
-multiple allocation families, copies of identifiers, and history garbage collection. The
+A second connected emitter supports several independent allocation families and copied
+identifiers inside fixed records, tuples and finite-domain maps. Initialization establishes
+each numeric occurrence is at most its family's frontier. Branches can copy old identifiers,
+write retained literal anchors, choose between transfers using supported tests, or write a
+fresh offset within that branch's frontier increment. Finite actor bounds are expanded.
+Container domains and shapes must stay fixed. Guards and observations expose comparisons
+between live identifiers and anchors; independent leaves see only retained state.
+
+`NestedCertificate.lean` proves correspondence for this explicit transfer IR.
+`NestedRank.lean` proves that canonical positive ranks encode exactly the relative order,
+while zero and negative sentinels retain their exact values. The generated finite reference
+list includes every numeric path and anchor; Lean checks its completeness. The key theorem
+connects this vector to the quotient. Source lowering, fixed-shape representation, inferred
+domains, independent leaf interpretation and the Rust structural key walker remain trusted.
+The unbounded [nested example](../proofs/ordered/Nested.tla) completes with 13 states.
+
+Dynamic container shapes, identifier-valued keys and sets, cross-family comparisons,
+unsupported arithmetic and immutable history collection remain uncertified candidates.
+This still excludes the MongoDB collection-incarnation model. The
 [MongoDB oracle fixture](../crates/tlx-cli/tests/fixtures/optimization_ordered/README.md)
 retains an independent TLC VIEW with 19,048 distinct states as a future coverage target;
 that count is not a current automatic optimization claim.

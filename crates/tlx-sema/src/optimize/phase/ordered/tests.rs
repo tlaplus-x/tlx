@@ -193,5 +193,8 @@ fn certificates_follow_renamed_seeds_branches_and_observations() {
     for condition in ["frontier # 1", "1 < frontier", "~(frontier <= 1)", "(frontier >= 1) /\\ ~(frontier = 1)"] {
         assert!(plan(&SCALAR.replace("Cardinality({frontier, 1}) = 2", condition)).unwrap().certificate.is_some(), "{condition}");
     }
-    assert!(plan(&SCALAR.replace("Cardinality({frontier, 1}) = 2", "frontier = frontier")).unwrap().certificate.is_none());
+    // The nested order-pattern model also certifies direct reference comparisons
+    // when no fixed anchor is observed, even with no stored copies.
+    let proof = plan(&SCALAR.replace("Cardinality({frontier, 1}) = 2", "frontier = frontier")).unwrap().certificate.unwrap();
+    assert!(proof.contains("namespace TlxOptimization.GeneratedNested"));
 }

@@ -187,7 +187,8 @@ Automatic state reductions require a compiler-generated Lean certificate connect
 that application. Currently enabled rules remove unobserved variables with literal/copy
 updates, summarize supported append-only histories, cap relative timestamp ages (including
 finite age-filtered sets), combine supported age and history reductions, and reduce a
-restricted scalar allocation frontier. A connected sequence-length certificate can
+scalar or fixed nested allocation frontiers. The [nested allocation example](proofs/ordered/README.md)
+reduces an unbounded model with two allocation families to 13 states. A connected sequence-length certificate can
 merge different sequence contents when every use depends only on current lengths.
 [Phase-field certificates](proofs/field/README.md) erase record fields in phases where
 they are overwritten before their next use. Lean checks the generated liveness tables. A history

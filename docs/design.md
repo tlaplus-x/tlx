@@ -106,7 +106,7 @@ Every automatic state-reducing application must carry a connected Lean certifica
 `tlx-eval::model::optimization::project_state` enforces this before installing a VIEW.
 Candidates without certificates cannot preempt certified candidates. Accepted checking
 currently covers unobserved-variable erasure, relative ages, a subset of finite history
-summaries, phase-dependent fields, exact sequence lengths, and a restricted scalar ordered-allocation rule. Checked invariants are observations, never
+summaries, phase-dependent fields, exact sequence lengths, and scalar or fixed nested ordered allocation. Checked invariants are observations, never
 assumptions; source actions and concrete state values remain intact for replay.
 
 `phase/keyed.rs` separately certifies automatic symmetry of fixed-domain maps
@@ -137,8 +137,13 @@ remain history-independent. Dependent binders and next-state history reads refus
 
 `phase/ordered/lean.rs` emits a scalar frontier's initial anchor, literal nonnegative
 increments, guards and observations. `OrderedCertificate.lean` additionally connects
-formal projection equality to runtime rank-key equality. Nested allocation copies,
-multiple families and immutable version collection remain uncertified candidates.
+formal projection equality to runtime rank-key equality. `phase/ordered/nested` lowers
+fixed records, tuples and maps into explicit numeric paths, retained leaves, finite branch
+choices and conditional transfers for multiple independent families. `NestedCertificate.lean`
+proves the order-pattern quotient; `NestedRank.lean` connects positive ranks and exact
+nonpositive sentinels to that quotient. Fixed shapes, lowering, domain inference and the
+runtime structural walker remain trusted. Dynamic shapes and immutable version collection
+remain uncertified candidates.
 
 `phase/age/lean.rs` lowers fixed-domain timestamp maps to explicit per-key keep/reset/erase
 updates and deadline tests, using the same inferred caps as the runtime VIEW.
