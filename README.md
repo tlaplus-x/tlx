@@ -207,8 +207,12 @@ successor correspondence, observations, counterexample lifting and deadlock pres
 cleanup and saturation pass, plus their composition. The generated finite model
 can be checked separately; export does not itself check safety.
 
+[Automatic keyed symmetry](proofs/symmetry/README.md) emits a connected certificate
+for fixed-domain maps with identifier-free payloads. It runs in default mode and
+merges states differing only by a permutation of their map keys.
+
 Proof coverage is incomplete. Broader age/history compositions, broad ordered
-allocation and automatic symmetry remain unavailable without connected certificates.
+allocation and other symmetry shapes remain unavailable without connected certificates.
 Unsupported checking applications keep the original graph. Explicit user `VIEW` and `SYMMETRY` declarations
 retain their TLC behavior. Automatic projections currently decline symmetry composition.
 See [the coverage inventory](docs/optimization.md#proof-coverage).

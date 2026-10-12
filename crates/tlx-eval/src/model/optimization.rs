@@ -71,6 +71,36 @@ impl InterpModel {
         None
     }
 
+    /// Certify one full key permutation group. This does not install it.
+    pub fn symmetry_certificate(&self, keys: &[String]) -> Option<String> {
+        let cfg = &self.ip.cfg;
+        if !self.live.is_empty()
+            || self.has_view()
+            || !self.symmetry.is_empty()
+            || cfg.symmetry.is_some()
+            || !self.possible.is_empty()
+            || !self.postconditions.is_empty()
+            || !self.constraints.is_empty()
+            || !self.action_constraints.is_empty()
+            || !self.action_props.is_empty()
+            || !self.init_props.is_empty()
+            || self.alias.is_some()
+            || !cfg.constants.iter().all(|b| {
+                matches!(b,
+                ConstBinding::Value { name, module: None, .. } if self.ip.root_def(name).is_none())
+            })
+        {
+            return None;
+        }
+        let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
+        tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, keys)
+    }
+
+    /// Retain the proof of the automatic group actually installed by the caller.
+    pub fn record_symmetry_certificate(&mut self, certificate: String) {
+        self.projection_certificate = Some(certificate.into());
+    }
+
     /// The accepted pass's generated proof; generation never invokes Lean.
     pub fn projection_certificate(&self) -> Option<&str> {
         self.projection_certificate.as_deref()

@@ -1,5 +1,5 @@
 //! Replace record reads by explicit phase/data inputs. No raw record reaches C.
-use super::super::super::variable;
+use super::super::super::{max_local, variable};
 use super::{Emitter, Reads};
 use crate::{builtins::Builtin as B, hir::*, visit};
 
@@ -95,29 +95,4 @@ pub(super) fn mentions(e: &Expr, var: VarId) -> bool {
     let mut found = false;
     visit::children(e, &mut |e| found |= mentions(e, var));
     found
-}
-
-// Bound declarations, even unused ones, must not capture inserted inputs.
-fn max_local(e: &Expr) -> u32 {
-    let mut max = 0;
-    let mut ids = |ids: &[LocalId]| {
-        for id in ids {
-            max = max.max(id.0);
-        }
-    };
-    match &*e.kind {
-        ExprKind::Local(id) => ids(&[*id]),
-        ExprKind::Quant { bounds, .. } | ExprKind::FnConstruct { bounds, .. } | ExprKind::SetMap { bounds, .. } => {
-            for b in bounds {
-                ids(b.vars.locals());
-            }
-        }
-        ExprKind::SetFilter { bound, .. } => ids(bound.vars.locals()),
-        ExprKind::Choose { vars, .. } => ids(vars.locals()),
-        ExprKind::Lambda { params, .. } => ids(params),
-        ExprKind::QuantUnbounded { vars, .. } | ExprKind::TemporalQuant { vars, .. } => ids(vars),
-        _ => {}
-    }
-    visit::children(e, &mut |e| max = max.max(max_local(e)));
-    max
 }

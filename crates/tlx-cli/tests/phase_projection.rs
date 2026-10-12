@@ -136,7 +136,7 @@ fn symmetric_spec() -> String {
 }
 
 #[test]
-fn unproved_composition_keeps_only_explicit_symmetry() {
+fn uncertified_composition_keeps_projection_and_symmetry_separate() {
     for declared in [false, true] {
         let cfg = format!("{CFG}CONSTANT Actors = {{a, b}}\n{}", if declared { "SYMMETRY Sym\n" } else { "" });
         let dir = tlx_testkit::TempDir::with_spec("phase-symmetry", &symmetric_spec(), &cfg);
@@ -144,7 +144,7 @@ fn unproved_composition_keeps_only_explicit_symmetry() {
             // Four local states give ten multisets; projecting idle data
             // leaves three local states and six multisets of two actors.
             for (flags, count) in [
-                (vec![], if declared { 10 } else { 16 }),
+                (vec![], 10),
                 (vec!["-optimize"], if declared { 10 } else { 9 }),
                 (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 }),
             ] {

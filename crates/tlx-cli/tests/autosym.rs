@@ -1,5 +1,4 @@
-//! Candidate diagnostics and refusal of uncertified automatic symmetry,
-//! including forced and guarded applications.
+//! Certified keyed symmetry and refusal of unsupported automatic applications.
 
 use std::time::Duration;
 
@@ -44,7 +43,7 @@ fn a_provable_symmetry_is_suggested_under_tlc() {
     let r = run(SYMMETRIC, "INVARIANT Inv", &["-tlc"], &[]);
     assert_eq!(r.code, 0, "{}", r.text());
     assert!(
-        r.stdout.contains("Symmetry: Permutations(Proc) is provable for safety checking and not declared; to use it, define Perms == Permutations(Proc) and add \"SYMMETRY Perms\" to the cfg."),
+        r.stdout.contains("Symmetry: Permutations(Proc) is provable for safety checking and not declared; to use it, run without -tlc, or define Perms == Permutations(Proc) and add \"SYMMETRY Perms\" to the cfg."),
         "{}",
         r.text()
     );
@@ -54,12 +53,13 @@ fn a_provable_symmetry_is_suggested_under_tlc() {
 }
 
 #[test]
-fn the_default_mode_refuses_symmetry_without_a_connected_certificate() {
+fn the_default_mode_applies_connected_keyed_symmetry() {
     for tier in ["-interp", "-compile"] {
         let r = run(SYMMETRIC, "INVARIANT Inv", &[tier], &[]);
         assert_eq!(r.code, 0, "{}", r.text());
-        assert!(r.stdout.contains("Optimizations: none applicable."), "{}", r.text());
-        assert!(r.stdout.contains("27 distinct states found, 0 states left on queue."), "{}", r.text());
+        assert!(r.stdout.contains("certificate generated"), "{}", r.text());
+        assert!(r.stdout.contains("10 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
+        assert!(r.stdout.contains("Lean output:"), "{}", r.text());
         assert!(!r.stdout.contains("Symmetry: "), "no suggestion in the default mode: {}", r.text());
     }
     let r = run(SYMMETRIC, "INVARIANT Inv", &["-noautosymmetry"], &[]);
@@ -114,13 +114,13 @@ fn suggest_checks_every_candidate() {
 fn force_cannot_bypass_the_certificate_gate() {
     let r = run(SYMMETRIC, "INVARIANT Inv", &[], &[("TLX_AUTOSYM_FORCE", "Proc"), ("TLX_SYMMETRY_PARANOID", "1")]);
     assert_eq!(r.code, 0, "{}", r.text());
-    // Even an explicitly forced candidate cannot bypass the proof gate.
-    assert!(r.stdout.contains("27 distinct states found, 0 states left on queue."), "{}", r.text());
-    assert!(r.stdout.contains("Optimizations: none applicable."), "{}", r.text());
+    // Force changes candidate selection only; the connected proof is still required.
+    assert!(r.stdout.contains("10 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
+    assert!(r.stdout.contains("certificate generated"), "{}", r.text());
 }
 
 #[test]
-fn refused_symmetry_has_no_reduction_label_in_dumps_or_statistics() {
+fn certified_symmetry_labels_dumps_and_statistics() {
     let dir = tlx_testkit::TempDir::new("autosym-label");
     std::fs::write(
         dir.join("Spec.tla"),
@@ -134,11 +134,11 @@ fn refused_symmetry_has_no_reduction_label_in_dumps_or_statistics() {
         .timeout(Duration::from_secs(30))
         .run();
     assert_eq!(r.code, 0, "{}", r.text());
-    assert!(r.stdout.contains("@!@!@STARTMSG 9100:0 @!@!@\nOptimizations: none applicable."), "{}", r.text());
+    assert!(r.stdout.contains("@!@!@STARTMSG 9100:0 @!@!@\nOptimizations: symmetry"), "{}", r.text());
     let dump = std::fs::read_to_string(dir.join("states.dump")).unwrap();
-    assert!(!dump.starts_with("\\* reduced by symmetry; use -tlc for the full graph\n"), "{dump}");
+    assert!(dump.starts_with("\\* reduced by symmetry; use -tlc for the full graph\n"), "{dump}");
     let stats = std::fs::read_to_string(dir.join("stats.json")).unwrap();
-    assert!(stats.contains(r#""optimizations":[]"#), "{stats}");
+    assert!(stats.contains(r#""proof":"generated-lean""#), "{stats}");
 }
 
 #[test]
@@ -222,5 +222,47 @@ fn unproved_guard_candidates_are_not_evaluated() {
         assert_eq!(guarded.code, 0, "{}", guarded.text());
         assert!(!guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
         assert!(guarded.stdout.contains("17 distinct states found, 0 states left on queue."), "{}", guarded.text());
+    }
+}
+
+#[test]
+fn generated_symmetry_proofs_are_mandatory_and_never_overwritten() {
+    let dir = spec(SYMMETRIC, "INVARIANT Inv");
+    let run = || tlx_testkit::tlx_default!().args(["check", "Spec.tla", "-interp"]).dir(&dir).run();
+    for _ in 0..2 {
+        let r = run();
+        assert_eq!(r.code, 0, "{}", r.text());
+        assert!(r.stdout.contains("not verified; parametric keyed-symmetry"), "{}", r.text());
+    }
+    let proofs: Vec<_> = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().collect();
+    assert_eq!(proofs.len(), 2);
+    for proof in proofs {
+        let text = std::fs::read_to_string(proof.unwrap().path().join("Optimization.lean")).unwrap();
+        assert!(text.contains("namespace TlxOptimization.GeneratedSymmetry"));
+        assert!(text.contains("theorem counterexample_lifts"));
+    }
+    let blocked = spec(SYMMETRIC, "INVARIANT Inv");
+    std::fs::write(blocked.join(".tlx-proofs"), "occupied").unwrap();
+    let r = tlx_testkit::tlx_default!().args(["check", "Spec.tla", "-interp"]).dir(&blocked).run();
+    assert_eq!(r.code, 2, "{}", r.text());
+    assert!(r.stdout.contains("Cannot write mandatory optimization Lean output"), "{}", r.text());
+    assert!(!r.stdout.contains("Computing initial states"), "{}", r.text());
+}
+
+#[test]
+fn certified_symmetry_preserves_deadlocks_and_concrete_violations() {
+    let body = format!("{SYMMETRIC}\nSmall == \\A p \\in Proc : pc[p] < 2");
+    for tier in ["-interp", "-compile"] {
+        let bad = run(&body, "INVARIANT Small", &[tier], &[("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")]);
+        assert_eq!(bad.code, 12, "{}", bad.text());
+        assert!(bad.stdout.contains("certificate generated"), "{}", bad.text());
+        assert_eq!(bad.stdout.lines().filter(|l| l.starts_with("State ")).count(), 3, "{}", bad.text());
+        let d = spec(SYMMETRIC, "INVARIANT Inv");
+        let cfg = std::fs::read_to_string(d.join("Spec.cfg")).unwrap().replace("CHECK_DEADLOCK FALSE", "CHECK_DEADLOCK TRUE");
+        std::fs::write(d.join("Spec.cfg"), cfg).unwrap();
+        let dead = tlx_testkit::tlx_default!().args(["check", "Spec.tla", tier]).dir(&d).run();
+        assert_eq!(dead.code, 11, "{}", dead.text());
+        assert!(dead.stdout.contains("certificate generated"), "{}", dead.text());
+        assert!(dead.stdout.contains("Deadlock reached"), "{}", dead.text());
     }
 }

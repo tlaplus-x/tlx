@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -54,6 +54,8 @@ def verify(lean, path, negative):
     ):
         axioms[name] = []
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace == "GeneratedOrdered" else set())
+    if namespace == "GeneratedSymmetry":
+        theorems |= {"orbit_key_equivalent"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
         theorems |= {"select_concrete", "select_reduced"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
@@ -121,6 +123,11 @@ def verify(lean, path, negative):
                 ("  writes := writes", "  writes := fun _ _ => false", "exposed dead framed fields"),
                 ("  readsGlobal := readsGlobal", "  readsGlobal := fun _ _ => true", "read dead fields of another actor"),
             ] if namespace == "GeneratedField" else [
+                ("fun i => p.toFun (keys i)", "fun i => keys i", "failed to rename bound keys"),
+                ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
+                ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
+                ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
+            ] if namespace == "GeneratedSymmetry" else [
                 ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
                 ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
                 ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),

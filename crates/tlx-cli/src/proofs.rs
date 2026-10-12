@@ -33,6 +33,8 @@ pub(crate) fn emit(model: &InterpModel, applied: Option<(&str, &[String])>) -> R
         "parametric phase-field rule-IR certificate; lowering and runtime remain trusted"
     } else if rule == Some("sequence-length-projection") && model.projection_certificate().is_some() {
         "parametric sequence-length rule-IR certificate; lowering and runtime remain trusted"
+    } else if rule == Some("keyed-symmetry") && model.projection_certificate().is_some() {
+        "parametric keyed-symmetry rule-IR certificate; lowering, group closure and runtime remain trusted"
     } else if model.projection_certificate().is_some() {
         "parametric history rule-IR certificate; lowering and runtime remain trusted"
     } else {

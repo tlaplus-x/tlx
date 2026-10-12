@@ -56,7 +56,9 @@ pub fn projection_lean(
         ("structuralOrderPlan", format!("{ordered:#?}")),
         (
             "projectionMechanism",
-            if ordered.is_some() {
+            if rule == Some("keyed-symmetry") {
+                "The certified full key-permutation group is closed and canonicalized at the fingerprint boundary."
+            } else if ordered.is_some() {
                 "The structuralOrderPlan replaces the identity afterViewHIR at the fingerprint boundary."
             } else {
                 "The afterViewHIR expression is evaluated at the fingerprint boundary."

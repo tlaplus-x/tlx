@@ -1,4 +1,5 @@
 //! Lower the actual length-only slice, retaining its branch choices and events.
+use super::super::max_local;
 use std::fmt::Write;
 
 use super::super::{binding, variable, Branch};
@@ -190,30 +191,6 @@ impl Emitter<'_> {
     }
 }
 
-// Declared but unused binders also occupy names: a new hole cannot capture one.
-fn max_local(e: &Expr) -> u32 {
-    let mut max = 0;
-    let mut record = |ids: &[LocalId]| {
-        for id in ids {
-            max = max.max(id.0);
-        }
-    };
-    match &*e.kind {
-        ExprKind::Local(id) => record(&[*id]),
-        ExprKind::Quant { bounds, .. } | ExprKind::FnConstruct { bounds, .. } | ExprKind::SetMap { bounds, .. } => {
-            for b in bounds {
-                record(b.vars.locals());
-            }
-        }
-        ExprKind::SetFilter { bound, .. } => record(bound.vars.locals()),
-        ExprKind::Choose { vars, .. } => record(vars.locals()),
-        ExprKind::Lambda { params, .. } => record(params),
-        ExprKind::QuantUnbounded { vars, .. } | ExprKind::TemporalQuant { vars, .. } => record(vars),
-        _ => {}
-    }
-    visit::children(e, &mut |e| max = max.max(max_local(e)));
-    max
-}
 fn conjunction(parts: &[String]) -> String {
     if parts.is_empty() {
         "True".into()

@@ -106,8 +106,18 @@ Every automatic state-reducing application must carry a connected Lean certifica
 `tlx-eval::model::optimization::project_state` enforces this before installing a VIEW.
 Candidates without certificates cannot preempt certified candidates. Accepted checking
 currently covers unobserved-variable erasure, relative ages, a subset of finite history
-summaries, and a restricted scalar ordered-allocation rule. Checked invariants are observations, never
+summaries, phase-dependent fields, exact sequence lengths, and a restricted scalar ordered-allocation rule. Checked invariants are observations, never
 assumptions; source actions and concrete state values remain intact for replay.
+
+`phase/keyed.rs` separately certifies automatic symmetry of fixed-domain maps
+with key-free payloads. The emitter exposes key equality, quantifiers, reads,
+conditional values and actor writes in `KeyedCertificate.lean`'s rule IR.
+The shared proof establishes equivariance and constructs a permutation-quotient
+certificate with successor lifting from every representative. Candidate shape
+analysis cannot authorize application alone: `autosym` requires this certificate
+before installing one full group and emits Lean before the search. Source lowering,
+domains, semantic leaves, permutation closure and runtime canonicalization remain
+trusted. Other symmetry shapes and composition with projection stay gated.
 
 `phase/erasure.rs` emits each hidden variable's literal assignment or old-state copy,
 including copy cycles. Guards, retained updates and observations are interpreted over

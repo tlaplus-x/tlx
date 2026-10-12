@@ -46,7 +46,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
-| Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
+| Automatic keyed symmetry | Fixed-domain maps; explicit key equality, quantifiers, reads and writes; permutation quotient | Enabled for one full group; other shapes and runtime-guarded claims remain uncertified |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
 | Projection composed with symmetry | Missing | Automatic projection refused |
 
@@ -59,6 +59,40 @@ retain the TLC contract; they are not compiler-certified automatic reductions.
 The sections describing unsupported rules below document candidate algorithms and prior
 evidence, not enabled reductions or current performance claims. Disabling a candidate is
 not a proof of it: completing these certificates remains work.
+
+## Certified keyed symmetry
+
+The default-mode symmetry path accepts one full permutation group of two to six
+model values. State values may use those identifiers as the exact domain of one
+or more maps. Their payloads and the retained state must contain no moved
+identifiers, and payload values must be mutually comparable for runtime
+canonicalization. Domain inference uses initialization and every action, never
+selected invariants as assumptions.
+
+The compiler emits explicit key equality, Boolean connectives, quantifiers over
+the full key set, ordered map reads and map writes. Each map update currently
+writes one syntactic actor per branch; multiple payload-field patches preserve
+source order. Whole-payload conditional values become explicit decision trees.
+Untranslated key uses, multiple potentially aliasing actors in one map update,
+primed map reads, unknown domains and identifier-containing payloads refuse.
+
+`KeyedCertificate.lean` proves equivariance of these operations and constructs
+the permutation quotient. Its successor theorem lifts from every representative,
+not just the representative used to create an edge. Initialization uses actual
+source witnesses, so the formal rule does not need a symmetric initial predicate.
+Six exported theorem audits cover the main certificate, safety with and without
+stuttering, counterexamples, deadlocks, and equality of formal orbit keys.
+The runtime's permutation closure and minimum-representative algorithm remain
+trusted; the orbit theorem does not claim to verify their Rust implementation.
+
+Automatic application requires the connected certificate even for a forced
+candidate. Runtime guards and bounded checks cannot substitute for it. The CLI
+writes mandatory Lean before exploration, including without opt-in projection.
+An explicitly requested certified projection takes priority over automatic
+symmetry until composition has a certificate. Constraints, action/initial
+properties, aliases, temporal checking, declared VIEW/SYMMETRY and projection
+composition remain excluded. See the
+[reproduction example](../proofs/symmetry/README.md).
 
 ## Overlap with execution optimization
 
@@ -410,8 +444,8 @@ The predicate semantics include the duplicate-sensitive cardinality of the two-e
 `OrderedCertificate.lean` constructs the certificate and proves initialization correspondence,
 successor correspondence from every representative, observation preservation, safety with
 stuttering, concrete counterexample lifting and plain-Next deadlock preservation. No
-preservation premise or correctness axiom is assumed. Source lowering, totality, runtime
-execution and symmetry composition remain trusted. Generation still does not run Lean.
+preservation premise or correctness axiom is assumed. Source lowering, totality and
+runtime execution remain trusted. Symmetry composition is excluded. Generation does not run Lean.
 
 The wider provenance analysis can follow families through records, maps, sets and sequences,
 and recognize immutable version histories. These candidates are **not applied** without a
@@ -810,8 +844,8 @@ this avoids duplicating the entire TLA+ evaluator just to prove a history quotie
 **The trust boundary is still the lowering.** Lean checks preservation of the generated
 rule model, not that Rust translated TLA+/HIR faithfully. Domain inference and totality
 of reads, set/index predicate lowering, source bindings, the actual VIEW implementation,
-symmetry composition, backend execution and model-checking results remain outside the
-certificate. The proof does not establish the input model's safety or its state count.
+backend execution and model-checking results remain outside the certificate.
+Symmetry composition is excluded. The proof does not establish the input model's safety or its state count.
 
 History predicates can feed back into branch guards, retained-state updates, appended
 values and conditional append/reset transfers. The emitter replaces each supported
@@ -824,14 +858,13 @@ Branch bounds and initialization must remain history-independent; initial histor
 use finite resets. Supported predicates include prefix monitors, emptiness, sequence
 type membership and their Boolean combinations. Standalone history lowering still
 refuses dependent binders, next-state history reads, exact lengths and unsupported
-index patterns. Combined
-age/history certificates also require history-independent timestamp-map transfers and
-age-independent history events. A single retained expression may mix age-filtered
-sets with history predicates.
-Its emitted consumer receives exact selected source positions and explicit Boolean
-results, with both mappings recorded in HIR metadata. Fixed-domain filters can also
-contain history predicates. Dynamic domains, next-state inputs and non-enumerated
-binders remain unsupported. Constraints, action/initial properties and trace aliases exclude automatic reduction. Unsupported history cases and
+index patterns. Combined age/history certificates additionally support explicit
+history-dependent timestamp decisions, age-dependent event values and conditions,
+and finite filters whose consumers mix age and history results. Dynamic filter
+domains are expanded from inferred finite upper bounds with membership guards.
+The emitted consumer receives exact selected source positions and explicit Boolean
+results, with their mappings recorded in HIR metadata. Next-state inputs and
+non-enumerable binders remain unsupported. Constraints, action/initial properties and trace aliases exclude automatic reduction. Unsupported history cases and
 all other uncertified rules are refused. A no-pass run emits shared algebra and a record
 explicitly saying no reduction was applied. The export command likewise refuses its
 uncertified proposal. Generation does not imply Lean acceptance.

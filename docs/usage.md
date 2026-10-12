@@ -398,7 +398,7 @@ one line `compile: no JIT and no C compiler (cc not found): checking with the in
 shortest-trace length as TLC's ([compat.md](compat.md) section 0). Without it, the default mode may
 use optimizations TLC does not have; they keep the verdicts sound (a violation is reported exactly
 when one exists, with a genuine counterexample) but may change counts, depth or the counterexample.
-Automatic symmetry currently awaits connected Lean certificates and is not applied
+Automatic symmetry applies only within its connected certificate coverage
 ([section 6.3](#63-automatic-symmetry-in-the-default-mode)). Every run in the default mode names
 the optimizations it used in an `Optimizations:` line.
 
@@ -562,7 +562,7 @@ Many models bind a constant to a set of interchangeable model values (`RM = {r1,
 do not declare the symmetry. Before the search, tlx looks for such sets (a CONSTANT whose cfg
 value is a set of at least two model values, also through a `<-` substitution of a constant
 definition) that the cfg's SYMMETRY does not cover, and tries to prove statically that every
-permutation of them is an automorphism of the checked state graph. A candidate group is not applied automatically pending a connected Lean certificate
+permutation of them is an automorphism of the checked state graph. A candidate group is applied automatically only when it also receives a connected Lean certificate
 (section 6.3). Under `-tlc`, tlx prints a suggestion:
 
 ```
@@ -612,19 +612,22 @@ Proven symmetry: define Perms == Permutations(Key) \cup Permutations(Val) \cup P
 
 ### 6.3. Automatic symmetry in the default mode
 
-Automatic symmetry application is disabled until it has a compiler-generated Lean
-certificate connected to the reduction. The Rust analysis, its bounded cross-checks and
-runtime guards do not meet that proof requirement. This includes forced candidates:
-the development force setting cannot bypass the certificate gate.
+Automatic symmetry currently supports one full group over fixed-domain maps with
+identifier-free payloads. Each application emits connected Lean before search,
+without invoking Lean. The [certificate coverage](optimization.md#certified-keyed-symmetry)
+describes supported expressions and trusted layers. The Rust candidate analysis,
+bounded checks and runtime guards cannot substitute for this certificate; the
+development force setting cannot bypass the gate.
 
-Candidate analysis and `-checksymmetry -suggest` remain available. The `auto symmetry`
-section of `-stats` explains that a connected certificate is missing. Explicit user
-`SYMMETRY` declarations keep their existing behavior and responsibility; they are not
-compiler-certified reductions. See [proof coverage](optimization.md#proof-coverage).
+Other candidates remain available through analysis and `-checksymmetry -suggest`.
+Their refusal is recorded in the `auto symmetry` section of `-stats`. Explicit user
+`SYMMETRY` declarations keep their TLC behavior and responsibility.
 
-Every default-mode run still names applied optimizations (message code 9100 under `-tool`)
-and records an `optimizations` array in JSON statistics. With no certified opt-in projection,
-it reports `Optimizations: none applicable.` and explores the full graph.
+Every default-mode run names applied optimizations (message code 9100 under `-tool`)
+and records an `optimizations` array in JSON statistics. A certified symmetry is
+labelled `certificate generated`, with `proof: "generated-lean"`, and its counts
+are marked `symmetry-reduced`. With no certified automatic reduction, it reports
+`Optimizations: none applicable.` and explores the full graph.
 
 ---
 

@@ -47,15 +47,21 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     stats::phase("auto symmetry analysis", an.elapsed);
     report(&an);
     if a.tlc {
-        let advice = if model.live.is_empty() { Some(not_applicable(model, &an).is_none()) } else { None };
+        let advice = if model.live.is_empty() {
+            Some(not_applicable(model, &an).is_none() && an.select(MAX_ORDER).0.iter().any(|s| certify(model, s).is_some()))
+        } else {
+            None
+        };
         if let Some(line) = an.suggestion(advice) {
             out::info(code::GENERAL, &line);
         }
         return Ok(None);
     }
-    let applied = apply(model, &mut an, a.noautosymmetry)?;
-    let project = a.optimize && applied.as_ref().is_none_or(|s| !s.forced && !s.guarded);
-    if let Some((rule, omitted)) = project.then(|| model.project_state()).flatten() {
+    // Keep explicitly requested projection priority until composition has its
+    // own certificate. Automatic symmetry must not preempt an enabled pass.
+    let projection = a.optimize.then(|| model.project_state()).flatten();
+    let applied = if projection.is_some() { None } else { apply(model, &mut an, a.noautosymmetry)? };
+    if let Some((rule, omitted)) = projection {
         crate::proofs::emit(model, Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
         let arithmetic = match rule {
@@ -89,7 +95,9 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
             ),
         );
     } else {
-        if a.optimize {
+        if let Some(symmetry) = &applied {
+            crate::proofs::emit(model, Some(("keyed-symmetry", std::slice::from_ref(&symmetry.group))))?;
+        } else if a.optimize {
             crate::proofs::emit(model, None)?;
         }
         label(applied.as_ref());
@@ -147,22 +155,19 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool) -> Result<Option
     if chosen.is_empty() {
         return Ok(None);
     }
-    let guarded = !an.guards.is_empty();
-    let gens: Vec<_> = chosen.iter().flat_map(|s| s.generators()).collect();
-    let text = chosen.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
-    if guarded {
-        model.ip.install_symmetry_guards(an.guards.clone());
-    }
+    let certified = chosen.iter().find_map(|s| Some((*s, certify(model, s)?)));
+    let Some((chosen, certificate)) = certified else {
+        note("not applied: no connected Lean certificate for automatic symmetry");
+        return Ok(None);
+    };
+    let gens = chosen.generators();
+    let text = chosen.group_text().unwrap();
     let bounds = Bounds { time: Some(CROSS_CHECK_TIME), ..Bounds::default() };
     let t0 = Instant::now();
     let check = symcheck::check_perms(model, gens.clone(), &bounds);
     stats::phase("auto symmetry cross-check", t0.elapsed());
     if let Ok(r) = &check {
         if let Some(w) = &r.witness {
-            if guarded {
-                note("not applied: conditional symmetry failed its bounded check");
-                return Ok(None);
-            }
             out::error(
                 code::GENERAL,
                 &format!(
@@ -173,11 +178,25 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool) -> Result<Option
             return Err(ExitCode::from(101));
         }
     }
-    if guarded {
-        note("runtime guards: automatic checkpoints disabled; explicit checkpoint/recovery requests use static proofs only");
-    }
     model.apply_symmetry(gens);
-    Ok(Some(Applied { group: text, forced: !an.forced.is_empty(), guarded }))
+    model.record_symmetry_certificate(certificate);
+    Ok(Some(Applied { group: text, forced: false, guarded: false }))
+}
+
+fn certify(model: &InterpModel, candidate: &autosym::SetResult) -> Option<String> {
+    if !candidate.full() {
+        return None;
+    }
+    let keys = candidate
+        .candidate
+        .elems
+        .iter()
+        .map(|v| match v {
+            tlx_value::Value::ModelValue(k) => Some(k.as_str().to_owned()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    model.symmetry_certificate(&keys)
 }
 
 /// A symmetry applied to the search.
@@ -203,7 +222,7 @@ fn label(applied: Option<&Applied>) {
     } else if a.guarded {
         "runtime guard"
     } else {
-        "proven"
+        "certificate generated"
     };
     out::info(
         code::OPTIMIZATIONS_USED,
@@ -213,10 +232,15 @@ fn label(applied: Option<&Applied>) {
         ),
     );
     out::set_reduced("symmetry");
-    let json =
-        format!(
-        "[{{\"name\":\"symmetry\",\"scope\":\"safety\",\"proof\":\"{}\",\"preserved\":[\"V-safe\",\"CEX\",\"D\",\"L\"],\"detail\":{}}}]",
-        if a.forced { "none" } else if a.guarded { "runtime guard" } else { "static" },
+    let json = format!(
+        "[{{\"name\":\"symmetry\",\"scope\":\"safety\",\"proof\":\"{}\",\"preserved\":[\"V-safe\",\"CEX\"],\"detail\":{}}}]",
+        if a.forced {
+            "none"
+        } else if a.guarded {
+            "runtime guard"
+        } else {
+            "generated-lean"
+        },
         json_string(&a.group)
     );
     tlx_runtime::stats::set_json("optimizations", json);
@@ -244,7 +268,7 @@ fn not_applicable(model: &InterpModel, an: &Analysis) -> Option<String> {
     if an.incomplete {
         return Some("the analysis is incomplete".into());
     }
-    Some("no connected Lean certificate for automatic symmetry".into())
+    None
 }
 
 /// A line of the `-stats` section.

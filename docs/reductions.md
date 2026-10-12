@@ -1,9 +1,9 @@
 # Reductions and search modes beyond TLC
 
 This page documents the automatic-symmetry candidate analysis and the general search
-contract. **Automatic application is currently disabled:** Rust analysis and bounded
-checks do not replace a compiler-generated Lean certificate connected to the reduction.
-The algorithms and prior evidence below describe candidates awaiting that proof.
+contract. Automatic application requires a compiler-generated Lean certificate
+connected to the reduction. Fixed-domain keyed maps now have that certificate;
+other shapes below describe candidate analysis awaiting connected proofs.
 [optimization.md](optimization.md#proof-coverage) owns the current certificate inventory
 and enabled opt-in state projections. [compat.md](compat.md) owns compatibility,
 [usage.md](usage.md) owns user behavior, and [configuration.md](configuration.md) owns options.
@@ -90,14 +90,10 @@ when a bound is reached, in which case nothing is applied.
 
 ### 2.3 Runtime guards
 
-A `CHOOSE` rejects a set whose projections the analysis can, however, recognize: for a choice over
-exactly the elements of the candidate set, the chosen element is a projection of the state, and the
-search can carry a guard. The group is then admitted with a **runtime guard** instead of a proof, and
-the guard is checked as the run proceeds. If a guard fails — the projection it assumed does not hold
-for some state — the run **discards the reduced search and restarts from `Init` without automatic
-symmetry**, clears the reduction label, and does not publish the interrupted search's verdict,
-counters, dump or checkpoint as a result. The restarted run is the unreduced run, so the verdict is
-the one the `-tlc` run would give.
+The legacy analysis can attach runtime guards to some `CHOOSE` candidates. Those
+claims do not have connected certificates and cannot authorize automatic
+application. The guard/restart implementation is retained for diagnostics and
+future proof work. Ordinary checking leaves these candidates unreduced.
 
 ### 2.4 The bounded cross-check
 
@@ -107,8 +103,7 @@ levels deep, at most 100 permutations and 10000 edges, it compares `Init` member
 VIEW commutation, state constraints, successor sets in both directions, action constraints and
 action properties. The check has a 20 ms wall-clock budget and is reported as its own phase in
 `-stats`. A witness from a group that was *proven* is an internal error and exits 101, because the
-proof and the bounded check disagree; with a runtime-guarded group the witness instead means
-"not applied: conditional symmetry failed its bounded check", and the run continues unreduced.
+certificate and the bounded check disagree. Runtime-guarded claims are not applied.
 
 A group larger than 720 elements is not applied: the search tries every element of the group on each
 state it finds, so the cost of the canonical form grows with the group. Skipped groups are named
@@ -120,7 +115,10 @@ Application happens once, after the model is built and before the search, and on
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
 unchanged except for that line. A group is not applied when the specification has a declared
 `SYMMETRY`, a `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis — each
-reason is reported under `-stats`. `-noautosymmetry` turns the whole reduction off.
+reason is reported under `-stats`. Connected certificate coverage further excludes
+constraints, action/initial properties, aliases, unsupported key operations and
+projection composition. Mandatory Lean is written before exploration; it is not
+verified automatically. `-noautosymmetry` turns the whole reduction off.
 
 `-checksymmetry` is the separate declared-symmetry diagnostic: it looks for a genuine violation of a
 declared `SYMMETRY` within its bounds on an unreduced breadth-first search in the interpreter, and
@@ -131,12 +129,12 @@ the same check for the candidates the analysis could not prove.
 
 ### 2.6 Guarantees
 
-A proven group preserves **V-safe, CEX, D and L**: invariants, constraints and action properties are
-symmetric by the analysis, a state is deadlocked iff its images are, and all members of an orbit lie
-on the same BFS level, so depth and the length of the shortest counterexample are exact. It does not
-preserve **N-dist** or **N-gen** — those are the counts of the quotient, as with a declared
-`SYMMETRY` — and a runtime-guarded group is only as sound as its guard. Liveness is not reduced (a
-specification with temporal properties is not reduced at all), so V-live holds trivially.
+The connected keyed-state certificate preserves **V-safe** and **CEX** within its
+supported observation set: state invariants and deadlocks. Initialization and
+successors correspond, and every reduced violation has a concrete witness.
+Counts and depths describe the quotient. Temporal properties exclude automatic
+application. See [the certificate scope](optimization.md#certified-keyed-symmetry)
+for the distinction between formal orbit keys and trusted runtime canonicalization.
 
 ## 3. The labelling contract
 
@@ -144,8 +142,7 @@ Every run not under `-tlc` states which optimizations were active; the exact tex
 and the `-stats json` shape are [usage.md](usage.md) sections 6.2–6.3. What matters here is the contract they
 implement:
 
-- the `optimizations` array of `-stats json` carries `name`, `scope`, `proof` (`static`, `runtime
-  guard`, or `none` for a forced group), `preserved` (the symbols of §1.1) and `detail` (the group);
+- the `optimizations` array of `-stats json` carries `name`, `scope`, `proof` (`generated-lean` for a certified automatic group), `preserved` (the symbols of §1.1) and `detail` (the group);
 - the reduction names itself in the final statistics line (`(symmetry-reduced)`), and the start line
   says the counts refer to the reduced search;
 - a `-dump` file of a reduced search says so in its header; a `-dumpTrace` counterexample is
