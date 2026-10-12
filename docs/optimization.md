@@ -43,7 +43,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Ordered allocation | One scalar frontier, retained initial anchor, literal nonnegative increments | Enabled within this subset |
 | Phase-dependent fields | Missing | Candidate analysis only |
 | Sequence length | Missing | Candidate analysis only |
-| Relative ages | Fixed-domain timestamp maps, keep/reset/erase transfers, threshold tests, finite filters and quantifiers | Enabled within this subset |
+| Relative ages | Fixed-domain timestamp maps, conditional keep/reset/erase transfers, threshold tests, finite-domain filters and quantifiers | Enabled within this subset |
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation and live versions | Missing | Candidate analysis only |
 | Automatic symmetry, including forced/guarded paths | Missing | Suggestions/diagnostics only; never applied |
@@ -361,10 +361,17 @@ every representative, preserves observations, lifts counterexamples and preserve
 It reuses the proved age and history transfer lemmas, rather than assuming preservation of
 either generated transformation.
 
-History event values and transfer conditions must be independent of forgotten time and ages.
-History-dependent guards or retained updates still refuse composition. Next-state reads of
-age-map fields, domains or age-filtered sets also refuse the age certificate: semantic leaves currently receive
-old timestamp presence only. One history is summarized; other components remain concrete.
+History event values, transfer conditions, retained payloads and timestamp choices may
+use proved age comparisons and history-summary predicates. The generated `Decision`
+tree selects their values; its concrete/reduced equality and value-continuation lemmas
+are checked alongside the transition certificate. Raw time and age magnitudes remain
+unavailable to semantic leaves. Finite filters and quantifiers may use dynamic domains
+when inferred element ranges supply an enumerable upper bound; generated predicates
+include actual membership, including empty domains and multiple finite binders.
+Next-state reads of age-map fields, domains or age-filtered sets still refuse the age
+certificate: semantic leaves currently receive old timestamp presence only. Dependent
+binders without finite enumerations remain unsupported. One history is summarized;
+other components remain concrete.
 Inapplicable composition falls back to a certified standalone reduction when available.
 Source/HIR lowering, leaf interpretation, totality/domain analysis and runtime VIEW evaluation
 remain trusted, as for standalone reductions.

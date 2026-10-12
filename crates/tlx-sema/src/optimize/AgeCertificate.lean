@@ -148,6 +148,56 @@ theorem Test.select_reduced {K I : Type} {caps : K → Nat} (keys : List I)
     classical
     by_cases hp : (predicate k).reduced h <;> simp [hp]
 
+-- Values used by updates may depend on the same proved observations as guards.
+inductive Decision {K : Type} (caps : K → Nat) (V : Type) where
+  | pure (value : V)
+  | branch (test : Test caps) (yes no : Decision caps V)
+
+def Decision.bindValue {K V U : Type} {caps : K → Nat}
+    (v : Decision caps V) (f : V → Decision caps U) : Decision caps U :=
+  match v with
+  | .pure x => f x
+  | .branch p yes no => .branch p (yes.bindValue f) (no.bindValue f)
+
+noncomputable def Decision.concrete {K V : Type} {caps : K → Nat}
+    (now : Nat) (h : Stamps K now) : Decision caps V → V
+  | .pure v => v
+  | .branch p yes no => @ite V (p.concrete now h) (Classical.propDecidable _)
+      (yes.concrete now h) (no.concrete now h)
+
+noncomputable def Decision.reduced {K V : Type} {caps : K → Nat}
+    (h : Ages K) : Decision caps V → V
+  | .pure v => v
+  | .branch p yes no => @ite V (p.reduced h) (Classical.propDecidable _)
+      (yes.reduced h) (no.reduced h)
+
+theorem Decision.commutes {K V : Type} {caps : K → Nat}
+    (v : Decision caps V) (now : Nat) (h : Stamps K now) :
+    v.concrete now h = v.reduced (summarize caps now h) := by
+  induction v with
+  | pure => rfl
+  | branch p yes no ihYes ihNo =>
+    simp only [Decision.concrete, Decision.reduced, ihYes, ihNo]
+    rw [Test.commutes p now h]
+
+theorem Decision.bindValue_concrete {K V U : Type} {caps : K → Nat}
+    (v : Decision caps V) (f : V → Decision caps U) (now : Nat) (h : Stamps K now) :
+    (v.bindValue f).concrete now h = (f (v.concrete now h)).concrete now h := by
+  induction v with
+  | pure => rfl
+  | branch p yes no ihYes ihNo =>
+    simp only [Decision.bindValue, Decision.concrete, ihYes, ihNo]
+    split <;> rfl
+
+theorem Decision.bindValue_reduced {K V U : Type} {caps : K → Nat}
+    (v : Decision caps V) (f : V → Decision caps U) (h : Ages K) :
+    (v.bindValue f).reduced h = (f (v.reduced h)).reduced h := by
+  induction v with
+  | pure => rfl
+  | branch p yes no ihYes ihNo =>
+    simp only [Decision.bindValue, Decision.reduced, ihYes, ihNo]
+    split <;> rfl
+
 structure State (C K : Type) where
   core : C
   now : Nat
@@ -161,7 +211,7 @@ structure Model (C K W : Type) where
   seed : C → W → K → Bool
   delta : W → Nat
   guard : C → C → W → (K → Bool) → Test caps
-  change : C → C → W → (K → Bool) → K → Change
+  change : C → C → W → (K → Bool) → K → Decision caps Change
   observe : C → (K → Bool) → Test caps
 
 namespace Model
@@ -172,11 +222,11 @@ def seedState (c : C) (w : W) : State C K :=
   ⟨c, 0, fun k => if m.seed c w k then some ⟨0, Nat.le_refl _⟩ else none⟩
 def seedAbstract (c : C) (w : W) : Abstract C K :=
   (c, fun k => if m.seed c w k then some 0 else none)
-def advanceState (s : State C K) (d : C) (w : W) : State C K :=
+noncomputable def advanceState (s : State C K) (d : C) (w : W) : State C K :=
   ⟨d, s.now + m.delta w, fun k =>
-    updateStamp s.now (m.delta w) (m.change s.core d w (presence s.stamps) k) (s.stamps k)⟩
-def advanceAbstract (s : Abstract C K) (d : C) (w : W) : Abstract C K :=
-  (d, fun k => updateAge (m.caps k) (m.delta w) (m.change s.1 d w (presence s.2) k) (s.2 k))
+    updateStamp s.now (m.delta w) ((m.change s.core d w (presence s.stamps) k).concrete s.now s.stamps) (s.stamps k)⟩
+noncomputable def advanceAbstract (s : Abstract C K) (d : C) (w : W) : Abstract C K :=
+  (d, fun k => updateAge (m.caps k) (m.delta w) ((m.change s.1 d w (presence s.2) k).reduced s.2) (s.2 k))
 
 theorem seed_commutes (c : C) (w : W) : m.project (m.seedState c w) = m.seedAbstract c w := by
   unfold project seedState seedAbstract
@@ -192,7 +242,7 @@ theorem advance_commutes (s : State C K) (d : C) (w : W) :
   apply congrArg (fun ages => (d, ages))
   funext k
   simp only [summarize]
-  exact update_commutes _ _ _ _ _
+  rw [update_commutes, Decision.commutes]
 
 def concrete : System (State C K) where
   initial s := ∃ c w, m.initial c w ∧ s = m.seedState c w

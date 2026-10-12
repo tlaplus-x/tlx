@@ -39,7 +39,7 @@ def verify(lean, path, negative):
     if result.returncode:
         raise RuntimeError(f"{path}: Lean failed:\n{result.stdout}")
     axioms = {}
-    scope = rf"(?:{namespace}|AgeRule\.Test)" if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else namespace
+    scope = rf"(?:{namespace}|AgeRule\.(?:Test|Decision))" if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else namespace
     for name, values in re.findall(
         rf"'TlxOptimization\.{scope}\.(\w+)' depends on axioms: \[([^]]*)\]",
         result.stdout,
@@ -58,6 +58,8 @@ def verify(lean, path, negative):
         theorems |= {"select_concrete", "select_reduced"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
         theorems |= {"bind_concrete", "bind_reduced"}
+    if "theorem Decision.commutes" in source:
+        theorems |= {"commutes", "bindValue_concrete", "bindValue_reduced"}
     if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
     mutations = []
@@ -82,6 +84,11 @@ def verify(lean, path, negative):
             ])
         if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
             changes.append(("(next b).reduced h", "(next (!b)).reduced h", "passed the wrong Boolean to the consumer"))
+        if "theorem Decision.commutes" in source:
+            changes.extend([
+                ("(yes.reduced h) (no.reduced h)", "(no.reduced h) (yes.reduced h)", "swapped reduced update decision"),
+                (".branch p (yes.bindValue f) (no.bindValue f)", ".branch p (no.bindValue f) (yes.bindValue f)", "swapped value continuation branches"),
+            ])
         if namespace == "GeneratedHistory":
             changes.extend([
                 ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (History.summary m.predicate History.empty)", "discarded guard feedback"),
@@ -92,9 +99,11 @@ def verify(lean, path, negative):
                 ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
                 ("m.guard s.1.1 t.1.1 w (presence s.1.2) s.2", "m.guard s.1.1 t.1.1 w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded guard feedback"),
                 ("m.historyTransfer s.1.1 d w (presence s.1.2) s.2", "m.historyTransfer s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded transfer feedback"),
-                ("(m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
+                ("((m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced s.1.2).reduced m.predicate s.2" if "theorem Decision.commutes" in source else "(m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
                 ("(m.age.project s.1, History.summary m.predicate s.2)", "(m.age.project s.1, History.summary m.predicate History.empty)", "discarded observed history"),
             ])
+        if namespace == "GeneratedAgeHistory" and "theorem Decision.commutes" in source:
+            changes.append(("m.change s.1.1 d w (presence s.1.2) s.2 k", "m.change s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty) k", "discarded timestamp history feedback"))
         changes.append(
             ("def after := (model sem).reduced",
              "def after := { (model sem).reduced with safe := fun _ => True }",

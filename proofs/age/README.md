@@ -104,8 +104,17 @@ and fixed-domain filters whose predicates inspect history summaries.
 ./target/release/tlx check proofs/age/MixedHistory.tla -interp -optimize -noautosymmetry
 ```
 
-History-dependent timestamp-map transfers, dynamic filter domains, next-state
-inputs and multiple-history composition remain unsupported. Source/HIR lowering,
+`DependentHistory.tla` additionally uses a dynamic eligible-key set, a history-dependent
+payload, a history/age-dependent map update, and age-dependent appended events. It
+finishes with 135 distinct states (763 generated) despite unbounded clock and history.
+Its certificate includes the concrete/reduced decision equality and continuation laws.
+
+```sh
+./target/release/tlx check proofs/age/DependentHistory.tla -interp -optimize -noautosymmetry
+```
+
+Dynamic domains require an inferred finite element range. Next-state inputs,
+unenumerable dependent binders and multiple-history composition remain unsupported. Source/HIR lowering,
 leaf interpretation and runtime execution are still trusted.
 
 For the separately fetched external cleaner, `Cleaner.cfg` selects singleton

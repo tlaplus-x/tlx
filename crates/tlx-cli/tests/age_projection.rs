@@ -304,7 +304,7 @@ fn combined_history_feedback_finishes_in_every_executor() {
         let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         assert!(proof.contains("namespace TlxOptimization.GeneratedAgeHistory"));
-        assert!(proof.contains("sem.feedbackValue"));
+        assert!(proof.contains("Decision.branch"));
     }
 }
 
@@ -381,4 +381,46 @@ fn bounded_mixed_consumers_reduce_states_and_compatibility_bypasses() {
     }
     assert!(counts[1] < counts[0], "{counts:?}");
     assert_eq!(counts[0], counts[2]);
+}
+
+#[test]
+fn dependent_transfers_and_dynamic_filters_finish_in_every_executor() {
+    let base = include_str!("../../../proofs/age/DependentHistory.tla");
+    let cfg = include_str!("../../../proofs/age/DependentHistory.cfg");
+    for (spec, cfg, code) in [
+        (base.to_owned(), cfg.to_owned(), 0),
+        (base.replace("====", "Safe == selected = {}\n===="), format!("{cfg}INVARIANT Safe\n"), 12),
+        // Nested payload decisions and event decisions use the same lowering.
+        (
+            base.replace(
+                "IF history = <<>> THEN \"x\" ELSE \"y\"",
+                "IF records[k] = Empty THEN \"x\" ELSE IF records[k].created + 2 <= clock THEN \"y\" ELSE \"x\"",
+            ),
+            cfg.to_owned(),
+            0,
+        ),
+    ] {
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            let dir = tlx_testkit::TempDir::with_spec("age-dependent", &spec, &cfg);
+            let run = tlx_testkit::tlx_default!()
+                .check("DependentHistory.tla")
+                .args(args)
+                .args(["-optimize", "-noautosymmetry"])
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .dir(&dir)
+                .timeout(Duration::from_secs(60))
+                .run();
+            assert_eq!(run.code, code, "{tier}: {}", run.text());
+            assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
+            let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+            let proof = std::fs::read_to_string(path).unwrap();
+            assert!(proof.contains("Decision.branch"));
+            assert!(proof.contains("Decision.bindValue"));
+            if code == 12 {
+                assert!(run.stdout.contains("Invariant Safe is violated"));
+                assert!(run.stdout.contains("clock = 2"));
+            }
+        }
+    }
 }

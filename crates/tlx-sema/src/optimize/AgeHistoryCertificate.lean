@@ -8,7 +8,8 @@ structure Model (C K E I W : Type) where
   age : AgeRule.Model C K W
   predicate : I → E → (E → Prop) → Prop
   historySeed : C → W → History E
-  historyTransfer : C → C → W → (K → Bool) → HistoryRule.Summary E I → HistoryRule.Transfer E
+  historyTransfer : C → C → W → (K → Bool) → HistoryRule.Summary E I → Decision age.caps (HistoryRule.Transfer E)
+  change : C → C → W → (K → Bool) → HistoryRule.Summary E I → K → Decision age.caps Change
   guard : C → C → W → (K → Bool) → HistoryRule.Summary E I → Test age.caps
   observe : C → (K → Bool) → HistoryRule.Summary E I → Test age.caps
 
@@ -21,13 +22,17 @@ def seedState (c : C) (w : W) : State C K × History E :=
   (m.age.seedState c w, m.historySeed c w)
 def seedAbstract (c : C) (w : W) : Abstract C K × HistoryRule.Summary E I :=
   (m.age.seedAbstract c w, History.summary m.predicate (m.historySeed c w))
-def advanceState (s : State C K × History E) (d : C) (w : W) : State C K × History E :=
-  (m.age.advanceState s.1 d w,
-   (m.historyTransfer s.1.core d w (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.2)
-def advanceAbstract (s : Abstract C K × HistoryRule.Summary E I) (d : C) (w : W) :
+noncomputable def advanceState (s : State C K × History E) (d : C) (w : W) : State C K × History E :=
+  (⟨d, s.1.now + m.age.delta w, fun k =>
+      updateStamp s.1.now (m.age.delta w)
+        ((m.change s.1.core d w (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2) k).concrete s.1.now s.1.stamps)
+        (s.1.stamps k)⟩,
+   ((m.historyTransfer s.1.core d w (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.1.now s.1.stamps).concrete s.2)
+noncomputable def advanceAbstract (s : Abstract C K × HistoryRule.Summary E I) (d : C) (w : W) :
     Abstract C K × HistoryRule.Summary E I :=
-  (m.age.advanceAbstract s.1 d w,
-   (m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2)
+  ((d, fun k => updateAge (m.age.caps k) (m.age.delta w)
+      ((m.change s.1.1 d w (presence s.1.2) s.2 k).reduced s.1.2) (s.1.2 k)),
+   ((m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced s.1.2).reduced m.predicate s.2)
 
 theorem seed_commutes (c : C) (w : W) : m.project (m.seedState c w) = m.seedAbstract c w := by
   exact Prod.ext (m.age.seed_commutes c w) rfl
@@ -35,9 +40,14 @@ theorem seed_commutes (c : C) (w : W) : m.project (m.seedState c w) = m.seedAbst
 theorem advance_commutes (s : State C K × History E) (d : C) (w : W) :
     m.project (m.advanceState s d w) = m.advanceAbstract (m.project s) d w := by
   apply Prod.ext
-  · exact m.age.advance_commutes s.1 d w
-  · change History.summary m.predicate ((m.historyTransfer s.1.core d w (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.2) = _
-    rw [HistoryRule.Transfer.commutes]
+  · change (d, _) = (d, _)
+    apply congrArg (fun ages => (d, ages))
+    funext k
+    simp only [advanceState, project, AgeRule.Model.project,
+      summarize, presence_summary, HistoryRule.indexedSummary_eq]
+    rw [update_commutes, Decision.commutes]
+  · change History.summary m.predicate (((m.historyTransfer s.1.core d w (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.1.now s.1.stamps).concrete s.2) = _
+    rw [HistoryRule.Transfer.commutes, Decision.commutes]
     simp only [advanceAbstract, project, AgeRule.Model.project, presence_summary, HistoryRule.indexedSummary_eq]
 
 def concrete : System (State C K × History E) where

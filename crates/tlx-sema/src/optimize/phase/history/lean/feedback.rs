@@ -4,7 +4,7 @@ use super::Emitter;
 use crate::{builtins::Builtin as B, hir::*, visit};
 
 impl Emitter<'_> {
-    pub(super) fn value(&mut self, e: &Expr, primed: bool) -> Option<String> {
+    pub(in super::super::super) fn value(&mut self, e: &Expr, primed: bool) -> Option<String> {
         if self.independent(e) {
             let next = if primed { "d" } else { "c" };
             return Some(format!("(sem.value {} c {next} choice.2)", self.atom(e)?));

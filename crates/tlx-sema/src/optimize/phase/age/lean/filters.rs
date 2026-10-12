@@ -16,17 +16,44 @@ struct Inputs {
 }
 
 impl Emitter<'_, '_> {
-    fn finite_predicates(&mut self, bound: &Bound, pred: &Expr, observation: bool) -> Option<(Vec<super::Atom>, Vec<String>)> {
+    fn finite_predicates(
+        &mut self,
+        bound: &Bound,
+        pred: &Expr,
+        observation: bool,
+        universal: bool,
+    ) -> Option<(Vec<super::Atom>, Vec<String>)> {
         let BoundVars::Many(ids) = &bound.vars else { return None };
         let [local] = ids.as_slice() else { return None };
-        let keys: Vec<_> = self.proof.domains.exact_set(&bound.set)?.into_iter().collect();
+        let exact = self.proof.domains.exact_set(&bound.set);
+        let keys: Vec<_> = if let Some(keys) = &exact {
+            keys.iter().cloned().collect()
+        } else {
+            let locals = self.scope.iter().map(|(id, atom)| (*id, super::Domain::Atoms([atom.clone()].into()))).collect();
+            let super::Domain::Set(elements) = self.proof.domains.value(&bound.set, &locals) else { return None };
+            if matches!(*elements, super::Domain::Bottom) {
+                Vec::new()
+            } else {
+                elements.atoms()?.iter().cloned().collect()
+            }
+        };
         if keys.len() > 256 {
             return None;
         }
         let mut predicates = Vec::new();
         for key in &keys {
             self.scope.push((*local, key.clone()));
-            let predicate = self.test(pred, observation);
+            let predicate = if exact.is_some() {
+                self.test(pred, observation)
+            } else {
+                let member = super::builtin(B::In, vec![Expr::new(ExprKind::Local(*local), pred.span), bound.set.clone()], pred);
+                let guarded = if universal {
+                    super::builtin(B::Implies, vec![member, pred.clone()], pred)
+                } else {
+                    Expr::new(ExprKind::And(vec![member, pred.clone()]), pred.span)
+                };
+                self.test(&guarded, observation)
+            };
             self.scope.pop();
             let predicate = predicate?;
             self.remaining = self.remaining.checked_sub(predicate.len())?;
@@ -37,9 +64,25 @@ impl Emitter<'_, '_> {
 
     pub(super) fn quantified(&mut self, e: &Expr, observation: bool) -> Option<String> {
         let ExprKind::Quant { kind, bounds, body } = &*e.kind else { return None };
-        let [bound] = bounds.as_slice() else { return None };
-        let (_, tests) = self.finite_predicates(bound, body, observation)?;
+        let Some((bound, rest)) = bounds.split_first() else { return self.test(body, observation) };
+        let BoundVars::Many(ids) = &bound.vars else { return None };
+        let (first, others) = ids.split_first()?;
+        let mut bound = bound.clone();
+        bound.vars = BoundVars::Many(vec![*first]);
+        let mut remaining = Vec::new();
+        if !others.is_empty() {
+            let mut next = bound.clone();
+            next.vars = BoundVars::Many(others.to_vec());
+            remaining.push(next);
+        }
+        remaining.extend_from_slice(rest);
+        let body = if remaining.is_empty() {
+            body.clone()
+        } else {
+            Expr::new(ExprKind::Quant { kind: *kind, bounds: remaining, body: body.clone() }, e.span)
+        };
         let universal = matches!(kind, QuantKind::Forall);
+        let (_, tests) = self.finite_predicates(&bound, &body, observation, universal)?;
         Some(fold(tests, if universal { "conj" } else { "disj" }, if universal { "True" } else { "False" }))
     }
 
@@ -57,7 +100,7 @@ impl Emitter<'_, '_> {
         let mut next_local = local.checked_add(1)?;
         let mut inputs = Inputs::default();
         let masked = self.mask_filters(e, observation, &mut next_local, &mut inputs)?;
-        if inputs.filters.is_empty() || !self.independent(&masked) {
+        if (inputs.filters.is_empty() && inputs.predicates.is_empty()) || !self.independent(&masked) {
             return None;
         }
         let id = self.atoms.len();
@@ -116,9 +159,23 @@ impl Emitter<'_, '_> {
                 }
             }
         }
+        if let ExprKind::Builtin { op: B::Eq | B::Neq | B::Lt | B::Le | B::Gt | B::Ge, args } = &*e.kind {
+            if let [a, b] = args.as_slice() {
+                let ExprKind::Builtin { op, .. } = &*e.kind else { unreachable!() };
+                if let Some(predicate) = self.comparison(*op, a, b, observation) {
+                    if inputs.predicates.len() >= 256 {
+                        return None;
+                    }
+                    let local = LocalId(*next_local);
+                    *next_local = next_local.checked_add(1)?;
+                    inputs.predicates.push((local, predicate));
+                    return Some(Expr::new(ExprKind::Local(local), e.span));
+                }
+            }
+        }
         match &*e.kind {
             ExprKind::SetFilter { bound, pred } => {
-                let (keys, predicates) = self.finite_predicates(bound, pred, observation)?;
+                let (keys, predicates) = self.finite_predicates(bound, pred, observation, false)?;
                 if inputs.filters.iter().map(|f| f.keys.len()).sum::<usize>() + keys.len() > 256 {
                     return None;
                 }

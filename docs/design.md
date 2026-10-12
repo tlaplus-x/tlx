@@ -145,12 +145,18 @@ The concrete/reduced bind and selection lemmas connect those arguments to the or
 predicates. Semantic leaves cannot inspect absolute time, age magnitudes or raw history.
 `phase/age/lean/history.rs` connects one history to the same retained core and branch witness.
 `AgeHistoryCertificate.lean` proves the product transfer and observation correspondence;
-the generated `GeneratedAgeHistory` model contains both actual transfers. Event values and
-history transfer conditions cannot inspect forgotten time or ages. Summary feedback
-is supported in guards and retained updates, while timestamp-map transfers must stay
-history-independent. Mixed age-filter/history consumers now compose; dynamic filter
-domains, next-state inputs and multiple histories still refuse composition. Unsupported
-compositions retain a standalone fallback.
+the generated `GeneratedAgeHistory` model contains both actual transfers.
+`phase/age/lean/decisions.rs` lifts quotient-observable Boolean values and conditions
+into `Decision` trees. Their concrete and reduced evaluations are proved equal;
+continuation lemmas connect nested event construction to the evaluated branch.
+This supports history-dependent timestamp choices, age-dependent event values and
+conditions, and dependent retained payloads without exposing raw time or history to
+semantic leaves. Dynamic filter domains are enumerated from inferred finite upper
+bounds, with explicit membership tests. Universal quantification uses membership
+implication; existential quantification and filters use conjunction. Multiple finite
+binders retain their scopes. Domain inference remains trusted and never assumes
+selected invariants. Next-state inputs, unenumerable dependent binders and multiple
+histories still refuse composition. Unsupported compositions retain a standalone fallback.
 Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
 
 Phase-field and sequence-length analyzers remain available for developing

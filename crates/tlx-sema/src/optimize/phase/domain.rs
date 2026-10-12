@@ -239,6 +239,9 @@ impl Domains {
             ExprKind::Const(c) => self.constants.get(c).cloned().unwrap_or(D::Top),
             ExprKind::Local(l) => locals.get(l).cloned().unwrap_or(D::Top),
             ExprKind::SetEnum(es) => D::Set(Box::new(es.iter().fold(D::Bottom, |d, e| d.join(&val(e))))),
+            // Successful filtering only removes members; predicate definedness
+            // is handled separately, as for other may-value domains.
+            ExprKind::SetFilter { bound, .. } => val(&bound.set),
             ExprKind::Tuple(es) => D::Seq(Box::new(es.iter().fold(D::Bottom, |d, e| d.join(&val(e))))),
             ExprKind::Record(fs) => D::Record(fs.iter().map(|(k, e)| (k.clone(), val(e))).collect()),
             ExprKind::FnConstruct { bounds, body } if bounds.len() == 1 => {

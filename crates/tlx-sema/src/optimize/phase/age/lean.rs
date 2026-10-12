@@ -2,6 +2,7 @@
 //! retained payloads and field presence, never absolute time or timestamp ages.
 use std::fmt::Write;
 
+mod decisions;
 mod filters;
 mod history;
 
@@ -64,7 +65,7 @@ pub(super) fn emit(
     for (i, (_, changes, _)) in initial.iter().enumerate() {
         writeln!(out, "  | {i} => match k.val with").unwrap();
         for (k, change) in changes.iter().enumerate() {
-            writeln!(out, "    | {k} => {}", change == "Change.reset").unwrap();
+            writeln!(out, "    | {k} => {}", change == "(Decision.pure Change.reset)").unwrap();
         }
         out.push_str("    | _ => false\n");
     }
@@ -86,16 +87,16 @@ pub(super) fn emit(
         writeln!(out, "  | {i} => {guard}").unwrap();
     }
     out.push_str("  | _ => Test.pure False\n");
-    writeln!(out, "def change {params} (c d : C) (choice : Nat × W) (p : Key → Bool) (k : Key) : Change :=\n  match choice.1 with")
+    writeln!(out, "def change {params} (c d : C) (choice : Nat × W) (p : Key → Bool) {summary} (k : Key) : Decision caps Change :=\n  match choice.1 with")
         .unwrap();
     for (i, (_, changes, _)) in steps.iter().enumerate() {
         writeln!(out, "  | {i} => match k.val with").unwrap();
         for (k, change) in changes.iter().enumerate() {
             writeln!(out, "    | {k} => {change}").unwrap();
         }
-        out.push_str("    | _ => Change.keep\n");
+        out.push_str("    | _ => Decision.pure Change.keep\n");
     }
-    out.push_str("  | _ => Change.keep\n");
+    out.push_str("  | _ => Decision.pure Change.keep\n");
     if let Some(code) = history_code {
         e.emit_history(&mut out, params, code, observations);
     } else {
@@ -198,15 +199,11 @@ impl Emitter<'_, '_> {
     fn branch(&mut self, b: &Branch, primed: bool) -> Option<(String, Vec<String>, bool)> {
         let tick = primed && clock_transfer(&binding(b, self.proof.clock, true)?, self.proof.clock)?;
         let mut tests = vec![];
-        let mut changes = vec!["Change.keep".to_owned(); self.slots.len()];
+        let mut changes = vec!["(Decision.pure Change.keep)".to_owned(); self.slots.len()];
         for i in 0..self.proof.stamps.len() {
             let var = self.proof.stamps[i].var;
             let rhs = binding(b, var, primed)?;
-            let payload = self.payload(&rhs, i)?;
-            let lhs = Expr::new(ExprKind::Var(var), rhs.span);
-            let lhs = if primed { builtin(B::Prime, vec![lhs], &rhs) } else { lhs };
-            let equation = builtin(B::Eq, vec![lhs, payload], &rhs);
-            tests.push(format!("(Test.pure ({}))", self.atom(&equation, false, true)?));
+            tests.push(self.payload_guard(&rhs, i, primed)?);
             for (k, change) in changes.iter_mut().enumerate() {
                 if self.slots[k].0 == i {
                     *change = self.change(&rhs, i, k, primed)?;
@@ -215,7 +212,7 @@ impl Emitter<'_, '_> {
         }
         for bound in &b.bounds {
             let BoundVars::Many(ids) = &bound.vars else { return None };
-            if !self.independent(&bound.set) {
+            if !primed && !self.independent(&bound.set) {
                 return None;
             }
             for id in ids {
@@ -276,6 +273,30 @@ impl Emitter<'_, '_> {
         Some(())
     }
 
+    fn payload_guard(&mut self, rhs: &Expr, i: usize, primed: bool) -> Option<String> {
+        if primed {
+            if let Some((test, then, els)) = self.split_decision(rhs) {
+                let yes = self.payload_guard(&then, i, primed)?;
+                let no = self.payload_guard(&els, i, primed)?;
+                self.remaining = self.remaining.checked_sub(test.len() * 2 + yes.len() + no.len())?;
+                return Some(format!("(Test.disj (Test.conj {test} {yes}) (Test.conj (Test.neg {test}) {no}))"));
+            }
+        }
+        if let ExprKind::If { cond, then, els } = &*rhs.kind {
+            if primed {
+                let test = self.test(cond, false)?;
+                let yes = self.payload_guard(then, i, primed)?;
+                let no = self.payload_guard(els, i, primed)?;
+                return Some(format!("(Test.disj (Test.conj {test} {yes}) (Test.conj (Test.neg {test}) {no}))"));
+            }
+        }
+        let payload = self.payload(rhs, i)?;
+        let lhs = Expr::new(ExprKind::Var(self.proof.stamps[i].var), rhs.span);
+        let lhs = if primed { builtin(B::Prime, vec![lhs], rhs) } else { lhs };
+        let equation = builtin(B::Eq, vec![lhs, payload], rhs);
+        Some(format!("(Test.pure ({}))", self.atom(&equation, false, true)?))
+    }
+
     fn record(&self, e: &Expr, i: usize) -> Option<Expr> {
         let ExprKind::Record(fs) = &*e.kind else { return None };
         let fields: Vec<_> = fs.iter().filter(|(f, _)| *f != self.proof.stamps[i].field).cloned().collect();
@@ -322,15 +343,30 @@ impl Emitter<'_, '_> {
 
     fn change(&mut self, e: &Expr, i: usize, k: usize, primed: bool) -> Option<String> {
         self.remaining = self.remaining.checked_sub(1)?;
+        if primed {
+            if let Some((test, then, els)) = self.split_decision(e) {
+                let yes = self.change(&then, i, k, primed)?;
+                let no = self.change(&els, i, k, primed)?;
+                self.remaining = self.remaining.checked_sub(test.len() + yes.len() + no.len())?;
+                return Some(format!("(Decision.branch {test} {yes} {no})"));
+            }
+        }
         let record_change = |r: &Expr| {
             let ExprKind::Record(fs) = &*r.kind else { return None };
-            Some(if fs.iter().any(|(f, _)| *f == self.proof.stamps[i].field) { "Change.reset" } else { "Change.erase" }.to_owned())
+            Some(
+                if fs.iter().any(|(f, _)| *f == self.proof.stamps[i].field) {
+                    "(Decision.pure Change.reset)"
+                } else {
+                    "(Decision.pure Change.erase)"
+                }
+                .to_owned(),
+            )
         };
         match &*e.kind {
-            ExprKind::Var(_) if primed => Some("Change.keep".into()),
+            ExprKind::Var(_) if primed => Some("(Decision.pure Change.keep)".into()),
             ExprKind::FnConstruct { body, .. } => record_change(body),
             ExprKind::Except { updates, .. } if primed => {
-                let mut result = "Change.keep".to_owned();
+                let mut result = "(Decision.pure Change.keep)".to_owned();
                 for (path, rhs) in updates {
                     let [ExceptKey::Index(indices), rest @ ..] = path.as_slice() else { return None };
                     let [index] = indices.as_slice() else { return None };
@@ -339,7 +375,7 @@ impl Emitter<'_, '_> {
                         // EXCEPT on an absent record field is a no-op. Preserve
                         // the presence bit instead of manufacturing a timestamp.
                         [ExceptKey::Field(f)] if *f == self.proof.stamps[i].field => {
-                            format!("(Change.refresh {result} (p ⟨{k}, by decide⟩))")
+                            format!("(Decision.bindValue {result} (fun previous => Decision.pure (Change.refresh previous (p ⟨{k}, by decide⟩))))")
                         }
                         [ExceptKey::Field(_)] => continue,
                         _ => return None,
@@ -350,8 +386,8 @@ impl Emitter<'_, '_> {
                 Some(result)
             }
             ExprKind::If { cond, then, els } if primed => Some(format!(
-                "(if {} then {} else {})",
-                self.atom(cond, false, false)?,
+                "(Decision.branch {} {} {})",
+                self.test(cond, false)?,
                 self.change(then, i, k, primed)?,
                 self.change(els, i, k, primed)?
             )),

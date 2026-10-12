@@ -86,9 +86,8 @@ fn refuses_observed_magnitudes_future_stamps_and_unknown_transfers() {
 }
 
 #[test]
-fn certificate_rejects_age_dependent_payloads_and_map_conditions() {
-    // The applicability scan accepts these deadline reads, but the narrower
-    // certificate must not interpret them as age-independent HIR leaves.
+fn certificate_connects_age_dependent_payloads_and_map_conditions() {
+    // Values are selected by proved age tests before reaching retained leaves.
     for body in [
         BODY.replace("payload |-> \"x\"", "payload |-> IF records[1].created + 2 <= clock THEN \"x\" ELSE \"y\""),
         BODY.replace(
@@ -96,18 +95,18 @@ fn certificate_rejects_age_dependent_payloads_and_map_conditions() {
             "records' = IF records[k].created + 2 <= clock THEN [records EXCEPT ![k] = Empty] ELSE records",
         ),
     ] {
-        assert!(projection(&body).is_empty(), "{body}");
+        assert!(!projection(&body.replace("payload: {\"x\"}", "payload: {\"x\", \"y\"}")).is_empty(), "{body}");
     }
 }
 
 #[test]
-fn finite_filters_and_quantifiers_are_certified_but_dynamic_domains_are_not() {
+fn finite_filters_and_quantifiers_include_dynamic_domain_membership() {
     let spec = include_str!("../../../proofs/age/FilteredAge.tla");
     let body = spec.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
     let body = format!("VARIABLE{body}");
     assert!(!projection(&body).is_empty());
     let dynamic = body.replace("k \\in {1}: records[k] # Empty", "k \\in selected: records[k] # Empty");
-    assert!(projection(&dynamic).is_empty());
+    assert!(!projection(&dynamic).is_empty());
     let filter = r#"{k \in {1}: records[k] # Empty /\ records[k].created + 2 <= clock}"#;
     assert!(projection(&body.replace(filter, &format!("({filter})'"))).is_empty());
     let observed = body.replace("Inv ==", "Inv == (\\A k \\in {1}: records[k] = Empty \\/ records[k].created <= clock) /\\");
@@ -115,9 +114,8 @@ fn finite_filters_and_quantifiers_are_certified_but_dynamic_domains_are_not() {
 }
 
 #[test]
-fn composition_refuses_age_dependent_events() {
+fn composition_refuses_absolute_time_and_primed_events() {
     for body in [
-        BODY.replace("Append(h, \"drop\")", "Append(h, IF records[k].created + 2 <= clock THEN \"drop\" ELSE \"put\")"),
         BODY.replace("Append(h, \"put\")", "Append(h, clock)"),
         BODY.replace("Append(h, \"put\")", "Append(h, IF (\"created\" \\in DOMAIN records[k])' THEN \"put\" ELSE \"drop\")"),
     ] {
@@ -131,21 +129,27 @@ fn composition_certifies_history_feedback() {
         BODY.replace("Tick ==", "Tick == h = <<>> /\\"),
         BODY.replace("Append(h, \"put\")", "(IF h = <<>> THEN Append(h, \"put\") ELSE h)"),
     ] {
-        assert!(projection(&body).contains(&"h.history".to_owned()), "{body}");
+        assert!(projection(&body.replace("payload: {\"x\"}", "payload: {\"x\", \"y\"}")).contains(&"h.history".to_owned()), "{body}");
     }
 }
 
 #[test]
-fn composition_keeps_uncertified_feedback_boundaries() {
+fn composition_refuses_primed_history() {
+    assert!(!projection(&BODY.replace("Tick ==", "Tick == (h = <<>>)' /\\")).contains(&"h.history".to_owned()));
+}
+
+#[test]
+fn composition_certifies_dependent_events_updates_and_bounds() {
     for body in [
-        BODY.replace("Tick ==", "Tick == (h = <<>>)' /\\"),
+        BODY.replace("Append(h, \"drop\")", "Append(h, IF records[k].created + 2 <= clock THEN \"drop\" ELSE \"put\")"),
         BODY.replace("k \\in {1, 2}:", "k \\in (IF h = <<>> THEN {1} ELSE {2}):"),
         BODY.replace(
             "records' = [records EXCEPT ![k] = Empty]",
             "records' = (IF h = <<>> THEN [records EXCEPT ![k] = Empty] ELSE records)",
         ),
+        BODY.replace("payload |-> \"x\"", "payload |-> IF h = <<>> THEN \"x\" ELSE \"y\""),
     ] {
-        assert!(!projection(&body).contains(&"h.history".to_owned()), "{body}");
+        assert!(projection(&body.replace("payload: {\"x\"}", "payload: {\"x\", \"y\"}")).contains(&"h.history".to_owned()), "{body}");
     }
 }
 
@@ -164,11 +168,28 @@ fn mixed_consumers_refuse_dynamic_domains_and_primed_inputs() {
     let source = include_str!("../../../proofs/age/MixedHistory.tla");
     let body = source.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
     let body = format!("VARIABLE{body}");
-    for body in [
-        body.replace("IF Ready /\\", "IF Ready' /\\"),
-        body.replace("THEN Expired ELSE", "THEN Expired' ELSE"),
-        body.replace("{k \\in Keys:", "{k \\in (IF history = <<>> THEN {1} ELSE Keys):"),
-    ] {
+    for body in [body.replace("IF Ready /\\", "IF Ready' /\\"), body.replace("THEN Expired ELSE", "THEN Expired' ELSE")] {
         assert!(!projection(&body).contains(&"history.history".to_owned()), "{body}");
+    }
+}
+
+#[test]
+fn mixed_filters_certify_dynamic_domains() {
+    let source = include_str!("../../../proofs/age/MixedHistory.tla");
+    let body = source.split("VARIABLE").nth(1).unwrap().split("====").next().unwrap();
+    let body = format!("VARIABLE{body}").replace("{k \\in Keys:", "{k \\in (IF history = <<>> THEN {1} ELSE Keys):");
+    assert!(projection(&body).contains(&"history.history".to_owned()));
+}
+
+#[test]
+fn finite_quantifiers_preserve_dependent_membership_and_multiple_binders() {
+    for predicate in [
+        "\\A i, j \\in {1, 2}: records[i] = Empty \\/ records[i].created <= clock",
+        "\\A i \\in {1, 2}: \\A j \\in {i}: records[j] = Empty \\/ records[j].created <= clock",
+        "\\A i \\in (IF h = <<>> THEN {} ELSE {1}): records[i] = Empty \\/ records[i].created <= clock",
+        "\\E i \\in (IF h = <<>> THEN {} ELSE {1}): records[i] = Empty \\/ records[i].created <= clock",
+    ] {
+        let body = BODY.replace("Inv ==", &format!("Inv == ({predicate}) /\\"));
+        assert!(projection(&body).contains(&"h.history".to_owned()), "{predicate}");
     }
 }
