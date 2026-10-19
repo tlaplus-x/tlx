@@ -205,11 +205,23 @@ pub struct Positions {
 
 impl Positions {
     /// The positions of the states logged at `refs`, in this order (initial
-    /// states; the first level of a resumed search without positions).
+    /// states).
     pub(super) fn of_seq(refs: &[LogRef]) -> Positions {
+        Self::of(refs.len(), refs.iter().enumerate().map(|(j, &r)| (r, j as u64)))
+    }
+
+    /// The positions of the states of a level as `(trace-log entry,
+    /// position)`, each position below `places.len()` once (the first level
+    /// of a resumed search).
+    pub(super) fn of_places(places: &[(LogRef, u64)]) -> Positions {
+        Self::of(places.len(), places.iter().copied())
+    }
+
+    /// The positions of the `len` states `places` gives, twice over.
+    fn of(len: usize, places: impl Iterator<Item = (LogRef, u64)> + Clone) -> Positions {
         let mut tables: Vec<Option<Table>> = Vec::new();
         let mut span: Vec<(usize, usize)> = Vec::new();
-        for &r in refs {
+        for (r, _) in places.clone() {
             let (w, i) = split_log_ref(r);
             if span.len() <= w {
                 span.resize(w + 1, (usize::MAX, 0));
@@ -219,15 +231,15 @@ impl Positions {
         for &(lo, hi) in &span {
             tables.push((lo < hi).then(|| Table { start: lo, entries: vec![(0, 0); hi - lo], charge: Charge::default() }));
         }
-        for (j, &r) in refs.iter().enumerate() {
+        for (r, j) in places {
             let (w, i) = split_log_ref(r);
             let t = tables[w].as_mut().expect("a table");
-            t.entries[i - t.start] = (0, j as u64);
+            t.entries[i - t.start] = (0, j);
         }
         Positions {
             tables: tables.into_iter().map(|t| t.map(Arc::new)).collect(),
             first: Box::new([0]),
-            len: refs.len() as u64,
+            len: len as u64,
             charge: Charge::default(),
         }
     }
@@ -1010,6 +1022,23 @@ mod tests {
         let held = order.gauge().bytes();
         drop(old);
         assert!(order.gauge().bytes() < held, "old positions stay charged until their last reader leaves");
+    }
+
+    #[test]
+    fn recovered_positions_follow_their_entries_not_the_order_read() {
+        use super::super::tracelog::log_ref;
+        // A level read from a checkpoint in worker order, its BFS positions
+        // recorded: the same positions as the level queued in BFS order.
+        let read = [(log_ref(1, 5), 2), (log_ref(0, 7), 0), (log_ref(1, 4), 3), (log_ref(0, 9), 1)];
+        let placed = Positions::of_places(&read);
+        let mut bfs = read;
+        bfs.sort_by_key(|&(_, p)| p);
+        let refs: Vec<LogRef> = bfs.iter().map(|&(r, _)| r).collect();
+        let sorted = Positions::of_seq(&refs);
+        for (r, p) in read {
+            assert_eq!((placed.pos(r), sorted.pos(r)), (p, p));
+        }
+        assert_eq!(placed.len, 4);
     }
 
     #[test]

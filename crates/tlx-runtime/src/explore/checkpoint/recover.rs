@@ -364,40 +364,53 @@ enum Queued<S> {
     Task(Task<S>),
 }
 
+impl<S> Queued<S> {
+    /// Its trace-log entry.
+    fn log(&self) -> u64 {
+        match self {
+            Queued::Words { log, .. } => *log,
+            Queued::Task(t) => t.log,
+        }
+    }
+
+    /// Queue it in `seed`'s next level, at depth `level`.
+    fn push(self, seed: &mut Local<'_, '_, S>, level: u32) {
+        match self {
+            Queued::Words { log, fp, words } => seed.push_words(log, fp, level, &words),
+            Queued::Task(t) => seed.push_new(t),
+        }
+    }
+}
+
 /// Read the queued states into `seed` (in BFS order: by position if the
 /// checkpoint has them), and start choosing representatives from there.
 /// Encoded states are queued encoded (the compressed blocks of the queue),
 /// not decoded.
+///
+/// With one worker the order of expansion is BFS order, so states with
+/// positions are sorted before they are queued: a whole level held at
+/// once. With several (`shared.order`), a state's place in BFS order is
+/// looked up by its trace-log entry (`Positions::pos`), not by its place
+/// in the queue: each is queued as it is read, and only its entry and
+/// position are kept, so the level stays compressed and within the memory
+/// budget as it grows (`relieve`, as for the archive).
 fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::State>, rec: &Recovery) -> Result<(), String> {
     let model = shared.model;
     let m = &rec.m;
     let level = m.level;
     let bad = |what: &str| format!("corrupt queue ({what})");
     let mut prev = XorPrev::new(m.words);
-    // (With positions: the states, sorted before they are queued.)
+    // (With positions and one worker: the states, sorted before they are queued.)
     let mut sorted: Vec<(u64, Queued<M::State>)> = Vec::new();
-    // The trace-log entries of the states queued, in BFS order (choosing
-    // representatives).
-    let mut seq = Vec::new();
+    // The trace-log entries of the states queued and their positions in BFS
+    // order (choosing representatives): by the order read, else as recorded.
+    let mut places: Vec<(u64, u64)> = Vec::new();
     let ordered = shared.order.is_some();
-    let mut queue = |q: Queued<M::State>, seq: &mut Vec<u64>| match q {
-        Queued::Words { log, fp, words } => {
-            if ordered {
-                seq.push(log);
-            }
-            seed.push_words(log, fp, level, &words);
-        }
-        Queued::Task(t) => {
-            if ordered {
-                seq.push(t.log);
-            }
-            seed.push_new(t);
-        }
-    };
     let mut n = 0u64;
     for name in &m.queue_files {
         let mut f = rec.input(name, K_QUEUE)?;
         while let Some(c) = f.chunk()? {
+            shared.relieve();
             let mut r = Reader::new(&c);
             let e = |e: tlx_value::ser::DecodeError| bad(&e.to_string());
             let words = r.u8().map_err(e)? != 0;
@@ -429,14 +442,19 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
             }
             let mut r = Reader::new(&c[at..]);
             for q in items {
+                let pos = if positions { r.uvar().map_err(e)? } else { n };
                 n += 1;
-                if positions {
-                    sorted.push((r.uvar().map_err(e)?, q));
-                } else {
-                    queue(q, &mut seq);
+                if positions && !ordered {
+                    sorted.push((pos, q));
+                    continue;
                 }
+                if ordered {
+                    places.push((q.log(), pos));
+                }
+                q.push(seed, level);
             }
             r.finish().map_err(e)?;
+            seed.spill();
         }
     }
     if n != m.queued {
@@ -444,10 +462,19 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
     }
     sorted.sort_by_key(|(p, _)| *p);
     for (_, q) in sorted {
-        queue(q, &mut seq);
+        q.push(seed, level);
     }
     if let Some(o) = &shared.order {
-        o.start(Arc::new(Positions::of_seq(&seq)));
+        // Each position of the level once.
+        let mut taken = vec![false; places.len()];
+        for &(_, p) in &places {
+            let slot = usize::try_from(p).ok().and_then(|p| taken.get_mut(p)).ok_or_else(|| bad("a position past the level"))?;
+            if std::mem::replace(slot, true) {
+                return Err(bad("a position twice"));
+            }
+        }
+        drop(taken);
+        o.start(Arc::new(Positions::of_places(&places)));
     }
     Ok(())
 }

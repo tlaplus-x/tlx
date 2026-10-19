@@ -500,9 +500,13 @@ checkpoint is kept (`DirHold::keep`).
   tried). Otherwise, with a disk tier, each section becomes a disk run directly (`FpSet::add_run`) and the
   table starts empty, as after a rotation. Without a disk tier (`-spill off`, `-fpmem`) it reports a full
   set.
-- **Queue**: encoded states go into worker 0's compressed blocks without decoding (`Local::push_words`);
-  with BFS positions they are sorted and `Positions::of_seq` rebuilds the positions, so representatives
-  are chosen in BFS order whatever the worker count.
+- **Queue**: encoded states go into worker 0's compressed blocks without decoding (`Local::push_words`),
+  under the memory budget as they are read (`relieve` and `Local::spill` per chunk, as for the archive).
+  With BFS positions and several workers they are queued in the order read and `Positions::of_places`
+  gives each its recorded position (a state's position is looked up by its trace-log entry, not by its
+  place in the queue); with one worker, whose order of expansion is BFS order, they are decoded and sorted
+  by position first, the whole level held at once. Either way representatives are chosen in BFS order
+  whatever the worker count.
 - **Liveness** uses the recorded edges, no re-exploration; a checkpoint written by the same binary always
   contains them when there are temporal properties and no VIEW/SYMMETRY.
 - **Compiled mode**: the CLI restores the string table before parsing; the driver restores the Dyn interner
