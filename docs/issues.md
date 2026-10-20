@@ -39,6 +39,17 @@ Validate an explicitly larger budget as a separate configuration, or reduce prod
 use. Do not silently raise the budget of an existing measurement or treat a resource failure as
 success.
 
+## Recovering an ordered queue with one worker
+
+A checkpoint written by a search of several workers under VIEW, SYMMETRY or `-coverage` records
+each queued state's BFS position. With several workers, recovery queues the states compressed as
+it reads them and keeps only their positions ([scale.md](scale.md) section 9.3). With one worker,
+whose order of expansion must be BFS order, `read_queue` still decodes every queued state and
+sorts the whole level by position before queueing it, outside the memory budget: about the
+level's decoded size at once (some 3 KB per state on a wide model, 78 GB for a 26M-state level).
+Sort a compact form instead (the XOR-varint records, or an external sort into the metadir), or
+queue in file order and expand by position.
+
 ## Incomplete upstream EWD998 examples
 
 The upstream examples `ewd998/EWD998ChanID_export` and `ewd998/EWD998ChanID_shiviz` are incomplete:
