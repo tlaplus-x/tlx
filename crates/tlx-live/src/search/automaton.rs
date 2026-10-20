@@ -31,7 +31,7 @@ impl NodeMap {
     pub(super) fn get_or_insert(&mut self, s: u32, q: u32, fresh: u32) -> (u32, bool) {
         let slot = match self {
             NodeMap::Dense { q: nq, ids } => &mut ids[s as usize * *nq + q as usize],
-            NodeMap::Sparse(m) => m.entry((u64::from(s) << 32) | u64::from(q)).or_insert(NONE),
+            NodeMap::Sparse(m) => m.entry(sparse_key(s, q)).or_insert(NONE),
         };
         if *slot == NONE {
             *slot = fresh;
@@ -49,6 +49,16 @@ impl NodeMap {
             NodeMap::Sparse(m) => m.capacity() * 13 * 8 / 7,
         }
     }
+}
+
+/// The sparse map's key of `(s, q)`: the state in the low half. FxHasher's
+/// finishing rotation fills the bucket index's bits past 26 from the key's
+/// low bits, so keyed `(s << 32) | q` all states of one slot share at most
+/// 2^26 home buckets, and past that many states the probe sequences grow
+/// without bound.
+#[inline]
+fn sparse_key(s: u32, q: u32) -> u64 {
+    (u64::from(q) << 32) | u64::from(s)
 }
 
 /// What the product needs to know about the states of the automaton.
@@ -299,7 +309,23 @@ impl GraphBfs {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeMap, DENSE_LIMIT};
+    use super::{sparse_key, NodeMap, DENSE_LIMIT};
+    use std::collections::HashSet;
+    use std::hash::BuildHasher;
+    use tlx_base::hash::FxBuildHasher;
+
+    /// The sparse keys of distinct states spread over a table past 2^26
+    /// buckets: 2^20 states of one slot land in about as many 16-bucket
+    /// probe groups of a 2^28-bucket table (94%). Keyed `(s << 32) | q`,
+    /// they shared 2^26 home buckets (82%), and building the product of a
+    /// 176M-state graph took days instead of minutes.
+    #[test]
+    fn sparse_keys_spread_past_two_to_the_26_buckets() {
+        let n = 1u32 << 20;
+        let mask = (1u64 << 28) - 1;
+        let groups: HashSet<u64> = (0..n).map(|s| (FxBuildHasher::default().hash_one(sparse_key(s, 1)) & mask) >> 4).collect();
+        assert!(groups.len() as f64 > 0.9 * f64::from(n), "{} groups", groups.len());
+    }
 
     /// `NodeMap` keys by `(state, slot)`: an existing pair keeps its id and
     /// reports no insertion, a new one gets the next id once, in both the
