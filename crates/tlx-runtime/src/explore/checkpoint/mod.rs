@@ -233,6 +233,14 @@ impl Checkpointer {
         self.dir(spill).map(|_| ())
     }
 
+    /// Keep the last checkpoint when the search ends, and take no other: the
+    /// search stops for a resource it may recover from with more (memory).
+    /// Whether there is one: committed, or recovered from.
+    pub fn keep_last(&self) -> bool {
+        self.keep.store(true, Ordering::SeqCst);
+        self.hold.lock().is_some()
+    }
+
     /// The search ended (not killed): remove the checkpoint (unless it is
     /// to be kept, with the metadir) and release the metadir.
     pub(super) fn finish(&self) {

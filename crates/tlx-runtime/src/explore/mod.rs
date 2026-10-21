@@ -408,6 +408,10 @@ const SP_TEST: u32 = 1 << 31;
 /// watermark, or by a worker that found it at its hard limit).
 pub(super) const SP_GROW: u32 = 1 << 1;
 
+/// Safepoint request: drop the fingerprint set's old table (its run is on
+/// disk), made by the budget once nothing else is left to give back.
+const SP_DROP_OLD: u32 = 1 << 2;
+
 /// A fingerprint set growing from at least this many home slots at a
 /// safepoint of fewer workers than the search has is rehashed by as many
 /// threads as the search has workers (`Shared::grow_seen`).
@@ -475,6 +479,11 @@ impl<M: Model> Shared<'_, M> {
     /// Serve the safepoint requests `req`: every active worker is parked
     /// (see `safepoint`).
     fn serve_safepoint(&self, req: u32, crew: &Crew<'_>) {
+        if req & SP_DROP_OLD != 0 {
+            // SAFETY: every active worker is parked, the others hold no
+            // reference into the set.
+            unsafe { self.seen.drop_old() };
+        }
         if req & SP_GROW != 0 {
             self.grow_seen(Some(crew));
         }
@@ -797,7 +806,24 @@ impl<M: Model> Shared<'_, M> {
             self.frontier.squeeze(true);
             return;
         }
-        self.spill_frontier();
+        if self.spill_frontier() {
+            return;
+        }
+        // Every stage is reached: what is left over budget the components
+        // cannot write out (the representatives' candidates of a wide
+        // level, say). The fingerprint set's old table is only a cache of
+        // its run on disk: it goes, at the next safepoint.
+        if self.seen.old_bytes() > 0 {
+            self.control().request(SP_DROP_OLD);
+        }
+        // Near the memory the process can have, the kernel would kill it:
+        // stop instead, keeping the last checkpoint to recover with more.
+        if let Some(mut why) = over_ceiling(used, total, crate::mem::physical_bytes()) {
+            if self.opts.checkpoint.as_ref().is_some_and(|c| c.keep_last()) {
+                why.push_str(", recovering the last checkpoint, which is kept");
+            }
+            self.fail(Outcome::Io(why), NO_PARENT);
+        }
     }
 
     /// The test safepoint: nothing changes the seen set while it lasts.
@@ -1111,6 +1137,26 @@ fn init_relieve<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::St
     spill.error().map(|e| (Outcome::Io(e.0), NO_PARENT))
 }
 
+/// Why a search over its budget `total` stops, holding `used` bytes of the
+/// `limit` the process can have (its control group's, else the machine's):
+/// within a margin of it (1/16, at least 2 GiB: memory grows between the
+/// budget's looks every 50 ms), the kernel would kill the process next.
+fn over_ceiling(used: usize, total: usize, limit: usize) -> Option<String> {
+    const MIB: usize = 1 << 20;
+    let margin = (limit / 16).max(2 << 30);
+    if used <= total || used < limit.saturating_sub(margin) {
+        return None;
+    }
+    Some(format!(
+        "out of memory: the process holds {} MiB, within {} MiB of the {} MiB it can have, past its budget of {} MiB (-maxmem); \
+         what it cannot write to disk (the representatives' candidates of a wide level, say) grew past the budget: rerun with more memory",
+        used / MIB,
+        margin / MIB,
+        limit / MIB,
+        total / MIB
+    ))
+}
+
 /// Apply the memory budget every 50 ms (`Shared::relieve`) until `done`.
 fn budget_monitor<M: Model>(shared: &Shared<'_, M>, done: &tlx_base::par::Done) {
     tlx_base::par::every(Duration::from_millis(50), done, || shared.relieve());
@@ -1125,4 +1171,28 @@ fn progress_monitor<M: Model>(shared: &Shared<'_, M>, p: &Progress, done: &tlx_b
             next += p.every.max(Duration::from_millis(100));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceilings() {
+        const G: usize = 1 << 30;
+        // RS_pack_zombie2: 58 GiB held of 58.5, past a 46.8 GiB budget.
+        let why = over_ceiling(58 * G, 46 * G, 58 * G + G / 2).expect("stops");
+        assert!(why.starts_with("out of memory: the process holds 59392 MiB, within 3744 MiB of the 59904 MiB"), "{why}");
+        // Within budget, or with room left before the margin: it goes on.
+        assert_eq!(over_ceiling(58 * G, 59 * G, 58 * G + G / 2), None);
+        assert_eq!(over_ceiling(54 * G, 46 * G, 58 * G + G / 2), None);
+        // A small limit keeps a margin of 2 GiB.
+        assert!(over_ceiling(7 * G, 6 * G, 8 * G).is_some());
+        assert_eq!(over_ceiling(6 * G - 1, 5 * G, 8 * G), None);
+    }
+
+    #[test]
+    fn keep_last_without_a_checkpoint() {
+        assert!(!Checkpointer::new(CheckpointConfig::default()).keep_last());
+    }
 }
