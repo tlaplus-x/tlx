@@ -538,6 +538,14 @@ impl<S> Pre<S> {
             Pre::Tasks(ts) => ts.len(),
         }
     }
+
+    /// The depth of its states (one level each).
+    pub(super) fn depth(&self) -> u32 {
+        match self {
+            Pre::Block(b) => b.depth(),
+            Pre::Tasks(ts) => ts.first().map_or(0, |t| t.depth),
+        }
+    }
 }
 
 /// Record the liveness edges of the states `pre` (of the levels before the
