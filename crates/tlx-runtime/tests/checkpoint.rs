@@ -578,3 +578,44 @@ fn checkpoints_are_removed_at_the_end() {
     assert_eq!(ck.count(), 0);
     assert!(!dir.exists());
 }
+
+/// The first checkpoint of a recovered search links the segments of the one
+/// it recovered from (the trace logs, the liveness edges and the archive,
+/// which the recovery read into worker 0's part) and writes only what came
+/// after, numbering on from it; recovered again, the search is the
+/// uninterrupted one.
+#[test]
+fn recovered_search_links_the_recovered_segments() {
+    const RETAIN: Option<usize> = Some(1 << 30);
+    let names = |dir: &Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir.join("checkpoint")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect()
+    };
+    let segment = |f: &String| ["trace-", "edges-", "archive-"].iter().any(|p| f.starts_with(p)) && f.contains('.');
+    for coded in [true, false] {
+        let make = || Layers { live: true, ..Layers::new(90, None, coded) };
+        let want = explore(&make(), &opts(1, Spill::default(), None));
+        let dir = metadir(&format!("links-{coded}"));
+        let first = stopping(400, 2);
+        explore_from(&make(), &opts(4, spill_in(&dir, SpillMode::Auto, false), Some(first.clone())), Start::Init, RETAIN);
+        assert_eq!(first.count(), 2);
+        let before: Vec<String> = names(&dir).into_iter().filter(segment).collect();
+        assert!(before.iter().any(|f| f.starts_with("archive-1.")) == coded, "{before:?}");
+        let rec = Recovery::open(&dir).unwrap();
+        let ck = stopping(400, 1);
+        let r = explore_from(&make(), &opts(2, spill_in(&dir, SpillMode::Auto, true), Some(ck.clone())), Start::Recover(&rec), RETAIN).0;
+        assert_eq!(ck.count(), 1, "{:?}", r.outcome);
+        let after = names(&dir);
+        // Every recovered segment is linked (the archive's of all four
+        // workers, as worker 0's); the new ones are those of checkpoint 3.
+        for f in &before {
+            assert!(after.contains(f), "coded {coded}: {f} not linked: {after:?}");
+        }
+        let new: Vec<&String> = after.iter().filter(|f| segment(f) && !before.contains(f)).collect();
+        assert!(!new.is_empty() && new.iter().all(|f| f.ends_with(".3")), "coded {coded}: {new:?}");
+        let rec = Recovery::open(&dir).unwrap();
+        let r = explore_from(&make(), &opts(1, spill_in(&dir, SpillMode::Auto, true), Some(none())), Start::Recover(&rec), RETAIN).0;
+        assert_eq!(summary(&r, PARALLEL), summary(&want, PARALLEL), "coded {coded}");
+        assert_eq!(canon(r.live_graph.as_ref().unwrap().as_ref().unwrap()), canon(want.live_graph.as_ref().unwrap().as_ref().unwrap()));
+        assert!(!dir.exists());
+    }
+}

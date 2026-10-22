@@ -305,14 +305,20 @@ fn recover<'m, M: Model>(
         shared.history.lock().push(log, edges);
     }
     // The archive (if this search archives: else it cannot resume).
+    let mut archive_blocks = None;
     if seed.archiving() {
         if m.archive {
             for w in 0..m.workers {
                 read_archive(rec, w, words, seed, model.caps().codec(), &|| shared.relieve())?;
             }
+            // (Its blocks closed: new states go to the blocks after them.)
+            archive_blocks = seed.archived().map(|b| b.len() as u64);
         } else {
             shared.retention.drop_archive();
         }
+    }
+    if let Some(c) = &shared.ckpt {
+        c.recovered(&rec.dir, m, archive_blocks);
     }
     // The queued states.
     read_queue(shared, seed, rec)?;

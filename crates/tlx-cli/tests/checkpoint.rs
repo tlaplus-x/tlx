@@ -298,6 +298,49 @@ fn layout_miss_after_the_recovery() {
     }
 }
 
+/// A checkpoint taken by a recovered run links the archive it recovered
+/// (the segments of every worker, as worker 0's) and writes only the rest:
+/// recovered from it, a layout miss resumes from the whole archive.
+#[test]
+fn layout_miss_resumes_from_the_linked_archive() {
+    let dir = tlx_testkit::TempDir::with_spec("miss-linked", REG, REG_CFG);
+    let env = [("TLX_PRERUN", "1"), ("TLX_RETAIN_MB", "1024")];
+    let args = ["-compile", "-workers", "4"];
+    let (code, want) = run(&dir, "CkReg", &args, &env);
+    assert_eq!(code, 0, "{want}");
+    let md = dir.child_path("md");
+    let checkpoint = [("TLX_CHECKPOINT_STATES", "300"), ("TLX_CHECKPOINT_ABORT", "1")];
+    let e = [&env[..], &checkpoint].concat();
+    let (code, out) = run(&dir, "CkReg", &[&args[..], &["-metadir", md.to_str().unwrap()]].concat(), &e);
+    assert_ne!(code, 0, "{out}");
+    let first: Vec<String> = archive_files(&md);
+    assert!(first.iter().any(|f| f.starts_with("archive-3.")), "{first:?}");
+    let recover = [&args[..], &["-recover", md.to_str().unwrap()]].concat();
+    let (code, out) = run(&dir, "CkReg", &recover, &e);
+    assert_ne!(code, 0, "{out}");
+    let second = archive_files(&md);
+    for f in &first {
+        assert!(second.contains(f), "{f} not linked: {second:?}");
+    }
+    // (Numbered on from the recovered checkpoint: 2.)
+    assert!(second.iter().any(|f| f.ends_with(".2")), "{second:?}");
+    let (code, out) = run(&dir, "CkReg", &recover, &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("layout miss on y") && out.contains("compile: resuming the search at depth"), "{out}");
+    assert_eq!(results(&out, false, false), results(&want, false, false), "{out}");
+}
+
+/// The archive's segments in the checkpoint of metadir `md`.
+fn archive_files(md: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(md.join("checkpoint"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|f| f.starts_with("archive-"))
+        .collect();
+    names.sort();
+    names
+}
+
 /// Wait (up to two minutes) for `path` to exist.
 fn wait_for(path: &Path, child: &mut std::process::Child) {
     let deadline = Instant::now() + Duration::from_secs(120);

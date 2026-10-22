@@ -36,7 +36,9 @@
 //! What a search only appends to (the trace logs, the archive, the edge
 //! logs' columns: streams) is written in segments `<stream>.<n>`, the
 //! values appended before checkpoint `n`; a checkpoint hard-links the
-//! segments of the previous one (by the same search) and the runs of the
+//! segments of the previous one (by the same search, or the one it
+//! recovered from: the recovered archive, read into worker 0's part, as the
+//! first segments of `archive-0`, numbering on from it) and the runs of the
 //! seen set it wrote (`fpset-run-<id>`: runs never change), and writes only
 //! the rest (incremental checkpoints).
 //!
@@ -380,8 +382,13 @@ pub(super) struct CkptRun {
     tmp: Mutex<Option<(DirCommit, Instant)>>,
     /// The workers' parts (per worker).
     parts: Mutex<Vec<Option<Result<Part, String>>>>,
-    /// The last checkpoint committed by this search.
+    /// The last checkpoint committed by this search, or the one it
+    /// recovered from: what the next one links.
     prev: Mutex<Option<Arc<Prev>>>,
+    /// The number of the checkpoint this search recovered from (0: none):
+    /// its checkpoints count on from it, so that the segments they write
+    /// are never named as the recovered ones they link.
+    base: AtomicU64,
     /// The shared files to write (set when a checkpoint starts), the next
     /// one to take, and what each wrote.
     jobs: Mutex<Vec<Job>>,
@@ -399,6 +406,7 @@ impl CkptRun {
             tmp: Mutex::new(None),
             parts: Mutex::new((0..workers).map(|_| None).collect()),
             prev: Mutex::new(None),
+            base: AtomicU64::new(0),
             jobs: Mutex::new(Vec::new()),
             next_job: AtomicUsize::new(0),
             jobs_done: Mutex::new(Vec::new()),

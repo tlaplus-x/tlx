@@ -45,6 +45,43 @@ impl Prev {
     }
 }
 
+impl CkptRun {
+    /// The number of the checkpoint being written: on from the one this
+    /// search recovered from, if any.
+    fn number(&self) -> u64 {
+        self.base.load(Ordering::Relaxed) + self.ck.count() + 1
+    }
+
+    /// This search recovered from checkpoint `m` in directory `dir`: its
+    /// first checkpoint links the recovered segments of the streams rather
+    /// than write them again (the trace logs and liveness edges, as they
+    /// were; the archive, which the recovery read into worker 0's part, as
+    /// the prefix of `archive-0` that its first `archive_blocks` blocks
+    /// are, or None if this search does not archive).
+    pub(super) fn recovered(&self, dir: &Path, m: &Manifest, archive_blocks: Option<u64>) {
+        let mut streams: std::collections::HashMap<String, Segments> = std::collections::HashMap::new();
+        let mut archive = Segments::new();
+        for w in 0..m.workers {
+            if let Some((_, segs)) = m.streams.iter().find(|(n, _)| *n == format!("archive-{w}")) {
+                // (Counted in the recovered blocks: all of them on the last.)
+                archive.extend(segs.iter().map(|(f, _)| (f.clone(), 0)));
+            }
+        }
+        for (name, segs) in &m.streams {
+            if !name.starts_with("archive-") {
+                streams.insert(name.clone(), segs.clone());
+            }
+        }
+        if let (Some(k), Some(last)) = (archive_blocks, archive.last_mut()) {
+            last.1 = k;
+            streams.insert("archive-0".to_string(), archive);
+        }
+        let runs = std::collections::HashSet::new();
+        *self.prev.lock() = Some(Arc::new(Prev { dir: dir.to_path_buf(), streams, runs, linked: AtomicU64::new(0) }));
+        self.base.store(m.number, Ordering::Relaxed);
+    }
+}
+
 /// Link `files` of directory `from` into `to`, adding them (with their
 /// sizes) to `out`; on failure, none (and false).
 fn link_files<'a>(from: &Path, to: &Path, files: impl Iterator<Item = &'a String> + Clone, out: &mut Vec<(String, u64)>) -> bool {
@@ -250,7 +287,7 @@ impl<M: Model> Shared<'_, M> {
             coverage: self.coverage_counts(),
         };
         let m = Manifest {
-            number: c.ck.count() + 1,
+            number: c.number(),
             identity: c.ck.cfg.identity.clone(),
             workers: ps.len(),
             shards: self.history.lock().len(),
@@ -497,7 +534,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
         let c = shared.ckpt.as_ref().expect("checkpointing");
         let prev = c.prev.lock().clone();
         let prev = prev.as_deref();
-        let number = c.ck.count() + 1;
+        let number = c.number();
         let mut files = Vec::new();
         let mut streams = Vec::new();
         let history = shared.history.lock().snapshot();
