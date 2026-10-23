@@ -341,6 +341,24 @@ impl InterpModel {
         self.ip.set_register(key, Value::record(fields));
     }
 
+    /// Recovering from a checkpoint: the `_POSSIBLE` predicates the
+    /// checkpointed search witnessed, by their counts in its registers
+    /// (`main`, then each worker's of `snaps`), as the states it expanded
+    /// are not evaluated again.
+    pub(super) fn restore_witnessed(&self, main: &[u8], snaps: &[Vec<u8>]) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let key = crate::builtins::named_register(Sym::new("s:_possible"));
+        for b in std::iter::once(main).chain(snaps.iter().map(Vec::as_slice)).filter(|b| !b.is_empty()) {
+            let Some(Value::Record(fs)) = crate::interp::read_registers(b)?.remove(&key) else { continue };
+            for p in self.possible.iter() {
+                if fs.iter().any(|(k, n)| k.as_str() == p.name && matches!(n, Value::Int(n) if *n > 0)) {
+                    p.witnessed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// State `s` (number `level` of a trace, followed by `next` if any)
     /// displayed through the ALIAS: its fields in the order written. None
     /// without ALIAS or if it cannot be evaluated (then shown as usual).

@@ -48,7 +48,8 @@ impl tlx_runtime::Persist<State> for InterpModel {
     }
 }
 
-/// Checkpoints: the string table, and the TLCSet registers.
+/// Checkpoints: the string table, and the TLCSet registers (with the
+/// counts of the `_POSSIBLE` predicates, which recovery restores).
 impl tlx_runtime::Checkpointed for InterpModel {
     fn files(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
         Ok(vec![(STRINGS_FILE.to_string(), strings_snapshot())])
@@ -63,6 +64,7 @@ impl tlx_runtime::Checkpointed for InterpModel {
     }
 
     fn restore_workers(&self, main: &[u8], snaps: &[Vec<u8>]) -> Result<(), String> {
-        self.ip.resume_registers(main, snaps)
+        self.ip.resume_registers(main, snaps)?;
+        self.restore_witnessed(main, snaps)
     }
 }

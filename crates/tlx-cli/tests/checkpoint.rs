@@ -4,7 +4,7 @@
 //! verdict, counts, depth and trace length (one worker: the same trace),
 //! with the interpreter and `-compile`, other numbers of workers, VIEW
 //! (representatives in BFS order), liveness, the disk tier, a layout miss
-//! after the recovery and TLCSet registers. SIGINT keeps a committed
+//! after the recovery, TLCSet registers and `_POSSIBLE` witnesses. SIGINT keeps a committed
 //! checkpoint; a checkpoint of another run, or a damaged one, is refused.
 
 #![cfg(unix)]
@@ -124,6 +124,20 @@ Inv == \A k \in DOMAIN r : r[k] \in 0..2
 "#;
 const REC_CFG: &str = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
 
+/// `_POSSIBLE` predicates witnessed only in the first two levels, long
+/// before the checkpoints: the recovered run must still count them.
+const POSS: &str = r#"---- MODULE CkPoss ----
+EXTENDS Naturals
+VARIABLES x, y
+Init == x = 0 /\ y = 0
+Next == \/ x < 60 /\ x' = x + 1 /\ y' = y
+        \/ y < 30 /\ y' = y + 1 /\ x' = x
+Early == x = 1 /\ y = 0
+First == x = 0 /\ y = 0 /\ x' = 1
+====
+"#;
+const POSS_CFG: &str = "INIT Init\nNEXT Next\n_POSSIBLE Early First\nCHECK_DEADLOCK FALSE\n";
+
 /// 600,000 states over 1,200 levels: long enough to be killed while it runs.
 const BIG: &str = r#"---- MODULE CkBig ----
 EXTENDS Naturals
@@ -217,6 +231,7 @@ fn recovered_runs_match_uninterrupted_ones() {
         ("CkView", VIEW, VIEW_CFG, "300"),
         ("CkReg", REG, REG_CFG, "300"),
         ("CkRec", REC, REC_CFG, "300"),
+        ("CkPoss", POSS, POSS_CFG, "300"),
     ] {
         let dir = tlx_testkit::TempDir::with_spec(&format!("match-{name}"), src, cfg);
         for tier in [&[][..], &["-compile"]] {

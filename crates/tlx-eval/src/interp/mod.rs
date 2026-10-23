@@ -170,7 +170,7 @@ fn write_registers(regs: &Registers) -> Result<Vec<u8>, String> {
 }
 
 /// Registers written by `write_registers`.
-fn read_registers(b: &[u8]) -> Result<Registers, String> {
+pub(crate) fn read_registers(b: &[u8]) -> Result<Registers, String> {
     let mut r = tlx_value::ser::Reader::new(b);
     let e = |e: tlx_value::ser::DecodeError| format!("corrupt TLCSet registers in the checkpoint: {e}");
     let n = r.count(2).map_err(e)?;

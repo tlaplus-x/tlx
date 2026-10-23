@@ -231,7 +231,7 @@ impl tlx_runtime::Checkpointed for EncModel {
         self.base.ip.main_registers_snapshot()
     }
     fn restore_workers(&self, main: &[u8], snaps: &[Vec<u8>]) -> Result<(), String> {
-        self.base.ip.resume_registers(main, snaps)
+        tlx_runtime::Checkpointed::restore_workers(&*self.base, main, snaps)
     }
 }
 
