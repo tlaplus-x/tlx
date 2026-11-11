@@ -4,8 +4,9 @@
 //! verdict, counts, depth and trace length (one worker: the same trace),
 //! with the interpreter and `-compile`, other numbers of workers, VIEW
 //! (representatives in BFS order), liveness, the disk tier, a layout miss
-//! after the recovery, TLCSet registers and `_POSSIBLE` witnesses. SIGINT keeps a committed
-//! checkpoint; a checkpoint of another run, or a damaged one, is refused.
+//! after the recovery, TLCSet registers and `_POSSIBLE` witnesses. SIGINT
+//! keeps a committed checkpoint; a checkpoint of another run, or a damaged
+//! one, is refused.
 
 #![cfg(unix)]
 
