@@ -211,13 +211,21 @@ impl Positions {
     }
 
     /// The positions of the states of a level as `(trace-log entry,
-    /// position)`, each position below `places.len()` once (the first level
-    /// of a resumed search).
-    pub(super) fn of_places(places: &[(LogRef, u64)]) -> Positions {
-        Self::of(places.len(), places.iter().copied())
+    /// position)` (the first level of a resumed search). Each position
+    /// below `places.len()` must occur once.
+    pub(super) fn of_places(places: &[(LogRef, u64)]) -> Result<Positions, &'static str> {
+        let mut taken = vec![false; places.len()];
+        for &(_, p) in places {
+            let slot = usize::try_from(p).ok().and_then(|p| taken.get_mut(p)).ok_or("a position past the level")?;
+            if std::mem::replace(slot, true) {
+                return Err("a position twice");
+            }
+        }
+        Ok(Self::of(places.len(), places.iter().copied()))
     }
 
-    /// The positions of the `len` states `places` gives, twice over.
+    /// The positions of the `len` states `places` gives (iterated twice:
+    /// to size the tables, then to fill them).
     fn of(len: usize, places: impl Iterator<Item = (LogRef, u64)> + Clone) -> Positions {
         let mut tables: Vec<Option<Table>> = Vec::new();
         let mut span: Vec<(usize, usize)> = Vec::new();
@@ -1030,7 +1038,7 @@ mod tests {
         // A level read from a checkpoint in worker order, its BFS positions
         // recorded: the same positions as the level queued in BFS order.
         let read = [(log_ref(1, 5), 2), (log_ref(0, 7), 0), (log_ref(1, 4), 3), (log_ref(0, 9), 1)];
-        let placed = Positions::of_places(&read);
+        let placed = Positions::of_places(&read).expect("valid positions");
         let mut bfs = read;
         bfs.sort_by_key(|&(_, p)| p);
         let refs: Vec<LogRef> = bfs.iter().map(|&(r, _)| r).collect();
@@ -1039,6 +1047,16 @@ mod tests {
             assert_eq!((placed.pos(r), sorted.pos(r)), (p, p));
         }
         assert_eq!(placed.len, 4);
+    }
+
+    #[test]
+    fn recovered_positions_must_cover_the_level_once() {
+        use super::super::tracelog::log_ref;
+        let twice = [(log_ref(0, 1), 0), (log_ref(0, 2), 0)];
+        assert_eq!(Positions::of_places(&twice).err(), Some("a position twice"));
+        let past = [(log_ref(0, 1), 0), (log_ref(0, 2), 2)];
+        assert_eq!(Positions::of_places(&past).err(), Some("a position past the level"));
+        assert_eq!(Positions::of_places(&[]).map(|p| p.len).ok(), Some(0));
     }
 
     #[test]

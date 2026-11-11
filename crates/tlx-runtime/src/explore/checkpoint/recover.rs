@@ -416,11 +416,15 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
     for name in &m.queue_files {
         let mut f = rec.input(name, K_QUEUE)?;
         while let Some(c) = f.chunk()? {
-            shared.relieve();
             let mut r = Reader::new(&c);
             let e = |e: tlx_value::ser::DecodeError| bad(&e.to_string());
             let words = r.u8().map_err(e)? != 0;
             let positions = r.u8().map_err(e)? != 0;
+            // (Not while sorting: the budget cannot shrink what is held to
+            // be sorted, and its stages would drop the archive instead.)
+            if !positions || ordered {
+                shared.relieve();
+            }
             let k = r.uvar().map_err(e)?;
             if words && model.caps().codec().is_none() {
                 return Err(bad("encoded states"));
@@ -471,16 +475,7 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
         q.push(seed, level);
     }
     if let Some(o) = &shared.order {
-        // Each position of the level once.
-        let mut taken = vec![false; places.len()];
-        for &(_, p) in &places {
-            let slot = usize::try_from(p).ok().and_then(|p| taken.get_mut(p)).ok_or_else(|| bad("a position past the level"))?;
-            if std::mem::replace(slot, true) {
-                return Err(bad("a position twice"));
-            }
-        }
-        drop(taken);
-        o.start(Arc::new(Positions::of_places(&places)));
+        o.start(Arc::new(Positions::of_places(&places).map_err(bad)?));
     }
     Ok(())
 }
