@@ -128,7 +128,10 @@ fn rotating_to_disk_gives_the_same_results() {
         let o = forced(workers, "same");
         let r = explore(&m, &o);
         assert_eq!(summary(&r), want, "{workers} workers");
-        // (Everything written was given back.)
+        // (Everything written was given back, once the IO threads have
+        // dropped the stores of the requests they finished.)
+        o.spill.wait_for_writes();
+        o.spill.wait_for_reads();
         assert_eq!(o.spill.counters().used, 0);
         // (It did go to disk: how often depends on when the workers reach
         // the safepoints that rotate, so only that it happened.)
