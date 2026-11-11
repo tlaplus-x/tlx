@@ -470,7 +470,11 @@ checkpoint stays. TLC's messages 2195-2198 are printed.
 recorded (`CkptRun::prev`). The next checkpoint hard-links still valid previous segments (the stream is
 append-only, so an old segment remains a prefix) and run files of the same `<id>` and writes only what was
 appended (`SpillVec::iter_from`); if linking fails the stream is rewritten. Edge-log columns are
-append-only and the header is rewritten. For eight checkpoints of a 9.9M-state model this cut the bytes
+append-only and the header is rewritten. A recovered search starts from the checkpoint it recovered
+(`CkptRun::recovered`): its trace and edge streams as they were, and the archive segments of every
+worker, which recovery reads into worker 0's part, as the first segments of `archive-0` (the seen set's
+runs are not linked: recovery reads them into the table or new runs). Its manifests number on from the
+recovered one (`CkptRun::base`), so new segments are never named like those they link. For eight checkpoints of a 9.9M-state model this cut the bytes
 written from 2.0 GB to 0.76 GB (1.27 GB linked) and the time from 3.3-4.3 s to 1.5-1.9 s. `-stats` reports
 bytes written and linked. Parallel writing of the shared files helps less on macOS, where per-file syncs
 queue.
