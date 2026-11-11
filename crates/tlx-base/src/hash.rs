@@ -7,9 +7,11 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 pub const INTEGER_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// The general-purpose in-memory hasher: `rustc-hash` 2 (deterministic, unseeded,
-/// well distributed in the low bits that hashbrown uses). Nothing persisted
-/// (fingerprints, checkpoints, cache keys) may depend on it; those use `fmix64`
-/// and friends below.
+/// well distributed in the low bits that hashbrown uses). Its finishing rotation
+/// fills bucket-index bits 26 and up from the key's low bits: pack a `u64` key
+/// with its varying part in the low half (see `tlx-live`'s `sparse_key`).
+/// Nothing persisted (fingerprints, checkpoints, cache keys) may depend on it;
+/// those use `fmix64` and friends below.
 pub use rustc_hash::FxHasher;
 pub type FxBuildHasher = rustc_hash::FxBuildHasher;
 pub type FxMap<K, V> = HashMap<K, V, FxBuildHasher>;

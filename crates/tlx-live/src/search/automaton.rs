@@ -316,15 +316,19 @@ mod tests {
 
     /// The sparse keys of distinct states spread over a table past 2^26
     /// buckets: 2^20 states of one slot land in about as many 16-bucket
-    /// probe groups of a 2^28-bucket table (94%). Keyed `(s << 32) | q`,
-    /// they shared 2^26 home buckets (82%), and building the product of a
-    /// 176M-state graph took days instead of minutes.
+    /// probe groups of a 2^28-bucket table (94%), and the bucket index's
+    /// bits 26 and 27 take every value. Keyed `(s << 32) | q`, those bits
+    /// were fixed by the slot (82% of the groups), and the liveness check
+    /// of a 176M-state graph ran for more than three hours without ending.
     #[test]
     fn sparse_keys_spread_past_two_to_the_26_buckets() {
         let n = 1u32 << 20;
         let mask = (1u64 << 28) - 1;
-        let groups: HashSet<u64> = (0..n).map(|s| (FxBuildHasher::default().hash_one(sparse_key(s, 1)) & mask) >> 4).collect();
+        let hash = |s: u32| FxBuildHasher::default().hash_one(sparse_key(s, 1));
+        let groups: HashSet<u64> = (0..n).map(|s| (hash(s) & mask) >> 4).collect();
         assert!(groups.len() as f64 > 0.9 * f64::from(n), "{} groups", groups.len());
+        let high: HashSet<u64> = (0..n).map(|s| (hash(s) & mask) >> 26).collect();
+        assert_eq!(high.len(), 4, "bits 26 and 27 of the bucket index: {high:?}");
     }
 
     /// `NodeMap` keys by `(state, slot)`: an existing pair keeps its id and
