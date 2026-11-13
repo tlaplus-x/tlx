@@ -7,7 +7,7 @@ use crate::explore::resume::BaseCounters;
 use crate::explore::{OutdegreeHist, OUTDEGREE_BUCKETS};
 
 /// The version of the manifest's contents.
-const VERSION: u64 = 3;
+const VERSION: u64 = 4;
 
 /// A file of the seen set's fingerprints (ascending).
 #[derive(Clone, Debug)]
@@ -42,6 +42,11 @@ pub(super) struct Manifest {
     pub(super) archive: bool,
     /// The liveness edges are recorded (files `edges-<shard>`).
     pub(super) edges: bool,
+    /// The states of the levels below this one were expanded before a
+    /// resume (after a layout miss), and their liveness edges are recorded
+    /// only at the end of the search, from the archive (`Shared::live_pre`);
+    /// 0 if none.
+    pub(super) pre_level: u32,
     /// The words of the encoded states (0: `Persist` bytes).
     pub(super) words: usize,
     /// The files of the seen set (the runs, then the parts of the table).
@@ -125,6 +130,7 @@ impl Manifest {
         for &c in &b.coverage {
             w.uvar(c);
         }
+        w.uvar(u64::from(self.pre_level));
         w.into_bytes()
     }
 
@@ -199,6 +205,7 @@ impl Manifest {
         for _ in 0..n {
             coverage.push(r.uvar().map_err(e)?);
         }
+        let pre_level = r.uvar().map_err(e)?;
         r.finish().map_err(e)?;
         let small = |v: u64| u32::try_from(v).map_err(|_| "corrupt manifest: a count out of range".to_string());
         Ok(Manifest {
@@ -220,6 +227,7 @@ impl Manifest {
             ordered: flags & 1 != 0,
             archive: flags & 2 != 0,
             edges: flags & 4 != 0,
+            pre_level: small(pre_level)?,
             words,
             fp_sections,
             queue_files,

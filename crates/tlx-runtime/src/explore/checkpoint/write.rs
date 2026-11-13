@@ -301,6 +301,7 @@ impl<M: Model> Shared<'_, M> {
             ordered: self.order.is_some(),
             archive,
             edges,
+            pre_level: self.live_pre.lock().iter().map(|p| p.depth() + 1).max().unwrap_or(0),
             words: model.caps().codec().map_or(0, |c| c.words()),
             fp_sections,
             queue_files,

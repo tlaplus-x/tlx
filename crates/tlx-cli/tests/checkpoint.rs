@@ -268,6 +268,24 @@ fn recovered_liveness_uses_the_recorded_edges() {
     }
 }
 
+/// A layout miss before the checkpoint: the resume leaves the liveness
+/// edges of the levels before its resume point to be recorded at the end,
+/// from the archive, and so does the recovered run. (It used to find no
+/// graph: "the search recorded no liveness edges".)
+#[test]
+fn recovered_liveness_after_a_layout_miss_before_the_checkpoint() {
+    let dir = tlx_testkit::TempDir::with_spec("edges-miss", LIVE, LIVE_CFG);
+    let env = [("TLX_PRERUN", "1"), ("TLX_PRERUN_REUSE", "0")];
+    let args = ["-compile", "-stats"];
+    let (code, want) = run(&dir, "CkLive", &args, &env);
+    assert_eq!(code, 13, "{want}");
+    let (code, out, killed) = interrupted(&dir, "CkLive", &args, &args, &env, "300", "1");
+    assert!(killed.contains("compile: resuming the search at depth"), "{killed}");
+    assert_eq!(code, 13, "{out}");
+    assert!(out.contains("liveness: edge graph (CSR)"), "{out}");
+    assert_eq!(results(&out, false, false), results(&want, false, false), "{out}");
+}
+
 /// The disk tier (everything spilled: fingerprint runs, queue segments,
 /// trace logs, edges) before and after the checkpoint.
 #[test]

@@ -14,7 +14,7 @@ use super::{K_ARCHIVE, K_EDGES, K_FPSET, K_MANIFEST, K_MODEL, K_QUEUE, K_TRACE, 
 use crate::explore::edges::{AtomBits, EdgeRec};
 use crate::explore::frontier::{Local, Task};
 use crate::explore::order::Positions;
-use crate::explore::resume::BaseCounters;
+use crate::explore::resume::{BaseCounters, Pre};
 use crate::explore::tracelog::{TraceLog, NO_PARENT};
 use crate::explore::{fp_set_full, InitResult, Outcome, Shared, Stats};
 use crate::io::checkpoint_dirs;
@@ -319,6 +319,14 @@ fn recover<'m, M: Model>(
     }
     if let Some(c) = &shared.ckpt {
         c.recovered(&rec.dir, m, archive_blocks);
+    }
+    // The levels a resume before the checkpoint left to record the liveness
+    // edges of at the end: their states again, from the archive (else the
+    // graph lacks them and cannot be built).
+    if m.pre_level > 0 && shared.live_atoms.is_some() {
+        let pre =
+            seed.archived().into_iter().flatten().filter(|b| b.depth() < m.pre_level).filter_map(|b| b.share().map(Pre::Block)).collect();
+        *shared.live_pre.lock() = pre;
     }
     // The queued states.
     read_queue(shared, seed, rec)?;
