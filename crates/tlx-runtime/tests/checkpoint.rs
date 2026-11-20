@@ -195,6 +195,14 @@ fn spill_in(dir: &Path, mode: SpillMode, reused: bool) -> Spill {
     Spill::new(SpillConfig { mode, dir: Some(dir.to_path_buf()), reused, ..Default::default() })
 }
 
+/// Wait for a previous search's spill IO threads to drop their `BlockStore`
+/// references (and release the directory `LOCK`) before the same process
+/// opens that metadir again.
+fn settle(spill: &Spill) {
+    spill.wait_for_writes();
+    spill.wait_for_reads();
+}
+
 const IDENTITY: &str = "test run";
 
 /// Checkpoints every `states` new states; the search stops after the
@@ -248,14 +256,18 @@ fn interrupted<M: Model>(
     let dir = metadir("run");
     let ck = stopping(every, stop);
     let first = make();
-    let r = explore(&first, &opts(kill, spill_in(&dir, mode, false), Some(ck.clone())));
+    let s1 = spill_in(&dir, mode, false);
+    let r = explore(&first, &opts(kill, s1.clone(), Some(ck.clone())));
+    settle(&s1);
     assert_eq!(ck.count(), stop, "checkpoints taken before the stop: {:?}", r.outcome);
     assert!(dir.join("checkpoint/MANIFEST").is_file());
     let rec = Recovery::open(&dir).expect("a checkpoint");
     assert_eq!(rec.identity(), [("run".to_string(), IDENTITY.to_string())]);
     assert_eq!(rec.workers(), kill);
     let m = make();
-    let r = explore_from(&m, &opts(recover, spill_in(&dir, mode, true), Some(none())), Start::Recover(&rec), None).0;
+    let s2 = spill_in(&dir, mode, true);
+    let r = explore_from(&m, &opts(recover, s2.clone(), Some(none())), Start::Recover(&rec), None).0;
+    settle(&s2);
     // (Removed once the recovered search ended: the checkpoint, the
     // metadir made by the first search.)
     assert!(!dir.exists(), "{} left", dir.display());
@@ -320,16 +332,22 @@ fn repeated_recovery_with_fewer_workers(bad: Option<(u32, u32)>, [initial, fewer
             let want = explore(&make(), &opts(1, Spill::default(), None));
             let dir = metadir("repeated");
             let first = stopping(400, 2);
-            explore(&make(), &opts(initial, spill_in(&dir, mode, false), Some(first.clone())));
+            let s0 = spill_in(&dir, mode, false);
+            explore(&make(), &opts(initial, s0.clone(), Some(first.clone())));
+            settle(&s0);
             assert_eq!(first.count(), 2);
             for workers in [fewer, more] {
                 let rec = Recovery::open(&dir).unwrap();
                 let ck = stopping(400, 1);
-                let r = explore_from(&make(), &opts(workers, spill_in(&dir, mode, true), Some(ck.clone())), Start::Recover(&rec), None).0;
+                let s = spill_in(&dir, mode, true);
+                let r = explore_from(&make(), &opts(workers, s.clone(), Some(ck.clone())), Start::Recover(&rec), None).0;
+                settle(&s);
                 assert_eq!(ck.count(), 1, "{:?}", r.outcome);
             }
             let rec = Recovery::open(&dir).unwrap();
-            let r = explore_from(&make(), &opts(1, spill_in(&dir, mode, true), Some(none())), Start::Recover(&rec), None).0;
+            let s = spill_in(&dir, mode, true);
+            let r = explore_from(&make(), &opts(1, s.clone(), Some(none())), Start::Recover(&rec), None).0;
+            settle(&s);
             assert_eq!(summary(&r, PARALLEL), summary(&want, PARALLEL), "coded {coded}, bad {bad:?}, mode {mode:?}");
             if let Some(bad) = bad {
                 assert_eq!(r.trace.first().unwrap().state.0, 0);
@@ -411,15 +429,19 @@ fn recovered_search_with_the_disk_tier() {
             let dir = metadir("disk");
             let ck = stopping(300, 2);
             let fp = FpConfig::default().with_disk_slots(1024);
-            let o = |w, reused, ck| Options {
+            let o = |w, spill, ck| Options {
                 fp,
                 queue: tlx_runtime::queue::Config { seg_bytes: 4096, ..Default::default() },
-                ..opts(w, spill_in(&dir, SpillMode::Always, reused), Some(ck))
+                ..opts(w, spill, Some(ck))
             };
-            explore(&make(), &o(kill, false, ck.clone()));
+            let s1 = spill_in(&dir, SpillMode::Always, false);
+            explore(&make(), &o(kill, s1.clone(), ck.clone()));
+            settle(&s1);
             assert_eq!(ck.count(), 2);
             let rec = Recovery::open(&dir).expect("a checkpoint");
-            let r = explore_from(&make(), &o(recover, true, none()), Start::Recover(&rec), None).0;
+            let s2 = spill_in(&dir, SpillMode::Always, true);
+            let r = explore_from(&make(), &o(recover, s2.clone(), none()), Start::Recover(&rec), None).0;
+            settle(&s2);
             assert_eq!(
                 summary(&r, if kill == 1 { EXACT } else { PARALLEL }),
                 summary(&explore(&make(), &opts(1, Spill::default(), None)), if kill == 1 { EXACT } else { PARALLEL }),
@@ -596,13 +618,17 @@ fn recovered_search_links_the_recovered_segments() {
         let want = explore(&make(), &opts(1, Spill::default(), None));
         let dir = metadir(&format!("links-{coded}"));
         let first = stopping(400, 2);
-        explore_from(&make(), &opts(4, spill_in(&dir, SpillMode::Auto, false), Some(first.clone())), Start::Init, RETAIN);
+        let s1 = spill_in(&dir, SpillMode::Auto, false);
+        explore_from(&make(), &opts(4, s1.clone(), Some(first.clone())), Start::Init, RETAIN);
+        settle(&s1);
         assert_eq!(first.count(), 2);
         let before: Vec<String> = names(&dir).into_iter().filter(segment).collect();
         assert!(before.iter().any(|f| f.starts_with("archive-1.")) == coded, "{before:?}");
         let rec = Recovery::open(&dir).unwrap();
         let ck = stopping(400, 1);
-        let r = explore_from(&make(), &opts(2, spill_in(&dir, SpillMode::Auto, true), Some(ck.clone())), Start::Recover(&rec), RETAIN).0;
+        let s2 = spill_in(&dir, SpillMode::Auto, true);
+        let r = explore_from(&make(), &opts(2, s2.clone(), Some(ck.clone())), Start::Recover(&rec), RETAIN).0;
+        settle(&s2);
         assert_eq!(ck.count(), 1, "{:?}", r.outcome);
         let after = names(&dir);
         // Every recovered segment is linked (the archive's of all four
@@ -613,7 +639,9 @@ fn recovered_search_links_the_recovered_segments() {
         let new: Vec<&String> = after.iter().filter(|f| segment(f) && !before.contains(f)).collect();
         assert!(!new.is_empty() && new.iter().all(|f| f.ends_with(".3")), "coded {coded}: {new:?}");
         let rec = Recovery::open(&dir).unwrap();
-        let r = explore_from(&make(), &opts(1, spill_in(&dir, SpillMode::Auto, true), Some(none())), Start::Recover(&rec), RETAIN).0;
+        let s3 = spill_in(&dir, SpillMode::Auto, true);
+        let r = explore_from(&make(), &opts(1, s3.clone(), Some(none())), Start::Recover(&rec), RETAIN).0;
+        settle(&s3);
         assert_eq!(summary(&r, PARALLEL), summary(&want, PARALLEL), "coded {coded}");
         assert_eq!(canon(r.live_graph.as_ref().unwrap().as_ref().unwrap()), canon(want.live_graph.as_ref().unwrap().as_ref().unwrap()));
         assert!(!dir.exists());

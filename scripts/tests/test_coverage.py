@@ -103,7 +103,9 @@ class Reports(unittest.TestCase):
                         "Init == x = 0\nNext == x < 1000000000 /\\ x' = x + 1\n====\n")
             with open(cfg, 'w') as f:
                 f.write('INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n')
-            r = C.run({'id': 'signal-fixture', 'tla': tla, 'cfg': cfg}, 5, binary, True)
+            # Allow enough time for C compilation on slow CI runners so the
+            # static coverage report is printed before SIGTERM stops BFS.
+            r = C.run({'id': 'signal-fixture', 'tla': tla, 'cfg': cfg}, 15, binary, True)
             self.assertEqual(r['status'], 'timeout')
             self.assertTrue(r['static']['reported'], r['output'])
             self.assertIsNone(r['dynamic']['native_share'])
