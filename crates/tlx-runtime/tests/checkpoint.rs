@@ -623,7 +623,11 @@ fn recovered_search_links_the_recovered_segments() {
         settle(&s1);
         assert_eq!(first.count(), 2);
         let before: Vec<String> = names(&dir).into_iter().filter(segment).collect();
-        assert!(before.iter().any(|f| f.starts_with("archive-1.")) == coded, "{before:?}");
+        if coded {
+            assert!(before.iter().any(|f| f.starts_with("archive-1.")), "{before:?}");
+        } else {
+            assert!(!before.iter().any(|f| f.starts_with("archive-")), "{before:?}");
+        }
         let rec = Recovery::open(&dir).unwrap();
         let ck = stopping(400, 1);
         let s2 = spill_in(&dir, SpillMode::Auto, true);
@@ -646,4 +650,21 @@ fn recovered_search_links_the_recovered_segments() {
         assert_eq!(canon(r.live_graph.as_ref().unwrap().as_ref().unwrap()), canon(want.live_graph.as_ref().unwrap().as_ref().unwrap()));
         assert!(!dir.exists());
     }
+}
+
+/// An unencoded model (`StateFormat::Bytes`) must not write archive files
+/// even when a worker archived zero blocks (`[].iter().all(Block::encoded)`
+/// is vacuously true).
+#[test]
+fn unencoded_checkpoint_writes_no_archive_for_idle_workers() {
+    let dir = metadir("unencoded-idle");
+    let ck = stopping(1000, 1);
+    let s = spill_in(&dir, SpillMode::Auto, false);
+    explore_from(&Chain(vec!["Step".into()]), &opts(4, s.clone(), Some(ck.clone())), Start::Init, Some(1 << 30));
+    settle(&s);
+    assert_eq!(ck.count(), 1);
+    let files: Vec<String> =
+        std::fs::read_dir(dir.join("checkpoint")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(!files.iter().any(|f| f.starts_with("archive-")), "{files:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

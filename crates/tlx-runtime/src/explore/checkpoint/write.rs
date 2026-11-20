@@ -551,9 +551,10 @@ impl<M: Model> WorkerState<'_, '_, M> {
             out.write(shard)?;
             edges &= shard.edges.is_some();
         }
-        let words = shared.model.caps().codec().map_or(0, |c| c.words());
+        let codec = shared.model.caps().codec();
         let archived = match self.local.archived() {
-            Some(blocks) if blocks.iter().all(|b| b.encoded()) => {
+            Some(blocks) if codec.is_some() && blocks.iter().all(|b| b.encoded()) => {
+                let words = codec.expect("codec").words();
                 let name = format!("archive-{me}");
                 let segs = write_stream(prev, tmp, number, &name, K_ARCHIVE, blocks.len() as u64, &mut files, |start, out| {
                     write_archive(&blocks[start as usize..], words, out)
