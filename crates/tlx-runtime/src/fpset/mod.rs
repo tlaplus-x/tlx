@@ -426,6 +426,10 @@ pub struct FpSet {
     /// in progress (by the disk tier).
     mem: Arc<Gauge>,
     tables: Part,
+    /// The memory of the old table (published by `account`, so other
+    /// threads like the budget monitor can read it without racing on
+    /// `disk`).
+    old_bytes: AtomicUsize,
 }
 
 // SAFETY: the table and the disk tier are only replaced or changed by
@@ -477,6 +481,7 @@ impl FpSet {
             rotate_ns: AtomicU64::new(0),
             mem: Arc::new(Gauge::new()),
             tables: Part::default(),
+            old_bytes: AtomicUsize::new(0),
         };
         s.account();
         s
@@ -870,7 +875,9 @@ impl FpSet {
     /// Publish the memory of the tables and runs (after they changed, with
     /// exclusive access).
     fn account(&self) {
-        self.tables.set(&self.mem, self.table().bytes() + self.disk().map_or(0, |d| d.old_bytes() + d.runs_bytes()));
+        let old = self.disk().map_or(0, Disk::old_bytes);
+        self.old_bytes.store(old, Ordering::Relaxed);
+        self.tables.set(&self.mem, self.table().bytes() + old + self.disk().map_or(0, Disk::runs_bytes));
     }
 
     /// The gauge of the set's memory (`bytes`, as published).
@@ -890,9 +897,10 @@ impl FpSet {
         self.disk().map_or(0, |d| d.index_bytes())
     }
 
-    /// The memory of the old table.
+    /// The memory of the old table (published by `account`; safe to read
+    /// concurrently with exclusive-access updates).
     pub fn old_bytes(&self) -> usize {
-        self.disk().map_or(0, |d| d.old_bytes())
+        self.old_bytes.load(Ordering::Relaxed)
     }
 
     /// The memory the next rotation adds: the Bloom filter and index of a

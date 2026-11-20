@@ -89,11 +89,10 @@ pub(super) fn finalize<'m, M: Model>(
     // whichever fails first, too.)
     let mut live_error = if graph_wanted { edges.iter_mut().find_map(|e| e.take_error()) } else { None };
     let pre = std::mem::take(&mut *shared.live_pre.lock());
-    // (Not after a resume: the levels before its resume point were
-    // expanded by an earlier search. After a recovery, the checkpointed
-    // search recorded the edges of those before the checkpoint, so it
-    // evaluated their atoms too.)
-    let live_atoms_ok = live_atoms.is_some() && !resumed && !in_init && all_edges && edges.iter().all(|e| !e.failed());
+    // (Not after a resume, or a recovery that still owes pre-resume edges:
+    // the levels before the resume point were expanded by an earlier search
+    // without recording their liveness atoms.)
+    let live_atoms_ok = live_atoms.is_some() && !resumed && pre.is_empty() && !in_init && all_edges && edges.iter().all(|e| !e.failed());
     let resumable = matches!(failure, Some((Outcome::Error(_), _)))
         && !in_init
         && shared.retention.on

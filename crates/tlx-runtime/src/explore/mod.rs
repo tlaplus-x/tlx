@@ -806,7 +806,8 @@ impl<M: Model> Shared<'_, M> {
             self.frontier.squeeze(true);
             return;
         }
-        if self.spill_frontier() {
+        let already_spilling = self.frontier.queue_spilling();
+        if self.spill_frontier() && !already_spilling {
             return;
         }
         // Every stage is reached: what is left over budget the components
@@ -1139,11 +1140,12 @@ fn init_relieve<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::St
 
 /// Why a search over its budget `total` stops, holding `used` bytes of the
 /// `limit` the process can have (its control group's, else the machine's):
-/// within a margin of it (1/16, at least 2 GiB: memory grows between the
-/// budget's looks every 50 ms), the kernel would kill the process next.
+/// within a margin of it (1/16, at least 2 GiB, capped at 1/4 for limits
+/// under 8 GiB: memory grows between the budget's looks every 50 ms), the
+/// kernel would kill the process next.
 fn over_ceiling(used: usize, total: usize, limit: usize) -> Option<String> {
     const MIB: usize = 1 << 20;
-    let margin = (limit / 16).max(2 << 30);
+    let margin = (limit / 16).max(2 << 30).min(limit / 4);
     if used <= total || used < limit.saturating_sub(margin) {
         return None;
     }
@@ -1176,6 +1178,52 @@ fn progress_monitor<M: Model>(shared: &Shared<'_, M>, p: &Progress, done: &tlx_b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::{Spill, SpillConfig};
+    use crate::model::{Caps, StateFormat};
+    use crate::queue::StateCodec;
+
+    struct DummyModel;
+    impl StateCodec<u64> for DummyModel {
+        fn words(&self) -> usize {
+            1
+        }
+        fn encode(&self, s: &u64, out: &mut [u64]) -> u64 {
+            out[0] = *s;
+            *s
+        }
+        fn decode(&self, w: &[u64], _depth: u32, _fp: u64) -> u64 {
+            w[0]
+        }
+    }
+    impl Model for DummyModel {
+        type State = u64;
+        crate::model_without_checks!();
+        fn init_states(&self, out: &mut dyn FnMut(u64)) -> Result<(), ModelError> {
+            out(1);
+            Ok(())
+        }
+        fn successors(&self, _s: &u64, _out: &mut dyn FnMut(u64, u32) -> bool) -> Result<(), ModelError> {
+            Ok(())
+        }
+        fn fingerprint(&self, s: &u64) -> u64 {
+            *s
+        }
+        fn check_invariants(&self, _s: &u64) -> Result<Option<usize>, ModelError> {
+            Ok(None)
+        }
+        fn invariant_names(&self) -> &[String] {
+            &[]
+        }
+        fn action_names(&self) -> &[String] {
+            &[]
+        }
+        fn render(&self, s: &u64) -> String {
+            s.to_string()
+        }
+        fn caps(&self) -> Caps<'_, u64> {
+            Caps { format: Some(StateFormat::Words(self)), ..Default::default() }
+        }
+    }
 
     #[test]
     fn ceilings() {
@@ -1186,13 +1234,42 @@ mod tests {
         // Within budget, or with room left before the margin: it goes on.
         assert_eq!(over_ceiling(58 * G, 59 * G, 58 * G + G / 2), None);
         assert_eq!(over_ceiling(54 * G, 46 * G, 58 * G + G / 2), None);
-        // A small limit keeps a margin of 2 GiB.
+        // A small limit keeps a margin of 2 GiB down to 8 GiB, and 1/4 below.
         assert!(over_ceiling(7 * G, 6 * G, 8 * G).is_some());
         assert_eq!(over_ceiling(6 * G - 1, 5 * G, 8 * G), None);
+        assert_eq!(over_ceiling(G, G / 2, 2 * G), None);
+        let small = over_ceiling(3 * G / 2, G, 2 * G).expect("stops at 3/4 of 2 GiB");
+        assert!(small.contains("within 512 MiB of the 2048 MiB"), "{small}");
     }
 
     #[test]
     fn keep_last_without_a_checkpoint() {
         assert!(!Checkpointer::new(CheckpointConfig::default()).keep_last());
+    }
+
+    /// Regression test: once queue spilling is already active, `relieve` must
+    /// not return early before requesting `SP_DROP_OLD`.
+    #[test]
+    fn relieve_requests_drop_old_while_frontier_spills() {
+        let dir = std::env::temp_dir().join(format!("tlx-relieve-drop-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = Options {
+            workers: 1,
+            maxmem: 512 << 10,
+            fp: FpConfig::default().with_disk_slots(1024),
+            spill: Spill::new(SpillConfig { mode: SpillMode::Always, dir: Some(dir.clone()), ..Default::default() }),
+            ..Default::default()
+        };
+        let r = run::prepare(&DummyModel, &opts, &Start::Init, None, None, Instant::now());
+        let shared = &r.shared;
+        assert!(shared.frontier.queue_spilling());
+        shared.rotate_seen(None, 1);
+        assert!(shared.seen.old_bytes() > 0, "rotation kept the old table");
+        shared.relieve();
+        assert_ne!(shared.control().requests() & SP_DROP_OLD, 0, "relieve must request SP_DROP_OLD even while frontier spills");
+        drop(r);
+        opts.spill.wait_for_writes();
+        opts.spill.wait_for_reads();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

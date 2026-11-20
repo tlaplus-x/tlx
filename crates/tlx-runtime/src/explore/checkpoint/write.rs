@@ -203,6 +203,7 @@ impl<M: Model> Shared<'_, M> {
                 // (This run's count, not the manifest's number `c.number()`,
                 // which a recovered search continues: `TLX_CHECKPOINT_ABORT`
                 // and `-stats` count the checkpoints of this process.)
+                c.ck.present.store(true, Ordering::SeqCst);
                 let number = c.ck.count.fetch_add(1, Ordering::SeqCst) + 1;
                 let time = t0.elapsed();
                 stats::add_secs("checkpoints", time);

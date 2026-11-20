@@ -506,9 +506,11 @@ fn rotating_without_the_old_table() {
             Err(Full) => {
                 // SAFETY: single-threaded.
                 unsafe { s.rotate(None, 3, 1024 + i % 2000, i % 2 == 0) }.unwrap();
+                assert_eq!(s.old_bytes() > 0, i % 2 == 0);
                 if i % 3 == 0 {
                     // SAFETY: single-threaded.
                     unsafe { s.drop_old() };
+                    assert_eq!(s.old_bytes(), 0);
                 }
                 s.try_insert(f).unwrap()
             }

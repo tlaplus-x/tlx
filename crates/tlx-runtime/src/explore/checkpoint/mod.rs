@@ -163,6 +163,8 @@ pub struct Checkpointer {
     count: AtomicU64,
     /// The metadir, held from the first checkpoint (or the recovery) on.
     hold: Mutex<Option<DirHold>>,
+    /// Whether a committed or recovered checkpoint exists in `hold`.
+    present: AtomicBool,
     /// Keep the last checkpoint when the search ends (`AfterCommit::Stop`).
     keep: AtomicBool,
 }
@@ -180,6 +182,7 @@ impl Checkpointer {
             last: Mutex::new((Instant::now(), 0)),
             count: AtomicU64::new(0),
             hold: Mutex::new(None),
+            present: AtomicBool::new(false),
             keep: AtomicBool::new(false),
         })
     }
@@ -230,7 +233,9 @@ impl Checkpointer {
     /// Hold the metadir of a recovered run (its checkpoint is removed at
     /// the end like this run's own).
     pub(super) fn adopt(&self, spill: &Spill) -> Result<(), String> {
-        self.dir(spill).map(|_| ())
+        self.dir(spill)?;
+        self.present.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Keep the last checkpoint when the search ends, and take no other: the
@@ -238,14 +243,14 @@ impl Checkpointer {
     /// Whether there is one: committed, or recovered from.
     pub fn keep_last(&self) -> bool {
         self.keep.store(true, Ordering::SeqCst);
-        self.hold.lock().is_some()
+        self.present.load(Ordering::SeqCst)
     }
 
     /// The search ended (not killed): remove the checkpoint (unless it is
     /// to be kept, with the metadir) and release the metadir.
     pub(super) fn finish(&self) {
         let Some(h) = self.hold.lock().take() else { return };
-        if self.keep.load(Ordering::SeqCst) {
+        if self.keep.load(Ordering::SeqCst) && self.present.load(Ordering::SeqCst) {
             h.keep();
             return;
         }
