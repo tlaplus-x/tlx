@@ -1048,7 +1048,7 @@ def run_checked(a, cancel):
     what will be launched; from there `cloud/session.py` owns the run and its
     single cleanup.
     """
-    owner = current_owner() if a.mine or not (a.list or a.cleanup) else None
+    owner = current_owner() if a.mine or not (a.list or a.cleanup or a.grant) else None
     check_override(a.budget_override)
     if a.prune_sg:
         check_coordinator()

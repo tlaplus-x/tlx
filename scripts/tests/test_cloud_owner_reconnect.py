@@ -61,6 +61,15 @@ class GrantOwner(testkit.GuardedTestCase):
              self.assertRaisesRegex(common.CloudStop, '--grant feature/baseline'):
             cloud.run(cloud.parse_args(['--grant', 'baseline']))
 
+    def test_grant_does_not_require_a_current_branch(self):
+        detached = mock.patch.object(
+            cloud, 'current_owner', side_effect=common.CloudStop('cloud ownership needs a current git branch', 25))
+        with detached, mock.patch.object(cloud, 'LaunchLedger', return_value=self.ledger), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cloud.run(cloud.parse_args(['--grant', 'feature/baseline'])), 0)
+        rows = json.loads(Path(self.ledger.path).read_text())
+        self.assertEqual(rows[-1]['owner'], 'feature/baseline')
+
 
 class Reconnect(unittest.TestCase):
     def run_case(self, rc, drops, *, seconds=0, dead_at=20000):
