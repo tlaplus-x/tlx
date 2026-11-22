@@ -2645,20 +2645,36 @@ class AllowlistProviders(testkit.GuardedTestCase):
         ec2.revoke_security_group_ingress.assert_not_called()
 
     def test_aws_instance_state(self):
-        from botocore.exceptions import ClientError
-        aws = cloud_aws.AwsProvider()
-        m = mock.Mock(region="ap-northeast-1", id="i-1")
-        for state, want in (("running", "running"), ("stopped", "stopped"), ("terminated", "gone"),
-                            ("shutting-down", "gone"), ("pending", "running")):
-            with self.subTest(state=state):
-                ec2 = mock.Mock()
-                ec2.describe_instances.return_value = {"Reservations": [{"Instances": [{"State": {"Name": state}}]}]}
-                with mock.patch.object(aws, "ec2", return_value=ec2):
-                    self.assertEqual(aws.instance_state(m), want)
-        ec2 = mock.Mock()
-        ec2.describe_instances.side_effect = ClientError({"Error": {"Code": "InvalidInstanceID.NotFound"}}, "DescribeInstances")
-        with mock.patch.object(aws, "ec2", return_value=ec2):
-            self.assertEqual(aws.instance_state(m), "gone")
+        patch_botocore = contextlib.nullcontext()
+        try:
+            from botocore.exceptions import ClientError
+        except ModuleNotFoundError:
+            import types
+
+            class ClientError(Exception):
+                def __init__(self, response, operation_name):
+                    super().__init__(operation_name)
+                    self.response = response
+
+            botocore = types.ModuleType("botocore")
+            exceptions = types.ModuleType("botocore.exceptions")
+            exceptions.ClientError = ClientError
+            botocore.exceptions = exceptions
+            patch_botocore = mock.patch.dict(sys.modules, {"botocore": botocore, "botocore.exceptions": exceptions})
+        with patch_botocore:
+            aws = cloud_aws.AwsProvider()
+            m = mock.Mock(region="ap-northeast-1", id="i-1")
+            for state, want in (("running", "running"), ("stopped", "stopped"), ("terminated", "gone"),
+                                ("shutting-down", "gone"), ("pending", "running")):
+                with self.subTest(state=state):
+                    ec2 = mock.Mock()
+                    ec2.describe_instances.return_value = {"Reservations": [{"Instances": [{"State": {"Name": state}}]}]}
+                    with mock.patch.object(aws, "ec2", return_value=ec2):
+                        self.assertEqual(aws.instance_state(m), want)
+            ec2 = mock.Mock()
+            ec2.describe_instances.side_effect = ClientError({"Error": {"Code": "InvalidInstanceID.NotFound"}}, "DescribeInstances")
+            with mock.patch.object(aws, "ec2", return_value=ec2):
+                self.assertEqual(aws.instance_state(m), "gone")
 
     # --- the three fakes the provider cases above need ---
 

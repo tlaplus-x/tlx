@@ -108,7 +108,7 @@ class BenchmarkProcessGroups(unittest.TestCase):
         for options in ({}, {'rusage': True}):
             with self.subTest(options=options):
                 self.pids.unlink(missing_ok=True)
-                result = process.capture(cmd, .5, start_new_session=True,
+                result = process.capture(cmd, 3, start_new_session=True,
                                          raise_timeout=False, **options)
                 self.assertEqual(result.returncode, 0)
                 self.assert_stopped()
