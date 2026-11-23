@@ -9,17 +9,24 @@ pub(super) struct Normalizer<'a> {
     stack: Vec<DefId>,
     remaining: usize,
     local: u32,
-    at: Option<Expr>,
-    at_reads: usize,
+    at_stack: Vec<(Expr, bool)>,
+    let_at: HashMap<DefId, Option<usize>>,
 }
 
 impl<'a> Normalizer<'a> {
     pub fn new(program: &'a Program) -> Self {
-        Self { program, stack: Vec::new(), remaining: 100_000, local: program.locals.len() as u32, at: None, at_reads: 0 }
+        Self {
+            program,
+            stack: Vec::new(),
+            remaining: 100_000,
+            local: program.locals.len() as u32,
+            at_stack: Vec::new(),
+            let_at: HashMap::new(),
+        }
     }
 
     pub fn root(&mut self, e: &Expr) -> Option<Expr> {
-        self.expand(e, &HashMap::new(), 0)
+        self.expand(e, &HashMap::new(), None, 0)
     }
 
     fn bind(&mut self, vars: &BoundVars, env: &mut HashMap<LocalId, Expr>, span: Span) -> BoundVars {
@@ -39,18 +46,18 @@ impl<'a> Normalizer<'a> {
         }
     }
 
-    fn bounds(&mut self, bounds: &[Bound], env: &mut HashMap<LocalId, Expr>, depth: usize) -> Option<Vec<Bound>> {
+    fn bounds(&mut self, bounds: &[Bound], env: &mut HashMap<LocalId, Expr>, lex_at: Option<usize>, depth: usize) -> Option<Vec<Bound>> {
         bounds
             .iter()
             .map(|b| {
-                let set = self.expand(&b.set, env, depth)?;
+                let set = self.expand(&b.set, env, lex_at, depth)?;
                 let vars = self.bind(&b.vars, env, b.set.span);
                 Some(Bound { vars, set })
             })
             .collect()
     }
 
-    fn expand(&mut self, e: &Expr, env: &HashMap<LocalId, Expr>, depth: usize) -> Option<Expr> {
+    fn expand(&mut self, e: &Expr, env: &HashMap<LocalId, Expr>, lex_at: Option<usize>, depth: usize) -> Option<Expr> {
         if depth >= 128 || self.remaining == 0 {
             return None;
         }
@@ -58,12 +65,28 @@ impl<'a> Normalizer<'a> {
         let kind = match &*e.kind {
             ExprKind::Local(l) => return Some(env.get(l).unwrap_or(e).clone()),
             ExprKind::At => {
-                self.at_reads += 1;
-                return self.at.clone();
+                let idx = lex_at?;
+                let (expr, used) = self.at_stack.get_mut(idx)?;
+                *used = true;
+                return Some(expr.clone());
             }
-            ExprKind::Let { body, .. } => return self.expand(body, env, depth + 1),
+            ExprKind::Let { defs, body } => {
+                let prev: Vec<_> = defs.iter().map(|&d| (d, self.let_at.insert(d, lex_at))).collect();
+                let res = self.expand(body, env, lex_at, depth + 1);
+                for (d, old) in prev {
+                    match old {
+                        Some(v) => {
+                            self.let_at.insert(d, v);
+                        }
+                        None => {
+                            self.let_at.remove(&d);
+                        }
+                    }
+                }
+                return res;
+            }
             ExprKind::Apply { op, args } => {
-                let args: Vec<_> = args.iter().map(|a| self.expand(a, env, depth + 1)).collect::<Option<_>>()?;
+                let args: Vec<_> = args.iter().map(|a| self.expand(a, env, lex_at, depth + 1)).collect::<Option<_>>()?;
                 match op {
                     OpRef::Builtin(op) => ExprKind::Builtin { op: *op, args },
                     OpRef::Def(id) => {
@@ -86,8 +109,9 @@ impl<'a> Normalizer<'a> {
                                 }
                                 DefKind::Pending => return None,
                             };
+                            let def_at = self.let_at.get(id).copied().unwrap_or(None);
                             self.stack.push(*id);
-                            let result = self.expand(&body, &scope, depth + 1);
+                            let result = self.expand(&body, &scope, def_at, depth + 1);
                             self.stack.pop();
                             return result;
                         }
@@ -98,35 +122,35 @@ impl<'a> Normalizer<'a> {
             ExprKind::OpArg(_) | ExprKind::Lambda { .. } | ExprKind::InstVar { .. } => return None,
             ExprKind::Quant { kind, bounds, body } => {
                 let mut scope = env.clone();
-                let bounds = self.bounds(bounds, &mut scope, depth + 1)?;
-                ExprKind::Quant { kind: *kind, bounds, body: self.expand(body, &scope, depth + 1)? }
+                let bounds = self.bounds(bounds, &mut scope, lex_at, depth + 1)?;
+                ExprKind::Quant { kind: *kind, bounds, body: self.expand(body, &scope, lex_at, depth + 1)? }
             }
             ExprKind::FnConstruct { bounds, body } => {
                 let mut scope = env.clone();
-                let bounds = self.bounds(bounds, &mut scope, depth + 1)?;
-                ExprKind::FnConstruct { bounds, body: self.expand(body, &scope, depth + 1)? }
+                let bounds = self.bounds(bounds, &mut scope, lex_at, depth + 1)?;
+                ExprKind::FnConstruct { bounds, body: self.expand(body, &scope, lex_at, depth + 1)? }
             }
             ExprKind::SetMap { expr, bounds } => {
                 let mut scope = env.clone();
-                let bounds = self.bounds(bounds, &mut scope, depth + 1)?;
-                ExprKind::SetMap { expr: self.expand(expr, &scope, depth + 1)?, bounds }
+                let bounds = self.bounds(bounds, &mut scope, lex_at, depth + 1)?;
+                ExprKind::SetMap { expr: self.expand(expr, &scope, lex_at, depth + 1)?, bounds }
             }
             ExprKind::SetFilter { bound, pred } => {
                 let mut scope = env.clone();
-                let mut bounds = self.bounds(std::slice::from_ref(bound), &mut scope, depth + 1)?;
-                ExprKind::SetFilter { bound: bounds.remove(0), pred: self.expand(pred, &scope, depth + 1)? }
+                let mut bounds = self.bounds(std::slice::from_ref(bound), &mut scope, lex_at, depth + 1)?;
+                ExprKind::SetFilter { bound: bounds.remove(0), pred: self.expand(pred, &scope, lex_at, depth + 1)? }
             }
             ExprKind::Choose { vars, set, body } => {
                 let set = match set {
-                    Some(s) => Some(self.expand(s, env, depth + 1)?),
+                    Some(s) => Some(self.expand(s, env, lex_at, depth + 1)?),
                     None => None,
                 };
                 let mut scope = env.clone();
                 let vars = self.bind(vars, &mut scope, e.span);
-                ExprKind::Choose { vars, set, body: self.expand(body, &scope, depth + 1)? }
+                ExprKind::Choose { vars, set, body: self.expand(body, &scope, lex_at, depth + 1)? }
             }
             ExprKind::Except { base, updates } => {
-                let base = self.expand(base, env, depth + 1)?;
+                let base = self.expand(base, env, lex_at, depth + 1)?;
                 let mut expanded = Vec::new();
                 for (path, rhs) in updates {
                     let mut old = base.clone();
@@ -135,7 +159,7 @@ impl<'a> Normalizer<'a> {
                         let key = match key {
                             ExceptKey::Field(field) => ExceptKey::Field(field.clone()),
                             ExceptKey::Index(args) => {
-                                ExceptKey::Index(args.iter().map(|e| self.expand(e, env, depth + 1)).collect::<Option<_>>()?)
+                                ExceptKey::Index(args.iter().map(|e| self.expand(e, env, lex_at, depth + 1)).collect::<Option<_>>()?)
                             }
                         };
                         old = Expr::new(
@@ -147,14 +171,14 @@ impl<'a> Normalizer<'a> {
                         );
                         keys.push(key);
                     }
-                    let outer = self.at.replace(old);
-                    let reads = self.at_reads;
-                    let rhs = self.expand(rhs, env, depth + 1);
-                    self.at = outer;
+                    let at_idx = self.at_stack.len();
+                    self.at_stack.push((old, false));
+                    let rhs = self.expand(rhs, env, Some(at_idx), depth + 1);
+                    let (_, at_used) = self.at_stack.pop().unwrap();
                     // EXCEPT updates are sequential. Using the original base
                     // for @ is valid only when preceding writes cannot touch
                     // this point. Check after expansion to include LET helpers.
-                    if self.at_reads != reads && expanded.iter().any(|(prior, _): &(Vec<ExceptKey>, Expr)| !disjoint(prior, path)) {
+                    if at_used && expanded.iter().any(|(prior, _): &(Vec<ExceptKey>, Expr)| !disjoint(prior, path)) {
                         return None;
                     }
                     expanded.push((keys, rhs?));
@@ -165,7 +189,7 @@ impl<'a> Normalizer<'a> {
             _ => {
                 let mut out = Expr::new((*e.kind).clone(), e.span);
                 let mut valid = true;
-                visit::children_mut(&mut out, &mut |c| match self.expand(c, env, depth + 1) {
+                visit::children_mut(&mut out, &mut |c| match self.expand(c, env, lex_at, depth + 1) {
                     Some(x) => *c = x,
                     None => valid = false,
                 });

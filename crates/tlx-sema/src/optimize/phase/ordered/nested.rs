@@ -87,12 +87,7 @@ impl Context<'_> {
         Some(id)
     }
     fn atom(&self, e: &Expr) -> Option<Atom> {
-        if let ExprKind::Local(id) = &*e.kind {
-            if let Some(a) = self.aliases.get(id) {
-                return Some(a.clone());
-            }
-        }
-        self.domains.atom_value(e)
+        self.domains.state_atom_value(e, &self.aliases)
     }
     fn atom_expr(&mut self, a: &Atom, span: Span) -> Option<Expr> {
         if let Some(e) = self.domains.atom_expr(a, span) {

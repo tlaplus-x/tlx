@@ -10,6 +10,7 @@ mod liveness;
 mod normalize;
 mod ordered;
 mod sequence;
+pub(crate) mod sym_norm;
 
 pub use age::age_projection;
 pub use erasure::unobserved_projection;
@@ -17,6 +18,7 @@ pub use history::history_projection;
 pub use keyed::{symmetry_certificate, symmetry_projection_certificate};
 pub use ordered::{ordered_projection, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::sequence_length_projection;
+pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
 
 use tlx_front::cfg::Config;
 
@@ -172,24 +174,161 @@ fn unchanged(e: &Expr, v: VarId) -> usize {
     }
 }
 
-fn binding(branch: &Branch, v: VarId, primed: bool) -> Option<Expr> {
-    let mut values = Vec::new();
-    for e in &branch.terms {
-        match &*e.kind {
-            ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 && variable(&args[0], primed) == Some(v) => {
-                values.push(args[1].clone());
-            }
-            ExprKind::Builtin { op: B::Unchanged, args } if primed && args.len() == 1 => {
-                values.extend((0..unchanged(&args[0], v)).map(|_| Expr::new(ExprKind::Var(v), e.span)));
-            }
-            _ => {}
+fn collect_unchanged_vars(e: &Expr, out: &mut Vec<VarId>) {
+    match &*e.kind {
+        ExprKind::Var(x) => out.push(*x),
+        ExprKind::Tuple(es) => es.iter().for_each(|x| collect_unchanged_vars(x, out)),
+        _ => {}
+    }
+}
+
+fn mentions_phase_var(e: &Expr, primed: bool) -> bool {
+    match &*e.kind {
+        ExprKind::Var(_) => !primed,
+        ExprKind::Builtin { op: B::Prime | B::Unchanged, args } => primed && args.iter().any(|a| mentions_phase_var(a, false)),
+        ExprKind::Builtin { op: B::Enabled, .. } => false,
+        _ => {
+            let mut found = false;
+            crate::visit::children(e, &mut |c| found |= mentions_phase_var(c, primed));
+            found
         }
     }
-    if values.len() == 1 {
-        values.pop()
-    } else {
-        None
+}
+
+fn collect_phase_vars(e: &Expr, primed: bool, out: &mut std::collections::BTreeSet<VarId>) {
+    match &*e.kind {
+        ExprKind::Var(v) if !primed => {
+            out.insert(*v);
+        }
+        ExprKind::Builtin { op: B::Prime | B::Unchanged, args } if primed => {
+            for a in args {
+                collect_phase_vars(a, false, out);
+            }
+        }
+        ExprKind::Builtin { op: B::Enabled, .. } => {}
+        _ => crate::visit::children(e, &mut |c| collect_phase_vars(c, primed, out)),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroundState {
+    Visiting,
+    Grounded(bool),
+}
+
+struct BranchBindings {
+    primed: bool,
+    single_eq: std::collections::HashMap<VarId, (usize, Expr)>,
+    single_rev_eq: std::collections::HashMap<VarId, (usize, Expr)>,
+    first_membership: std::collections::HashMap<VarId, usize>,
+    state: std::cell::RefCell<std::collections::HashMap<VarId, GroundState>>,
+}
+
+impl BranchBindings {
+    fn new(branch: &Branch, primed: bool) -> Self {
+        let mut eq_counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+        let mut rev_counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+        let mut single_eq = std::collections::HashMap::new();
+        let mut single_rev_eq = std::collections::HashMap::new();
+        let mut first_membership = std::collections::HashMap::new();
+        let mut unch = Vec::new();
+        for (idx, e) in branch.terms.iter().enumerate() {
+            match &*e.kind {
+                ExprKind::Builtin { op: B::In | B::SubsetEq, args } if args.len() == 2 => {
+                    if let Some(v) = variable(&args[0], primed) {
+                        first_membership.entry(v).or_insert(idx);
+                    }
+                }
+                ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 => {
+                    let lhs_v = variable(&args[0], primed);
+                    let rhs_v = variable(&args[1], primed);
+                    if let Some(v) = lhs_v {
+                        let c = eq_counts.entry(v).or_insert(0);
+                        *c += 1;
+                        if *c == 1 {
+                            single_eq.insert(v, (idx, args[1].clone()));
+                        } else {
+                            single_eq.remove(&v);
+                        }
+                    }
+                    if let Some(v) = rhs_v {
+                        if lhs_v != Some(v) {
+                            let rc = rev_counts.entry(v).or_insert(0);
+                            *rc += 1;
+                            if *rc == 1 {
+                                single_rev_eq.insert(v, (idx, args[0].clone()));
+                            } else {
+                                single_rev_eq.remove(&v);
+                            }
+                        }
+                    }
+                }
+                ExprKind::Builtin { op: B::Unchanged, args } if primed && args.len() == 1 => {
+                    unch.clear();
+                    collect_unchanged_vars(&args[0], &mut unch);
+                    for &v in &unch {
+                        let c = eq_counts.entry(v).or_insert(0);
+                        *c += 1;
+                        if *c == 1 {
+                            single_eq.insert(v, (idx, Expr::new(ExprKind::Var(v), e.span)));
+                        } else {
+                            single_eq.remove(&v);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self { primed, single_eq, single_rev_eq, first_membership, state: std::cell::RefCell::new(std::collections::HashMap::new()) }
+    }
+
+    fn has_earlier_membership(&self, v: VarId, limit_idx: usize) -> bool {
+        self.first_membership.get(&v).is_some_and(|&first| first < limit_idx)
+    }
+
+    fn var_is_grounded(&self, u: VarId, state: &mut std::collections::HashMap<VarId, GroundState>) -> bool {
+        match state.get(&u).copied() {
+            Some(GroundState::Grounded(ok)) => return ok,
+            Some(GroundState::Visiting) => return false,
+            None => {}
+        }
+        state.insert(u, GroundState::Visiting);
+        let ok = match self.single_eq.get(&u) {
+            Some((_, u_rhs)) if !mentions_phase_var(u_rhs, self.primed) => true,
+            Some((idx, u_rhs)) if !self.has_earlier_membership(u, *idx) => {
+                let mut deps = std::collections::BTreeSet::new();
+                collect_phase_vars(u_rhs, self.primed, &mut deps);
+                deps.into_iter().all(|w| self.var_is_grounded(w, state))
+            }
+            _ => self.first_membership.contains_key(&u),
+        };
+        state.insert(u, GroundState::Grounded(ok));
+        ok
+    }
+
+    fn get(&self, v: VarId) -> Option<Expr> {
+        let (idx, rhs) = self.single_eq.get(&v)?;
+        if mentions_phase_var(rhs, self.primed)
+            && (self.has_earlier_membership(v, *idx) || !self.var_is_grounded(v, &mut self.state.borrow_mut()))
+        {
+            return None;
+        }
+        Some(rhs.clone())
+    }
+
+    fn get_or_reversed(&self, v: VarId) -> Option<Expr> {
+        self.get(v).or_else(|| {
+            let (idx, lhs) = self.single_rev_eq.get(&v)?;
+            if mentions_phase_var(lhs, self.primed) || self.has_earlier_membership(v, *idx) {
+                return None;
+            }
+            Some(lhs.clone())
+        })
+    }
+}
+
+fn binding(branch: &Branch, v: VarId, primed: bool) -> Option<Expr> {
+    BranchBindings::new(branch, primed).get(v)
 }
 
 // Bound declarations, even unused ones, must not capture inserted inputs.
