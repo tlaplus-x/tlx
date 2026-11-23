@@ -109,15 +109,21 @@ currently covers unobserved-variable erasure, relative ages, a subset of finite 
 summaries, phase-dependent fields, exact sequence lengths, and scalar or fixed nested ordered allocation. Checked invariants are observations, never
 assumptions; source actions and concrete state values remain intact for replay.
 
-`phase/keyed.rs` separately certifies automatic symmetry of fixed-domain maps
-with key-free payloads. The emitter exposes key equality, quantifiers, reads,
-conditional values and actor writes in `KeyedCertificate.lean`'s rule IR.
-The shared proof establishes equivariance and constructs a permutation-quotient
-certificate with successor lifting from every representative. Candidate shape
-analysis cannot authorize application alone: `autosym` requires this certificate
-before installing one full group and emits Lean before the search. Source lowering,
-domains, semantic leaves, permutation closure and runtime canonicalization remain
-trusted. `keyed/erasure.rs` additionally connects the actual installed retained-variable
+`phase/keyed.rs` separately certifies automatic symmetry for disjoint products of
+full permutation groups (each 2–6 model values, total order at most 720) across
+fixed-domain maps, mixed fixed-domain maps, scalar/optional key slots, sets of
+keys, sets of single-key tagged records, and fixed records of those shapes. The
+emitter exposes key/slot/fixed equality, group membership, quantifiers, finite
+key cardinalities, map and slot-indexed reads, conditional values/slots,
+point/whole-map writes (including multi-writer updates), and slot writes in
+`KeyedCertificate.lean`'s rule IR. The shared proof establishes equivariance
+under `GroupPerm` and constructs a permutation-quotient certificate with
+successor lifting from every representative. Candidate shape analysis cannot
+authorize application alone: `autosym` requires this certificate before
+installing the largest certifiable product subset and emits Lean before the
+search. Source lowering, inferred domains and shape splitting, semantic leaves,
+totality, permutation closure and runtime canonicalization remain trusted.
+`keyed/erasure.rs` additionally connects the actual installed retained-variable
 tuple to explicit hidden literal/copy/frame transfers. `ErasedKeyedCertificate.lean`
 shares branch choices with the keyed operations, proves erasure, and composes that
 certificate with the orbit certificate for the same intermediate system. Runtime

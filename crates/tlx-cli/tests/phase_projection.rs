@@ -235,13 +235,17 @@ Sym == Permutations(Actors)
                 .run();
             assert_eq!(run.code, 0, "{tier}: {}", run.text());
             assert!(
-                run.stdout.contains(if declared { "3 distinct states found" } else { "2 distinct states found" }),
+                run.stdout.contains(if declared { "3 distinct states found" } else { "1 distinct states found" }),
                 "{tier}: {}",
                 run.text()
             );
             assert_eq!(run.stdout.contains("unobserved-state-projection"), !declared, "{tier}: {}", run.text());
+            assert_eq!(run.stdout.contains("composed with symmetry Permutations(Actors)"), !declared, "{tier}: {}", run.text());
             let stats = std::fs::read_to_string(dir.join("stats.json")).unwrap();
-            assert!(!stats.contains(r#""name":"symmetry""#), "{stats}");
+            assert_eq!(stats.contains(r#""name":"symmetry""#), !declared, "{stats}");
+            if !declared {
+                assert!(stats.contains(r#""proof":"generated-lean""#), "{stats}");
+            }
             assert_eq!(stats.contains(r#""name":"unobserved-state-projection""#), !declared, "{stats}");
         }
     }

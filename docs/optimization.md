@@ -47,9 +47,11 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Combined age/history | One age projection and one finite history; shared branch choices and retained core | Enabled within this subset |
 | Nested ordered allocation | Fixed record/tuple/map paths, multiple independent families, conditional copy/fresh/reset transfers and rank-key equivalence | Enabled within this subset |
 | Immutable live versions | Singleton seed, fresh append/frame transfers, explicit live-root payload feedback and retained-table key equivalence | Enabled within this subset |
-| Automatic keyed symmetry | Fixed-domain maps; explicit key equality, quantifiers, reads and writes; permutation quotient | Enabled for one full group; other shapes and runtime-guarded claims remain uncertified |
+| Automatic keyed symmetry | Disjoint products of full groups; fixed/mixed maps, scalar/optional key slots, sets of keys, sets of single-key tagged records, fixed records, cardinalities, multi-writer and whole-map writes; permutation quotient | Enabled within this certified subset; delegates unsupported shapes to the fallback symmetry certificates below |
+| Automatic equivariant symmetry | Disjoint products of full groups; recursive finite values (key-valued and nested maps, multi-key records, bounded sequences/tuples, finite sets, comprehensions, `KSubset`, `IsInjective`) and equivariant HIR formulas; permutation quotient | Enabled as fallback when `KeyedCertificate` declines and no `CHOOSE` over keys is used |
+| Automatic choice-irrelevant symmetry | Disjoint products of full groups; unique-witness key `CHOOSE` (`ChooseOne`, at-most-one active key), projected uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`); inductive invariant + permutation quotient | Enabled as fallback when `CHOOSE` is used within this certified subset; runtime-guarded claims remain uncertified |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
-| Projection composed with symmetry | Unobserved-variable transfers and keyed operations share one source IR; erasure and orbit certificates compose | Enabled for certified variable erasure plus one keyed group |
+| Projection composed with symmetry | Unobserved-variable transfers and keyed operations share one source IR; erasure and orbit certificates compose | Enabled for certified variable erasure plus certified keyed group(s) |
 
 All enabled projection certificates prove initialization, successor correspondence from
 every representative, preservation of state observations, concrete counterexample lifting,
@@ -63,37 +65,97 @@ not a proof of it: completing these certificates remains work.
 
 ## Certified keyed symmetry
 
-The default-mode symmetry path accepts one full permutation group of two to six
-model values. State values may use those identifiers as the exact domain of one
-or more maps. Their payloads and the retained state must contain no moved
-identifiers, and payload values must be mutually comparable for runtime
-canonicalization. Domain inference uses initialization and every action, never
-selected invariants as assumptions.
+The default-mode symmetry path accepts a disjoint product of one or more full
+permutation groups of two to six model values each, with total group order at
+most 720 (matching `autosym`'s runtime order cap). State variables may use those
+identifiers in any combination of the following certified shapes:
 
-The compiler emits explicit key equality, Boolean connectives, quantifiers over
-the full key set, ordered map reads and map writes. Each map update currently
-writes one syntactic actor per branch; multiple payload-field patches preserve
-source order. Whole-payload conditional values become explicit decision trees.
-Untranslated key uses, multiple potentially aliasing actors in one map update,
-primed map reads, unknown domains and identifier-containing payloads refuse.
+- Fixed-domain maps `[K -> V]` and mixed fixed-domain maps `[K \cup Fixed -> V]`
+  with key-free, mutually comparable payloads `V` (fixed entries remain in core state `C`).
+- Scalar or optional key variables (`K` or `K \cup Fixed`), represented as explicit
+  key/fixed sum slots (`KeyVal`).
+- Sets of keys (`SUBSET K` or `SUBSET (K \cup Fixed)`), represented by indicator
+  maps over moved keys plus a key-free fixed-element subset in `C`.
+- Sets of tagged records where every record shape has at most one pure-key field
+  and all remaining fields are key-free and mutually comparable; key-free shapes
+  stay in `C` and each keyed shape maps keys to sets of key-free payload records.
+- Fixed-shape records whose fields are independently core values, fixed-domain
+  maps, or scalar/optional key slots.
 
-`KeyedCertificate.lean` proves equivariance of these operations and constructs
-the permutation quotient. Its successor theorem lifts from every representative,
-not just the representative used to create an edge. Initialization uses actual
-source witnesses, so the formal rule does not need a symmetric initial predicate.
-Six exported theorem audits cover the main certificate, safety with and without
-stuttering, counterexamples, deadlocks, and equality of formal orbit keys.
-The runtime's permutation closure and minimum-representative algorithm remain
-trusted; the orbit theorem does not claim to verify their Rust implementation.
+Retained core state and payloads must contain no moved identifiers, and values at
+permuted slots must be mutually comparable for runtime canonicalization. Domain
+inference uses initialization and every action (including `v \in S` membership
+bounds and action-level `IF` splits), never selected invariants as assumptions.
+
+The compiler emits explicit key/slot/fixed equality, group-mask membership,
+Boolean connectives, quantifiers over group unions or pure key-set variables,
+finite key cardinalities (`bindCount`), ordered map and slot-indexed map reads,
+point and whole-map writes (`Write.point` / `Write.all`, including multi-writer
+`EXCEPT`, whole-map resets, and set-of-keys / tagged-record-set insertions), and
+explicit scalar/optional slot transfers (`SlotExpr`). Whole-payload and slot
+conditionals become explicit decision trees. Untranslated key uses, overlapping
+or unused groups, partial/pinned subsets, multi-key record shapes, key-bearing
+map payloads, multi-actor partial field patches that could alias, primed
+non-core reads, `CHOOSE` over keys, and unknown domains refuse.
+
+`KeyedCertificate.lean` models the product group as `GroupPerm sizes` acting on
+the tagged disjoint union `Key sizes := Σ g, Fin (sizes g)`, proves equivariance
+of every IR construct (including finite `countKeys` cardinality invariance via
+`countFin_rename`), and constructs the permutation quotient. Its successor
+theorem lifts from every representative, not just the representative used to
+create an edge. Initialization uses actual source witnesses, so the formal rule
+does not need a symmetric initial predicate. Six exported theorem audits cover
+the main certificate, safety with and without stuttering, counterexamples,
+deadlocks, and equality of formal orbit keys.
+
+**Trusted computing base (TCB):** source parsing and HIR lowering, forward
+domain inference and shape bijection (splitting records, mixed maps, and sets
+into core `C`, maps `M`, and slots `S`), independent semantic leaf
+interpretation, expression totality/error equivalence, runtime group closure
+from adjacent-transposition generators, and runtime representative selection
+(minimum-key canonicalization) remain trusted; the orbit theorem characterizes
+the formal quotient, not the Rust canonicalizer implementation.
 
 Automatic application requires the connected certificate even for a forced
 candidate. Runtime guards and bounded checks cannot substitute for it. The CLI
-writes mandatory Lean before exploration, including without opt-in projection.
-An explicitly requested certified projection takes priority. A keyed group can join
-unobserved-variable erasure only with a connected composition certificate.
-Constraints, action/initial properties, aliases, temporal checking, declared
-VIEW/SYMMETRY and other projection/symmetry combinations remain excluded. See the
-[reproduction example](../proofs/symmetry/README.md).
+searches `autosym`'s proven full-group candidates (up to order 720, within a
+bounded certification budget) for the largest-order certifiable disjoint
+product subset and writes mandatory Lean before exploration, including without
+opt-in projection. An explicitly requested certified projection takes priority.
+Certified keyed group(s) can join unobserved-variable erasure only with a
+connected composition certificate. Constraints, action/initial properties,
+aliases, temporal checking, declared VIEW/SYMMETRY and other projection/symmetry
+combinations remain excluded. See the
+[reproduction examples](../proofs/symmetry/README.md).
+
+### Equivariant and choice-irrelevant fallback certificates
+
+When the specialized keyed emitter declines a specification (for example, on
+key-valued maps `[K1 -> K2]`, multi-key message records, sequences of keys, or
+certified `CHOOSE` patterns), `phase::symmetry_certificate` tries two fallback
+certificate generators in order:
+
+1. **`EquivSymCertificate.lean` (`equiv_sym`):** lowers normalized `Init`,
+   `Next`, and selected `INVARIANT` formulas into a closed recursive finite
+   value and formula IR (`Val`, `Expr`, `SetPred`, `Form`), proves equivariance
+   under `GroupPerm sizes`, and discharges the same permutation-quotient
+   theorems (safety with and without stuttering, counterexample lifting,
+   deadlock preservation, and orbit-key equivalence).
+2. **`ChooseSymCertificate.lean` (`choose_sym`):** handles `CHOOSE`-bearing
+   specifications whose choices are unique-witness key selections (`x = target`,
+   `ChooseOne`, or inductively proved at-most-one active key in a key set or
+   Boolean flag map), projected value-invariant selections (key-free-value
+   record comprehensions, predicate-pinned `.val`, or inductively proved
+   constant/uniform `.val` message sets), or commutative-associative recursive
+   `CHOOSE` integer set-sum folds (`chooseFoldAdd`), while preserving
+   empty-witness `CHOOSE` errors (`EvalOutcome.error`).
+
+**Additional TCB for symmetry certificates:** all symmetry certificate engines
+share the conservative `sym_totality` static gate, which derives abstract shapes
+and 32-bit integer intervals strictly from `Init` and `Next` (never assuming
+checked invariants) to verify expression totality, TLC comparability (including
+typed vs. untyped model values), 32-bit checked-arithmetic and cardinality
+bounds, and finite enumerability before any certificate can be emitted.
 
 ## Overlap with execution optimization
 

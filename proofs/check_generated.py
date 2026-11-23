@@ -30,7 +30,7 @@ def invoke(lean, path):
 def verify(lean, path, negative):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedNested", "GeneratedLive", "GeneratedErasedSymmetry")
+    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedEquivSymmetry", "GeneratedChooseSymmetry", "GeneratedNested", "GeneratedLive", "GeneratedErasedSymmetry")
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
@@ -54,8 +54,10 @@ def verify(lean, path, negative):
     ):
         axioms[name] = []
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
-    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry"}:
+    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry"}:
         theorems |= {"orbit_key_equivalent"}
+    if namespace == "GeneratedChooseSymmetry":
+        theorems |= {"inductive_invariant", "orbit_key_equivalent"}
     if namespace == "GeneratedErasedSymmetry":
         theorems |= {"erasure_certificate"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
@@ -127,9 +129,30 @@ def verify(lean, path, negative):
             ] if namespace == "GeneratedField" else [
                 ("fun i => p.toFun (keys i)", "fun i => keys i", "failed to rename bound keys"),
                 ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
+                ("fun s => renameKeyVal p (u s)", "fun s => u s", "failed to permute scalar key slots"),
+                ("| .inl k => .inl (p.toFun k)", "| .inl k => .inl k", "failed to rename key values"),
+                ("if mask g then countFin (sizes g) (fun i => pred ⟨g, i⟩) else 0", "if mask g then (List.finRange (sizes g)).findIdx (fun i => pred ⟨g, i⟩) else 0", "replaced key cardinality with order-dependent index"),
                 ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
             ] if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry"} else [
+                ("| .key k => .key (p.toFun k)", "| .key k => .key k", "failed to rename keys"),
+                ("| .seq xs => .seq (renameRawList p xs)", "| .seq xs => .seq xs", "failed to rename sequence elements"),
+                ("| .set xs => .set (renameRawList p xs)", "| .set xs => .set xs", "failed to rename set elements"),
+                ("| .fn ps => .fn (renameRawPairs p ps)", "| .fn ps => .fn ps", "failed to rename function entries"),
+                ("| .set xs => some (dedupList (xs.map mkVal)).length", "| .set xs => some xs.length", "replaced set cardinality with non-extensional list length"),
+                ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
+                ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
+            ] if namespace == "GeneratedEquivSymmetry" else [
+                ("fun i => p.toFun (keys i)", "fun i => keys i", "failed to rename bound keys"),
+                ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
+                ("fun f k => fl f (p.invFun k)", "fun f k => fl f k", "failed to permute flag keys"),
+                ("fun id k => ms id (p.invFun k)", "fun id k => ms id k", "failed to permute message-set keys"),
+                ("!(mask y.1 && q.eval testFn fixedAtom st (push keys y) aux) || decide (y = k)", "!(mask y.1 && q.eval testFn fixedAtom st (push keys y) aux) || true", "dropped syntactic uniqueness guard in CHOOSE"),
+                ("| .atMostOneFlag mask flag _ =>\n      inv.atMostOneFlags.any (fun item => decide (item.1 = flag) && maskImplies mask item.2)", "| .atMostOneFlag _ _ _ => true", "accepted unproved unique-flag choice"),
+                ("| .msgUniform ms _ =>\n      inv.uniformValMsgs.any (fun m => decide (m = ms)) ||\n        inv.constValMsgs.any (fun item => decide (item.1 = ms))", "| .msgUniform _ _ => true", "accepted unproved projected-value choice"),
+                ("next a b := ∃ s t, m.project s = a ∧ m.validConcrete.next s t ∧ m.project t = b", "next a b := False ∧ ∃ s t, m.project s = a ∧ m.validConcrete.next s t ∧ m.project t = b", "discarded quotient successors"),
+                ("initial a := ∃ s, m.validConcrete.initial s ∧ m.project s = a", "initial a := False ∧ ∃ s, m.validConcrete.initial s ∧ m.project s = a", "discarded quotient initialization"),
+            ] if namespace == "GeneratedChooseSymmetry" else [
                 ("slots := fun i => ((transfers i).eval layout s).eval layout s", "slots := fun _ => 0", "discarded nested slot transfers"),
                 ("(∀ i, sentinel (read layout s i) = sentinel (read layout t i))", "True", "forgot exact nonpositive sentinels"),
                 ("next a b := ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "next a b := False ∧ ∃ s t, m.project s = a ∧ m.concrete.next s t ∧ m.project t = b", "discarded quotient successors"),
