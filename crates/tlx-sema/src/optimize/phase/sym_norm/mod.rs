@@ -17,7 +17,6 @@
 //!
 //! All modes enforce `Enumerator::target` / `Enumerator::unchanged` assignment
 //! preservation via [`block_non_target`] and [`block_unchanged_tuple`].
-#![allow(dead_code, unused_imports)]
 
 mod folds;
 mod helpers;

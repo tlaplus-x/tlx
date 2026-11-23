@@ -1,6 +1,5 @@
 //! Recognition and normalization of commutative-associative recursive `CHOOSE`
 //! integer set-sum folds (`NormMode::Choose`).
-#![allow(dead_code, unused_imports)]
 
 use std::collections::HashMap;
 

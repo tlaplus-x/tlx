@@ -1,6 +1,5 @@
 //! Checked 32-bit interval arithmetic, shape lattice operations, comparability,
 //! lazy-membership safety, and container projection helpers.
-#![allow(dead_code, unused_imports)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

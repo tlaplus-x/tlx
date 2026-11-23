@@ -1,6 +1,5 @@
 //! Shared symmetry-group validation, key reference IR, and domain independence/comparability
 //! helpers used by both `keyed` and `choose_sym`.
-#![allow(dead_code, unused_imports)]
 
 use super::domain::{self, Atom, Domain};
 use crate::{hir::*, visit};

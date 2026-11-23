@@ -1,6 +1,5 @@
 //! Forward may-value domains, inferred from Init and every Next alternative.
 //! Unknown operations widen to Top. Checked properties are never assumptions.
-#![allow(dead_code, unused_imports)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;

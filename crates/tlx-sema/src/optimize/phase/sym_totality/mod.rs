@@ -7,7 +7,6 @@
 //! value-position Boolean contexts are proved total, 32-bit overflow-free,
 //! type-comparable, and finitely enumerable from `Init` and `Next` alone
 //! (never assuming checked invariants).
-#![allow(dead_code, unused_imports)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

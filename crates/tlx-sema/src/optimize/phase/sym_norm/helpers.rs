@@ -1,6 +1,5 @@
 //! Structural helpers, `Enumerator::target` preservation wrappers, branch
 //! splitting, and public forward-domain queries backed by [`SymNormalizer`].
-#![allow(dead_code, unused_imports)]
 
 use std::sync::Arc;
 

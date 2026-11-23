@@ -2,6 +2,7 @@
 //! history summaries. These reuse normalized branches and forward domains.
 
 mod age;
+mod choose_sym;
 mod domain;
 mod equiv_sym;
 mod erasure;
@@ -16,6 +17,7 @@ pub(crate) mod sym_norm;
 mod sym_totality;
 
 pub use age::age_projection;
+pub use choose_sym::choose_symmetry_certificate;
 pub use equiv_sym::symmetry_certificate as equiv_symmetry_certificate;
 pub use erasure::unobserved_projection;
 pub use history::history_projection;
@@ -38,6 +40,7 @@ pub fn symmetry_certificate(
 ) -> Option<String> {
     keyed::symmetry_certificate(program, cfg, init, next, observations, groups)
         .or_else(|| equiv_sym::symmetry_certificate(program, cfg, init, next, observations, groups))
+        .or_else(|| choose_sym::choose_symmetry_certificate(program, cfg, init, next, observations, groups))
 }
 
 use tlx_front::cfg::Config;
