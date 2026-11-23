@@ -14,18 +14,31 @@ impl Emitter<'_> {
         };
         writeln!(out, "\nnamespace TlxOptimization.{namespace}").unwrap();
         out.push_str("open TlxOptimization KeyedRule\nnoncomputable section\nset_option linter.unusedVariables false\nset_option maxRecDepth 10000\n");
+        writeln!(out, "abbrev GroupCount : Nat := {}", self.groups.len()).unwrap();
+        out.push_str("def groupSizes (g : Fin GroupCount) : Nat :=\n  match g.val with\n");
+        for (i, g) in self.groups.iter().enumerate() {
+            writeln!(out, "  | {i} => {}", g.size).unwrap();
+        }
+        out.push_str("  | _ => 0\n");
         writeln!(
             out,
-            "abbrev Key := Fin {}\nabbrev MapId := Fin {}\nabbrev BranchId := Fin {}",
-            self.keys.len(),
-            self.maps.len(),
+            "abbrev MapId := Fin {}\nabbrev SlotId := Fin {}\nabbrev BranchId := Fin {}",
+            self.num_maps,
+            self.num_slots,
             cases.len()
         )
         .unwrap();
         writeln!(
             out,
             "def layout : String := {}",
-            literal(&format!("Full permutation group of {:?}; maps {:?}; payloads and core contain no moved keys", self.keys, self.maps))
+            literal(&format!(
+                "Disjoint product of {} full permutation group(s) {:?}; shapes {:?}; maps {}; slots {}; payloads and core contain no moved keys",
+                self.groups.len(),
+                self.groups.iter().map(|g| &g.keys).collect::<Vec<_>>(),
+                self.shapes,
+                self.num_maps,
+                self.num_slots
+            ))
         )
         .unwrap();
         writeln!(
@@ -38,6 +51,9 @@ impl Emitter<'_> {
         for (i, atom) in self.atoms.iter().enumerate() {
             writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
         }
+        for (i, fa) in self.fixed_atoms.iter().enumerate() {
+            writeln!(out, "def fixedAtom{i} : String := {}", literal(fa)).unwrap();
+        }
         for (i, c) in cases.iter().enumerate() {
             writeln!(
                 out,
@@ -46,28 +62,33 @@ impl Emitter<'_> {
             )
             .unwrap();
         }
-        out.push_str("-- C and W contain no renamed keys; V contains only key-free payloads.\n-- Lowering, inferred domains, leaf interpretation, totality, group closure and\n-- runtime canonicalization remain trusted. Init need not be symmetric.\n");
+        out.push_str("-- C, A and W contain no renamed keys; V contains only key-free payloads.\n-- Lowering, inferred domains, leaf interpretation, totality, group closure and\n-- runtime canonicalization remain trusted. Init need not be symmetric.\n");
         if self.omitted.is_empty() {
-            out.push_str("structure Semantics (C V W : Type) where\n  initial : State C MapId Key V → Prop\n  test : Nat → C → C → W → List V → Prop\n  value : Nat → C → C → W → List V → V\n  observe : Nat → C → List V → Prop\n");
+            out.push_str("structure Semantics (C V A W : Type) where\n  initial : State C MapId SlotId (Key groupSizes) V A → Prop\n  fixedAtom : Nat → A\n  test : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → Prop\n  value : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → V\n  fixedVal : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → A\n  observe : Nat → C → List V → List (Option V) → List (Option A) → List Nat → Prop\n");
         } else {
             self.erasure_semantics(&mut out);
         }
-        out.push_str("def guard (b : BranchId) : Test MapId :=\n  match b.val with\n");
+        out.push_str("def guard (b : BranchId) : Test GroupCount MapId SlotId :=\n  match b.val with\n");
         for (i, c) in cases.iter().enumerate() {
             writeln!(out, "  | {i} => {}", c.guard).unwrap();
         }
         out.push_str("  | _ => Test.truth false\n");
-        out.push_str("def writes (b : BranchId) : List (Write MapId) :=\n  match b.val with\n");
+        out.push_str("def writes (b : BranchId) : List (Write GroupCount MapId SlotId) :=\n  match b.val with\n");
         for (i, c) in cases.iter().enumerate() {
             writeln!(out, "  | {i} => [{}]", c.writes.join(", ")).unwrap();
         }
         out.push_str("  | _ => []\n");
-        writeln!(out, "def observation : Test MapId := {observation}").unwrap();
+        out.push_str("def slotWrites (b : BranchId) : List (SlotWrite GroupCount MapId SlotId) :=\n  match b.val with\n");
+        for (i, c) in cases.iter().enumerate() {
+            writeln!(out, "  | {i} => [{}]", c.slot_writes.join(", ")).unwrap();
+        }
+        out.push_str("  | _ => []\n");
+        writeln!(out, "def observation : Test GroupCount MapId SlotId := {observation}").unwrap();
         if !self.omitted.is_empty() {
             self.erasure_model(&mut out, cases);
             return out;
         }
-        out.push_str("variable {C V W : Type} (sem : Semantics C V W)\ndef model : KeyedRule.Model C MapId Key V BranchId W where\n  initial := sem.initial\n  guard := guard\n  test := fun _ c d w id inputs => sem.test id c d w inputs\n  writes := writes\n  value := fun _ c d w id inputs => sem.value id c d w inputs\n  observation := observation\n  observe := fun c id inputs => sem.observe id c inputs\n");
+        out.push_str("variable {C V A W : Type} (sem : Semantics C V A W)\ndef model : KeyedRule.Model GroupCount groupSizes C MapId SlotId V A BranchId W where\n  initial := sem.initial\n  fixedAtom := sem.fixedAtom\n  guard := guard\n  test := fun _ c d w id inputs sinputs finputs nats => sem.test id c d w inputs sinputs finputs nats\n  writes := writes\n  value := fun _ c d w id inputs sinputs finputs nats => sem.value id c d w inputs sinputs finputs nats\n  slotWrites := slotWrites\n  fixedVal := fun _ c d w id inputs sinputs finputs nats => sem.fixedVal id c d w inputs sinputs finputs nats\n  observation := observation\n  observe := fun c id inputs sinputs finputs nats => sem.observe id c inputs sinputs finputs nats\n");
         out.push_str(include_str!("certificate.lean"));
         out
     }

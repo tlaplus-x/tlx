@@ -365,3 +365,10 @@ fn projection_proof_requires_installed_runtime_obligations() {
     let model = try_load_with(&tlx_testkit::module("M", &format!("{HEAD}{body}")), CFG).unwrap();
     assert!(autosym::analyze_guarded(&model).proven().next().is_none());
 }
+
+#[test]
+fn subseteq_assignment_propagates_set_shape_and_detects_breakers() {
+    assert_proven("VARIABLE s\nInit == s \\subseteq Proc\nNext == s' \\subseteq Proc\n");
+    let body = "VARIABLE s\nInit == s \\subseteq Proc\nNext == UNCHANGED s /\\ (s = {} \\/ (CHOOSE x \\in s : TRUE) \\in s)\n";
+    assert_rejected(body, "CHOOSE", line_of(body, "CHOOSE"));
+}

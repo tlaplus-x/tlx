@@ -1,6 +1,6 @@
 def before := (model sem).concrete
 def after := (model sem).reduced
-def project (_sem : Semantics C V W) := KeyedRule.project (C := C) (M := MapId) (K := Key) (V := V)
+def project (_sem : Semantics C V A W) := KeyedRule.project (sizes := groupSizes) (C := C) (M := MapId) (S := SlotId) (V := V) (A := A)
 theorem certificate : Certificate (before sem) (after sem) (project sem) :=
 (model sem).certificate
 theorem optimization_correct :
@@ -14,16 +14,16 @@ theorem specification_correct :
 theorem counterexample_lifts {a} (ha : Reachable (after sem) a) (bad : ¬ (after sem).safe a) :
 ∃ s, Reachable (before sem) s ∧ project sem s = a ∧ ¬ (before sem).safe s :=
 (model sem).counterexample_lifts ha bad
-theorem deadlock_preserved (s : State C MapId Key V) :
+theorem deadlock_preserved (s : State C MapId SlotId (Key groupSizes) V A) :
 (¬ ∃ t, (before sem).next s t) ↔ (¬ ∃ a, (after sem).next (project sem s) a) :=
 (model sem).deadlock_preserved s
-theorem orbit_key_equivalent (s t : State C MapId Key V) :
+theorem orbit_key_equivalent (s t : State C MapId SlotId (Key groupSizes) V A) :
 project sem s = project sem t ↔ Orbit s t :=
 by
   constructor
   · exact Quotient.exact
   · intro h
-    exact Quotient.sound (show (orbits C MapId Key V).r s t from h)
+    exact Quotient.sound (show (orbits groupSizes C MapId SlotId V A).r s t from h)
 #print axioms orbit_key_equivalent
 #print axioms certificate
 #print axioms optimization_correct

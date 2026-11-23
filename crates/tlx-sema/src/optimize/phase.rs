@@ -3,6 +3,7 @@
 
 mod age;
 mod domain;
+mod equiv_sym;
 mod erasure;
 mod history;
 mod keyed;
@@ -10,15 +11,34 @@ mod liveness;
 mod normalize;
 mod ordered;
 mod sequence;
+mod sym_groups;
 pub(crate) mod sym_norm;
+mod sym_totality;
 
 pub use age::age_projection;
+pub use equiv_sym::symmetry_certificate as equiv_symmetry_certificate;
 pub use erasure::unobserved_projection;
 pub use history::history_projection;
-pub use keyed::{symmetry_certificate, symmetry_projection_certificate};
+pub use keyed::symmetry_projection_certificate;
 pub use ordered::{ordered_projection, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::sequence_length_projection;
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
+
+/// Generate a connected Lean symmetry certificate for a disjoint product of full
+/// permutation groups. Prefers the specialized keyed-state IR, then falls back
+/// to the generic recursive equivariant value & expression IR, and finally to
+/// certified choice-irrelevant symmetry when `CHOOSE` expressions are present.
+pub fn symmetry_certificate(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    observations: &[Expr],
+    groups: &[Vec<String>],
+) -> Option<String> {
+    keyed::symmetry_certificate(program, cfg, init, next, observations, groups)
+        .or_else(|| equiv_sym::symmetry_certificate(program, cfg, init, next, observations, groups))
+}
 
 use tlx_front::cfg::Config;
 

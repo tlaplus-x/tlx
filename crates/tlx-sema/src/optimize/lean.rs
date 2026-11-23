@@ -57,7 +57,11 @@ pub fn projection_lean(
         (
             "projectionMechanism",
             if rule == Some("keyed-symmetry") {
-                "The certified full key-permutation group is closed and canonicalized at the fingerprint boundary."
+                if certificate.is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedEquivSymmetry")) {
+                    "The certified full key-permutation group is closed and canonicalized at the fingerprint boundary via generic equivariant value symmetry."
+                } else {
+                    "The certified full key-permutation group is closed and canonicalized at the fingerprint boundary."
+                }
             } else if ordered.is_some() {
                 "The structuralOrderPlan replaces the identity afterViewHIR at the fingerprint boundary."
             } else {

@@ -33,6 +33,14 @@ impl<'a> Analyzer<'a> {
                 }
                 return Sh::plain();
             }
+            (B::SubsetEq, [a, s]) => {
+                self.expr(a);
+                let sub = Sh::set(self.expr(s).elems());
+                if let Some(v) = self.target(a) {
+                    self.assign(v, &sub);
+                }
+                return Sh::plain();
+            }
             (B::TLCGet, [x]) if matches!(&*x.kind, ExprKind::Str(s) if &**s == "level" || &**s == "config") => {
                 return Sh::plain();
             }

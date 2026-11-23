@@ -22,7 +22,7 @@ theorem deadlock_preserved (s : (model sem).Source) :
 (¬ ∃ t, (before sem).next s t) ↔ (¬ ∃ a, (after sem).next (project sem s) a) :=
 (model sem).deadlock_preserved s
 theorem orbit_key_equivalent (s t : (model sem).Source) :
-project sem s = project sem t ↔ ∃ p : Permutation Key, rename p s.1 = t.1 :=
+project sem s = project sem t ↔ ∃ p : GroupPerm groupSizes, rename p s.1 = t.1 :=
 (model sem).orbit_key_equivalent s t
 #print axioms erasure_certificate
 #print axioms orbit_key_equivalent

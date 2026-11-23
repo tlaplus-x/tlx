@@ -1,29 +1,33 @@
-/- Erasure and symmetry share the same branch, environment and map transfer. -/
+/- Erasure and symmetry share the same branch, environment and state transfers. -/
 set_option autoImplicit false
 namespace TlxOptimization.ErasedKeyedRule
 open TlxOptimization KeyedRule
 noncomputable section
 
-structure Model (C M K V B W H : Type) extends Operations C M K V B W where
-  initial : (State C M K V × H) → Prop
-  hiddenUpdate : B → State C M K V → W → Environment K → H → H
+structure Model (d : Nat) (sizes : Fin d → Nat) (C M S V A B W H : Type)
+    extends Operations d sizes C M S V A B W where
+  initial : (State C M S (Key sizes) V A × H) → Prop
+  hiddenUpdate : B → State C M S (Key sizes) V A → W → Environment (Key sizes) → H → H
 
 namespace Model
-variable {C M K V B W H : Type} (m : Model C M K V B W H)
-abbrev Source (_m : Model C M K V B W H) := State C M K V × H
+variable {d : Nat} {sizes : Fin d → Nat} {C M S V A B W H : Type} (m : Model d sizes C M S V A B W H)
+abbrev Source (_m : Model d sizes C M S V A B W H) := State C M S (Key sizes) V A × H
 
 def concrete : System m.Source where
   initial := m.initial
-  next s t := ∃ b w keys, (m.guard b).eval (m.test b s.1.1 t.1.1 w) s.1.2 keys ∧
-    t.1 = (t.1.1, update (m.test b s.1.1 t.1.1 w) (m.value b s.1.1 t.1.1 w) s.1.2 keys (m.writes b)) ∧
+  next s t := ∃ b w keys,
+    (m.guard b).eval (m.test b s.1.1 t.1.1 w) m.fixedAtom s.1.2.1 s.1.2.2 keys [] ∧
+    t.1 = (t.1.1,
+      update (m.test b s.1.1 t.1.1 w) (m.value b s.1.1 t.1.1 w) m.fixedAtom s.1.2.1 s.1.2.2 keys (m.writes b),
+      updateSlots (m.test b s.1.1 t.1.1 w) (m.fixedVal b s.1.1 t.1.1 w) m.fixedAtom s.1.2.1 s.1.2.2 keys (m.slotWrites b)) ∧
     t.2 = m.hiddenUpdate b s.1 w keys s.2
-  safe s := ∀ keys, m.observation.eval (m.observe s.1.1) s.1.2 keys
+  safe s := ∀ keys, m.observation.eval (m.observe s.1.1) m.fixedAtom s.1.2.1 s.1.2.2 keys []
 
-def erased : KeyedRule.Model C M K V B W where
+def erased : KeyedRule.Model d sizes C M S V A B W where
   toOperations := m.toOperations
   initial s := ∃ h, m.initial (s, h)
 
-def erase (s : m.Source) : State C M K V := s.1
+def erase (s : m.Source) : State C M S (Key sizes) V A := s.1
 
 theorem erasure_certificate : Certificate m.concrete m.erased.concrete m.erase := by
   constructor
@@ -51,12 +55,12 @@ theorem certificate : Certificate m.concrete m.reduced m.project :=
   compose (p := m.erase) (q := KeyedRule.project) m.erasure_certificate m.erased.certificate
 
 theorem orbit_key_equivalent (s t : m.Source) :
-    m.project s = m.project t ↔ ∃ p : Permutation K, rename p s.1 = t.1 :=
+    m.project s = m.project t ↔ ∃ p : GroupPerm sizes, rename p s.1 = t.1 :=
 by
     constructor
     · exact Quotient.exact
     · intro h
-      exact Quotient.sound (show (orbits C M K V).r s.1 t.1 from h)
+      exact Quotient.sound (show (orbits sizes C M S V A).r s.1 t.1 from h)
 
 theorem optimization_correct :
     (∀ s, Reachable m.concrete s → m.concrete.safe s) ↔

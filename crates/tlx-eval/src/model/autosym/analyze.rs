@@ -23,7 +23,8 @@
 //!
 //! The analysis is flow-insensitive for the variables: the shape of a
 //! variable is the join of everything assigned to it anywhere (`x' = e`,
-//! `x' \in S`, and `x = e`, `x \in S` of the initial predicate), computed
+//! `x' \in S`, `x' \subseteq S`, and `x = e`, `x \in S`, `x \subseteq S` of
+//! the initial predicate), computed
 //! as a fixpoint over passes. Operator applications are analyzed per
 //! shape of their arguments (memoized; recursion by a fixpoint).
 

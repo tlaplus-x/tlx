@@ -11,9 +11,9 @@ mod projection;
 
 pub use lean::projection_lean;
 pub use phase::{
-    age_projection, history_projection, infer_var_domains, ordered_projection, phase_projection, proves_var_membership,
-    sequence_length_projection, symmetry_certificate, symmetry_projection_certificate, unobserved_projection, FieldProjection,
-    OrderedHistory, OrderedPlan, OrderedShape, SymNormalizer,
+    age_projection, equiv_symmetry_certificate, history_projection, infer_var_domains, ordered_projection, phase_projection,
+    proves_var_membership, sequence_length_projection, symmetry_certificate, symmetry_projection_certificate, unobserved_projection,
+    FieldProjection, OrderedHistory, OrderedPlan, OrderedShape, SymNormalizer,
 };
 pub use projection::unobserved_variables;
 mod certify;

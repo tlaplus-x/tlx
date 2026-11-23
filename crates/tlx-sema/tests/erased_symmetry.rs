@@ -23,7 +23,7 @@ fn certificate(source: &str, kept: &[u32]) -> Option<String> {
         &roots[0],
         &roots[1],
         &roots[2..],
-        &["p1".into(), "p2".into(), "p3".into()],
+        &[vec!["p1".into(), "p2".into(), "p3".into()]],
         &view,
     )
 }

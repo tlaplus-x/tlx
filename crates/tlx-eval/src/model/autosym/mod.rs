@@ -448,20 +448,36 @@ impl Analysis {
         if g.is_empty() {
             return None;
         }
+        self.suggestion_for(advice.map(|ok| ok.then_some(g.as_str())))
+    }
+
+    /// Like [`Self::suggestion`], naming the exact `certified` group text when
+    /// default mode certifies a proper subset of `self.group_text()`.
+    pub fn suggestion_for(&self, certified: Option<Option<&str>>) -> Option<String> {
+        let g = self.group_text();
+        if g.is_empty() {
+            return None;
+        }
         let mut s = format!("Symmetry: {g} is provable for safety checking and not declared");
         let declare = self.symmetry_definition().map(|d| format!("define Perms == {d} and add \"SYMMETRY Perms\" to the cfg"));
-        match (advice, declare) {
-            (Some(true), Some(d)) => {
+        match (certified, declare) {
+            (Some(Some(cg)), Some(d)) if cg == g => {
                 let _ = write!(s, "; to use it, run without -tlc, or {d}.");
             }
-            (Some(true), None) => s.push_str("; to use it, run without -tlc."),
-            (Some(false), Some(d)) => {
+            (Some(Some(cg)), Some(d)) => {
+                let _ = write!(s, "; run without -tlc to use {cg}, or {d} for the full group.");
+            }
+            (Some(Some(cg)), None) if cg == g => s.push_str("; to use it, run without -tlc."),
+            (Some(Some(cg)), None) => {
+                let _ = write!(s, "; run without -tlc to use {cg}.");
+            }
+            (Some(None), Some(d)) => {
                 let _ = write!(s, "; to use it, {d}.");
             }
             (None, _) => {
                 s.push_str(" (not for the temporal properties this run checks: under SYMMETRY, TLC can miss or invent their violations).")
             }
-            (Some(false), None) => s.push('.'),
+            (Some(None), None) => s.push('.'),
         }
         Some(s)
     }

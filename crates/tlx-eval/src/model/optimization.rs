@@ -71,8 +71,8 @@ impl InterpModel {
         None
     }
 
-    /// Certify one full key permutation group. This does not install it.
-    pub fn symmetry_certificate(&self, keys: &[String]) -> Option<String> {
+    /// Certify a disjoint product of full key permutation groups. This does not install it.
+    pub fn symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
             || (self.has_view() && !self.state_projection)
@@ -101,11 +101,11 @@ impl InterpModel {
                 &self.init,
                 &next,
                 &self.invariants,
-                keys,
+                groups,
                 self.view.as_ref()?,
             )
         } else {
-            tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, keys)
+            tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, groups)
         }
     }
 
