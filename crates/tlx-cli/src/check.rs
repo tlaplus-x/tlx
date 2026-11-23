@@ -81,6 +81,7 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
             a.spill_cfg.mode = a.spill_mode.or(env.spill).unwrap_or_default();
             a.spill_cfg.dir = a.spill_cfg.dir.take().or(env.metadir);
             a.spill_cfg.maxdisk = a.spill_cfg.maxdisk.or(env.maxdisk);
+            a.proofdir = a.proofdir.take().or(env.proofdir);
             // (Before the front end allocates: pages faulted in before keep
             // their size.)
             process::set_huge_pages(env.thp, a.maxmem, a.workers);

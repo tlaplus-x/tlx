@@ -23,6 +23,7 @@ fn certified_scalar_allocation_completes_and_emits_connected_proof() {
             .args(["-optimize", "-noautosymmetry", "-maxmem", "16"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
@@ -37,7 +38,8 @@ fn certified_scalar_allocation_completes_and_emits_connected_proof() {
             counts = Some(result);
         }
     }
-    for entry in std::fs::read_dir(dir.join(".tlx-proofs")).unwrap() {
+    assert!(!dir.join(".tlx-proofs").exists());
+    for entry in std::fs::read_dir(dir.join("proofs")).unwrap() {
         let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
         assert!(lean.contains("def structuralOrderPlan"));
         assert!(lean.contains("namespace TlxOptimization.GeneratedOrdered"));
@@ -58,6 +60,7 @@ fn reduced_failures_keep_concrete_allocation_values() {
             .args(["-optimize", "-noautosymmetry", "-tool", "-maxmem", "16"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
@@ -76,12 +79,14 @@ fn compatibility_bypasses_order_projection() {
             .check("Allocation.tla")
             .args(flags)
             .args(["-interp", "-noautosymmetry"])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{}", run.text());
         assert!(run.stdout.contains("4 distinct states found"), "{}", run.text());
         assert!(!run.stdout.contains("ordered-allocation-projection"));
+        assert!(!dir.join("proofs").exists());
         assert!(!dir.join(".tlx-proofs").exists());
     }
 }
@@ -130,6 +135,7 @@ fn cardinality_must_not_hide_an_allocation_anchor() {
             .args(["-optimize", "-noautosymmetry", "-maxmem", "16"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();

@@ -16,6 +16,7 @@ fn immutable_history_collection_is_finite_and_retains_payloads() {
                 .args(["-optimize", "-noautosymmetry", "-maxmem", "32"])
                 .envs(env.iter().copied())
                 .env("TLX_PARANOID", "1")
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
                 .dir(&dir)
                 .timeout(Duration::from_secs(600))
                 .run();
@@ -35,7 +36,7 @@ fn immutable_history_collection_is_finite_and_retains_payloads() {
                 }
             }
         }
-        for entry in std::fs::read_dir(dir.join(".tlx-proofs")).unwrap() {
+        for entry in std::fs::read_dir(dir.join("proofs")).unwrap() {
             let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
             assert!(lean.contains("namespace TlxOptimization.GeneratedLive"));
             assert!(lean.contains("theorem runtime_key_equivalent"));

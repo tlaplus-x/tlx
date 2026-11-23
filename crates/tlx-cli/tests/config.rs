@@ -238,6 +238,7 @@ const ACCEPTED_CHECK_OPTIONS: &[&str] = &[
     "-noautosymmetry",
     "-nowarning",
     "-progress",
+    "-proofdir",
     "-recover",
     "-seed",
     "-simulate",

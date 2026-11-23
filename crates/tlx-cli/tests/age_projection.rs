@@ -31,6 +31,7 @@ fn certified_age_reduction_preserves_concrete_counterexamples() {
             .args(["-optimize", "-noautosymmetry"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
@@ -58,13 +59,15 @@ fn compatibility_bypasses_age_reduction_and_absolute_bounds_refuse_it() {
             .check("Age.tla")
             .args(["-interp", "-noautosymmetry"])
             .args(flags.clone())
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{}", run.text());
         let active = flags == ["-optimize"];
         assert_eq!(run.stdout.contains("relative-age-projection"), active, "{}", run.text());
-        assert_eq!(dir.join(".tlx-proofs").exists(), active);
+        assert_eq!(dir.join("proofs").exists(), active);
+        assert!(!dir.join(".tlx-proofs").exists());
         let line = run.stdout.lines().find(|l| l.contains("distinct states found")).unwrap();
         let count: u64 =
             line.split("distinct states found").next().unwrap().split_whitespace().last().unwrap().replace(',', "").parse().unwrap();
@@ -109,13 +112,14 @@ fn unbounded_clock_finishes_with_four_states_in_every_executor() {
             .args(["-optimize", "-noautosymmetry"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{tier}: {}", run.text());
         assert!(run.stdout.contains("relative-age-projection"), "{tier}: {}", run.text());
         assert!(run.stdout.contains("4 distinct states found"), "{tier}: {}", run.text());
-        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         assert!(proof.contains("namespace TlxOptimization.GeneratedAge"));
         assert!(proof.contains("def caps"));
@@ -158,12 +162,13 @@ fn timestamp_field_reset_preserves_absent_fields() {
         let run = tlx_testkit::tlx_default!()
             .check("Age.tla")
             .args(["-interp", "-optimize", "-noautosymmetry"])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{}", run.text());
         assert!(run.stdout.contains("relative-age-projection"), "{}", run.text());
-        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         let generated = proof.split("namespace TlxOptimization.GeneratedAge").nth(1).unwrap();
         assert!(generated.contains("(Change.refresh"));
@@ -182,12 +187,13 @@ fn filtered_sets_and_quantified_deadlines_finish_in_every_executor() {
             .args(["-optimize", "-noautosymmetry"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{tier}: {}", run.text());
         assert!(run.stdout.contains("8 distinct states found"), "{tier}: {}", run.text());
-        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         let generated = proof.split("namespace TlxOptimization.GeneratedAge").nth(1).unwrap();
         assert!(generated.contains("Test.select [0]"));
@@ -236,13 +242,14 @@ fn age_and_history_composition_finishes_in_every_executor() {
             .args(["-optimize", "-noautosymmetry"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{tier}: {}", run.text());
         assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
         assert!(run.stdout.contains("15 distinct states found, 0 states left on queue"), "{tier}: {}", run.text());
-        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         assert!(proof.contains("namespace TlxOptimization.GeneratedAgeHistory\n"));
         assert!(proof.contains("Test.select [0]"));
@@ -296,12 +303,13 @@ fn combined_history_feedback_finishes_in_every_executor() {
             .args(["-optimize", "-noautosymmetry"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
             .dir(&dir)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(run.code, 0, "{tier}: {}", run.text());
         assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
-        let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+        let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
         let proof = std::fs::read_to_string(path).unwrap();
         assert!(proof.contains("namespace TlxOptimization.GeneratedAgeHistory"));
         assert!(proof.contains("Decision.branch"));
@@ -334,12 +342,13 @@ fn mixed_age_filters_and_history_predicates_are_certified_in_every_executor() {
                 .args(["-optimize", "-noautosymmetry"])
                 .envs(env.iter().copied())
                 .env("TLX_PARANOID", "1")
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
                 .dir(&dir)
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
             assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
-            let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+            let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
             let proof = std::fs::read_to_string(path).unwrap();
             let generated = proof.split("namespace TlxOptimization.GeneratedAgeHistory").nth(1).unwrap();
             assert!(generated.contains("Boolean hole"));
@@ -408,12 +417,13 @@ fn dependent_transfers_and_dynamic_filters_finish_in_every_executor() {
                 .args(["-optimize", "-noautosymmetry"])
                 .envs(env.iter().copied())
                 .env("TLX_PARANOID", "1")
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
                 .dir(&dir)
                 .timeout(Duration::from_secs(60))
                 .run();
             assert_eq!(run.code, code, "{tier}: {}", run.text());
             assert!(run.stdout.contains("history.history"), "{tier}: {}", run.text());
-            let path = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+            let path = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
             let proof = std::fs::read_to_string(path).unwrap();
             assert!(proof.contains("Decision.branch"));
             assert!(proof.contains("Decision.bindValue"));

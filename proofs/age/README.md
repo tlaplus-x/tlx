@@ -12,8 +12,9 @@ cargo build -p tlx-cli --release
 ./target/release/tlx check proofs/age/Age.tla -interp -optimize -noautosymmetry
 ```
 
-The command prints a fresh `.tlx-proofs/run-PID-N/Optimization.lean` path. Verify
-that actual output explicitly:
+The command prints the content-addressed `Optimization.lean` path (under
+`~/.cache/tlx/proofs/` by default, or `-proofdir DIR`). Verify that actual
+output explicitly:
 
 ```sh
 python3 proofs/check_generated.py --lean /path/to/lean --negative /path/to/Optimization.lean

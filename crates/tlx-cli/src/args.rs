@@ -35,6 +35,10 @@ pub(crate) struct Args {
     pub(crate) tlc: bool,
     /// Opt-in proven state-space reductions.
     pub(crate) optimize: bool,
+    /// `-proofdir DIR` (or `TLX_PROOF_DIR`): directory for generated Lean
+    /// optimization certificates (default: `$TLX_CACHE/proofs` or
+    /// `~/.cache/tlx/proofs`).
+    pub(crate) proofdir: Option<PathBuf>,
     /// `-noautosymmetry`: the default mode applies no symmetry of its own.
     pub(crate) noautosymmetry: bool,
     pub(crate) checksymmetry: bool,
@@ -263,6 +267,7 @@ pub(crate) fn parse_args() -> Args {
         tier_note: None,
         tlc: false,
         optimize: false,
+        proofdir: None,
         noautosymmetry: false,
         checksymmetry: false,
         suggest: false,
@@ -323,6 +328,7 @@ pub(crate) fn parse_args() -> Args {
             "-interp" => a.tier = TierChoice::Interp,
             "-tlc" => a.tlc = true,
             "-optimize" => a.optimize = true,
+            "-proofdir" => a.proofdir = Some(opt_value(&x, it.next(), |v| Some(PathBuf::from(v)))),
             "-noautosymmetry" => a.noautosymmetry = true,
             "-checksymmetry" => a.checksymmetry = true,
             "-suggest" => a.suggest = true,

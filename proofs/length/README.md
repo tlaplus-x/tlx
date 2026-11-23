@@ -10,8 +10,11 @@ deadlock preservation. Next-state length inputs currently refuse the certificate
 
 ```sh
 ./target/release/tlx check proofs/length/Length.tla -interp -optimize -noautosymmetry
-python3 proofs/check_generated.py --negative .tlx-proofs/run-PID-0/Optimization.lean
+python3 proofs/check_generated.py --negative /path/to/Optimization.lean
 ```
+
+Use the `Lean output:` path printed by the check (under `~/.cache/tlx/proofs/` by
+default, or pass `-proofdir DIR`).
 
 `Length.tla` includes two sequences, a conditional append/reset, and a retained update
 that reads a length. Its ordinary graph is finite because growth is bounded. A separate

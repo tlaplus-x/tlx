@@ -26,7 +26,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     if a.simulate.is_some() || !model.has_behavior {
         if !a.tlc {
             if a.optimize {
-                crate::proofs::emit(model, None)?;
+                crate::proofs::emit(model, a.proofdir.as_deref(), None)?;
             }
             label(None);
         }
@@ -62,7 +62,7 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
     let projection = a.optimize.then(|| model.project_state()).flatten();
     let applied = apply(model, &mut an, a.noautosymmetry)?;
     if let Some((rule, omitted)) = projection {
-        crate::proofs::emit(model, Some((rule, &omitted)))?;
+        crate::proofs::emit(model, a.proofdir.as_deref(), Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
         let arithmetic = match rule {
             "relative-age-projection" => "; mathematical clock arithmetic",
@@ -96,9 +96,9 @@ pub fn run(model: &mut InterpModel, a: &Args, guards_allowed: bool) -> Result<Op
         );
     } else {
         if let Some(symmetry) = &applied {
-            crate::proofs::emit(model, Some(("keyed-symmetry", std::slice::from_ref(&symmetry.group))))?;
+            crate::proofs::emit(model, a.proofdir.as_deref(), Some(("keyed-symmetry", std::slice::from_ref(&symmetry.group))))?;
         } else if a.optimize {
-            crate::proofs::emit(model, None)?;
+            crate::proofs::emit(model, a.proofdir.as_deref(), None)?;
         }
         label(applied.as_ref());
     }

@@ -151,6 +151,7 @@ pub static KNOBS: &[Knob] = &[
         .blank_unset(),
     text("TLX_SPILL", U, CLI, "", "as -spill (the command line wins)").meta("MODE").what("auto, off or always").blank_unset(),
     Knob::new("TLX_METADIR", Kind::Path, U, CLI, "as -metadir (the command line wins)").meta("DIR").blank_unset(),
+    Knob::new("TLX_PROOF_DIR", Kind::Path, U, CLI, "as -proofdir (the command line wins)").meta("DIR").blank_unset(),
     text("TLX_MAXDISK", U, CLI, "", "as -maxdisk (the command line wins)").meta("X").what("MiB, or a size with K/M/G/T").blank_unset(),
     Knob::new("TLX_THP", Kind::Choice { values: &["auto", "on", "off"], fold: true }, D, CLI, "Linux: transparent huge pages for the process (default auto: on, off under a -maxmem below 512 MiB + 64 MiB per worker; MIMALLOC_ALLOW_THP, when set, decides instead)")
         .meta("auto|on|off")

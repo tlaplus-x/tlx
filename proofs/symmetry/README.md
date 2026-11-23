@@ -14,7 +14,7 @@ cargo build --release
 ./target/release/tlx check proofs/symmetry/Keyed.tla -compile
 ./target/release/tlx check proofs/symmetry/Keyed.tla -tlc -interp
 python3 proofs/check_generated.py --lean lean --negative \
-  .tlx-proofs/run-PID-N/Optimization.lean
+  /path/to/Optimization.lean
 ```
 
 Use the actual Lean path printed by the check. Automatic symmetry emits it even

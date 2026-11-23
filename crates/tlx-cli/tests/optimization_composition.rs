@@ -20,6 +20,7 @@ fn erasure_precedes_symmetry_and_preserves_concrete_traces() {
                 .envs(env.iter().copied())
                 .env("TLX_PARANOID", "1")
                 .env("TLX_SYMMETRY_PARANOID", "1")
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
                 .dir(&dir)
                 .timeout(Duration::from_secs(600))
                 .run();
@@ -33,7 +34,8 @@ fn erasure_precedes_symmetry_and_preserves_concrete_traces() {
                 assert!(run.stdout.contains("previous ="), "{}", run.text());
             }
         }
-        for entry in std::fs::read_dir(dir.join(".tlx-proofs")).unwrap() {
+        assert!(!dir.join(".tlx-proofs").exists());
+        for entry in std::fs::read_dir(dir.join("proofs")).unwrap() {
             let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
             assert!(lean.contains("namespace TlxOptimization.GeneratedErasedSymmetry"));
             assert!(lean.contains("theorem erasure_certificate"));
@@ -47,13 +49,14 @@ fn disabling_symmetry_retains_only_the_erasure_certificate() {
     let run = tlx_testkit::tlx_default!()
         .check("Erased.tla")
         .args(["-optimize", "-noautosymmetry", "-interp"])
+        .env("TLX_PROOF_DIR", dir.join("proofs"))
         .dir(&dir)
         .timeout(Duration::from_secs(600))
         .run();
     assert_eq!(run.code, 0, "{}", run.text());
     assert!(run.stdout.contains("27 distinct states found"), "{}", run.text());
     assert!(!run.stdout.contains("composed with symmetry"));
-    let proof = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+    let proof = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
     assert!(std::fs::read_to_string(proof).unwrap().contains("namespace TlxOptimization.GeneratedErasure"));
 }
 
@@ -62,12 +65,17 @@ fn ordered_projection_keeps_its_proof_when_composition_is_unsupported() {
     let spec = include_str!("../../../proofs/ordered/Nested.tla");
     let cfg = include_str!("../../../proofs/ordered/Nested.cfg");
     let dir = tlx_testkit::TempDir::with_spec("ordered-no-composition", spec, cfg);
-    let run =
-        tlx_testkit::tlx_default!().check("Nested.tla").args(["-optimize", "-interp"]).dir(&dir).timeout(Duration::from_secs(600)).run();
+    let run = tlx_testkit::tlx_default!()
+        .check("Nested.tla")
+        .args(["-optimize", "-interp"])
+        .env("TLX_PROOF_DIR", dir.join("proofs"))
+        .dir(&dir)
+        .timeout(Duration::from_secs(600))
+        .run();
     assert_eq!(run.code, 0, "{}", run.text());
     assert!(run.stdout.contains("13 distinct states found"), "{}", run.text());
     assert!(!run.stdout.contains("composed with symmetry"));
-    let proof = std::fs::read_dir(dir.join(".tlx-proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
+    let proof = std::fs::read_dir(dir.join("proofs")).unwrap().next().unwrap().unwrap().path().join("Optimization.lean");
     let lean = std::fs::read_to_string(proof).unwrap();
     assert!(lean.contains("namespace TlxOptimization.GeneratedNested"));
     assert!(!lean.contains("namespace TlxOptimization.GeneratedSymmetry"));

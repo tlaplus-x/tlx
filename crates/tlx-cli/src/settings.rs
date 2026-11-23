@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tlx_base::knobs;
 
 /// The first line of the usage message.
-pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
+pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
 
 /// `tlx check -h`.
 const HELP_OPTIONS: &str = "\
@@ -114,6 +114,9 @@ tlx options:
                        (safety checks only; the Optimizations line names
                        it)
   -optimize            apply proven state reductions; emit Lean, never run it (disabled by -tlc)
+  -proofdir DIR        directory for generated Lean certificates (default:
+                       ~/.cache/tlx/proofs, or $TLX_CACHE/proofs; TLX_PROOF_DIR
+                       is a synonym)
   -noautosymmetry      apply no symmetry tlx proves (default mode)
   -stats [json[=FILE]] report where the time and work went (phases, search
                        work, worker utilization, native/IR/interpreter runs
@@ -149,11 +152,12 @@ pub struct Env {
     /// `TLX_FP_SPILL_SLOTS` (testing): with `-spill always`, the slots of
     /// the fingerprint set's table that rotates to disk.
     pub fp_spill_slots: Option<usize>,
-    /// `TLX_SPILL`, `TLX_METADIR`, `TLX_MAXDISK`: as `-spill`, `-metadir`,
-    /// `-maxdisk`.
+    /// `TLX_SPILL`, `TLX_METADIR`, `TLX_MAXDISK`, `TLX_PROOF_DIR`: as
+    /// `-spill`, `-metadir`, `-maxdisk`, `-proofdir`.
     pub spill: Option<tlx_runtime::io::SpillMode>,
     pub metadir: Option<PathBuf>,
     pub maxdisk: Option<u64>,
+    pub proofdir: Option<PathBuf>,
     /// `TLX_CHECKPOINT_SECS`, `TLX_CHECKPOINT_STATES`, `TLX_CHECKPOINT_ABORT`
     /// (testing): checkpoints every that many seconds, or new distinct
     /// states; abort the process after the n-th one.
@@ -193,6 +197,7 @@ impl Env {
             spill: env.parsed("TLX_SPILL", tlx_runtime::io::SpillMode::parse)?,
             metadir: env.path("TLX_METADIR"),
             maxdisk: env.parsed("TLX_MAXDISK", tlx_runtime::io::parse_size)?,
+            proofdir: env.path("TLX_PROOF_DIR"),
             checkpoint_secs: env.opt_num("TLX_CHECKPOINT_SECS")?,
             checkpoint_states: env.opt_num("TLX_CHECKPOINT_STATES")?.filter(|&n| n > 0),
             checkpoint_abort: env.opt_num("TLX_CHECKPOINT_ABORT")?.filter(|&n| n > 0),
