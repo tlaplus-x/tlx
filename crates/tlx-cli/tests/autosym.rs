@@ -609,7 +609,7 @@ fn multi_group_subset_search_picks_largest_order_despite_many_small_sets() {
 
 #[test]
 fn multi_group_attainable_order_beats_greedy_prefix_truncation() {
-    // R10-#6: 20 disjoint 3-element sets (`6!`-bounded prefixes `6^3 = 216`, `C(20,3) = 1,140`)
+    // 20 disjoint 3-element sets (`6!`-bounded prefixes `6^3 = 216`, `C(20,3) = 1,140`)
     // and 4 disjoint 2-element sets (`2^4 = 16`): `6^2 * 2^4 = 576` fits `<= 720` and beats `6^3 * 2 = 432`.
     let dir = tlx_testkit::TempDir::new("autosym-attainable-order");
     let mut const_names = Vec::new();
@@ -664,7 +664,7 @@ fn multi_group_attainable_order_beats_greedy_prefix_truncation() {
 
 #[test]
 fn choose_record_payload_preserves_integer_field_alongside_key_comparison() {
-    // End-to-end R10-#5 verification: `[n |-> 7, same |-> (p = owner)]` must preserve `n = 7`
+    // End-to-end verification: `[n |-> 7, same |-> (p = owner)]` must preserve `n = 7`
     // under certified CHOOSE symmetry in both `-interp` and `-compile`.
     let body = "\
         VARIABLE owner, info\n\
@@ -680,7 +680,7 @@ fn choose_record_payload_preserves_integer_field_alongside_key_comparison() {
 
 #[test]
 fn budget_fallback_recovers_certifiable_product_behind_uncertifiable_proven_sets() {
-    // R12-#4 & R12-#5: 15 disjoint order-2 proven candidate sets (`S1..S15`, `C(15, 9) = 5,005 > 1,024`
+    // 15 disjoint order-2 proven candidate sets (`S1..S15`, `C(15, 9) = 5,005 > 1,024`
     // order-512 products). `S1..S13` occur in state through symmetric tuple-set constants
     // `T{i} = {<<u{i}a, u{i}b>>, <<u{i}b, u{i}a>>}` so `autosym::analyze` proves all 15 full order-2
     // groups, while every product containing any `S1..S13` fails certificate lowering. After the 1,024
@@ -738,7 +738,7 @@ fn budget_fallback_recovers_certifiable_product_behind_uncertifiable_proven_sets
 
 #[test]
 fn tlc_advice_finds_certifiable_group_behind_pinned_order_720_candidate() {
-    // R12-#3: `Big` has 6 movable elements (`6! = 720`) plus 1 pinned element (`b7`), so `!Big.full()`
+    // `Big` has 6 movable elements (`6! = 720`) plus 1 pinned element (`b7`), so `!Big.full()`
     // even though `an.select(720)` greedily consumes the entire 720 budget on `Big` alone.
     // Both `-tlc` advice and default-mode `apply` must still find and certify `Permutations(Small)`.
     let dir = tlx_testkit::TempDir::new("autosym-tlc-advice-pinned-big");
@@ -792,7 +792,7 @@ INVARIANT Inv
 
 #[test]
 fn absent_non_model_except_key_on_untyped_model_map_reduces_in_both_tiers() {
-    // R13-#2 end-to-end verification: `[m EXCEPT ![0] = 0]` on `m = [p \in Proc |-> p]` leaves `m`
+    // `[m EXCEPT ![0] = 0]` on `m = [p \in Proc |-> p]` leaves `m`
     // unchanged at runtime without error and certifies automatic symmetry in `-interp` and `-compile`.
     let body = "\
         VARIABLES m, c\n\
@@ -808,7 +808,6 @@ fn absent_non_model_except_key_on_untyped_model_map_reduces_in_both_tiers() {
 
 #[test]
 fn subseteq_assign_and_empty_map_except_guard_behave_soundly_in_both_tiers() {
-    // R16-#1 & R16-#2 end-to-end verification:
     // 1. `s \subseteq Proc /\ m = [p \in s |-> p]` with unguarded `\E p \in Proc : m' = [m EXCEPT ![p] = p]`
     //    must refuse automatic symmetry in both tiers and match `-noautosymmetry`.
     let unsafe_body = "\

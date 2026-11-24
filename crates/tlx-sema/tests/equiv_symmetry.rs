@@ -181,11 +181,11 @@ Inv ==
 }
 
 #[test]
-fn finding1_quantified_partial_ops_refuse_and_corpus_specs_certify() {
+fn quantified_partial_ops_refuse_and_corpus_specs_certify() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // Codex Astra's exact non-CHOOSE 0^0 counterexample must refuse.
+    // Short-circuiting quantified `0^0` must refuse.
     let zero_pow_zero = r#"---- MODULE QuantZeroPow ----
 EXTENDS Naturals
 CONSTANTS Proc
@@ -300,7 +300,7 @@ fn certify_roots(name: &str, spec: &str, cfg: &str, init: &str, next: &str, invs
 }
 
 #[test]
-fn finding2_and_3_seq_fn_extensional_eq_and_oob_except_certify() {
+fn seq_fn_extensional_eq_and_oob_except_certify() {
     let spec = r#"---- MODULE SeqFnExcept ----
 EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS Proc
@@ -322,7 +322,7 @@ Inv ==
 }
 
 #[test]
-fn finding4_tuple_arity_validation() {
+fn tuple_arity_validation() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
@@ -352,7 +352,7 @@ Inv == \A <<a, b>> \in Proc \X Proc : a = b \/ a # b
 }
 
 #[test]
-fn finding5_and_6_is_finite_set_semantics_and_linear_nested_size() {
+fn is_finite_set_semantics_and_linear_nested_size() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
@@ -413,12 +413,12 @@ Inv == \E y \in {1, <<x>>} : IsFiniteSet(y)
 }
 
 #[test]
-fn round2_codex_astra_all_15_soundness_regressions_refuse() {
+fn totality_arithmetic_comparability_and_choose_refusals() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // R2-#1a: keyed path must be gated by totality (`1 \div 0` under short-circuiting `\E`).
-    let r2_1a = r#"---- MODULE R2KeyedDivZero ----
+    // keyed path must be gated by totality (`1 \div 0` under short-circuiting `\E`).
+    let r2_1a = r#"---- MODULE KeyedDivZero ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -427,10 +427,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ 1 \div 0 = 0
 ====
 "#;
-    assert!(certify("R2KeyedDivZero", r2_1a, cfg, group).is_none(), "R2-#1a must refuse");
+    assert!(certify("KeyedDivZero", r2_1a, cfg, group).is_none(), "must refuse");
 
-    // R2-#1b: choose_sym path must be gated by totality (`1 \div 0` alongside a certified CHOOSE).
-    let r2_1b = r#"---- MODULE R2ChooseDivZero ----
+    // choose_sym path must be gated by totality (`1 \div 0` alongside a certified CHOOSE).
+    let r2_1b = r#"---- MODULE ChooseDivZero ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -439,10 +439,10 @@ Next == UNCHANGED owner
 Inv == (\E p \in Proc : owner = p \/ 1 \div 0 = 0) /\ (CHOOSE p \in Proc : p = owner) = owner
 ====
 "#;
-    assert!(certify("R2ChooseDivZero", r2_1b, cfg, group).is_none(), "R2-#1b must refuse");
+    assert!(certify("ChooseDivZero", r2_1b, cfg, group).is_none(), "must refuse");
 
-    // R2-#2: top-level observation equality/inequality without explicit quantifier (`f # [p \in Proc |-> 1]`).
-    let r2_2 = r#"---- MODULE R2TopLevelNeq ----
+    // top-level observation equality/inequality without explicit quantifier (`f # [p \in Proc |-> 1]`).
+    let r2_2 = r#"---- MODULE TopLevelNeq ----
 CONSTANTS Proc
 VARIABLE f
 Init == \E r \in Proc : f = [p \in Proc |-> IF p = r THEN 0 ELSE "a"]
@@ -450,10 +450,10 @@ Next == UNCHANGED f
 Inv == f # [p \in Proc |-> 1]
 ====
 "#;
-    assert!(certify("R2TopLevelNeq", r2_2, cfg, group).is_none(), "R2-#2 must refuse");
+    assert!(certify("TopLevelNeq", r2_2, cfg, group).is_none(), "must refuse");
 
-    // R2-#3: 32-bit signed arithmetic overflow (`2147483647 + 1`).
-    let r2_3 = r#"---- MODULE R2Overflow ----
+    // 32-bit signed arithmetic overflow (`2147483647 + 1`).
+    let r2_3 = r#"---- MODULE Overflow ----
 EXTENDS Integers
 CONSTANTS Proc
 VARIABLE owner
@@ -462,10 +462,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ (2147483647 + 1 = 0)
 ====
 "#;
-    assert!(certify("R2Overflow", r2_3, cfg, group).is_none(), "R2-#3 must refuse");
+    assert!(certify("Overflow", r2_3, cfg, group).is_none(), "must refuse");
 
-    // R2-#4: conservative `\div` across both divisor endpoints (`1 \div (1 \div d)` for `d \in {1, 2}`).
-    let r2_4 = r#"---- MODULE R2DivUpper ----
+    // conservative `\div` across both divisor endpoints (`1 \div (1 \div d)` for `d \in {1, 2}`).
+    let r2_4 = r#"---- MODULE DivUpper ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE parent
@@ -474,10 +474,10 @@ Next == UNCHANGED parent
 Inv == \E p \in Proc : (1 \div (1 \div (IF parent[p] = p THEN 1 ELSE 2))) = 1
 ====
 "#;
-    assert!(certify("R2DivUpper", r2_4, cfg, group).is_none(), "R2-#4 must refuse");
+    assert!(certify("DivUpper", r2_4, cfg, group).is_none(), "must refuse");
 
-    // R2-#5: dependent Init assignment (`a = "x" /\ b = a`).
-    let r2_5 = r#"---- MODULE R2DepInit ----
+    // dependent Init assignment (`a = "x" /\ b = a`).
+    let r2_5 = r#"---- MODULE DepInit ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES a, b, owner
@@ -486,10 +486,10 @@ Next == UNCHANGED <<a, b, owner>>
 Inv == \E p \in Proc : owner = p \/ b + 1 = 0
 ====
 "#;
-    assert!(certify("R2DepInit", r2_5, cfg, group).is_none(), "R2-#5 must refuse");
+    assert!(certify("DepInit", r2_5, cfg, group).is_none(), "must refuse");
 
-    // R2-#6: 14-variable chain must converge or fail closed (never drop unpropagated 0).
-    let r2_6 = r#"---- MODULE R2Chain14 ----
+    // 14-variable chain must converge or fail closed (never drop unpropagated 0).
+    let r2_6 = r#"---- MODULE Chain14 ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13
@@ -504,10 +504,10 @@ Next ==
 Inv == \E p \in Proc : owner = p \/ (1 \div v13 = 1)
 ====
 "#;
-    assert!(certify("R2Chain14", r2_6, cfg, group).is_none(), "R2-#6 must refuse");
+    assert!(certify("Chain14", r2_6, cfg, group).is_none(), "must refuse");
 
-    // R2-#7: value-position Boolean `\E` in `Next` (`ok' = (\E p \in Proc : ...)`).
-    let r2_7 = r#"---- MODULE R2ValPosExists ----
+    // value-position Boolean `\E` in `Next` (`ok' = (\E p \in Proc : ...)`).
+    let r2_7 = r#"---- MODULE ValPosExists ----
 CONSTANTS Proc
 VARIABLES parent, ok
 Init == (\E r \in Proc : parent = [p \in Proc |-> r]) /\ ok = TRUE
@@ -515,12 +515,12 @@ Next == parent' = parent /\ ok' = (\E p \in Proc : parent'[p] = p \/ parent[1] =
 Inv == ok
 ====
 "#;
-    assert!(certify("R2ValPosExists", r2_7, cfg, group).is_none(), "R2-#7 must refuse");
+    assert!(certify("ValPosExists", r2_7, cfg, group).is_none(), "must refuse");
 
-    // R2-#8: typed model values (`P_1`, `P_2`, `P_3`) are incomparable with integers and `Nat`.
+    // typed model values (`P_1`, `P_2`, `P_3`) are incomparable with integers and `Nat`.
     let typed_group = &[vec!["P_1".into(), "P_2".into(), "P_3".into()]];
     let typed_cfg = "CONSTANTS Proc = {P_1, P_2, P_3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
-    let r2_8 = r#"---- MODULE R2TypedMv ----
+    let r2_8 = r#"---- MODULE TypedMv ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -529,13 +529,13 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ 1 = p
 ====
 "#;
-    assert!(certify("R2TypedMv", r2_8, typed_cfg, typed_group).is_none(), "R2-#8 eq must refuse");
-    let r2_8_mem = r2_8.replace("R2TypedMv", "R2TypedMvMem").replace("1 = p", r"p \in Nat");
-    assert!(certify("R2TypedMvMem", &r2_8_mem, typed_cfg, typed_group).is_none(), "R2-#8 mem must refuse");
+    assert!(certify("TypedMv", r2_8, typed_cfg, typed_group).is_none(), "eq must refuse");
+    let r2_8_mem = r2_8.replace("TypedMv", "TypedMvMem").replace("1 = p", r"p \in Nat");
+    assert!(certify("TypedMvMem", &r2_8_mem, typed_cfg, typed_group).is_none(), "mem must refuse");
 
-    // R2-#9: `slot # A` must NOT remove unrelated unmoved model value `B`.
+    // `slot # A` must NOT remove unrelated unmoved model value `B`.
     let ab_cfg = "CONSTANTS Proc = {p1, p2, p3} A = A B = B\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
-    let r2_9 = r#"---- MODULE R2SlotNotA ----
+    let r2_9 = r#"---- MODULE SlotNotA ----
 CONSTANTS Proc, A, B
 VARIABLES slot, f
 Init == slot \in Proc \cup {A, B} /\ f = [p \in Proc |-> 1]
@@ -543,10 +543,10 @@ Next == UNCHANGED <<slot, f>>
 Inv == \E p \in Proc : slot = p \/ (slot # A /\ f[slot] = 1)
 ====
 "#;
-    assert!(certify("R2SlotNotA", r2_9, ab_cfg, group).is_none(), "R2-#9 must refuse");
+    assert!(certify("SlotNotA", r2_9, ab_cfg, group).is_none(), "must refuse");
 
-    // R2-#10: `a.val > 0` must NOT refine `@` in unrelated record `[b EXCEPT !.val = 1 \div @]`.
-    let r2_10 = r#"---- MODULE R2CrossRecAt ----
+    // `a.val > 0` must NOT refine `@` in unrelated record `[b EXCEPT !.val = 1 \div @]`.
+    let r2_10 = r#"---- MODULE CrossRecAt ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES a, b, owner
@@ -555,10 +555,10 @@ Next == UNCHANGED <<a, b, owner>>
 Inv == \E p \in Proc : owner = p \/ (a.val > 0 /\ [b EXCEPT !.val = 1 \div @] = b)
 ====
 "#;
-    assert!(certify("R2CrossRecAt", r2_10, cfg, group).is_none(), "R2-#10 must refuse");
+    assert!(certify("CrossRecAt", r2_10, cfg, group).is_none(), "must refuse");
 
-    // R2-#11: string-indexed record EXCEPT `!["n"] = 0` must update field `n`'s shape.
-    let r2_11 = r#"---- MODULE R2StrIdxExcept ----
+    // string-indexed record EXCEPT `!["n"] = 0` must update field `n`'s shape.
+    let r2_11 = r#"---- MODULE StrIdxExcept ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES rec, owner
@@ -567,10 +567,10 @@ Next == rec' = [rec EXCEPT !["n"] = 0] /\ UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ 1 \div rec.n = 1
 ====
 "#;
-    assert!(certify("R2StrIdxExcept", r2_11, cfg, group).is_none(), "R2-#11 must refuse");
+    assert!(certify("StrIdxExcept", r2_11, cfg, group).is_none(), "must refuse");
 
-    // R2-#12: `SUBSET Nat` is non-enumerable and must refuse inside quantifiers.
-    let r2_12 = r#"---- MODULE R2SubsetNat ----
+    // `SUBSET Nat` is non-enumerable and must refuse inside quantifiers.
+    let r2_12 = r#"---- MODULE SubsetNat ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -579,10 +579,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ (\E i \in SUBSET Nat : TRUE)
 ====
 "#;
-    assert!(certify("R2SubsetNat", r2_12, cfg, group).is_none(), "R2-#12 must refuse");
+    assert!(certify("SubsetNat", r2_12, cfg, group).is_none(), "must refuse");
 
-    // R2-#13: `Cardinality(SUBSET (1..31))` overflows 32-bit int and must refuse.
-    let r2_13 = r#"---- MODULE R2CardOverflow ----
+    // `Cardinality(SUBSET (1..31))` overflows 32-bit int and must refuse.
+    let r2_13 = r#"---- MODULE CardOverflow ----
 EXTENDS Naturals, FiniteSets
 CONSTANTS Proc
 VARIABLE owner
@@ -591,10 +591,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ Cardinality(SUBSET (1..31)) >= 0
 ====
 "#;
-    assert!(certify("R2CardOverflow", r2_13, cfg, group).is_none(), "R2-#13 must refuse");
+    assert!(certify("CardOverflow", r2_13, cfg, group).is_none(), "must refuse");
 
-    // R2-#14: `CASE` without `OTHER` and `Assert` must refuse.
-    let r2_14a = r#"---- MODULE R2CaseNoOther ----
+    // `CASE` without `OTHER` and `Assert` must refuse.
+    let r2_14a = r#"---- MODULE CaseNoOther ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -602,9 +602,9 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ ~(CASE FALSE -> TRUE)
 ====
 "#;
-    assert!(certify("R2CaseNoOther", r2_14a, cfg, group).is_none(), "R2-#14a must refuse");
+    assert!(certify("CaseNoOther", r2_14a, cfg, group).is_none(), "must refuse");
 
-    let r2_14b = r#"---- MODULE R2Assert ----
+    let r2_14b = r#"---- MODULE Assert ----
 EXTENDS TLC
 CONSTANTS Proc
 VARIABLE owner
@@ -613,10 +613,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ ~Assert(FALSE, "bad")
 ====
 "#;
-    assert!(certify("R2Assert", r2_14b, cfg, group).is_none(), "R2-#14b must refuse");
+    assert!(certify("Assert", r2_14b, cfg, group).is_none(), "must refuse");
 
-    // R2-#15: empty-witness `CHOOSE` equality must refuse in both equiv_sym and top-level symmetry.
-    let r2_15 = r#"---- MODULE R2EmptyChoose ----
+    // empty-witness `CHOOSE` equality must refuse in both equiv_sym and top-level symmetry.
+    let r2_15 = r#"---- MODULE EmptyChoose ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -624,17 +624,17 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ ((CHOOSE x \in {} : TRUE) = (CHOOSE x \in {} : TRUE))
 ====
 "#;
-    assert!(certify_equiv_direct("R2EmptyChoose", r2_15, cfg, group).is_none(), "R2-#15 equiv must refuse");
-    assert!(certify("R2EmptyChoose", r2_15, cfg, group).is_none(), "R2-#15 top-level must refuse");
+    assert!(certify_equiv_direct("EmptyChoose", r2_15, cfg, group).is_none(), "equiv must refuse");
+    assert!(certify("EmptyChoose", r2_15, cfg, group).is_none(), "top-level must refuse");
 }
 
 #[test]
-fn round3_codex_astra_all_regressions_refuse_and_terminate() {
+fn primed_unchanged_domain_and_string_sequence_refusals() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // R3-#1: primed equality after `UNCHANGED` is a comparison, not an assignment.
-    let r3_1 = r#"---- MODULE R3BoundPrimedEq ----
+    // primed equality after `UNCHANGED` is a comparison, not an assignment.
+    let r3_1 = r#"---- MODULE BoundPrimedEq ----
 CONSTANTS Proc
 VARIABLES owner, f
 Init == owner \in Proc /\ f = [p \in Proc |-> 1]
@@ -642,10 +642,10 @@ Next == UNCHANGED <<owner, f>> /\ f' = [p \in Proc |-> IF p = owner THEN 0 ELSE 
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R3BoundPrimedEq", r3_1, cfg, group).is_none(), "R3-#1 must refuse");
+    assert!(certify("BoundPrimedEq", r3_1, cfg, group).is_none(), "must refuse");
 
-    // R3-#2: computed expression inside `UNCHANGED` must be checked in both states.
-    let r3_2 = r#"---- MODULE R3UnchangedExpr ----
+    // computed expression inside `UNCHANGED` must be checked in both states.
+    let r3_2 = r#"---- MODULE UnchangedExpr ----
 CONSTANTS Proc
 VARIABLES owner, f
 Init == owner \in Proc /\ f = [p \in Proc |-> 1]
@@ -653,10 +653,10 @@ Next == UNCHANGED <<owner, f>> /\ UNCHANGED (f # [p \in Proc |-> IF p = owner TH
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R3UnchangedExpr", r3_2, cfg, group).is_none(), "R3-#2 must refuse");
+    assert!(certify("UnchangedExpr", r3_2, cfg, group).is_none(), "must refuse");
 
-    // R3-#3: `p \in SUBSET Proc` errors on untyped model value `p` (must not use equality comparability).
-    let r3_3 = r#"---- MODULE R3SubsetMember ----
+    // `p \in SUBSET Proc` errors on untyped model value `p` (must not use equality comparability).
+    let r3_3 = r#"---- MODULE SubsetMember ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -664,10 +664,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ p \in SUBSET Proc
 ====
 "#;
-    assert!(certify("R3SubsetMember", r3_3, cfg, group).is_none(), "R3-#3 must refuse");
+    assert!(certify("SubsetMember", r3_3, cfg, group).is_none(), "must refuse");
 
-    // R3-#4: EXCEPT index type must match container (string index on tuple, int index on record).
-    let r3_4a = r#"---- MODULE R3ExceptTupleStr ----
+    // EXCEPT index type must match container (string index on tuple, int index on record).
+    let r3_4a = r#"---- MODULE ExceptTupleStr ----
 CONSTANTS Proc
 VARIABLES owner, f
 Init == owner \in Proc /\ f = <<1>>
@@ -675,9 +675,9 @@ Next == UNCHANGED <<owner, f>>
 Inv == \E p \in Proc : owner = p \/ [f EXCEPT !["a"] = 1] = f
 ====
 "#;
-    assert!(certify("R3ExceptTupleStr", r3_4a, cfg, group).is_none(), "R3-#4a must refuse");
+    assert!(certify("ExceptTupleStr", r3_4a, cfg, group).is_none(), "must refuse");
 
-    let r3_4b = r#"---- MODULE R3ExceptRecInt ----
+    let r3_4b = r#"---- MODULE ExceptRecInt ----
 CONSTANTS Proc
 VARIABLES owner, f
 Init == owner \in Proc /\ f = [a |-> 1]
@@ -685,10 +685,10 @@ Next == UNCHANGED <<owner, f>>
 Inv == \E p \in Proc : owner = p \/ [f EXCEPT ![1] = 2] = f
 ====
 "#;
-    assert!(certify("R3ExceptRecInt", r3_4b, cfg, group).is_none(), "R3-#4b must refuse");
+    assert!(certify("ExceptRecInt", r3_4b, cfg, group).is_none(), "must refuse");
 
-    // R3-#5: Boolean singleton `TRUE :> 1` must not claim `exact_dom` over all of `BOOLEAN`.
-    let r3_5 = r#"---- MODULE R3BoolSingleton ----
+    // Boolean singleton `TRUE :> 1` must not claim `exact_dom` over all of `BOOLEAN`.
+    let r3_5 = r#"---- MODULE BoolSingleton ----
 EXTENDS TLC
 CONSTANTS Proc
 VARIABLES owner, f
@@ -697,10 +697,10 @@ Next == UNCHANGED <<owner, f>>
 Inv == \E p \in Proc : owner = p \/ f[FALSE] = 1
 ====
 "#;
-    assert!(certify("R3BoolSingleton", r3_5, cfg, group).is_none(), "R3-#5 must refuse");
+    assert!(certify("BoolSingleton", r3_5, cfg, group).is_none(), "must refuse");
 
-    // R3-#6: Union of tuples `({"a"} \X {"a"}) \cup ({"b"} \X {"b"})` must not lose correlation.
-    let r3_6 = r#"---- MODULE R3TupleCup ----
+    // Union of tuples `({"a"} \X {"a"}) \cup ({"b"} \X {"b"})` must not lose correlation.
+    let r3_6 = r#"---- MODULE TupleCup ----
 CONSTANTS Proc
 VARIABLES owner, f
 Init == owner \in Proc /\ f = [x \in ({"a"} \X {"a"}) \cup ({"b"} \X {"b"}) |-> 1]
@@ -708,10 +708,10 @@ Next == UNCHANGED <<owner, f>>
 Inv == \E p \in Proc : owner = p \/ f[<<"a", "b">>] = 1
 ====
 "#;
-    assert!(certify("R3TupleCup", r3_6, cfg, group).is_none(), "R3-#6 must refuse");
+    assert!(certify("TupleCup", r3_6, cfg, group).is_none(), "must refuse");
 
-    // R3-#7: Extensionally equal `Func` and `Tuple` must not be treated as disjoint in narrowing.
-    let r3_7 = r#"---- MODULE R3ExtEqNarrow ----
+    // Extensionally equal `Func` and `Tuple` must not be treated as disjoint in narrowing.
+    let r3_7 = r#"---- MODULE ExtEqNarrow ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, f
@@ -720,10 +720,10 @@ Next == UNCHANGED owner /\ f' = owner
 Inv == \E p \in Proc : owner = p \/ (f = <<0>> /\ f)
 ====
 "#;
-    assert!(certify("R3ExtEqNarrow", r3_7, cfg, group).is_none(), "R3-#7 must refuse");
+    assert!(certify("ExtEqNarrow", r3_7, cfg, group).is_none(), "must refuse");
 
-    // R3-#8: Recursive CHOOSE fold defined on `SUBSET leaders` applied to `Proc` must refuse.
-    let r3_8 = r#"---- MODULE R3FoldDomIncl ----
+    // Recursive CHOOSE fold defined on `SUBSET leaders` applied to `Proc` must refuse.
+    let r3_8 = r#"---- MODULE FoldDomIncl ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, leaders, votes
@@ -737,10 +737,10 @@ Next == UNCHANGED <<owner, leaders, votes>>
 Inv == Sum(Proc) >= 0
 ====
 "#;
-    assert!(certify("R3FoldDomIncl", r3_8, cfg, group).is_none(), "R3-#8 must refuse");
+    assert!(certify("FoldDomIncl", r3_8, cfg, group).is_none(), "must refuse");
 
-    // R3-#9: `Len("abc")` on a string must not emit sequence `Expr.len`.
-    let r3_9 = r#"---- MODULE R3StrLen ----
+    // `Len("abc")` on a string must not emit sequence `Expr.len`.
+    let r3_9 = r#"---- MODULE StrLen ----
 EXTENDS Sequences
 CONSTANTS Proc
 VARIABLES owner, f
@@ -749,10 +749,10 @@ Next == UNCHANGED owner /\ f' = Len("abc")
 Inv == TRUE
 ====
 "#;
-    assert!(certify_equiv_direct("R3StrLen", r3_9, cfg, group).is_none(), "R3-#9 must refuse");
+    assert!(certify_equiv_direct("StrLen", r3_9, cfg, group).is_none(), "must refuse");
 
-    // R3-#10 & #11: Self-nesting tuple growth (`f' = <<f, f>>`) and `SUBSET (1..32)` must not OOM or panic.
-    let r3_10 = r#"---- MODULE R3GrowthAndShift ----
+    // Self-nesting tuple growth (`f' = <<f, f>>`) and `SUBSET (1..32)` must not OOM or panic.
+    let r3_10 = r#"---- MODULE GrowthAndShift ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, f, s
@@ -761,16 +761,16 @@ Next == UNCHANGED <<owner, s>> /\ (FALSE /\ f' = <<f, f>>)
 Inv == TRUE
 ====
 "#;
-    let _ = certify("R3GrowthAndShift", r3_10, cfg, group);
+    let _ = certify("GrowthAndShift", r3_10, cfg, group);
 }
 
 #[test]
-fn round4_codex_astra_all_regressions_refuse() {
+fn except_capture_record_set_and_injective_range_refusals() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // R4-#1: Caller `@` passed into an operator containing another `EXCEPT` must not be captured.
-    let r4_1 = r#"---- MODULE R4AtCapture ----
+    // Caller `@` passed into an operator containing another `EXCEPT` must not be captured.
+    let r4_1 = r#"---- MODULE AtCapture ----
 EXTENDS Integers, Sequences
 CONSTANTS Proc
 VARIABLE owner
@@ -781,10 +781,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = <<p>> \/ 1 \div N = 0
 ====
 "#;
-    assert!(certify("R4AtCapture", r4_1, cfg, group).is_none(), "R4-#1 must refuse");
+    assert!(certify("AtCapture", r4_1, cfg, group).is_none(), "must refuse");
 
-    // R4-#2: Record-set membership checks matching prefix fields before stopping at a name mismatch.
-    let r4_2 = r#"---- MODULE R4RecSetOrder ----
+    // Record-set membership checks matching prefix fields before stopping at a name mismatch.
+    let r4_2 = r#"---- MODULE RecSetOrder ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -792,10 +792,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [a |-> "bad", c |-> 0] \in [a : {1}, b : {0}]
 ====
 "#;
-    assert!(certify("R4RecSetOrder", r4_2, cfg, group).is_none(), "R4-#2 must refuse");
+    assert!(certify("RecSetOrder", r4_2, cfg, group).is_none(), "must refuse");
 
-    // R4-#3: `IsInjective` on assignment RHS must check range self-comparability.
-    let r4_3 = r#"---- MODULE R4IsInjRhs ----
+    // `IsInjective` on assignment RHS must check range self-comparability.
+    let r4_3 = r#"---- MODULE IsInjRhs ----
 EXTENDS Functions, FiniteSets
 CONSTANTS Proc
 VARIABLES owner, ok
@@ -804,10 +804,10 @@ Next == UNCHANGED owner /\ ok' = IsInjective([p \in Proc |-> IF p \in owner THEN
 Inv == ok \in BOOLEAN
 ====
 "#;
-    assert!(certify("R4IsInjRhs", r4_3, cfg, group).is_none(), "R4-#3 must refuse");
+    assert!(certify("IsInjRhs", r4_3, cfg, group).is_none(), "must refuse");
 
-    // R4-#4: Orbit-canonicalized state variable with incomparable mixed range must refuse.
-    let r4_4 = r#"---- MODULE R4OrbitCmp ----
+    // Orbit-canonicalized state variable with incomparable mixed range must refuse.
+    let r4_4 = r#"---- MODULE OrbitCmp ----
 CONSTANTS Proc
 VARIABLE f
 Init == f = [p \in Proc |-> 1]
@@ -815,10 +815,10 @@ Next == \E r \in Proc : f' = [p \in Proc |-> IF p = r THEN 1 ELSE "no"]
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R4OrbitCmp", r4_4, cfg, group).is_none(), "R4-#4 must refuse");
+    assert!(certify("OrbitCmp", r4_4, cfg, group).is_none(), "must refuse");
 
-    // R4-#5: String `Tail`/`Concat`/`SubSeq` must not lower to sequence-only Lean IR.
-    let r4_5 = r#"---- MODULE R4StrTail ----
+    // String `Tail`/`Concat`/`SubSeq` must not lower to sequence-only Lean IR.
+    let r4_5 = r#"---- MODULE StrTail ----
 EXTENDS Sequences
 CONSTANTS Proc
 VARIABLES owner, s
@@ -827,16 +827,16 @@ Next == UNCHANGED owner /\ s' = Tail("ab")
 Inv == TRUE
 ====
 "#;
-    assert!(certify_equiv_direct("R4StrTail", r4_5, cfg, group).is_none(), "R4-#5 must refuse");
+    assert!(certify_equiv_direct("StrTail", r4_5, cfg, group).is_none(), "must refuse");
 }
 
 #[test]
-fn round5_codex_astra_all_regressions_refuse() {
+fn nested_membership_cardinality_and_rhs_totality_refusals() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // R5-#1: Nested membership `<<p>> \in Seq(SUBSET {1})` errors on non-set `p`.
-    let r5_1 = r#"---- MODULE R5NestedSeqMember ----
+    // Nested membership `<<p>> \in Seq(SUBSET {1})` errors on non-set `p`.
+    let r5_1 = r#"---- MODULE NestedSeqMember ----
 EXTENDS Sequences
 CONSTANTS Proc
 VARIABLE owner
@@ -845,10 +845,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ <<p>> \in Seq(SUBSET {1})
 ====
 "#;
-    assert!(certify("R5NestedSeqMember", r5_1, cfg, group).is_none(), "R5-#1 must refuse");
+    assert!(certify("NestedSeqMember", r5_1, cfg, group).is_none(), "must refuse");
 
-    // R5-#2: Set comparison `[1..32 -> BOOLEAN] = {}` overflows 32-bit cardinality.
-    let r5_2 = r#"---- MODULE R5SetCardEq ----
+    // Set comparison `[1..32 -> BOOLEAN] = {}` overflows 32-bit cardinality.
+    let r5_2 = r#"---- MODULE SetCardEq ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -857,10 +857,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [1..32 -> BOOLEAN] = {}
 ====
 "#;
-    assert!(certify("R5SetCardEq", r5_2, cfg, group).is_none(), "R5-#2 must refuse");
+    assert!(certify("SetCardEq", r5_2, cfg, group).is_none(), "must refuse");
 
-    // R5-#3: Extra Init guard constraining nondeterministic flags must refuse.
-    let r5_3 = r#"---- MODULE R5InitFlagGuard ----
+    // Extra Init guard constraining nondeterministic flags must refuse.
+    let r5_3 = r#"---- MODULE InitFlagGuard ----
 CONSTANTS Proc, Offers
 VARIABLES owner, leaders
 Init == owner \in Proc /\ leaders \in Offers /\ ~(owner \notin leaders)
@@ -869,10 +869,10 @@ Inv == owner \in leaders
 ====
 "#;
     let r5_3_cfg = "CONSTANTS Proc = {p1, p2, p3} Offers = {{p1}, {p2}, {p3}}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
-    assert!(certify("R5InitFlagGuard", r5_3, r5_3_cfg, group).is_none(), "R5-#3 must refuse");
+    assert!(certify("InitFlagGuard", r5_3, r5_3_cfg, group).is_none(), "must refuse");
 
-    // R5-#4: Guard after potentially failing CHOOSE must not be hoisted into preGuard.
-    let r5_4 = r#"---- MODULE R5ChooseGuardOrder ----
+    // Guard after potentially failing CHOOSE must not be hoisted into preGuard.
+    let r5_4 = r#"---- MODULE ChooseGuardOrder ----
 CONSTANTS Proc, Offers
 VARIABLES owner, leaders
 Init == owner \in Proc /\ (leaders = {} \/ leaders \in Offers)
@@ -880,13 +880,13 @@ Next == owner' = (CHOOSE q \in Proc : q \in leaders) /\ FALSE /\ UNCHANGED leade
 Inv == owner \in Proc
 ====
 "#;
-    let r5_4_cert = certify("R5ChooseGuardOrder", r5_4, r5_3_cfg, group);
+    let r5_4_cert = certify("ChooseGuardOrder", r5_4, r5_3_cfg, group);
     if let Some(proof) = r5_4_cert {
-        assert!(!proof.contains("preGuard := (PureTest.truth false)"), "R5-#4 must not hoist FALSE before CHOOSE:\n{proof}");
+        assert!(!proof.contains("preGuard := (PureTest.truth false)"), "must not hoist FALSE before CHOOSE:\n{proof}");
     }
 
-    // R5-#5: Assignment RHS `n' = 1 \div 0` must refuse.
-    let r5_5 = r#"---- MODULE R5RhsDivZero ----
+    // Assignment RHS `n' = 1 \div 0` must refuse.
+    let r5_5 = r#"---- MODULE RhsDivZero ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES s, n
@@ -895,16 +895,16 @@ Next == UNCHANGED s /\ n' = 1 \div 0
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R5RhsDivZero", r5_5, cfg, group).is_none(), "R5-#5 must refuse");
+    assert!(certify("RhsDivZero", r5_5, cfg, group).is_none(), "must refuse");
 }
 
 #[test]
-fn round6_codex_astra_all_regressions_refuse() {
+fn eager_union_lazy_membership_and_nonenumerable_next_refusals() {
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
 
-    // R6-#1: Eager union construction `{1} \cup {"a"}` errors even if membership is checked per operand.
-    let r6_1 = r#"---- MODULE R6CupMerge ----
+    // Eager union construction `{1} \cup {"a"}` errors even if membership is checked per operand.
+    let r6_1 = r#"---- MODULE CupMerge ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -912,10 +912,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : p = owner \/ p \in ({1} \cup {"a"})
 ====
 "#;
-    assert!(certify("R6CupMerge", r6_1, cfg, group).is_none(), "R6-#1 must refuse");
+    assert!(certify("CupMerge", r6_1, cfg, group).is_none(), "must refuse");
 
-    // R6-#2: Lazy-set membership preconditions through IF (`p \in IF ... THEN SUBSET {1} ELSE SUBSET {2}`).
-    let r6_2 = r#"---- MODULE R6IfSubset ----
+    // Lazy-set membership preconditions through IF (`p \in IF ... THEN SUBSET {1} ELSE SUBSET {2}`).
+    let r6_2 = r#"---- MODULE IfSubset ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -923,10 +923,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : p = owner \/ p \in (IF TRUE THEN SUBSET {1} ELSE SUBSET {2})
 ====
 "#;
-    assert!(certify("R6IfSubset", r6_2, cfg, group).is_none(), "R6-#2 must refuse");
+    assert!(certify("IfSubset", r6_2, cfg, group).is_none(), "must refuse");
 
-    // R6-#3: Nested set-cardinality overflow during set normalization `{[1..32 -> BOOLEAN], {}}`.
-    let r6_3 = r#"---- MODULE R6SetNormCard ----
+    // Nested set-cardinality overflow during set normalization `{[1..32 -> BOOLEAN], {}}`.
+    let r6_3 = r#"---- MODULE SetNormCard ----
 EXTENDS Naturals, FiniteSets
 CONSTANTS Proc
 VARIABLE owner
@@ -935,10 +935,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : p = owner \/ Cardinality({[1..32 -> BOOLEAN], {}}) > 0
 ====
 "#;
-    assert!(certify("R6SetNormCard", r6_3, cfg, group).is_none(), "R6-#3 must refuse");
+    assert!(certify("SetNormCard", r6_3, cfg, group).is_none(), "must refuse");
 
-    // R6-#4: Empty-domain function set `[D -> {}]` has cardinality 1 (overflows `2147483647 + ...`).
-    let r6_4 = r#"---- MODULE R6EmptyFnSetCard ----
+    // Empty-domain function set `[D -> {}]` has cardinality 1 (overflows `2147483647 + ...`).
+    let r6_4 = r#"---- MODULE EmptyFnSetCard ----
 EXTENDS Integers, FiniteSets
 CONSTANTS Proc
 VARIABLE holder
@@ -948,11 +948,11 @@ Next == UNCHANGED holder
 Inv == \E p \in Proc : p = holder \/ 2147483647 + Cardinality([D -> {}]) = 0
 ====
 "#;
-    assert!(certify("R6EmptyFnSetCard", r6_4, cfg, group).is_none(), "R6-#4 must refuse");
+    assert!(certify("EmptyFnSetCard", r6_4, cfg, group).is_none(), "must refuse");
 
-    // R6-#5: Post-CHOOSE guard after a CHOOSE-bearing assignment must refuse.
+    // Post-CHOOSE guard after a CHOOSE-bearing assignment must refuse.
     let r6_5_cfg = "CONSTANTS Proc = {p1, p2, p3} Offers = {{p1}, {p2}, {p3}}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
-    let r6_5 = r#"---- MODULE R6ChooseSlotOrder ----
+    let r6_5 = r#"---- MODULE ChooseSlotOrder ----
 CONSTANTS Proc, Offers
 VARIABLES owner, leaders
 Init == owner \in Proc /\ (leaders = {} \/ leaders \in Offers)
@@ -960,10 +960,10 @@ Next == owner' = (CHOOSE q \in Proc : q \in leaders) /\ FALSE /\ UNCHANGED leade
 Inv == owner \in Proc
 ====
 "#;
-    assert!(certify("R6ChooseSlotOrder", r6_5, r6_5_cfg, group).is_none(), "R6-#5 must refuse");
+    assert!(certify("ChooseSlotOrder", r6_5, r6_5_cfg, group).is_none(), "must refuse");
 
-    // R6-#6: Fresh `n' \in Nat` in `Next` is not finitely enumerable and must refuse.
-    let r6_6 = r#"---- MODULE R6NextInNat ----
+    // Fresh `n' \in Nat` in `Next` is not finitely enumerable and must refuse.
+    let r6_6 = r#"---- MODULE NextInNat ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, n
@@ -972,17 +972,17 @@ Next == UNCHANGED owner /\ n' \in Nat
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R6NextInNat", r6_6, cfg, group).is_none(), "R6-#6 must refuse");
+    assert!(certify("NextInNat", r6_6, cfg, group).is_none(), "must refuse");
 }
 
 #[test]
-fn round7_codex_astra_all_regressions_refuse() {
+fn partial_record_domain_and_except_choose_hoist_refusals() {
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
 
-    // R7-#1: DOMAIN over a record with a partial field must not be treated as a total exact_set.
+    // DOMAIN over a record with a partial field must not be treated as a total exact_set.
     let r7_1_cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
-    let r7_1 = r#"---- MODULE R7DomainPartialRecord ----
+    let r7_1 = r#"---- MODULE DomainPartialRecord ----
 EXTENDS Integers, Sequences
 VARIABLE q
 Init == q = <<>>
@@ -990,8 +990,8 @@ Next == Len(q) = 0 /\ (q' = Append(q, "a") \/ q' = Append(q, "b"))
 Inv == Len(q) = 0 \/ q \in Seq(DOMAIN [a |-> IF q[1] = "a" THEN 1 ELSE 1 \div 0, b |-> 0])
 ====
 "#;
-    let dir_r7_1 = tlx_testkit::TempDir::new("r7-domain-partial");
-    let path_r7_1 = dir_r7_1.write("R7DomainPartialRecord.tla", r7_1);
+    let dir_r7_1 = tlx_testkit::TempDir::new("domain-partial");
+    let path_r7_1 = dir_r7_1.write("DomainPartialRecord.tla", r7_1);
     let mut p_r7_1 = Program::load(&path_r7_1, &[]).unwrap();
     p_r7_1.resolve_all_root();
     let roots_r7_1 = ["Init", "Next", "Inv"].map(|root| {
@@ -1005,10 +1005,10 @@ Inv == Len(q) = 0 \/ q \in Seq(DOMAIN [a |-> IF q[1] = "a" THEN 1 ELSE 1 \div 0,
         &roots_r7_1[1],
         &roots_r7_1[2..],
     );
-    assert!(plan_r7_1.is_none(), "R7-#1 must not project away partial DOMAIN record check");
+    assert!(plan_r7_1.is_none(), "must not project away partial DOMAIN record check");
 
-    // R7-#2: Nested lazy membership hidden behind function application `[x \in {1} |-> [Proc -> SUBSET {1}]][1]`.
-    let r7_2 = r#"---- MODULE R7NestedLazyApp ----
+    // Nested lazy membership hidden behind function application `[x \in {1} |-> [Proc -> SUBSET {1}]][1]`.
+    let r7_2 = r#"---- MODULE NestedLazyApp ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -1016,10 +1016,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [q \in Proc |-> p] \in [x \in {1} |-> [Proc -> SUBSET {1}]][1]
 ====
 "#;
-    assert!(certify("R7NestedLazyApp", r7_2, cfg, group).is_none(), "R7-#2 must refuse");
+    assert!(certify("NestedLazyApp", r7_2, cfg, group).is_none(), "must refuse");
 
-    // R7-#3: IsInjective compares range values via eq_tlc, so range set cardinalities must be <= i32::MAX.
-    let r7_3 = r#"---- MODULE R7IsInjectiveCard ----
+    // IsInjective compares range values via eq_tlc, so range set cardinalities must be <= i32::MAX.
+    let r7_3 = r#"---- MODULE IsInjectiveCard ----
 EXTENDS Naturals, Functions
 CONSTANTS Proc
 VARIABLE owner
@@ -1028,10 +1028,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ IsInjective([q \in Proc |-> IF p = q THEN [1..32 -> BOOLEAN] ELSE {}])
 ====
 "#;
-    assert!(certify("R7IsInjectiveCard", r7_3, cfg, group).is_none(), "R7-#3 must refuse");
+    assert!(certify("IsInjectiveCard", r7_3, cfg, group).is_none(), "must refuse");
 
-    // R7-#4: CHOOSE inside a conditionally evaluated EXCEPT update must not be hoisted unconditionally.
-    let r7_4 = r#"---- MODULE R7ChooseInExcept ----
+    // CHOOSE inside a conditionally evaluated EXCEPT update must not be hoisted unconditionally.
+    let r7_4 = r#"---- MODULE ChooseInExcept ----
 EXTENDS Naturals, Sequences
 CONSTANTS Proc
 VARIABLE msgs
@@ -1040,10 +1040,10 @@ Next == UNCHANGED msgs
 Inv == [<<0>> EXCEPT ![2] = (CHOOSE m \in msgs : m.val = 8).val] = <<0>>
 ====
 "#;
-    assert!(certify("R7ChooseInExcept", r7_4, cfg, group).is_none(), "R7-#4 must refuse");
+    assert!(certify("ChooseInExcept", r7_4, cfg, group).is_none(), "must refuse");
 
-    // R7-#5: Assignment RHS arithmetic must be overflow-free (`2147483647 + 1` overflows i32).
-    let r7_5 = r#"---- MODULE R7RhsArithOverflow ----
+    // Assignment RHS arithmetic must be overflow-free (`2147483647 + 1` overflows i32).
+    let r7_5 = r#"---- MODULE RhsArithOverflow ----
 EXTENDS Integers
 CONSTANTS Proc
 VARIABLES owner, x
@@ -1052,16 +1052,16 @@ Next == UNCHANGED owner /\ x' = <<2147483647 + 1>>
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R7RhsArithOverflow", r7_5, cfg, group).is_none(), "R7-#5 must refuse");
+    assert!(certify("RhsArithOverflow", r7_5, cfg, group).is_none(), "must refuse");
 }
 
 #[test]
-fn round8_codex_astra_all_regressions_refuse() {
+fn unbound_primed_self_read_and_nested_except_base_refusals() {
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
 
-    // R8-#1: Self-read of unbound primed variable inside assignment RHS `ok' = (... \/ ok')`.
-    let r8_1 = r#"---- MODULE R8UnboundPrimedRead ----
+    // Self-read of unbound primed variable inside assignment RHS `ok' = (... \/ ok')`.
+    let r8_1 = r#"---- MODULE UnboundPrimedRead ----
 CONSTANTS Proc
 VARIABLES owner, ok
 Init == owner \in Proc /\ ok = TRUE
@@ -1069,10 +1069,10 @@ Next == ok' = (\E p \in Proc : owner = p \/ ok') /\ UNCHANGED owner
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R8UnboundPrimedRead", r8_1, cfg, group).is_none(), "R8-#1 must refuse");
+    assert!(certify("UnboundPrimedRead", r8_1, cfg, group).is_none(), "must refuse");
 
-    // R8-#2: Eager union construction `{1} \cup {"s"}` inside a RecordSet membership domain.
-    let r8_2 = r#"---- MODULE R8RecordSetCup ----
+    // Eager union construction `{1} \cup {"s"}` inside a RecordSet membership domain.
+    let r8_2 = r#"---- MODULE RecordSetCup ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -1080,10 +1080,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ p \in [k : {1} \cup {"s"}]
 ====
 "#;
-    assert!(certify("R8RecordSetCup", r8_2, cfg, group).is_none(), "R8-#2 must refuse");
+    assert!(certify("RecordSetCup", r8_2, cfg, group).is_none(), "must refuse");
 
-    // R8-#3: Record membership shared-field comparison regardless of Sym intern order.
-    let r8_3 = r#"---- MODULE R8RecordInternOrder ----
+    // Record membership shared-field comparison regardless of Sym intern order.
+    let r8_3 = r#"---- MODULE RecordInternOrder ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -1091,10 +1091,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [z |-> "x", a |-> 7] \in [z : {1}, b : {2}]
 ====
 "#;
-    assert!(certify("R8RecordInternOrder", r8_3, cfg, group).is_none(), "R8-#3 must refuse");
+    assert!(certify("RecordInternOrder", r8_3, cfg, group).is_none(), "must refuse");
 
-    // R8-#4: Lazy RecordSet membership hidden behind function application.
-    let r8_4 = r#"---- MODULE R8LazyRecordSetApp ----
+    // Lazy RecordSet membership hidden behind function application.
+    let r8_4 = r#"---- MODULE LazyRecordSetApp ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -1102,10 +1102,10 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [a |-> "x", c |-> 7] \in ([i \in Proc |-> [a : {1}, b : {2}]])[p]
 ====
 "#;
-    assert!(certify("R8LazyRecordSetApp", r8_4, cfg, group).is_none(), "R8-#4 must refuse");
+    assert!(certify("LazyRecordSetApp", r8_4, cfg, group).is_none(), "must refuse");
 
-    // R8-#5: Nested EXCEPT reading original `m[p]` must not flatten onto earlier overlapping `![p].a = 1`.
-    let r8_5 = r#"---- MODULE R8NestedExceptSourceBase ----
+    // Nested EXCEPT reading original `m[p]` must not flatten onto earlier overlapping `![p].a = 1`.
+    let r8_5 = r#"---- MODULE NestedExceptSourceBase ----
 CONSTANTS Proc
 VARIABLE m
 Init == m = [p \in Proc |-> [a |-> 0, b |-> 0]]
@@ -1113,8 +1113,8 @@ Next == \E p \in Proc : m' = [m EXCEPT ![p].a = 1, ![p] = [m[p] EXCEPT !.b = 2]]
 Inv == \A p \in Proc : m[p].a = 0
 ====
 "#;
-    let dir_r8_5 = tlx_testkit::TempDir::new("r8-nested-except");
-    let path_r8_5 = dir_r8_5.write("R8NestedExceptSourceBase.tla", r8_5);
+    let dir_r8_5 = tlx_testkit::TempDir::new("nested-except");
+    let path_r8_5 = dir_r8_5.write("NestedExceptSourceBase.tla", r8_5);
     let mut p_r8_5 = Program::load(&path_r8_5, &[]).unwrap();
     p_r8_5.resolve_all_root();
     let Some(RootSymbol::Def(next_id)) = p_r8_5.lookup_root("Next") else { panic!("missing Next") };
@@ -1123,10 +1123,10 @@ Inv == \A p \in Proc : m[p].a = 0
     let expanded = norm.normalize(&next_expr).expect("normalize");
     // The second update must remain a replacement `![p] = [m[p] EXCEPT !.b = 2]`, not flattened `![p].b = 2`.
     let dbg = format!("{expanded:?}");
-    assert!(dbg.contains("FnApp"), "R8-#5 must preserve original m[p] base in second EXCEPT update: {dbg}");
+    assert!(dbg.contains("FnApp"), "must preserve original m[p] base in second EXCEPT update: {dbg}");
 
-    // R8-#6: Already-bound `UNCHANGED x` after `x' \in {1}` and a CHOOSE-bearing assignment must refuse.
-    let r8_6 = r#"---- MODULE R8UnchangedAfterChoose ----
+    // Already-bound `UNCHANGED x` after `x' \in {1}` and a CHOOSE-bearing assignment must refuse.
+    let r8_6 = r#"---- MODULE UnchangedAfterChoose ----
 CONSTANTS Proc
 VARIABLES owner, x
 Init == owner \in Proc /\ x = 0
@@ -1134,10 +1134,10 @@ Next == x' \in {1} /\ owner' = (CHOOSE p \in Proc : p = owner /\ FALSE) /\ UNCHA
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R8UnchangedAfterChoose", r8_6, cfg, group).is_none(), "R8-#6 must refuse");
+    assert!(certify("UnchangedAfterChoose", r8_6, cfg, group).is_none(), "must refuse");
 
-    // Self-audit #1: Unbound self-read in Init `ok = (\E p \in Proc : owner = p \/ ok)` must refuse.
-    let self_1 = r#"---- MODULE SelfAuditInitUnboundRead ----
+    // Unbound self-read in Init `ok = (\E p \in Proc : owner = p \/ ok)` must refuse.
+    let self_1 = r#"---- MODULE InitUnboundRead ----
 CONSTANTS Proc
 VARIABLES owner, ok
 Init == owner \in Proc /\ ok = (\E p \in Proc : owner = p \/ ok)
@@ -1145,10 +1145,10 @@ Next == UNCHANGED <<owner, ok>>
 Inv == TRUE
 ====
 "#;
-    assert!(certify("SelfAuditInitUnboundRead", self_1, cfg, group).is_none(), "Self-audit #1 must refuse");
+    assert!(certify("InitUnboundRead", self_1, cfg, group).is_none(), "must refuse");
 
-    // Self-audit #2: `[1..32 -> BOOLEAN] \in SUBSET [1..32 -> BOOLEAN]` overflows enumeration and must refuse.
-    let self_2 = r#"---- MODULE SelfAuditSubsetOverflow ----
+    // `[1..32 -> BOOLEAN] \in SUBSET [1..32 -> BOOLEAN]` overflows enumeration and must refuse.
+    let self_2 = r#"---- MODULE SubsetOverflow ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE owner
@@ -1157,11 +1157,11 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = p \/ [1..32 -> BOOLEAN] \in SUBSET [1..32 -> BOOLEAN]
 ====
 "#;
-    assert!(certify("SelfAuditSubsetOverflow", self_2, cfg, group).is_none(), "Self-audit #2 must refuse");
+    assert!(certify("SubsetOverflow", self_2, cfg, group).is_none(), "must refuse");
 }
 
 #[test]
-fn round9_codex_astra_all_regressions_refuse() {
+fn lazy_set_ops_dynamic_map_except_and_subseteq_assign_refusals() {
     let cfg = "CONSTANTS Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let group = &[vec!["p1".into(), "p2".into(), "p3".into()]];
 
@@ -1184,11 +1184,11 @@ fn round9_codex_astra_all_regressions_refuse() {
         .is_some()
     };
 
-    // R9-#1: `Cap` and `SetMinus` call `member` on the other operand (`{p} \cap SUBSET {1}`, `{p} \ SUBSET {1}`).
+    // `Cap` and `SetMinus` call `member` on the other operand (`{p} \cap SUBSET {1}`, `{p} \ SUBSET {1}`).
     for (name, set_op) in [
-        ("R9CapSubsetMember", "({p} \\cap SUBSET {1}) = {}"),
-        ("R9CapSubsetMemberRev", "(SUBSET {1} \\cap {p}) = {}"),
-        ("R9DiffSubsetMember", "({p} \\ SUBSET {1}) = {p}"),
+        ("CapSubsetMember", "({p} \\cap SUBSET {1}) = {}"),
+        ("CapSubsetMemberRev", "(SUBSET {1} \\cap {p}) = {}"),
+        ("DiffSubsetMember", "({p} \\ SUBSET {1}) = {p}"),
     ] {
         let src = format!(
             "---- MODULE {name} ----\nEXTENDS Naturals\nCONSTANTS Proc\nVARIABLE owner\n\
@@ -1198,13 +1198,13 @@ fn round9_codex_astra_all_regressions_refuse() {
         assert!(certify(name, &src, cfg, group).is_none(), "{name} must refuse");
     }
 
-    // R9-#2 + structural lazy sets: `UNION`, `SetFilter`, `kSubset`, and `Product` lazy membership checks.
+    // structural lazy sets: `UNION`, `SetFilter`, `kSubset`, and `Product` lazy membership checks.
     for (name, expr) in [
-        ("R9UnionLazySubset", "p \\in UNION {SUBSET Proc}"),
-        ("R9FilterLazySubset", "p \\in {x \\in SUBSET {1} : TRUE}"),
-        ("R9KSubsetMember", "p \\in kSubset(1, {1, 2})"),
-        ("R9UnionLazyProductFcn", "[q \\in Proc |-> 1] \\in UNION {{1} \\X {1}}"),
-        ("R9DomainLazyFcnSubset", "p \\in DOMAIN [x \\in SUBSET {1} |-> 0]"),
+        ("UnionLazySubset", "p \\in UNION {SUBSET Proc}"),
+        ("FilterLazySubset", "p \\in {x \\in SUBSET {1} : TRUE}"),
+        ("KSubsetMember", "p \\in kSubset(1, {1, 2})"),
+        ("UnionLazyProductFcn", "[q \\in Proc |-> 1] \\in UNION {{1} \\X {1}}"),
+        ("DomainLazyFcnSubset", "p \\in DOMAIN [x \\in SUBSET {1} |-> 0]"),
     ] {
         let src = format!(
             "---- MODULE {name} ----\nEXTENDS Naturals, FiniteSets, FiniteSetsExt\nCONSTANTS Proc\nVARIABLE owner\n\
@@ -1214,14 +1214,14 @@ fn round9_codex_astra_all_regressions_refuse() {
         assert!(certify(name, &src, cfg, group).is_none(), "{name} must refuse");
     }
 
-    // R9-#3: `EXCEPT` index must inhabit the runtime domain representation (never untyped model values on
+    // `EXCEPT` index must inhabit the runtime domain representation (never untyped model values on
     // interval/empty/string functions, nor incompatible shared record fields on lazy record-domain functions).
     for (name, expr) in [
-        ("R9ExceptIntInterval", "[[i \\in 2..3 |-> i] EXCEPT ![p] = 0] = [i \\in 2..3 |-> i]"),
-        ("R9ExceptEmptyInterval", "[[i \\in 2..1 |-> i] EXCEPT ![p] = 0] = <<>>"),
-        ("R9ExceptStrDomain", "[[s \\in {\"a\"} |-> 0] EXCEPT ![p] = 0] = [s \\in {\"a\"} |-> 0]"),
+        ("ExceptIntInterval", "[[i \\in 2..3 |-> i] EXCEPT ![p] = 0] = [i \\in 2..3 |-> i]"),
+        ("ExceptEmptyInterval", "[[i \\in 2..1 |-> i] EXCEPT ![p] = 0] = <<>>"),
+        ("ExceptStrDomain", "[[s \\in {\"a\"} |-> 0] EXCEPT ![p] = 0] = [s \\in {\"a\"} |-> 0]"),
         (
-            "R9ExceptLazyRecordDom",
+            "ExceptLazyRecordDom",
             "[[r \\in [a : {1}, b : {2}] |-> 0] EXCEPT ![[a |-> \"x\", c |-> 7]] = 1] = [r \\in [a : {1}, b : {2}] |-> 0]",
         ),
     ] {
@@ -1233,14 +1233,14 @@ fn round9_codex_astra_all_regressions_refuse() {
         assert!(certify(name, &src, cfg, group).is_none(), "{name} must refuse");
     }
 
-    // R9-#4 + structural set-cardinality ban: oversized `FnSet`, `Times`, `RecordSet`, and `FnConstruct` domains must refuse.
+    // structural set-cardinality ban: oversized `FnSet`, `Times`, `RecordSet`, and `FnConstruct` domains must refuse.
     for (name, expr) in [
-        ("R9FnSetDomCardOverflow", "<<>> \\in [[1..32 -> BOOLEAN] -> Nat]"),
-        ("R9FnSetSingletonRangeOverflow", "<<>> \\in [[1..32 -> BOOLEAN] -> {0}]"),
-        ("R9FnSetValueCardOverflow", "[1..32 -> BOOLEAN] = {}"),
-        ("R9TimesCardOverflow", "((1..50000) \\X (1..50000)) = {}"),
-        ("R9RecordSetCardOverflow", "[a : 1..50000, b : 1..50000] = {}"),
-        ("R9FnConstructCardOverflow", "([x \\in 1..50000, y \\in 1..50000 |-> 0])[1, 1] = 0"),
+        ("FnSetDomCardOverflow", "<<>> \\in [[1..32 -> BOOLEAN] -> Nat]"),
+        ("FnSetSingletonRangeOverflow", "<<>> \\in [[1..32 -> BOOLEAN] -> {0}]"),
+        ("FnSetValueCardOverflow", "[1..32 -> BOOLEAN] = {}"),
+        ("TimesCardOverflow", "((1..50000) \\X (1..50000)) = {}"),
+        ("RecordSetCardOverflow", "[a : 1..50000, b : 1..50000] = {}"),
+        ("FnConstructCardOverflow", "([x \\in 1..50000, y \\in 1..50000 |-> 0])[1, 1] = 0"),
     ] {
         let src = format!(
             "---- MODULE {name} ----\nEXTENDS Naturals, Sequences\nCONSTANTS Proc\nVARIABLE owner\n\
@@ -1250,8 +1250,8 @@ fn round9_codex_astra_all_regressions_refuse() {
         assert!(certify(name, &src, cfg, group).is_none(), "{name} must refuse");
     }
 
-    // R9-#5: Partial `IF` interval endpoint in `domain.rs` must not let sequence-length projection erase `1 \div 0`.
-    let r9_5 = r#"---- MODULE R9PartialIntervalEndpoint ----
+    // Partial `IF` interval endpoint in `domain.rs` must not let sequence-length projection erase `1 \div 0`.
+    let r9_5 = r#"---- MODULE PartialIntervalEndpoint ----
 EXTENDS Integers, Sequences
 VARIABLE q
 Init == q = <<>>
@@ -1259,10 +1259,10 @@ Next == Len(q) = 0 /\ q' = Append(q, 2)
 Inv == Len(q) = 0 \/ q \in Seq(0..(IF 1 \div (q[1] - 2) = 4 THEN 2 ELSE 2))
 ====
 "#;
-    assert!(!seq_projection("R9PartialIntervalEndpoint", r9_5), "R9-#5 must not project away partial interval endpoint");
+    assert!(!seq_projection("PartialIntervalEndpoint", r9_5), "must not project away partial interval endpoint");
 
-    // R9-#6: Incompatible shared field `a` across equal-length record-union alternatives in `domain.rs` must refuse.
-    let r9_6 = r#"---- MODULE R9RecordUnionSharedField ----
+    // Incompatible shared field `a` across equal-length record-union alternatives in `domain.rs` must refuse.
+    let r9_6 = r#"---- MODULE RecordUnionSharedField ----
 EXTENDS Naturals, Sequences
 VARIABLE q
 Init == q = <<>>
@@ -1270,10 +1270,10 @@ Next == Len(q) = 0 /\ (q' = Append(q, [a |-> 1, b |-> 0]) \/ q' = Append(q, [a |
 Inv == Len(q) = 0 \/ q \in Seq([a : {1}, b : {0}] \cup [a : {"x"}, c : {0}])
 ====
 "#;
-    assert!(!seq_projection("R9RecordUnionSharedField", r9_6), "R9-#6 must refuse incompatible shared record field");
+    assert!(!seq_projection("RecordUnionSharedField", r9_6), "must refuse incompatible shared record field");
 
-    // R9-#7: Incomplete variable assignments on a disjunct (`Init == ... \/ TRUE`, `Next == ... \/ TRUE`) must refuse.
-    let r9_7_init = r#"---- MODULE R9IncompleteInit ----
+    // Incomplete variable assignments on a disjunct (`Init == ... \/ TRUE`, `Next == ... \/ TRUE`) must refuse.
+    let r9_7_init = r#"---- MODULE IncompleteInit ----
 CONSTANTS Proc
 VARIABLE owner
 Init == (\E p \in Proc : owner = <<p>>) \/ TRUE
@@ -1281,9 +1281,9 @@ Next == UNCHANGED owner
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R9IncompleteInit", r9_7_init, cfg, group).is_none(), "R9-#7 incomplete Init must refuse");
+    assert!(certify("IncompleteInit", r9_7_init, cfg, group).is_none(), "incomplete Init must refuse");
 
-    let r9_7_next = r#"---- MODULE R9IncompleteNext ----
+    let r9_7_next = r#"---- MODULE IncompleteNext ----
 CONSTANTS Proc
 VARIABLE owner
 Init == \E p \in Proc : owner = <<p>>
@@ -1291,10 +1291,10 @@ Next == (\E p \in Proc : owner' = <<p>>) \/ TRUE
 Inv == TRUE
 ====
 "#;
-    assert!(certify("R9IncompleteNext", r9_7_next, cfg, group).is_none(), "R9-#7 incomplete Next must refuse");
+    assert!(certify("IncompleteNext", r9_7_next, cfg, group).is_none(), "incomplete Next must refuse");
 
-    // R10-#3: Lexical `EXCEPT` `@` inside a `LAMBDA` or `LET` definition must not rebind to an inner `EXCEPT`.
-    let r10_3_lambda = r#"---- MODULE R10ExceptLambdaAt ----
+    // Lexical `EXCEPT` `@` inside a `LAMBDA` or `LET` definition must not rebind to an inner `EXCEPT`.
+    let r10_3_lambda = r#"---- MODULE ExceptLambdaAt ----
 EXTENDS Naturals, Sequences
 CONSTANTS Proc
 VARIABLE owner
@@ -1304,9 +1304,9 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = <<p>> \/ 1 \div ([<<0>> EXCEPT ![1] = Put(LAMBDA u : @)][1][1]) = 1
 ====
 "#;
-    assert!(certify("R10ExceptLambdaAt", r10_3_lambda, cfg, group).is_none(), "R10-#3 lambda @ across nested EXCEPT must refuse");
+    assert!(certify("ExceptLambdaAt", r10_3_lambda, cfg, group).is_none(), "lambda @ across nested EXCEPT must refuse");
 
-    let r10_3_let = r#"---- MODULE R10ExceptLetAt ----
+    let r10_3_let = r#"---- MODULE ExceptLetAt ----
 EXTENDS Naturals, Sequences
 CONSTANTS Proc
 VARIABLE owner
@@ -1315,12 +1315,12 @@ Next == UNCHANGED owner
 Inv == \E p \in Proc : owner = <<p>> \/ 1 \div ([<<0>> EXCEPT ![1] = LET x == @ IN [<<1>> EXCEPT ![1] = x]][1][1]) = 1
 ====
 "#;
-    assert!(certify("R10ExceptLetAt", r10_3_let, cfg, group).is_none(), "R10-#3 LET @ across nested EXCEPT must refuse");
+    assert!(certify("ExceptLetAt", r10_3_let, cfg, group).is_none(), "LET @ across nested EXCEPT must refuse");
 
-    // R13-#2: Provably absent non-model EXCEPT key on a non-empty exact untyped model-value map
+    // Provably absent non-model EXCEPT key on a non-empty exact untyped model-value map
     // (`[m EXCEPT ![0] = 0]` on `m = [p \in Proc |-> p]`) is total and certifies, while typed
     // model values, possibly-empty dynamic maps, and out-of-domain `FnApp` (`m[0]`) still refuse.
-    let r13_2_ok = r#"---- MODULE R13UntypedModelAbsentExcept ----
+    let r13_2_ok = r#"---- MODULE UntypedModelAbsentExcept ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE m
@@ -1330,21 +1330,21 @@ Inv == \A p \in Proc : m[p] = p
 ====
 "#;
     assert!(
-        certify("R13UntypedModelAbsentExcept", r13_2_ok, cfg, group).is_some(),
-        "R13-#2 absent integer EXCEPT key on non-empty untyped model-value map should certify"
+        certify("UntypedModelAbsentExcept", r13_2_ok, cfg, group).is_some(),
+        "absent integer EXCEPT key on non-empty untyped model-value map should certify"
     );
 
     let typed_cfg = "CONSTANTS Proc = {P_1, P_2, P_3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let typed_group = &[vec!["P_1".into(), "P_2".into(), "P_3".into()]];
     assert!(
-        certify("R13UntypedModelAbsentExcept", r13_2_ok, typed_cfg, typed_group).is_none(),
-        "R13-#2 typed model-value map must refuse non-model EXCEPT key"
+        certify("UntypedModelAbsentExcept", r13_2_ok, typed_cfg, typed_group).is_none(),
+        "typed model-value map must refuse non-model EXCEPT key"
     );
 
-    // R13-#2 / R15-#4: Dynamic subset `s \in SUBSET Proc` actively exercises `Proc` and makes both
+    // Dynamic subset `s \in SUBSET Proc` actively exercises `Proc` and makes both
     // empty (`<<>>` in -compile) and non-empty maps reachable: string `EXCEPT` refuses, while a
     // safe update on the identical initial state certifies.
-    let r13_2_empty_dyn = r#"---- MODULE R13DynamicEmptyModelMapExcept ----
+    let r13_2_empty_dyn = r#"---- MODULE DynamicEmptyModelMapExcept ----
 CONSTANTS Proc
 VARIABLES s, m
 Init == s \in SUBSET Proc /\ m = [p \in s |-> p]
@@ -1353,10 +1353,10 @@ Inv == m = [p \in s |-> p]
 ====
 "#;
     assert!(
-        certify("R13DynamicEmptyModelMapExcept", r13_2_empty_dyn, cfg, group).is_none(),
-        "R13-#2 possibly-empty map (decoded as <<>> in -compile) must refuse string EXCEPT key"
+        certify("DynamicEmptyModelMapExcept", r13_2_empty_dyn, cfg, group).is_none(),
+        "possibly-empty map (decoded as <<>> in -compile) must refuse string EXCEPT key"
     );
-    let r13_2_empty_dyn_safe = r#"---- MODULE R13DynamicEmptyModelMapSafe ----
+    let r13_2_empty_dyn_safe = r#"---- MODULE DynamicEmptyModelMapSafe ----
 CONSTANTS Proc
 VARIABLES s, m
 Init == s \in SUBSET Proc /\ m = [p \in s |-> p]
@@ -1365,11 +1365,11 @@ Inv == m = [p \in s |-> p]
 ====
 "#;
     assert!(
-        certify("R13DynamicEmptyModelMapSafe", r13_2_empty_dyn_safe, cfg, group).is_some(),
-        "R15-#4 control fixture with safe update must certify so R13DynamicEmptyModelMapExcept tests EXCEPT"
+        certify("DynamicEmptyModelMapSafe", r13_2_empty_dyn_safe, cfg, group).is_some(),
+        "control fixture with safe update must certify so DynamicEmptyModelMapExcept tests EXCEPT"
     );
 
-    let r13_2_fnapp = r#"---- MODULE R13UntypedModelOobFnApp ----
+    let r13_2_fnapp = r#"---- MODULE UntypedModelOobFnApp ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLE m
@@ -1379,13 +1379,13 @@ Inv == m[0] = 0
 ====
 "#;
     assert!(
-        certify("R13UntypedModelOobFnApp", r13_2_fnapp, cfg, group).is_none(),
-        "R13-#2 out-of-domain function application m[0] must still refuse"
+        certify("UntypedModelOobFnApp", r13_2_fnapp, cfg, group).is_none(),
+        "out-of-domain function application m[0] must still refuse"
     );
 
-    // R14-#1: Signed interval `[-1, 1]` straddling valid index `1` of a 1-element tuple must NOT
+    // Signed interval `[-1, 1]` straddling valid index `1` of a 1-element tuple must NOT
     // wrap `-1 as usize` into `usize::MAX > 1` and skip totality checking on `1 \div 0`.
-    let r14_1 = r#"---- MODULE R14StraddlingTupleExcept ----
+    let r14_1 = r#"---- MODULE StraddlingTupleExcept ----
 EXTENDS Integers
 CONSTANTS Proc
 VARIABLE owner
@@ -1395,13 +1395,13 @@ Inv == \A p \in Proc : owner = p \/ (\A i \in -1..1 : [<<0>> EXCEPT ![i] = 1 \di
 ====
 "#;
     assert!(
-        certify("R14StraddlingTupleExcept", r14_1, cfg, group).is_none(),
-        "R14-#1 signed interval [-1, 1] straddling tuple index 1 must refuse partial EXCEPT rhs"
+        certify("StraddlingTupleExcept", r14_1, cfg, group).is_none(),
+        "signed interval [-1, 1] straddling tuple index 1 must refuse partial EXCEPT rhs"
     );
 
-    // R15-#1: Right-hand target variable (`Next == owner = owner'` or `Init == p = owner`) is
+    // Right-hand target variable (`Next == owner = owner'` or `Init == p = owner`) is
     // evaluated as a test on an unassigned variable by `Enumerator::assign_eq` and must refuse.
-    let r15_1_next = r#"---- MODULE R15ReversedNextEq ----
+    let r15_1_next = r#"---- MODULE ReversedNextEq ----
 CONSTANTS Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -1409,9 +1409,9 @@ Next == owner = owner'
 Inv == owner \in Proc
 ====
 "#;
-    assert!(certify("R15ReversedNextEq", r15_1_next, cfg, group).is_none(), "R15-#1 reversed primed equality `owner = owner'` must refuse");
+    assert!(certify("ReversedNextEq", r15_1_next, cfg, group).is_none(), "reversed primed equality `owner = owner'` must refuse");
 
-    let r15_1_init = r#"---- MODULE R15ReversedInitEq ----
+    let r15_1_init = r#"---- MODULE ReversedInitEq ----
 CONSTANTS Proc
 VARIABLE owner
 Init == \E p \in Proc : p = owner
@@ -1419,11 +1419,11 @@ Next == owner' \in Proc
 Inv == owner \in Proc
 ====
 "#;
-    assert!(certify("R15ReversedInitEq", r15_1_init, cfg, group).is_none(), "R15-#1 reversed Init equality `p = owner` must refuse");
+    assert!(certify("ReversedInitEq", r15_1_init, cfg, group).is_none(), "reversed Init equality `p = owner` must refuse");
 
-    // R15-#2: Freshly bound `Init` variable `s = SUBSET {1}` holds a lazy powerset during `Init`
+    // Freshly bound `Init` variable `s = SUBSET {1}` holds a lazy powerset during `Init`
     // enumeration before `to_state` normalizes it, so `p \in s` in `Init` must refuse.
-    let r15_2_init_lazy = r#"---- MODULE R15InitLazyVarMembership ----
+    let r15_2_init_lazy = r#"---- MODULE InitLazyVarMembership ----
 CONSTANTS Proc
 VARIABLES s, owner
 Init == s = SUBSET {1} /\ owner \in Proc /\ (\E p \in Proc : p = owner \/ p \in s)
@@ -1432,14 +1432,14 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        certify("R15InitLazyVarMembership", r15_2_init_lazy, cfg, group).is_none(),
-        "R15-#2 freshly bound lazy powerset variable in Init must refuse non-enumerable model-value membership"
+        certify("InitLazyVarMembership", r15_2_init_lazy, cfg, group).is_none(),
+        "freshly bound lazy powerset variable in Init must refuse non-enumerable model-value membership"
     );
 
-    // R16-#1: Same-kind `EXCEPT` key (`p \in Proc`) on a possibly-empty map (`s \in SUBSET Proc`,
+    // Same-kind `EXCEPT` key (`p \in Proc`) on a possibly-empty map (`s \in SUBSET Proc`,
     // `m = [p \in s |-> p]`, decoded as `<<>>` when `s = {}` in `-compile`) must refuse unless
     // `p \in DOMAIN m` proves `m` non-empty.
-    let r16_1_same_kind_empty = r#"---- MODULE R16DynamicEmptySameKindExcept ----
+    let r16_1_same_kind_empty = r#"---- MODULE DynamicEmptySameKindExcept ----
 CONSTANTS Proc
 VARIABLES s, m
 Init == s \in SUBSET Proc /\ m = [p \in s |-> p]
@@ -1448,11 +1448,11 @@ Inv == m = [p \in s |-> p]
 ====
 "#;
     assert!(
-        certify("R16DynamicEmptySameKindExcept", r16_1_same_kind_empty, cfg, group).is_none(),
-        "R16-#1 same-kind EXCEPT key on possibly-empty dynamic map must refuse"
+        certify("DynamicEmptySameKindExcept", r16_1_same_kind_empty, cfg, group).is_none(),
+        "same-kind EXCEPT key on possibly-empty dynamic map must refuse"
     );
 
-    let r16_1_dom_guarded = r#"---- MODULE R16DynamicDomGuardedExcept ----
+    let r16_1_dom_guarded = r#"---- MODULE DynamicDomGuardedExcept ----
 CONSTANTS Proc
 VARIABLES s, m
 Init == s \in SUBSET Proc /\ m = [p \in s |-> p]
@@ -1461,13 +1461,13 @@ Inv == m = [p \in s |-> p]
 ====
 "#;
     assert!(
-        certify("R16DynamicDomGuardedExcept", r16_1_dom_guarded, cfg, group).is_some(),
-        "R16-#1 EXCEPT guarded by `p \\in DOMAIN m` proves non-emptiness and must certify"
+        certify("DynamicDomGuardedExcept", r16_1_dom_guarded, cfg, group).is_some(),
+        "EXCEPT guarded by `p \\in DOMAIN m` proves non-emptiness and must certify"
     );
 
-    // R16-#2: `s \subseteq Proc` / `s' \subseteq Proc` target assignments enumerate `powerset(Proc)`
+    // `s \subseteq Proc` / `s' \subseteq Proc` target assignments enumerate `powerset(Proc)`
     // (`|Proc| <= 30`) and certify, whereas `|S| > 30` (`1..31`) and reversed `Proc \subseteq s'` refuse.
-    let r16_2_subseteq_ok = r#"---- MODULE R16SubsetEqAssignOk ----
+    let r16_2_subseteq_ok = r#"---- MODULE SubsetEqAssignOk ----
 CONSTANTS Proc
 VARIABLE s
 Init == s \subseteq Proc
@@ -1476,11 +1476,11 @@ Inv == s \subseteq Proc
 ====
 "#;
     assert!(
-        certify("R16SubsetEqAssignOk", r16_2_subseteq_ok, cfg, group).is_some(),
-        "R16-#2 fresh `s \\subseteq Proc` and `s' \\subseteq Proc` assignments must certify"
+        certify("SubsetEqAssignOk", r16_2_subseteq_ok, cfg, group).is_some(),
+        "fresh `s \\subseteq Proc` and `s' \\subseteq Proc` assignments must certify"
     );
 
-    let r16_2_subseteq_overflow = r#"---- MODULE R16SubsetEqOverflow ----
+    let r16_2_subseteq_overflow = r#"---- MODULE SubsetEqOverflow ----
 EXTENDS Naturals
 CONSTANTS Proc
 VARIABLES owner, nums
@@ -1490,11 +1490,11 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        certify("R16SubsetEqOverflow", r16_2_subseteq_overflow, cfg, group).is_none(),
-        "R16-#2 `nums \\subseteq (1..31)` overflows 2^30 powerset enumeration and must refuse"
+        certify("SubsetEqOverflow", r16_2_subseteq_overflow, cfg, group).is_none(),
+        "`nums \\subseteq (1..31)` overflows 2^30 powerset enumeration and must refuse"
     );
 
-    let r16_2_subseteq_rev = r#"---- MODULE R16SubsetEqReversed ----
+    let r16_2_subseteq_rev = r#"---- MODULE SubsetEqReversed ----
 CONSTANTS Proc
 VARIABLE s
 Init == s \subseteq Proc
@@ -1503,14 +1503,14 @@ Inv == s \subseteq Proc
 ====
 "#;
     assert!(
-        certify("R16SubsetEqReversed", r16_2_subseteq_rev, cfg, group).is_none(),
-        "R16-#2 reversed `Proc \\subseteq s'` tests unassigned `s'` and must refuse"
+        certify("SubsetEqReversed", r16_2_subseteq_rev, cfg, group).is_none(),
+        "reversed `Proc \\subseteq s'` tests unassigned `s'` and must refuse"
     );
 
-    // R17-#1: Non-nullary operator call `Id(owner') = owner` or `UNCHANGED Id(owner)` is evaluated
+    // Non-nullary operator call `Id(owner') = owner` or `UNCHANGED Id(owner)` is evaluated
     // as a test on unassigned `owner'` by `Enumerator::target`/`unchanged` and must refuse, whereas
     // call-by-name action `Step(owner)` (`Step(x) == x' = x`) and already-assigned `owner' = owner /\ Id(owner') = owner` certify.
-    let r17_1_id_lhs = r#"---- MODULE R17NonNullaryCallTarget ----
+    let r17_1_id_lhs = r#"---- MODULE NonNullaryCallTarget ----
 CONSTANTS Proc
 VARIABLE owner
 Id(t) == t
@@ -1519,9 +1519,9 @@ Next == Id(owner') = owner
 Inv == owner \in Proc
 ====
 "#;
-    assert!(certify("R17NonNullaryCallTarget", r17_1_id_lhs, cfg, group).is_none(), "R17-#1 `Id(owner') = owner` must refuse");
+    assert!(certify("NonNullaryCallTarget", r17_1_id_lhs, cfg, group).is_none(), "`Id(owner') = owner` must refuse");
 
-    let r17_1_unchanged_id = r#"---- MODULE R17UnchangedNonNullaryCall ----
+    let r17_1_unchanged_id = r#"---- MODULE UnchangedNonNullaryCall ----
 CONSTANTS Proc
 VARIABLE owner
 Id(t) == t
@@ -1530,9 +1530,9 @@ Next == UNCHANGED Id(owner)
 Inv == owner \in Proc
 ====
 "#;
-    assert!(certify("R17UnchangedNonNullaryCall", r17_1_unchanged_id, cfg, group).is_none(), "R17-#1 `UNCHANGED Id(owner)` must refuse");
+    assert!(certify("UnchangedNonNullaryCall", r17_1_unchanged_id, cfg, group).is_none(), "`UNCHANGED Id(owner)` must refuse");
 
-    let r17_1_action_call_ok = r#"---- MODULE R17ByNameActionCallOk ----
+    let r17_1_action_call_ok = r#"---- MODULE ByNameActionCallOk ----
 CONSTANTS Proc
 VARIABLE owner
 Id(t) == t
@@ -1543,7 +1543,7 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        certify("R17ByNameActionCallOk", r17_1_action_call_ok, cfg, group).is_some(),
-        "R17-#1 call-by-name `Step(owner)` with post-assignment `Id(owner') = owner` test must certify"
+        certify("ByNameActionCallOk", r17_1_action_call_ok, cfg, group).is_some(),
+        "call-by-name `Step(owner)` with post-assignment `Id(owner') = owner` test must certify"
     );
 }

@@ -26,7 +26,7 @@ fn run_spec(body: &str, cfg_extra: &str, args: &[&str], env: &[(&str, &str)]) ->
 
 #[test]
 fn quantified_zero_pow_zero_fails_identically_with_and_without_autosym() {
-    // Codex Astra's exact non-CHOOSE counterexample: scan order in `\E p \in Proc`
+    // Scan order in `\E p \in Proc`
     // can short-circuit on `parent[p1] = p1` (1^1 = 1) for one orbit representative
     // while another orbit representative hits `0^0` first and errors.
     let body = "\
@@ -114,9 +114,9 @@ Inv ==
 }
 
 #[test]
-fn round2_soundness_repros_fail_identically_without_symmetry() {
+fn totality_refusal_repros_fail_identically_without_symmetry() {
     // End-to-end verification across both interpreter and compiled tiers that
-    // Round-2 totality counterexamples refuse automatic symmetry and fail identically
+    // partial/incomparable totality counterexamples refuse automatic symmetry and fail identically
     // to `-noautosymmetry`.
     let cases: &[(&str, &str, &str)] = &[
         (
@@ -162,7 +162,7 @@ fn round2_soundness_repros_fail_identically_without_symmetry() {
     ];
 
     for (name, const_cfg, body) in cases {
-        let dir = tlx_testkit::TempDir::new(&format!("r2-{name}"));
+        let dir = tlx_testkit::TempDir::new(&format!("totality-{name}"));
         std::fs::write(
             dir.join("Spec.tla"),
             format!("---- MODULE Spec ----\nEXTENDS TLC, Naturals, Sequences, FiniteSets\nCONSTANT Proc\n{body}\n====\n"),

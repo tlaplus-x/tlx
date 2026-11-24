@@ -128,7 +128,6 @@ Inv == owner \in leaders
 
 #[test]
 fn non_boolean_choose_predicate_is_refused_end_to_end() {
-    // Exact Codex Astra Round-2 counterexample:
     // For `owner = p1`, the first candidate matches `m.from = owner` and returns `TRUE`,
     // whereas for `owner = p2`, evaluating the `ELSE 1` branch fails with a non-boolean error.
     let body = r#"
@@ -146,7 +145,6 @@ Inv == (CHOOSE m \in msgs : IF m.from = owner THEN TRUE ELSE 1).val = 7
 
 #[test]
 fn incomparable_subseteq_in_choose_predicate_is_refused_end_to_end() {
-    // Exact Codex Astra Round-2 counterexample:
     // `{1} \subseteq {"x"}` compares integer `1` with string `"x"` and errors when `owner /= p1`.
     let body = r#"
 VARIABLES owner, msgs

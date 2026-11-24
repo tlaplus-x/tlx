@@ -570,7 +570,7 @@ AliasedOuter == [<<0>> EXCEPT ![1] = 9, ![1] = Put(LAMBDA u : @)]
 
 #[test]
 fn init_membership_seeds_preserved_under_reversed_and_cyclic_equalities() {
-    // R11-#1: `Init == x \in {1, 2} /\ y = x` must retain `1, 2` for both `x` and `y`
+    // `Init == x \in {1, 2} /\ y = x` must retain `1, 2` for both `x` and `y`
     // rather than collapsing to `{0}` via reversed equality `x := y`.
     let spec = r#"---- MODULE ReversedInitEq ----
 VARIABLES x, y
@@ -589,7 +589,7 @@ ZeroSet == {0}
     assert_eq!(
         proves_var_membership(&p, &cfg, &init, &next, x_var, &zero_set),
         Some(false),
-        "R11-#1 must NOT prove x \\in {{0}} when Init allows x \\in {{1, 2}}"
+        "must NOT prove x \\in {{0}} when Init allows x \\in {{1, 2}}"
     );
     let domains: std::collections::HashMap<String, String> =
         infer_var_domains(&p, &cfg, &init, &next).unwrap().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -626,7 +626,7 @@ Next == x' = 0 /\ y' = 0
     assert_eq!(d3["x"], "Top");
     assert_eq!(d3["y"], "Top");
 
-    // R12-#2: Reconvergent Fibonacci-style equality DAG (`x2 = x0 + x1`, ..., `x44 = x42 + x43`)
+    // Reconvergent Fibonacci-style equality DAG (`x2 = x0 + x1`, ..., `x44 = x42 + x43`)
     // must memoize groundedness per branch in linear time rather than taking exponential time.
     let mut vars = vec!["x0".to_string(), "x1".to_string()];
     let mut init_terms = vec!["x0 = 0".to_string(), "x1 = x0".to_string()];
@@ -651,7 +651,7 @@ Next == x' = 0 /\ y' = 0
     assert!(t0.elapsed().as_secs() < 5, "DAG grounding took too long: {:?}", t0.elapsed());
     assert_eq!(d4["x44"], "Integer(>=0)");
 
-    // R13-#3: Long linear chain (`x0 = 0 /\ x1 = x0 /\ ... /\ x199 = x198`) indexes bindings
+    // Long linear chain (`x0 = 0 /\ x1 = x0 /\ ... /\ x199 = x198`) indexes bindings
     // once per branch and reuses completed groundedness results across all 200 variables.
     let mut chain_vars = vec!["x0".to_string()];
     let mut chain_init = vec!["x0 = 0".to_string()];

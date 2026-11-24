@@ -743,7 +743,7 @@ mod tests {
         assert_eq!(sel3.iter().map(|s| s.candidate.name.as_str()).collect::<Vec<_>>(), vec!["Q1", "Q2"]);
         assert_eq!(cert3, "cert-q1q2-36");
 
-        // Case 4 (R15-#3): 15 disjoint order-2 candidates (`C(15, 9) = 5,005` order-512 products)
+        // Case 4: 15 disjoint order-2 candidates (`C(15, 9) = 5,005` order-512 products)
         // where all singletons and pairs (`len <= 2`) certify while `len >= 3` fails. Must never
         // retry any failed product across searches and must recover a certifiable pair (`order 4`).
         let bin: Vec<autosym::SetResult> = (1..=15).map(|i| mk_proven(&format!("B{i}"), &[&format!("b{i}a"), &format!("b{i}b")])).collect();

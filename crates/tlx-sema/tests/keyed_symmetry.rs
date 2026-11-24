@@ -221,7 +221,7 @@ Inv == m["fixed"][2] = 0
 
 #[test]
 fn mixed_keyset_cardinality_declines_keyed_and_certifies_via_equiv_sym() {
-    // R11-#5: `S = Proc \cup {0}` has `Cardinality(S) = 3`; `keyed` must not replace
+    // `S = Proc \cup {0}` has `Cardinality(S) = 3`; `keyed` must not replace
     // `Cardinality(S)` with moved-key count (`2`), instead delegating cleanly to `equiv_sym`.
     let cfg = "CONSTANT Proc = {p1, p2}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let spec = r#"---- MODULE MixedCard ----
@@ -235,9 +235,6 @@ Inv == Cardinality(S) = 3
 "#;
     let proof = certificate_with("MixedCard", spec, cfg, &[vec!["p1".into(), "p2".into()]])
         .expect("mixed KeySet cardinality should certify via equiv_sym");
-    assert!(
-        !proof.contains("namespace TlxOptimization.GeneratedSymmetry"),
-        "R11-#5 keyed certifier must decline mixed KeySet Cardinality(S)"
-    );
+    assert!(!proof.contains("namespace TlxOptimization.GeneratedSymmetry"), "keyed certifier must decline mixed KeySet Cardinality(S)");
     assert!(proof.contains("namespace TlxOptimization.GeneratedEquivSymmetry"), "equiv_sym should certify mixed KeySet Cardinality(S)");
 }

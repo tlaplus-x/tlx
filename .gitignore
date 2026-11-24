@@ -1,5 +1,4 @@
 /target
-/.tlx-proofs/
 /third_party
 /corpus/out
 *.dylib

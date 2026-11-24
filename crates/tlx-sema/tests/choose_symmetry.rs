@@ -207,7 +207,7 @@ Inv == TRUE
 }
 
 #[test]
-fn codex_astra_soundness_regressions_refuse_unsound_and_certify_fixed() {
+fn choose_uniqueness_fold_and_hoisting_soundness_regressions() {
     let cfg = "CONSTANT Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let g = &[vec!["p1".into(), "p2".into(), "p3".into()]];
 
@@ -363,11 +363,11 @@ Inv == owner \in leaders
 }
 
 #[test]
-fn codex_astra_round2_non_boolean_and_incomparable_set_predicates_are_refused() {
+fn non_boolean_and_incomparable_set_predicates_in_choose_are_refused() {
     let cfg = "CONSTANT Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let g = &[vec!["p1".into(), "p2".into(), "p3".into()]];
 
-    // 1. Non-boolean CHOOSE predicate in projected MsgSet CHOOSE (exact Codex Astra counterexample):
+    // 1. Non-boolean CHOOSE predicate in projected MsgSet CHOOSE:
     // `IF m.from = owner THEN TRUE ELSE 1` fails with a non-boolean error when `owner` is not the first element.
     let non_bool_msg = r#"---- MODULE NonBoolMsgPred ----
 EXTENDS Integers
@@ -422,7 +422,7 @@ Inv == owner \in Proc
     assert!(cert_with_invs("NonBoolUniquePred", non_bool_unique, cfg, &["Inv"], g).is_none());
 
     // 2. Incomparable element domains in set operations inside CHOOSE predicates:
-    // exact Codex Astra counterexample `{1} \subseteq {"x"}`, plus `\cup`, `\cap`, `\`, `=`, `#`, `\in`, `\notin`, `Cardinality({1, "x"})`.
+    // `{1} \subseteq {"x"}`, plus `\cup`, `\cap`, `\`, `=`, `#`, `\in`, `\notin`, `Cardinality({1, "x"})`.
     for (idx, bad_expr) in [
         r#"{1} \subseteq {"x"}"#,
         r#"{1} \cup {"x"} = {1}"#,
@@ -494,13 +494,13 @@ Inv == (CHOOSE m \in msgs : IF m.from = owner THEN TRUE ELSE {bad_expr}).val = 7
 }
 
 #[test]
-fn round10_codex_astra_choose_regressions() {
+fn choose_fold_guard_prime_and_comprehension_soundness_regressions() {
     let cfg = "CONSTANT Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
     let g = &[vec!["p1".to_owned(), "p2".to_owned(), "p3".to_owned()]];
 
-    // R10-#1: `EXTENDS Naturals` has `(0 - 1) \div 2 = 0` (`div_naturals`), so `0 - n` can be `0`
+    // `EXTENDS Naturals` has `(0 - 1) \div 2 = 0` (`div_naturals`), so `0 - n` can be `0`
     // and `1 \div (0 - n)` in a CHOOSE/quantifier observation must be refused.
-    let r10_1 = r#"---- MODULE R10NatDiv ----
+    let nat_div = r#"---- MODULE NatDivZero ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLES owner, n
@@ -509,10 +509,10 @@ Next == owner' = (CHOOSE p \in Proc : p = owner) /\ UNCHANGED n
 Inv == \E p \in Proc : p = owner \/ 1 \div (0 - n) = 1
 ====
 "#;
-    assert!(cert_with_invs("R10NatDiv", r10_1, cfg, &["Inv"], g).is_none(), "R10-#1 Naturals (-1) \\div 2 = 0 must refuse");
+    assert!(cert_with_invs("NatDivZero", nat_div, cfg, &["Inv"], g).is_none(), "Naturals (-1) \\div 2 = 0 must refuse");
 
-    // R10-#2a: Discarded folded record field `z |-> Sum(Proc)` with overflowing partial sums must refuse.
-    let r10_2a = r#"---- MODULE R10FoldDiscardedOverflow ----
+    // Discarded folded record field `z |-> Sum(Proc)` with overflowing partial sums must refuse.
+    let fold_discarded_overflow = r#"---- MODULE FoldDiscardedOverflow ----
 EXTENDS Integers
 CONSTANT Proc
 VARIABLES owner, votes
@@ -527,13 +527,13 @@ Inv == (CHOOSE r \in {[key |-> p, val |-> 7, z |-> Sum(Proc)] : p \in Proc} : TR
 ====
 "#;
     assert!(
-        cert_with_invs("R10FoldDiscardedOverflow", r10_2a, cfg, &["Inv"], g).is_none(),
-        "R10-#2a discarded overflowing fold field must refuse"
+        cert_with_invs("FoldDiscardedOverflow", fold_discarded_overflow, cfg, &["Inv"], g).is_none(),
+        "discarded overflowing fold field must refuse"
     );
 
-    // R10-#2b: Discarded function-form fold `Sum[{p}]` where `Sum == [S \in SUBSET leaders |-> ...]`
+    // Discarded function-form fold `Sum[{p}]` where `Sum == [S \in SUBSET leaders |-> ...]`
     // can fail its domain check when `p \notin leaders` and must refuse.
-    let r10_2b = r#"---- MODULE R10FoldDiscardedDom ----
+    let fold_discarded_dom = r#"---- MODULE FoldDiscardedDom ----
 EXTENDS Integers
 CONSTANT Proc
 VARIABLES leaders, votes
@@ -546,13 +546,13 @@ Inv == (CHOOSE r \in {[key |-> p, val |-> 7, z |-> Sum[{p}]] : p \in Proc} : TRU
 ====
 "#;
     assert!(
-        cert_with_invs("R10FoldDiscardedDom", r10_2b, cfg, &["Inv"], g).is_none(),
-        "R10-#2b discarded function-fold with unproved SUBSET domain must refuse"
+        cert_with_invs("FoldDiscardedDom", fold_discarded_dom, cfg, &["Inv"], g).is_none(),
+        "discarded function-fold with unproved SUBSET domain must refuse"
     );
 
-    // R10-#4: CHOOSE guard after an earlier choice-bearing assignment must refuse so `postGuard`
+    // CHOOSE guard after an earlier choice-bearing assignment must refuse so `postGuard`
     // cannot disable a branch before the assignment's empty-witness CHOOSE error is raised.
-    let r10_4 = r#"---- MODULE R10GuardAfterChooseAssign ----
+    let guard_after_choose_assign = r#"---- MODULE GuardAfterChooseAssign ----
 CONSTANT Proc
 VARIABLE owner
 Init == owner \in Proc
@@ -563,13 +563,13 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        cert_with_invs("R10GuardAfterChooseAssign", r10_4, cfg, &["Inv"], g).is_none(),
-        "R10-#4 CHOOSE guard after choice-bearing assignment must refuse"
+        cert_with_invs("GuardAfterChooseAssign", guard_after_choose_assign, cfg, &["Inv"], g).is_none(),
+        "CHOOSE guard after choice-bearing assignment must refuse"
     );
 
-    // R10-#5: Record lowering in `pure_expr` must leave integer field `n |-> 7` intact while
+    // Record lowering in `pure_expr` must leave integer field `n |-> 7` intact while
     // splitting Boolean field `same |-> p = owner` (and must NOT substitute TRUE/FALSE for 7).
-    let r10_5 = r#"---- MODULE R10RecordFieldSplit ----
+    let record_field_split = r#"---- MODULE RecordFieldSplit ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLES owner, info
@@ -582,17 +582,17 @@ Next ==
 Inv == \A p \in Proc : info[p].n = 7 /\ (info[p].same <=> (p = owner))
 ====
 "#;
-    let cert = cert_with_invs("R10RecordFieldSplit", r10_5, cfg, &["Inv"], g)
-        .expect("R10-#5 record with integer + key-equality Boolean field should certify");
+    let cert = cert_with_invs("RecordFieldSplit", record_field_split, cfg, &["Inv"], g)
+        .expect("record with integer + key-equality Boolean field should certify");
     assert!(
         cert.contains(r#"\"n\",\n                Expr {\n                    kind: Num(\n                        7,"#)
             && !cert.contains(r#"\"n\",\n                Expr {\n                    kind: Bool("#),
-        "R10-#5 certificate must keep integer literal 7 on field `n` rather than substituting Bool"
+        "certificate must keep integer literal 7 on field `n` rather than substituting Bool"
     );
 
-    // R11-#2: Synthetic fold cache must distinguish operator fold `A(Proc)` from function fold
+    // Synthetic fold cache must distinguish operator fold `A(Proc)` from function fold
     // `B[Proc]` (`B[S \in SUBSET {}]`) so out-of-domain `B[Proc]` is never replaced by `A(Proc)`'s hole.
-    let r11_2 = r#"---- MODULE R11FoldCacheDom ----
+    let fold_cache_dom = r#"---- MODULE FoldCacheDom ----
 EXTENDS Integers
 CONSTANT Proc
 VARIABLES votes, m1, m2
@@ -611,13 +611,13 @@ Inv == \A p \in Proc : m1[p] >= 0
 ====
 "#;
     assert!(
-        cert_with_invs("R11FoldCacheDom", r11_2, cfg, &["Inv"], g).is_none(),
-        "R11-#2 out-of-domain function fold B[Proc] must not reuse cached hole from A(Proc)"
+        cert_with_invs("FoldCacheDom", fold_cache_dom, cfg, &["Inv"], g).is_none(),
+        "out-of-domain function fold B[Proc] must not reuse cached hole from A(Proc)"
     );
 
-    // R11-#3: Existential quantifier `\E y \in {} : ...` after a CHOOSE assignment must not hoist
+    // Existential quantifier `\E y \in {} : ...` after a CHOOSE assignment must not hoist
     // ahead of the assignment's empty-witness CHOOSE error.
-    let r11_3 = r#"---- MODULE R11ExistsAfterChoose ----
+    let exists_after_choose = r#"---- MODULE ExistsAfterChoose ----
 CONSTANT Proc
 VARIABLES owner, other
 Init == owner \in Proc /\ other \in Proc
@@ -628,13 +628,13 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        cert_with_invs("R11ExistsAfterChoose", r11_3, cfg, &["Inv"], g).is_none(),
-        "R11-#3 existential bound after CHOOSE assignment must refuse"
+        cert_with_invs("ExistsAfterChoose", exists_after_choose, cfg, &["Inv"], g).is_none(),
+        "existential bound after CHOOSE assignment must refuse"
     );
 
-    // R11-#4: Primed CHOOSE `((CHOOSE r \in ...).val)'` must not hoist across `Prime` into pre-state
+    // Primed CHOOSE `((CHOOSE r \in ...).val)'` must not hoist across `Prime` into pre-state
     // (including when an unprimed copy was cached earlier in the same branch).
-    let r11_4 = r#"---- MODULE R11PrimedChooseHoist ----
+    let primed_choose_hoist = r#"---- MODULE PrimedChooseHoist ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLES n, m
@@ -645,9 +645,12 @@ Next ==
 Inv == \A p \in Proc : m[p] = n
 ====
 "#;
-    assert!(cert_with_invs("R11PrimedChooseHoist", r11_4, cfg, &["Inv"], g).is_none(), "R11-#4 hoisting CHOOSE across Prime must refuse");
+    assert!(
+        cert_with_invs("PrimedChooseHoist", primed_choose_hoist, cfg, &["Inv"], g).is_none(),
+        "hoisting CHOOSE across Prime must refuse"
+    );
 
-    let r11_4_cached = r#"---- MODULE R11PrimedChooseCached ----
+    let primed_choose_cached = r#"---- MODULE PrimedChooseCached ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLES n, pre, post
@@ -660,13 +663,13 @@ Inv == post = n
 ====
 "#;
     assert!(
-        cert_with_invs("R11PrimedChooseCached", r11_4_cached, cfg, &["Inv"], g).is_none(),
-        "R11-#4 cached CHOOSE must not rewrite inside Prime"
+        cert_with_invs("PrimedChooseCached", primed_choose_cached, cfg, &["Inv"], g).is_none(),
+        "cached CHOOSE must not rewrite inside Prime"
     );
 
-    // R12-#1: `IF Bad THEN (\E p \in empty : ...) ELSE (\E p \in empty : ...)` must not hoist
+    // `IF Bad THEN (\E p \in empty : ...) ELSE (\E p \in empty : ...)` must not hoist
     // arm-level existential bounds ahead of the `CHOOSE`-bearing `IF` condition.
-    let r12_1 = r#"---- MODULE R12IfCondChooseBeforeArmBounds ----
+    let if_cond_choose = r#"---- MODULE IfCondChooseBeforeArmBounds ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLES empty, m
@@ -679,13 +682,13 @@ Inv == \A p \in Proc : m[p] = 0
 ====
 "#;
     assert!(
-        cert_with_invs("R12IfCondChooseBeforeArmBounds", r12_1, cfg, &["Inv"], g).is_none(),
-        "R12-#1 IF condition with CHOOSE before existential arm bounds must refuse"
+        cert_with_invs("IfCondChooseBeforeArmBounds", if_cond_choose, cfg, &["Inv"], g).is_none(),
+        "IF condition with CHOOSE before existential arm bounds must refuse"
     );
 
-    // R17-#1: Non-nullary `Id(owner') = ...` in `choose_sym` must also refuse rather than normalizing
+    // Non-nullary `Id(owner') = ...` in `choose_sym` must also refuse rather than normalizing
     // into an assignment target that `Enumerator::target` rejects.
-    let r17_1_choose = r#"---- MODULE R17ChooseNonNullaryTarget ----
+    let choose_non_nullary_target = r#"---- MODULE ChooseNonNullaryTarget ----
 CONSTANT Proc
 VARIABLE owner
 Id(t) == t
@@ -695,14 +698,14 @@ Inv == owner \in Proc
 ====
 "#;
     assert!(
-        cert_with_invs("R17ChooseNonNullaryTarget", r17_1_choose, cfg, &["Inv"], g).is_none(),
-        "R17-#1 `Id(owner') = CHOOSE ...` must refuse"
+        cert_with_invs("ChooseNonNullaryTarget", choose_non_nullary_target, cfg, &["Inv"], g).is_none(),
+        "`Id(owner') = CHOOSE ...` must refuse"
     );
 
-    // R17-#2: Message comprehension in `Init` whose payload depends on an enclosing existential
+    // Message comprehension in `Init` whose payload depends on an enclosing existential
     // witness (`\E a, b \in Proc : msgs = {[from |-> p, val |-> IF a = b THEN 7 ELSE 8] : p \in Proc}`)
     // cannot be represented by core-only `MsgInit.comprehensionCore` and must refuse.
-    let r17_2_msg_init_witness = r#"---- MODULE R17MsgInitOuterWitness ----
+    let msg_init_witness = r#"---- MODULE MsgInitOuterWitness ----
 EXTENDS Naturals
 CONSTANT Proc
 VARIABLE msgs
@@ -712,7 +715,7 @@ Inv == (CHOOSE m \in msgs : TRUE).val = 7
 ====
 "#;
     assert!(
-        cert_with_invs("R17MsgInitOuterWitness", r17_2_msg_init_witness, cfg, &["Inv"], g).is_none(),
-        "R17-#2 outer Init witness inside message comprehension payload must refuse"
+        cert_with_invs("MsgInitOuterWitness", msg_init_witness, cfg, &["Inv"], g).is_none(),
+        "outer Init witness inside message comprehension payload must refuse"
     );
 }
