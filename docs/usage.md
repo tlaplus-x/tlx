@@ -612,12 +612,14 @@ Proven symmetry: define Perms == Permutations(Key) \cup Permutations(Val) \cup P
 
 ### 6.3. Automatic symmetry in the default mode
 
-Automatic symmetry currently supports one full group over fixed-domain maps with
-identifier-free payloads. Each application emits connected Lean before search,
-without invoking Lean. The [certificate coverage](optimization.md#certified-keyed-symmetry)
-describes supported expressions and trusted layers. The Rust candidate analysis,
-bounded checks and runtime guards cannot substitute for this certificate; the
-development force setting cannot bypass the gate.
+Automatic symmetry applies a disjoint product of full groups (two to six model
+values each, total order at most 720) when backed by a connected Lean certificate
+(`KeyedCertificate`, `EquivSymCertificate`, or `ChooseSymCertificate`). Each
+application emits standalone Lean before search, without invoking Lean. The
+[certificate coverage](optimization.md#certified-keyed-symmetry) describes
+supported shapes, expressions, and trusted layers. The Rust candidate analysis and
+bounded checks cannot substitute for this certificate; the development force
+setting cannot bypass the gate.
 
 Other candidates remain available through analysis and `-checksymmetry -suggest`.
 Their refusal is recorded in the `auto symmetry` section of `-stats`. Explicit user

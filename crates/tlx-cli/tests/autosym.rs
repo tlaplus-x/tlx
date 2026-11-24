@@ -273,25 +273,24 @@ fn certified_choice_symmetry_reduces_in_every_tier() {
 
 #[test]
 fn unproved_late_choice_keeps_the_original_search() {
-    // After the bounded probe, candidate projections first disagree. The
-    // chosen field then depends on the order of renamed process identities.
+    // Projected field value depends on state-dependent process pc values, so
+    // ChooseSymCertificate refuses it and the full unreduced search runs.
     let body = "VARIABLES pc, n\nInit == pc = [p \\in Proc |-> 0] /\\ n = 0\n\
         Next == (n < 15 /\\ n' = n + 1 /\\ UNCHANGED pc) \\/ (n = 15 /\\ \\E p \\in Proc : pc[p] = 0 /\\ pc' = [pc EXCEPT ![p] = 1] /\\ UNCHANGED n)\n\
         Inv == (CHOOSE m \\in {[from |-> p, val |-> pc[p]] : p \\in Proc} : TRUE).val = 0";
     for tier in ["-interp", "-compile"] {
         let reference = run(body, "INVARIANT Inv", &[tier, "-noautosymmetry"], &[]);
-        let guarded = run(body, "INVARIANT Inv", &[tier], &[("TLX_PARANOID", "1"), ("TLX_PRERUN", "1")]);
+        let default_run = run(body, "INVARIANT Inv", &[tier], &[("TLX_PARANOID", "1"), ("TLX_PRERUN", "1")]);
         assert_eq!(reference.code, 12, "{}", reference.text());
-        assert_eq!(guarded.code, reference.code, "{}", guarded.text());
-        assert!(!guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
+        assert_eq!(default_run.code, reference.code, "{}", default_run.text());
         let counts = |s: &str| s.lines().find(|s| s.contains("states generated,")).unwrap().to_string();
-        assert_eq!(counts(&guarded.stdout), counts(&reference.stdout));
-        assert!(!guarded.stdout.contains("(symmetry-reduced)"), "{}", guarded.text());
+        assert_eq!(counts(&default_run.stdout), counts(&reference.stdout));
+        assert!(!default_run.stdout.contains("(symmetry-reduced)"), "{}", default_run.text());
     }
 }
 
 #[test]
-fn unproved_guard_candidates_are_not_evaluated() {
+fn unproved_choice_does_not_evaluate_extra_candidates() {
     let body = "VARIABLES n, msgs\n\
         Init == n = 0 /\\ msgs = {[flag |-> f, from |-> p, val |-> 7] : f \\in {0, 1}, p \\in Proc}\n\
         Next == n < 16 /\\ n' = n + 1 /\\ UNCHANGED msgs\n\
@@ -299,10 +298,9 @@ fn unproved_guard_candidates_are_not_evaluated() {
     for env in [vec![], vec![("TLX_NO_NATIVE", "1")], vec![("TLX_PARANOID", "1")], vec![("TLX_JIT", "only")]] {
         let mut env = env;
         env.extend([("TLX_PRERUN", "1"), ("TLX_PRERUN_REUSE", "0")]);
-        let guarded = run(body, "INVARIANT Inv", &["-compile"], &env);
-        assert_eq!(guarded.code, 0, "{}", guarded.text());
-        assert!(!guarded.stdout.contains("restarting without automatic symmetry"), "{}", guarded.text());
-        assert!(guarded.stdout.contains("17 distinct states found, 0 states left on queue."), "{}", guarded.text());
+        let default_run = run(body, "INVARIANT Inv", &["-compile"], &env);
+        assert_eq!(default_run.code, 0, "{}", default_run.text());
+        assert!(default_run.stdout.contains("17 distinct states found, 0 states left on queue."), "{}", default_run.text());
     }
 }
 

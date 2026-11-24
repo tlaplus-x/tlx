@@ -352,18 +352,10 @@ fn choose_of_the_only_satisfying_element_is_symmetric() {
 }
 
 #[test]
-fn projection_proof_requires_installed_runtime_obligations() {
+fn projected_choice_without_static_uniqueness_is_rejected_by_analyzer() {
     let body = "VARIABLE msgs\nInit == msgs = {[from |-> p, val |-> 1] : p \\in Proc}\n\
                 Next == UNCHANGED msgs /\\ (CHOOSE m \\in msgs : TRUE).val = 1";
-    let model = try_load_with(&tlx_testkit::module("M", &format!("{HEAD}{body}")), CFG).unwrap();
-    assert!(autosym::analyze(&model).proven().next().is_none());
-    let conditional = autosym::analyze_guarded(&model);
-    assert_eq!(conditional.group_text(), "Permutations(Proc)");
-    assert_eq!(conditional.guards.len(), 1);
-    // A second use that exposes the whole ordered choice is still rejected.
-    let body = body.replace("Next ==", "Next == (CHOOSE m \\in msgs : TRUE) \\in msgs /\\");
-    let model = try_load_with(&tlx_testkit::module("M", &format!("{HEAD}{body}")), CFG).unwrap();
-    assert!(autosym::analyze_guarded(&model).proven().next().is_none());
+    assert_rejected(body, "CHOOSE", line_of(body, "CHOOSE"));
 }
 
 #[test]

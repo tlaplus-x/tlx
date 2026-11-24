@@ -210,7 +210,7 @@ pub static KNOBS: &[Knob] = &[
         .meta("N")
         .blank_unset(),
     opt_num("TLX_SYMMETRY_PARANOID", D, "tlx-eval", "a number of states", "check a symmetry tlx applies without a declaration at one expanded state in N: every generator must map the state's successors, invariants and constraints to its image's; a mismatch exits with 101").meta("N"),
-    text("TLX_AUTOSYM_FORCE", T, CLI, "", "testing: treat these sets of model values (constants, comma-separated) as proven symmetric and apply them, to test TLX_SYMMETRY_PARANOID and the bounded cross-check").meta("NAMES"),
+    text("TLX_AUTOSYM_FORCE", T, CLI, "", "testing: mark these sets of model values (constants, comma-separated) as candidate symmetric sets despite static-analysis rejection (still requires a connected Lean certificate to apply)").meta("NAMES"),
     Knob::new("TLX_STATS_SAMPLE", Kind::Num { default: 8, min: 1 }, D, CLI, "-stats: time one state expansion in N")
         .what("a positive integer")
         .meta("N")

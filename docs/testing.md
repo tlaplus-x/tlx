@@ -731,9 +731,9 @@ class and per allowed class of operations; `tlx-cli/tests/autosym.rs`):
   diagnostic; a witness is an internal error (exit 101). Run it over the corpus after changes to
   the analysis (`model/autosym`), also with `-symmetrystates 20000`.
 - `TLX_SYMMETRY_PARANOID=N` checks the applied group at one expanded state in N (1: every state)
-  in both tiers and fails with exit 101 on a mismatch. `TLX_AUTOSYM_FORCE=Set,...` applies sets as
-  if proven, to show that the check (and the bounded cross-check before the search) catches a wrong
-  proof:
+  in both tiers and fails with exit 101 on a mismatch. `TLX_AUTOSYM_FORCE=Set,...` marks candidate
+  sets despite static-analysis rejection while still requiring a connected Lean certificate before
+  application:
 
   ```sh
   python3 scripts/verify.py HEAD --quick --suites corpus-default --env TLX_SYMMETRY_PARANOID=1000

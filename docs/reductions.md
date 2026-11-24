@@ -2,8 +2,8 @@
 
 This page documents the automatic-symmetry candidate analysis and the general search
 contract. Automatic application requires a compiler-generated Lean certificate
-connected to the reduction. Fixed-domain keyed maps now have that certificate;
-other shapes below describe candidate analysis awaiting connected proofs.
+connected to the reduction (`KeyedCertificate`, `EquivSymCertificate`, or
+`ChooseSymCertificate`); unproved reduction algorithms are not kept in the codebase.
 [optimization.md](optimization.md#proof-coverage) owns the current certificate inventory
 and enabled opt-in state projections. [compat.md](compat.md) owns compatibility,
 [usage.md](usage.md) owns user behavior, and [configuration.md](configuration.md) owns options.
@@ -41,9 +41,9 @@ registers, `RandomElement` at state level, IO) is not reduced, with a one-line n
 
 ### 1.3 Classes
 
-- **Class A, default-eligible.** Sound, exhaustive, and proven to apply. Automatic symmetry is the
-  implemented candidate, currently gated off pending a connected certificate; each one has an explicit off switch
-  (`-noautosymmetry`) for diagnosis.
+- **Class A, default-eligible.** Sound, exhaustive, and proven to apply with a connected Lean
+  certificate. Certified automatic symmetry is enabled in the default mode and has an explicit off
+  switch (`-noautosymmetry`) for diagnosis.
 - **Class B, explicit.** Gives up exhaustiveness, or rests on an unproven assumption. It needs a
   flag that names what is given up, and a "no violation found" result is labelled incomplete. No
   class B technique is implemented, so no such flag exists today (§5).
@@ -53,8 +53,9 @@ registers, `RandomElement` at state level, IO) is not reduced, with a one-line n
 ## 2. Automatic symmetry
 
 A CONSTANT whose cfg value is a set of model values names interchangeable identities in most specs,
-but users forget to declare it. tlx looks for those sets, proves which of them the spec is invariant
-under. Application is gated off pending a connected Lean certificate. The reduction itself is
+but users forget to declare it. tlx looks for those sets, screens candidates statically, and applies
+disjoint products of full groups only when a connected Lean certificate (`KeyedCertificate`,
+`EquivSymCertificate`, or `ChooseSymCertificate`) proves the reduction. The reduction itself is
 TLC's: the search explores one representative per orbit, and the counts of a reduced run are the
 counts of the quotient.
 
@@ -88,14 +89,7 @@ The analysis is bounded, and a bound is not a proof of the contrary: it stops at
 frames, 4,000,000 steps and 12 passes, analyzes at most 64 candidates, and marks itself *incomplete*
 when a bound is reached, in which case nothing is applied.
 
-### 2.3 Runtime guards
-
-The legacy analysis can attach runtime guards to some `CHOOSE` candidates. Those
-claims do not have connected certificates and cannot authorize automatic
-application. The guard/restart implementation is retained for diagnostics and
-future proof work. Ordinary checking leaves these candidates unreduced.
-
-### 2.4 The bounded cross-check
+### 2.3 The bounded cross-check
 
 Before a group is applied, a bounded cross-check of the group runs as a cross-check of the proof
 (`symcheck::check_perms`) on the **unreduced** system: for each of at most 1000 states, up to 10
@@ -103,13 +97,13 @@ levels deep, at most 100 permutations and 10000 edges, it compares `Init` member
 VIEW commutation, state constraints, successor sets in both directions, action constraints and
 action properties. The check has a 20 ms wall-clock budget and is reported as its own phase in
 `-stats`. A witness from a group that was *proven* is an internal error and exits 101, because the
-certificate and the bounded check disagree. Runtime-guarded claims are not applied.
+certificate and the bounded check disagree.
 
 A group larger than 720 elements is not applied: the search tries every element of the group on each
 state it finds, so the cost of the canonical form grows with the group. Skipped groups are named
 under `-stats`.
 
-### 2.5 When it is applied
+### 2.4 When it is applied
 
 Application happens once, after the model is built and before the search, and only in the default
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
@@ -127,14 +121,15 @@ successful bounded run is evidence, never a proof, and a run that hit a bound sa
 `Symmetry check incomplete` and exits 2 instead of reporting either. `-checksymmetry -suggest` runs
 the same check for the candidates the analysis could not prove.
 
-### 2.6 Guarantees
+### 2.5 Guarantees
 
-The connected keyed-state certificate preserves **V-safe** and **CEX** within its
-supported observation set: state invariants and deadlocks. Initialization and
-successors correspond, and every reduced violation has a concrete witness.
-Counts and depths describe the quotient. Temporal properties exclude automatic
-application. See [the certificate scope](optimization.md#certified-keyed-symmetry)
-for the distinction between formal orbit keys and trusted runtime canonicalization.
+The connected symmetry certificates (`KeyedCertificate`, `EquivSymCertificate`, and
+`ChooseSymCertificate`) preserve **V-safe** and **CEX** within their supported
+observation set: state invariants and deadlocks. Initialization and successors
+correspond, and every reduced violation has a concrete witness. Counts and depths
+describe the quotient. Temporal properties exclude automatic application. See
+[the certificate scope](optimization.md#certified-keyed-symmetry) for the
+distinction between formal orbit keys and trusted runtime canonicalization.
 
 ## 3. The labelling contract
 
@@ -151,9 +146,7 @@ implement:
   optimization the recorded samples name, `none` means every recorded sample states an empty list,
   and `unknown` means the record does not state it. The column speaks for the tlx side only - a TLC
   baseline may declare its own `SYMMETRY` - so it does not by itself claim what the other side
-  explored;
-- the label is cleared when a guarded reduction restarts, so a restarted run never claims a reduction
-  it no longer has.
+  explored.
 
 A reduction does not change any exit code: V-safe means the verdict, and therefore the exit code, is
 the parity contract's. [usage.md](usage.md) section 10.3 owns the exit-code table.
@@ -185,10 +178,9 @@ were measured and ranked; the ranking and the reasons are in the archived propos
   proven operation class and per breaker class, asserting the exact rejection and its location.
 - `crates/tlx-cli/tests/autosym.rs` — the suggestion under `-tlc`, application in the default mode,
   `-noautosymmetry`, a violation keeping TLC's trace length, temporal properties and `PrintT` keeping
-  the full search, the checkpoint recording the group, `-checksymmetry -suggest`, the paranoid check
-  catching a wrong proof, `TLX_AUTOSYM_FORCE` and the guarded `CHOOSE` case, a late guard failure
-  restarting the unreduced search, and the exact `optimizations` JSON with the dump header and the
-  tool message code.
+  the full search, `-checksymmetry -suggest`, `TLX_AUTOSYM_FORCE` failing closed without a connected
+  certificate, certified and uncertified `CHOOSE` cases across tiers, multi-group product selection,
+  and the exact `optimizations` JSON with the dump header and the tool message code.
 - `crates/tlx-cli/tests/symcheck.rs` — the declared-symmetry diagnostic: each predicate checked
   independently, an inconclusive cutoff never reported as a violation, `VIEW` commutation, and the
   diagnostic forcing the interpreter and one worker under `-compile`.
@@ -197,5 +189,3 @@ were measured and ranked; the ranking and the reasons are in the archived propos
 - `scripts/autosym_mutants.py` (with `scripts/tests/test_autosym_mutants.py`) — mutation tests: invariant
   and deadlock mutants derived from the unreduced state graph must be found in the default mode with
   the `-tlc` depth and trace length, and a default run that was not reduced is a failure, not a pass.
-- `scripts/autosym_guards.py` — guarded runs against small TLC declared-symmetry oracles across the
-  interpreter, closure, C and JIT executors, including the restart case.

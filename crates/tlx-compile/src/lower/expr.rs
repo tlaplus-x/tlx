@@ -27,35 +27,6 @@ impl Lowerer<'_> {
         to_val(x)
     }
 
-    /// A projected CHOOSE with an exhaustive equality obligation. Ordinary
-    /// IR loops keep the success path native in closure, C and JIT tiers.
-    fn guarded_choice(&mut self, e: &hir::Expr, choice: &tlx_eval::model::autosym::guard::Choice, env: &LEnv, st: &St) -> Expr {
-        let BoundVars::Many(vars) = &choice.vars else { return self.interp(e, env) };
-        let [local] = vars.as_slice() else { return self.interp(e, env) };
-        let set = self.expr(&choice.set, env, st);
-        let (set, ety) = self.typed_iter_in(set, false);
-        let source = self.temp(set.ty);
-        let source_ref = temp_ref(set.ty, source);
-        let elem = self.iter_temp(ety, &source_ref);
-        let bound = env.bind(*local, LBind::Ir(temp_ref(ety, elem)));
-        let pred = self.bool_expr(&choice.pred, &bound, st);
-        let selected = Expr::new(ety, ExprKind::Choose { bind: elem, set: source_ref.clone(), body: pred.clone() });
-        let first = self.temp(ety);
-        let first_env = env.bind(*local, LBind::Ir(temp_ref(ety, first)));
-        let local_expr = hir::Expr::new(H::Local(*local), e.span);
-        let answer = self.typed_field(&local_expr, &choice.field, &first_env, st);
-        let answer = to_val(answer);
-        let result = self.temp(answer.ty);
-        let projected = self.typed_field(&local_expr, &choice.field, &bound, st);
-        let same = eq(to_val(projected), temp_ref(Ty::Val, result));
-        let all = Expr::new(Ty::Bool, ExprKind::Forall { bind: elem, set: source_ref, body: or(vec![not(pred), same]) });
-        // A failed guard uses the interpreter to latch the failure. Any
-        // evaluation error in a guarded search also causes a clean retry.
-        let fail = self.interp(e, env);
-        let out = Expr::new(Ty::Val, ExprKind::If(all, temp_ref(Ty::Val, result), fail));
-        let_in([(result, answer), (first, selected), (source, set)], out)
-    }
-
     /// `UNCHANGED e` as a boolean expression.
     pub(super) fn unchanged_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
         let u = hir::Expr::new(H::Builtin { op: B::Unchanged, args: vec![e.clone()] }, e.span);
@@ -77,9 +48,6 @@ impl Lowerer<'_> {
     }
 
     fn expr_lowered(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
-        if let Some(choice) = self.ip.symmetry_choice(e).cloned() {
-            return self.guarded_choice(e, &choice, env, st);
-        }
         if let Some(v) = self.const_value(e, env) {
             return const_expr(v);
         }

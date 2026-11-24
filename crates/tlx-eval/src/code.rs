@@ -169,8 +169,7 @@ impl Interp {
     #[inline]
     pub(crate) fn code_of(&self, e: &Expr) -> Option<&Code> {
         let id = self.prog.expr_id(e)?;
-        let codes = self.symmetry_guards.get().map_or(&self.codes, |g| &g.codes);
-        let slot = codes.get(id.index())?;
+        let slot = self.codes.get(id.index())?;
         Some(slot.get_or_init(|| self.compile(e)))
     }
 
@@ -181,9 +180,6 @@ impl Interp {
     /// The code of `e`; with `hoist`, its largest closed constant
     /// subexpressions are hoisted (`Node::Hoist`).
     fn compile_in(&self, e: &Expr, hoist: bool) -> Code {
-        if self.symmetry_choice(e).is_some() {
-            return Code { node: Node::Tree(e.clone()), span: e.span };
-        }
         if hoist && hoistable(e) && self.closed(e, &mut Vec::new()) {
             let inner = self.compile_in(e, false);
             if matches!(inner.node, Node::Lit(_) | Node::Shared(..)) {

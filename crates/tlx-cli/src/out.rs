@@ -29,11 +29,6 @@ pub fn set_reduced(what: &'static str) {
     *REDUCED.lock().unwrap() = Some(what);
 }
 
-/// Discard the label when a guarded reduction restarts.
-pub fn clear_reduced() {
-    *REDUCED.lock().unwrap() = None;
-}
-
 /// What reduced the search, if anything (`set_reduced`).
 pub fn reduced() -> Option<&'static str> {
     *REDUCED.lock().unwrap()

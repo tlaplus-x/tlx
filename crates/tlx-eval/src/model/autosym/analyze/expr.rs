@@ -22,20 +22,6 @@ impl<'a> Analyzer<'a> {
         if self.overflow {
             return Sh::any(ALL);
         }
-        if self.allow_guards {
-            if let Some(choice) = super::super::guard::projection(self.ip, e) {
-                let mark = self.locals.len();
-                let el = self.expr(&choice.set).elems();
-                self.bind_vars(&choice.vars, &el);
-                self.expr(&choice.pred);
-                self.locals.truncate(mark);
-                let result = el.field(&choice.field);
-                if el.mask() != 0 {
-                    self.guards.insert(super::super::guard::key(e), choice);
-                }
-                return result;
-            }
-        }
         match &*e.kind {
             ExprKind::Num(_) | ExprKind::Decimal(_) | ExprKind::Str(_) | ExprKind::Bool(_) => Sh::plain(),
             ExprKind::Var(v) => self.vars[v.idx()].clone(),

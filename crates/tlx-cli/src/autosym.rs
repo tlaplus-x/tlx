@@ -19,7 +19,7 @@ use crate::stats;
 /// the default mode apply the proven group when that is allowed and name
 /// the optimizations of the run. The symmetry applied, if any; an internal
 /// error (exit 101) if the cross-check of the proof finds a witness.
-pub fn run(model: &mut InterpModel, a: &Args, _guards_allowed: bool) -> Result<Option<Applied>, ExitCode> {
+pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCode> {
     if a.checksymmetry {
         return Ok(None);
     }
@@ -34,8 +34,7 @@ pub fn run(model: &mut InterpModel, a: &Args, _guards_allowed: bool) -> Result<O
     }
     let mut an = autosym::analyze(model);
     // Promote `CHOOSE`-rejected candidates only when a connected Lean
-    // choice-symmetry certificate (`ChooseSymCertificate`) proves them statically;
-    // uncertified runtime guards are never installed.
+    // choice-symmetry certificate (`ChooseSymCertificate`) proves them statically.
     let mut precertified: Option<Precertified> = None;
     if (a.tlc || !a.noautosymmetry)
         && tlx_base::knobs::Env::process().string_or_default("TLX_AUTOSYM_FORCE").trim().is_empty()
@@ -120,8 +119,7 @@ pub fn run(model: &mut InterpModel, a: &Args, _guards_allowed: bool) -> Result<O
 fn report(an: &Analysis) {
     let mut text = String::new();
     for s in an.proven() {
-        let proof = if an.guards.is_empty() { "proven" } else { "conditional, runtime guard" };
-        text.push_str(&format!("{}: {proof} {}\n", s.candidate.name, s.group_text().unwrap_or_default()));
+        text.push_str(&format!("{}: proven {}\n", s.candidate.name, s.group_text().unwrap_or_default()));
     }
     for line in an.rejections() {
         text.push_str(&line);
@@ -213,7 +211,7 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
     }
     model.apply_symmetry(gens);
     model.record_symmetry_certificate(certificate);
-    Ok(Some(Applied { group: text, forced: false, guarded: false }))
+    Ok(Some(Applied { group: text }))
 }
 
 #[derive(Clone)]
@@ -579,7 +577,6 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
 
 fn promote_certified_choices(model: &InterpModel, an: &mut Analysis) -> Option<Precertified> {
     let mut trial = an.clone();
-    trial.guards.clear();
     for s in &mut trial.sets {
         if matches!(&s.verdict, autosym::Verdict::Rejected { what, .. } if what == "CHOOSE") {
             s.verdict = autosym::Verdict::Proven { classes: vec![s.candidate.elems.clone()], pinned_by: Vec::new() };
@@ -590,17 +587,12 @@ fn promote_certified_choices(model: &InterpModel, an: &mut Analysis) -> Option<P
     let names: Vec<String> = selected.iter().map(|s| s.candidate.name.clone()).collect();
     let group_text = selected.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
     let certified_names: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
-    let mut promoted_any = false;
     for s in &mut an.sets {
         if certified_names.contains(s.candidate.name.as_str())
             && matches!(&s.verdict, autosym::Verdict::Rejected { what, .. } if what == "CHOOSE")
         {
             s.verdict = autosym::Verdict::Proven { classes: vec![s.candidate.elems.clone()], pinned_by: Vec::new() };
-            promoted_any = true;
         }
-    }
-    if promoted_any {
-        an.guards.clear();
     }
     Some(Precertified { names, group_text, certificate })
 }
@@ -609,9 +601,6 @@ fn promote_certified_choices(model: &InterpModel, an: &mut Analysis) -> Option<P
 pub struct Applied {
     /// The group, as TLA+ text (`Permutations(RM) x Permutations(Acceptor)`).
     pub group: String,
-    /// Forced by `TLX_AUTOSYM_FORCE` (not proven).
-    pub forced: bool,
-    pub guarded: bool,
 }
 
 /// Name the optimizations of a run in the default mode (docs/usage.md
@@ -623,30 +612,16 @@ fn label(applied: Option<&Applied>) {
         tlx_runtime::stats::set_json("optimizations", "[]".into());
         return;
     };
-    let proof = if a.forced {
-        "forced by TLX_AUTOSYM_FORCE, not proven"
-    } else if a.guarded {
-        "runtime guard"
-    } else {
-        "certificate generated"
-    };
     out::info(
         code::OPTIMIZATIONS_USED,
         &format!(
-            "Optimizations: symmetry {} ({proof}; safety checks only).\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics.",
+            "Optimizations: symmetry {} (certificate generated; safety checks only).\nCounts refer to the reduced search; run with -tlc for TLC-identical statistics.",
             a.group
         ),
     );
     out::set_reduced("symmetry");
     let json = format!(
-        "[{{\"name\":\"symmetry\",\"scope\":\"safety\",\"proof\":\"{}\",\"preserved\":[\"V-safe\",\"CEX\"],\"detail\":{}}}]",
-        if a.forced {
-            "none"
-        } else if a.guarded {
-            "runtime guard"
-        } else {
-            "generated-lean"
-        },
+        "[{{\"name\":\"symmetry\",\"scope\":\"safety\",\"proof\":\"generated-lean\",\"preserved\":[\"V-safe\",\"CEX\"],\"detail\":{}}}]",
         json_string(&a.group)
     );
     tlx_runtime::stats::set_json("optimizations", json);

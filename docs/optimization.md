@@ -49,7 +49,7 @@ Ordinary checking emits Lean without invoking Lean; development verification is 
 | Immutable live versions | Singleton seed, fresh append/frame transfers, explicit live-root payload feedback and retained-table key equivalence | Enabled within this subset |
 | Automatic keyed symmetry | Disjoint products of full groups; fixed/mixed maps, scalar/optional key slots, sets of keys, sets of single-key tagged records, fixed records, cardinalities, multi-writer and whole-map writes; permutation quotient | Enabled within this certified subset; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | Disjoint products of full groups; recursive finite values (key-valued and nested maps, multi-key records, bounded sequences/tuples, finite sets, comprehensions, `KSubset`, `IsInjective`) and equivariant HIR formulas; permutation quotient | Enabled as fallback when `KeyedCertificate` declines and no `CHOOSE` over keys is used |
-| Automatic choice-irrelevant symmetry | Disjoint products of full groups; unique-witness key `CHOOSE` (`ChooseOne`, at-most-one active key), projected uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`); inductive invariant + permutation quotient | Enabled as fallback when `CHOOSE` is used within this certified subset; runtime-guarded claims remain uncertified |
+| Automatic choice-irrelevant symmetry | Disjoint products of full groups; unique-witness key `CHOOSE` (`ChooseOne`, at-most-one active key), projected uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`); inductive invariant + permutation quotient | Enabled as fallback when `CHOOSE` is used within this certified subset; unproved `CHOOSE` forms stay unreduced |
 | Counter export and its cleanup pipeline | Closed before/after transition IR, inductive domains and pass composition | Enabled for the restricted scalar fragment |
 | Projection composed with symmetry | Unobserved-variable transfers and keyed operations share one source IR; erasure and orbit certificates compose | Enabled for certified variable erasure plus certified keyed group(s) |
 
@@ -117,7 +117,7 @@ from adjacent-transposition generators, and runtime representative selection
 the formal quotient, not the Rust canonicalizer implementation.
 
 Automatic application requires the connected certificate even for a forced
-candidate. Runtime guards and bounded checks cannot substitute for it. The CLI
+candidate. Bounded checks cannot substitute for it. The CLI
 searches `autosym`'s proven full-group candidates (up to order 720, within a
 bounded certification budget) for the largest-order certifiable disjoint
 product subset and writes mandatory Lean before exploration, including without

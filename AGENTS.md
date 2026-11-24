@@ -47,12 +47,15 @@ defect: document the evidence and the intentional difference in `docs/compat.md`
   supported checking mode requires it. Shared lemmas, serialized plans, tests and matching
   state counts do not satisfy this requirement. Do not assume the preservation obligations
   as certificate premises or introduce placeholder proofs or custom correctness axioms.
-- For new or changed reductions, explicitly verify the generated certificate with Lean
-  before declaring the implementation complete; audit its axioms and test that relevant
-  broken transformations are rejected. State the theorem's scope and every trusted layer,
-  including source lowering and runtime execution. Existing reductions without connected
-  certificates are unfinished proof work, not exceptions to this requirement. Ordinary
-  `tlx check -optimize` still emits Lean without invoking a verifier unless requested.
+- For automatic symmetry and state-reducing optimizations, every implemented reduction
+  algorithm in the codebase must have a connected compiler-generated Lean certificate;
+  do not keep unproved, legacy, or runtime-guarded reduction algorithms gated off in
+  the tree — prove them with Lean or delete them. For new or changed reductions,
+  explicitly verify the generated certificate with Lean before declaring the
+  implementation complete; audit its axioms and test that relevant broken
+  transformations are rejected. State the theorem's scope and every trusted layer,
+  including source lowering and runtime execution. Ordinary `tlx check` / `tlx check
+  -optimize` still emits Lean without invoking a verifier unless requested.
 - Write code, comments, commit messages, and public documentation in English. Follow the
   [commit convention](CONTRIBUTING.md#code-and-commits). Limit commit subjects to 75
   characters and wrap commit bodies at 75 columns; keep URLs and structured trailers

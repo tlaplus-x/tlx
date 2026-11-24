@@ -44,7 +44,6 @@ pub enum ConstVal {
 
 pub struct Interp {
     pub prog: Program,
-    pub(crate) symmetry_guards: OnceLock<crate::model::autosym::guard::Guards>,
     /// Unique id (key of the per-thread constant copies, `local`).
     pub(crate) uid: u64,
     /// Symbols of the strings in the program.
@@ -286,7 +285,6 @@ impl Interp {
         let def_redirect = DefTable::new(prog.defs.len(), def_redirect);
         let mut ip = Interp {
             uid: local::fresh_uid(),
-            symmetry_guards: OnceLock::new(),
             syms: local::SymTable::new(&prog),
             builtin_override,
             run: run::RunState::new(),

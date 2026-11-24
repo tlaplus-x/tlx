@@ -134,8 +134,6 @@ pub(super) struct Analyzer<'a> {
     steps: usize,
     /// The analysis gave up (too large): its result is not a proof.
     pub overflow: bool,
-    pub allow_guards: bool,
-    pub guards: HashMap<usize, super::guard::Choice>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -159,8 +157,6 @@ impl<'a> Analyzer<'a> {
             folds: fold_chooses(ip),
             steps: 0,
             overflow: false,
-            allow_guards: false,
-            guards: HashMap::new(),
         }
     }
 
@@ -170,7 +166,6 @@ impl<'a> Analyzer<'a> {
         for pass in 0.. {
             self.memo.clear();
             self.breakers.clear();
-            self.guards.clear();
             self.effects.clear();
             self.next_vars = self.vars.clone();
             for e in entries {

@@ -233,9 +233,6 @@ impl Interp {
     /// `eval` by walking the expression (its subexpressions are evaluated by
     /// `eval`).
     pub(crate) fn eval_tree(self: &Arc<Self>, e: &Expr, env: &Env, cx: &Ctx) -> EResult<Value> {
-        if let Some(choice) = self.symmetry_choice(e) {
-            return self.eval_symmetry_choice(choice, env, cx).map_err(|err| err.with_span(e.span));
-        }
         self.eval_inner(e, env, cx).map_err(|err| err.with_span(e.span))
     }
 
@@ -251,9 +248,6 @@ impl Interp {
     /// variable, a bound local, a constant or a part of one of these
     /// (`f[x]`, `r.field`); the same value and errors.
     pub(crate) fn eval_cow<'a>(self: &'a Arc<Self>, e: &'a Expr, env: &'a Env, cx: &Ctx<'a>) -> EResult<Cow<'a>> {
-        if self.symmetry_choice(e).is_some() {
-            return self.eval_tree(e, env, cx).map(Cow::Own);
-        }
         if let Some(c) = self.code_of(e) {
             return self.exec_cow(c, env, cx);
         }

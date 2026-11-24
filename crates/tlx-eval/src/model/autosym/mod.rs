@@ -15,7 +15,6 @@
 //! properties and deadlock.
 
 mod analyze;
-pub mod guard;
 mod shape;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -80,8 +79,6 @@ pub struct Analysis {
     /// The candidates treated as proven by `force`.
     pub forced: Vec<String>,
     pub elapsed: Duration,
-    /// Runtime obligations of the conditional analysis.
-    pub guards: HashMap<usize, guard::Choice>,
 }
 
 /// `file:line:col` of `sp`.
@@ -237,15 +234,6 @@ pub(super) fn trace_replay_limit(model: &InterpModel) -> Option<&'static str> {
 
 /// Analyze the candidates of `model`.
 pub fn analyze(model: &InterpModel) -> Analysis {
-    analyze_impl(model, false)
-}
-
-/// Static analysis with runtime obligations for projected choices.
-pub fn analyze_guarded(model: &InterpModel) -> Analysis {
-    analyze_impl(model, true)
-}
-
-fn analyze_impl(model: &InterpModel, guarded: bool) -> Analysis {
     let started = Instant::now();
     let ip = &model.ip;
     let cands = candidates(ip);
@@ -262,7 +250,6 @@ fn analyze_impl(model: &InterpModel, guarded: bool) -> Analysis {
     }
     let mask_of = |m: Sym| masks.get(&m).copied().unwrap_or(0);
     let mut an = analyze::Analyzer::new(ip, &mask_of);
-    an.allow_guards = guarded;
     if !analyzed.is_empty() && model.has_behavior {
         an.run(&checked_parts(model));
     }
@@ -289,7 +276,7 @@ fn analyze_impl(model: &InterpModel, guarded: bool) -> Analysis {
     }
     let mut effects: Vec<String> = an.effects.iter().map(|e| format!("{} at {}", e.what, location(ip, e.span))).collect();
     effects.dedup();
-    Analysis { sets, effects, incomplete: an.overflow, forced: Vec::new(), elapsed: started.elapsed(), guards: an.guards }
+    Analysis { sets, effects, incomplete: an.overflow, forced: Vec::new(), elapsed: started.elapsed() }
 }
 
 fn is_declared(e: &Value, declared: &HashSet<Sym>) -> bool {

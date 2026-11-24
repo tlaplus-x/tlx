@@ -376,7 +376,6 @@ def judge(mid, kind, name, ref, got):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--guard-fixtures", action="store_true", help="check projected choices and a late guard-failure mutant in all tiers")
     ap.add_argument("--filter", default="")
     ap.add_argument("--ids", default="")
     ap.add_argument("-j", "--jobs", dest="j", type=int, default=DEFAULT_JOBS)
@@ -393,10 +392,6 @@ def main():
     ap.add_argument("--report", default="", help="write the per-mutant reports to this JSON file")
     add_profile_args(ap)
     a = ap.parse_args()
-    if a.guard_fixtures:
-        from autosym_guards import check_fixtures
-        with build_tlx(profile=profile_of(a), prefix="tlx-mutants-") as binary:
-            sys.exit(check_fixtures(binary, a.timeout, a.refresh, a.report))
     oracle = load_oracle(filter=a.filter, ids=a.ids)
     models = {k: m for k, m in oracle.items()
               if m.get("tlc", {}).get("result") == "success" and (m["tlc"].get("distinct") or 10**9) <= a.max_states}

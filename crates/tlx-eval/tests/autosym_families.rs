@@ -202,17 +202,3 @@ fn expression_binders_stay_symmetric() {
     assert_symmetric("[a |-> p].a");
     assert_symmetric("(<<p, p>>)[1]");
 }
-
-#[test]
-fn guarded_projection_still_proves_after_the_split() {
-    // The guarded analysis chooses a field of a projected element: the group
-    // is proven with one runtime obligation, and the plain analysis leaves it
-    // unproven. Pinning both keeps the `choose` family's guard path intact.
-    let b = "VARIABLE msgs\nInit == msgs = {[from |-> p, val |-> 1] : p \\in Proc}\n\
-             Next == UNCHANGED msgs /\\ (CHOOSE m \\in msgs : TRUE).val = 1";
-    let model = try_load_with(&tlx_testkit::module("M", &format!("{HEAD}{b}")), CFG).unwrap();
-    assert!(autosym::analyze(&model).proven().next().is_none());
-    let conditional = autosym::analyze_guarded(&model);
-    assert_eq!(conditional.group_text(), "Permutations(Proc)");
-    assert_eq!(conditional.guards.len(), 1);
-}

@@ -1,5 +1,4 @@
 //! Prepare the model, dispatch the search and hand its report to `report::finish`.
-//! Automatic-symmetry retries drop the entire first run before starting again.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,29 +20,17 @@ use crate::{autosym, coverage, live, load, out, process, recovery, settings, sim
 use crate::{parse_only, print_finished, print_mode, PROGRESS_EVERY, PROGRESS_EVERY_SHORT};
 
 pub(crate) fn check(started: Instant) -> ExitCode {
-    let mut restart = false;
-    let result = check_once(started, false, &mut restart);
-    if !restart {
-        return result;
-    }
-    // The first search and all its state stores have been dropped.
-    out::clear_reduced();
-    out::info(code::GENERAL, "Automatic symmetry runtime guard failed; restarting without automatic symmetry.");
-    check_once(started, true, &mut false)
-}
-
-fn check_once(started: Instant, noautosymmetry: bool, restart: &mut bool) -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("optimize") {
         return crate::optimization::run();
     }
     if std::env::args().nth(1).as_deref() == Some("parse") {
         return parse_only();
     }
-    let prepared = match prepare(started, noautosymmetry, restart) {
+    let prepared = match prepare(started) {
         Ok(prepared) => prepared,
         Err(code) => return code,
     };
-    run(prepared, started, restart)
+    run(prepared, started)
 }
 
 /// A fully configured model. Early diagnostics and non-search commands have
@@ -59,9 +46,8 @@ struct Prepared {
 /// Preserve TLC's setup/error order: restore strings before loading, bind
 /// checkpoint identity after symmetry, then validate literals and assumptions.
 /// `Err` is an already reported exit, including successful non-search commands.
-fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result<Prepared, ExitCode> {
+fn prepare(started: Instant) -> Result<Prepared, ExitCode> {
     let mut a = parse_args();
-    a.noautosymmetry |= noautosymmetry;
     if let Some(o) = &a.stats {
         stats::enable(o.clone());
     }
@@ -134,17 +120,13 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
         out::info(code::TLC_SANY_END, "SANY finished.");
     }
     // (Before the identity of a checkpoint, which records the symmetry.)
-    let symmetry = match autosym::run(&mut model, &a, ck_env.0.is_none() && ck_env.1.is_none()) {
+    let symmetry = match autosym::run(&mut model, &a) {
         Ok(s) => s,
         Err(code) => {
             print_finished(started);
             return Err(code);
         }
     };
-    if model.ip.symmetry_guard_failed() {
-        *restart = true;
-        return Err(ExitCode::SUCCESS);
-    }
     let check_deadlock = model.check_deadlock && !a.no_deadlock;
     let identity = run_identity(&a, &model, check_deadlock, seed.or(a.seed).unwrap_or(0), symmetry.as_ref());
     if let Some(r) = &recovery {
@@ -153,7 +135,7 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
             return Err(ExitCode::from(EXIT_GENERAL_ERROR));
         }
     }
-    if !a.checksymmetry && a.simulate.is_none() && a.dump.is_none() && model.ip.symmetry_guard_counts().is_none() {
+    if !a.checksymmetry && a.simulate.is_none() && a.dump.is_none() {
         a.checkpointer = checkpointer(a.checkpoint.is_some(), ck_interval, ck_env, identity, recovery.is_some());
     }
     if !a.checksymmetry {
@@ -205,9 +187,6 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
         return Err(ExitCode::from(EXIT_LIVENESS_EVAL));
     }
     if let Err(e) = model.check_assumes() {
-        if guard_restart(&model.ip, true, restart) {
-            return Err(ExitCode::SUCCESS);
-        }
         match &e.context {
             ErrorContext::Assumption(at) => {
                 let text = format!("Evaluating assumption {at} failed.\n{}", out::nested(out::error_kind(&e), &e.message));
@@ -241,7 +220,7 @@ fn prepare(started: Instant, noautosymmetry: bool, restart: &mut bool) -> Result
 
 /// Dispatch simulation, init-only or BFS without wrapping the model. Each
 /// completed search hands its original tier to `report::finish`.
-fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
+fn run(prepared: Prepared, started: Instant) -> ExitCode {
     let Prepared { args: a, mut model, recovery, seed, check_deadlock } = prepared;
     if let (Some(traces), Some(seed)) = (a.simulate, seed) {
         return simulation::run(&a, model, traces, seed, check_deadlock, started);
@@ -253,9 +232,6 @@ fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
         let opts = a.options(1, false);
         out::info(code::TLC_COMPUTING_INIT, "Computing initial states...");
         let r = explore(&model, &opts);
-        if guard_restart(&model.ip, matches!(r.outcome, Outcome::Error(_)), restart) {
-            return ExitCode::SUCCESS;
-        }
         // (Unless the fingerprint set filled up while computing them: the
         // capacity error is the more accurate report, and `finish` gives it.)
         if r.stats.distinct > 0 && !matches!(r.outcome, Outcome::FpSetFull { .. }) {
@@ -293,9 +269,6 @@ fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
         let (m, r) = match tlx_compile::enc::check_from(base.clone(), &opts, 16, recovery.as_ref()) {
             Ok(tlx_compile::enc::Checked::Compiled(m, r)) => (m, r),
             Ok(tlx_compile::enc::Checked::Interpreted(r)) => {
-                if guard_restart(&base.ip, matches!(r.outcome, Outcome::Error(_)), restart) {
-                    return ExitCode::SUCCESS;
-                }
                 // The pre-run was the search (in the interpreter).
                 if a.dump.is_some() {
                     let dump_opts = Options { progress: None, coverage: false, coverage_report: None, checkpoint: None, ..opts.clone() };
@@ -304,9 +277,6 @@ fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
                 return finish(&*base, r, &run);
             }
             Err(e) => {
-                if guard_restart(&base.ip, true, restart) {
-                    return ExitCode::SUCCESS;
-                }
                 out::error(
                     code::GENERAL,
                     &match &a.recover {
@@ -317,9 +287,6 @@ fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
                 return ExitCode::from(EXIT_GENERAL_ERROR);
             }
         };
-        if guard_restart(&base.ip, matches!(r.outcome, Outcome::Error(_)), restart) {
-            return ExitCode::SUCCESS;
-        }
         if a.dump.is_some() {
             // The compiled search may restart; dump with a final search
             // (with the interpreter if it misses: it cannot restart).
@@ -334,22 +301,7 @@ fn run(prepared: Prepared, started: Instant, restart: &mut bool) -> ExitCode {
     }
     print_start(&recovery);
     let r = explore_dumping(&model, &opts, &a.dump, recovery.as_ref());
-    if guard_restart(&model.ip, matches!(r.outcome, Outcome::Error(_)), restart) {
-        return ExitCode::SUCCESS;
-    }
     finish(&model, r, &run)
-}
-
-/// Never publish a report from a search whose runtime proof failed.
-fn guard_restart(ip: &tlx_eval::Interp, error: bool, restart: &mut bool) -> bool {
-    if let Some((calls, candidates)) = ip.symmetry_guard_counts() {
-        tlx_runtime::stats::set_section(
-            "symmetry guards",
-            format!("interpreter: {calls} evaluations, {candidates} candidates; native guards use IR loops\n"),
-        );
-    }
-    *restart = ip.symmetry_guard_failed() || (error && ip.symmetry_guard_counts().is_some());
-    *restart
 }
 
 /// Explore (from checkpoint `recover` if given), writing the states to the
