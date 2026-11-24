@@ -10,7 +10,7 @@ use super::GroupMask;
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use tlx_front::cfg::{CfgValue, Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config};
 
 #[derive(Clone, Debug)]
 pub(super) enum VarShape {
@@ -132,10 +132,7 @@ pub(super) fn domain_is_integer(d: &Domain) -> bool {
 pub(super) fn exact_k_subset_family(program: &Program, cfg: &Config, set_expr: &Expr, groups: &[GroupInfo]) -> Option<(GroupMask, usize)> {
     let ExprKind::Const(cid) = &*set_expr.kind else { return None };
     let cname = &program.consts[cid.idx()].name;
-    let cval = cfg.constants.iter().find_map(|b| match b {
-        ConstBinding::Value { name, value, module: None } if name == &**cname => Some(value),
-        _ => None,
-    })?;
+    let cval = cfg.last_constant_value(cname)?;
     let CfgValue::Set(subsets) = cval else { return None };
     if subsets.is_empty() {
         return None;

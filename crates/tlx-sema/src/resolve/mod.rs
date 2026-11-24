@@ -531,6 +531,20 @@ impl Program {
         }
     }
 
+    /// Look up an already-resolved name in the root module's scope without
+    /// mutating `self`. Returns `None` if the root scope has not been built,
+    /// the name is absent, or a definition is still `Pending`.
+    pub fn lookup_resolved_root(&self, name: &str) -> Option<RootSymbol> {
+        let &sc = self.scope_of.get(&(ROOT_CTX, self.root_mod))?;
+        let sym = *self.scopes[sc].names.get(name)?;
+        match sym {
+            Sym::Var(v) => Some(RootSymbol::Var(v)),
+            Sym::Const(c) => Some(RootSymbol::Const(c)),
+            Sym::Def(d) => (!matches!(self.defs[d.idx()].kind, DefKind::Pending)).then_some(RootSymbol::Def(d)),
+            Sym::Decl { .. } | Sym::Instance(_) => None,
+        }
+    }
+
     /// TLC's check that the configuration assigns a value (or a `<-`
     /// substitution) to every constant the specification declares: the ones of
     /// the root module and of the modules it extends (SANY's
@@ -611,14 +625,11 @@ impl Program {
             }
             match self.defns_arity(rhs, &valued) {
                 None => return Some(CfgSubstError::WrongSubstitution { lhs: lhs.clone(), rhs: rhs.clone() }),
-                Some(Some(rhs_arity)) => {
-                    if let Some(n) = lhs_arity {
-                        if n != rhs_arity {
-                            return Some(CfgSubstError::WrongNumberOfArgs { lhs: lhs.clone(), rhs: rhs.clone() });
-                        }
+                Some(rhs_arity) => {
+                    if lhs_arity != rhs_arity {
+                        return Some(CfgSubstError::WrongNumberOfArgs { lhs: lhs.clone(), rhs: rhs.clone() });
                     }
                 }
-                Some(None) => {}
             }
         }
         if let Some(lhs) = unmatched {
@@ -641,37 +652,35 @@ impl Program {
             }
             match self.defns_arity(rhs, &valued) {
                 None => return Some(CfgSubstError::WrongSubstitution { lhs: lhs.clone(), rhs: rhs.clone() }),
-                Some(Some(rhs_arity)) => {
+                Some(rhs_arity) => {
                     if ds.iter().any(|&d| self.def_arity(d) != rhs_arity) {
                         return Some(CfgSubstError::WrongNumberOfArgs { lhs: lhs.clone(), rhs: rhs.clone() });
                     }
                 }
-                Some(None) => {}
             }
         }
         unknown.map(CfgSubstError::NoModules)
     }
 
     /// The arity of `name` as the left-hand side of a plain `<-`: a root
-    /// constant (never checked, `None`) or a root operator definition.
-    /// `None`: `name` is neither.
-    fn lhs_arity(&mut self, name: &str) -> Option<Option<usize>> {
+    /// constant or a root operator definition. `None`: `name` is neither.
+    fn lhs_arity(&mut self, name: &str) -> Option<usize> {
         match self.lookup_root(name) {
-            Some(RootSymbol::Const(_)) => Some(None),
-            Some(RootSymbol::Def(d)) => Some(Some(self.def_arity(d))),
+            Some(RootSymbol::Const(c)) => Some(self.consts[c.idx()].arity),
+            Some(RootSymbol::Def(d)) => Some(self.def_arity(d)),
             _ => None,
         }
     }
 
     /// What the right-hand side of a `<-` denotes in TLC's `defns`: an
-    /// operator definition (its arity), or a constant with a value (no arity
-    /// check). `None`: not defined.
-    fn defns_arity(&mut self, name: &str, valued: &[String]) -> Option<Option<usize>> {
+    /// operator definition (its arity), or a 0-ary constant with a value.
+    /// `None`: not defined.
+    fn defns_arity(&mut self, name: &str, valued: &[String]) -> Option<usize> {
         if valued.iter().any(|v| v == name) {
-            return Some(None);
+            return Some(0);
         }
         match self.lookup_root(name) {
-            Some(RootSymbol::Def(d)) => Some(Some(self.def_arity(d))),
+            Some(RootSymbol::Def(d)) => Some(self.def_arity(d)),
             _ => None,
         }
     }
@@ -682,25 +691,8 @@ impl Program {
     /// error). The invariants come first, then the behavior spec, then the
     /// properties, then the constraints — TLC's order.
     pub fn check_cfg_defs(&mut self, cfg: &tlx_front::cfg::Config) -> Option<CfgNameError> {
-        use tlx_front::cfg::{CfgValue, ConstBinding};
-        // TLC looks the name up in `defns`, which maps a cfg-assigned constant
-        // to its *value* and a `<-`-substituted name to the right-hand side's
-        // operator definition. A value of `TRUE` stands in for the name in an
-        // invariant/property/constraint (with a warning); a substitution is
-        // always an operator definition.
-        let mut true_consts: Vec<String> = Vec::new();
-        let mut subst_names: Vec<String> = Vec::new();
-        for b in &cfg.constants {
-            match b {
-                ConstBinding::Value { name, value: CfgValue::Bool(true), module: None } => true_consts.push(name.clone()),
-                ConstBinding::Subst { name, module: None, .. } => subst_names.push(name.clone()),
-                _ => {}
-            }
-        }
-        let tc = true_consts.as_slice();
-        let sn = subst_names.as_slice();
         for name in &cfg.invariants {
-            if let Some(e) = self.cfg_def("invariant", name, tc, sn) {
+            if let Some(e) = self.cfg_def("invariant", name, cfg, true) {
                 return Some(e);
             }
         }
@@ -708,33 +700,33 @@ impl Program {
             return Some(CfgNameError::NotBothSpecAndInit);
         }
         if let Some(name) = &cfg.specification {
-            if let Some(e) = self.cfg_def("name", name, &[], sn) {
+            if let Some(e) = self.cfg_def("name", name, cfg, false) {
                 return Some(e);
             }
         } else {
             if let Some(name) = &cfg.init {
-                if let Some(e) = self.cfg_def("initial predicate", name, &[], sn) {
+                if let Some(e) = self.cfg_def("initial predicate", name, cfg, false) {
                     return Some(e);
                 }
             }
             if let Some(name) = &cfg.next {
-                if let Some(e) = self.cfg_def("next state action", name, &[], sn) {
+                if let Some(e) = self.cfg_def("next state action", name, cfg, false) {
                     return Some(e);
                 }
             }
         }
         for name in &cfg.properties {
-            if let Some(e) = self.cfg_def("property", name, tc, sn) {
+            if let Some(e) = self.cfg_def("property", name, cfg, true) {
                 return Some(e);
             }
         }
         for name in &cfg.constraints {
-            if let Some(e) = self.cfg_def("constraint", name, tc, sn) {
+            if let Some(e) = self.cfg_def("constraint", name, cfg, true) {
                 return Some(e);
             }
         }
         for name in &cfg.action_constraints {
-            if let Some(e) = self.cfg_def("action constraint", name, tc, sn) {
+            if let Some(e) = self.cfg_def("action constraint", name, cfg, true) {
                 return Some(e);
             }
         }
@@ -742,16 +734,22 @@ impl Program {
     }
 
     /// `name` as an INIT/NEXT/SPECIFICATION/INVARIANT/... reference.
-    /// `true_consts`/`subst_names` come from [`Self::check_cfg_defs`].
-    fn cfg_def(&mut self, what: &'static str, name: &str, true_consts: &[String], subst_names: &[String]) -> Option<CfgNameError> {
-        if subst_names.iter().any(|n| n == name) {
-            // Substituted for a definition: TLC's `defns` holds an OpDefNode.
-            return None;
-        }
-        match self.lookup_root(name) {
+    ///
+    /// TLC looks the name up in `defns`, which maps a cfg-assigned constant
+    /// to its *value* and a `<-`-substituted name to the right-hand side's
+    /// binding (operator definition or valued constant). A value of `TRUE`
+    /// stands in for the name in an invariant/property/constraint (when
+    /// `allow_true_const` is true).
+    fn cfg_def(&mut self, what: &'static str, name: &str, cfg: &tlx_front::cfg::Config, allow_true_const: bool) -> Option<CfgNameError> {
+        let target = cfg.last_constant_subst(name).unwrap_or(name);
+        match self.lookup_root(target) {
             Some(RootSymbol::Def(d)) if self.defs[d.idx()].params.is_empty() => None,
             Some(RootSymbol::Def(_)) => Some(CfgNameError::RequiresNoArg { what, name: name.to_string() }),
-            Some(RootSymbol::Const(_)) if true_consts.iter().any(|n| n == name) => None,
+            Some(RootSymbol::Const(_))
+                if allow_true_const && matches!(cfg.last_constant_value(target), Some(tlx_front::cfg::CfgValue::Bool(true))) =>
+            {
+                None
+            }
             Some(RootSymbol::Const(_)) => Some(CfgNameError::IsConstant { what, name: name.to_string() }),
             _ => Some(CfgNameError::NotDefined { what, name: name.to_string() }),
         }

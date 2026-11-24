@@ -83,6 +83,61 @@ pub struct Config {
     pub check_deadlock: Option<bool>,
 }
 
+/// Effective unqualified (`module: None`) binding for a `.cfg` `CONSTANT` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectiveConst<'a> {
+    Value(&'a CfgValue),
+    Subst(&'a str),
+}
+
+impl Config {
+    /// Resolve the effective unqualified (`module: None`) binding for `name`,
+    /// matching TLC / runtime `bind_cfg` precedence: `<-` substitutions apply
+    /// after `=` values, and within each kind the last entry in `.cfg` wins.
+    ///
+    /// Returns `None` if `name` has no unqualified binding or is bound by an
+    /// operator table (`F(a) = v`) without a later substitution.
+    pub fn effective_constant(&self, name: &str) -> Option<EffectiveConst<'_>> {
+        let mut effective = None;
+        for b in &self.constants {
+            match b {
+                ConstBinding::Value { name: n, value, module: None } if n == name => {
+                    effective = Some(EffectiveConst::Value(value));
+                }
+                ConstBinding::OpValue { name: n, .. } if n == name => {
+                    effective = None;
+                }
+                _ => {}
+            }
+        }
+        for b in &self.constants {
+            if let ConstBinding::Subst { name: n, op, module: None } = b {
+                if n == name {
+                    effective = Some(EffectiveConst::Subst(op.as_str()));
+                }
+            }
+        }
+        effective
+    }
+
+    /// The effective unqualified `name = value` binding (last wins), returning
+    /// `None` if overridden by an unqualified `<-` substitution or `OpValue`.
+    pub fn last_constant_value(&self, name: &str) -> Option<&CfgValue> {
+        match self.effective_constant(name) {
+            Some(EffectiveConst::Value(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The effective unqualified `name <- op` substitution (last wins).
+    pub fn last_constant_subst(&self, name: &str) -> Option<&str> {
+        match self.effective_constant(name) {
+            Some(EffectiveConst::Subst(op)) => Some(op),
+            _ => None,
+        }
+    }
+}
+
 /// The configuration embedded in a `.tla` file as TLC reads it
 /// (`util.MonolithSpecExtractor.config`): the lines after the first line
 /// `---- CONFIG name ----` (four or more dashes on each side) up to the next

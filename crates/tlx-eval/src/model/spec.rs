@@ -96,8 +96,7 @@ fn classify(
         ExprKind::Let { body, .. } => classify(ip, body, name, subs, quants, names, out)?,
         ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => {
             let def_name = applied_name(ip, e, *d, names);
-            let t = ip.redirect_def(*d);
-            if tlc_has_value(ip, t) && ip.plain_op_body(t).is_some() {
+            if tlc_has_value(ip, *d) {
                 if let Ok(Value::Bool(b)) = ip.eval(e, &Env::default(), &Ctx::NONE) {
                     if !b {
                         return Err(EvalError::new(format!("The spec is trivially false because {def_name} is false.")));
@@ -184,7 +183,13 @@ fn applied_name(ip: &Interp, e: &Expr, d: DefId, names: &Names) -> String {
 /// (TLC's Java overrides with a `minLevel`, as TLCGet and IOExec, make a
 /// definition non-constant there; approximated by tlx's pure ones.)
 pub(super) fn tlc_has_value(ip: &Interp, d: DefId) -> bool {
+    if ip.has_def_value(d) {
+        return true;
+    }
     let d = ip.redirect_def(d);
+    if ip.has_def_value(d) {
+        return true;
+    }
     // (Temporal and action operators are not constant level for TLC.)
     ip.is_const_def(d)
         && ip.is_pure_def(d)

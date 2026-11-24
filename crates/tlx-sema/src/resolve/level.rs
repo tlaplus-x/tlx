@@ -818,15 +818,8 @@ impl Program {
     pub fn check_cfg_levels(&mut self, cfg: &tlx_front::cfg::Config) -> Option<CfgLevelError> {
         let resolve = |p: &mut Program, name: &str| -> Option<DefId> {
             // A cfg replacement `Inv <- Other` names the definition used.
-            let target = cfg
-                .constants
-                .iter()
-                .find_map(|b| match b {
-                    tlx_front::cfg::ConstBinding::Subst { name: n, op, module: None } if n == name => Some(op.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| name.to_string());
-            match p.lookup_root(&target)? {
+            let target = cfg.last_constant_subst(name).unwrap_or(name);
+            match p.lookup_root(target)? {
                 RootSymbol::Def(d) => Some(d),
                 _ => None,
             }

@@ -174,7 +174,10 @@ pub(super) fn lift_frames(e: &Expr, program: &crate::Program, cfg: &tlx_front::c
     fn nonempty(e: &Expr, program: &crate::Program, cfg: &tlx_front::cfg::Config) -> bool {
         match &*e.kind {
             ExprKind::SetEnum(es) => !es.is_empty(),
-            ExprKind::Const(c) => cfg.constants.iter().any(|b| matches!(b, tlx_front::cfg::ConstBinding::Value {name, value: tlx_front::cfg::CfgValue::Set(es), module: None} if name == &*program.consts[c.idx()].name && !es.is_empty())),
+            ExprKind::Const(c) => matches!(
+                cfg.last_constant_value(&program.consts[c.idx()].name),
+                Some(tlx_front::cfg::CfgValue::Set(es)) if !es.is_empty()
+            ),
             _ => false,
         }
     }

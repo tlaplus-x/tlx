@@ -682,18 +682,35 @@ impl<'a> TotalityChecker<'a> {
     }
 
     pub(super) fn const_exact_i32(&self, e: &Expr) -> Option<i32> {
+        self.const_exact_i32_inner(e, &mut Vec::new(), 0)
+    }
+
+    fn const_exact_i32_inner(&self, e: &Expr, seen: &mut Vec<ConstId>, depth: usize) -> Option<i32> {
+        if depth >= 32 {
+            return None;
+        }
         match &*e.kind {
             ExprKind::Num(n) => i32::try_from(*n).ok(),
             ExprKind::Const(c) => match self.consts.get(c)? {
                 ConstInfo::Value(CfgValue::Int(n)) => i32::try_from(*n).ok(),
-                ConstInfo::Subst(def_id) => match &self.program.defs[def_id.idx()].kind {
-                    DefKind::Op(body) => self.const_exact_i32(body),
-                    _ => None,
-                },
+                ConstInfo::Subst(def_id) => {
+                    if seen.contains(c) {
+                        return None;
+                    }
+                    seen.push(*c);
+                    let res = match &self.program.defs[def_id.idx()].kind {
+                        DefKind::Op(body) => self.const_exact_i32_inner(body, seen, depth + 1),
+                        _ => None,
+                    };
+                    seen.pop();
+                    res
+                }
                 _ => None,
             },
-            ExprKind::Builtin { op: B::Neg, args } if args.len() == 1 => self.const_exact_i32(&args[0])?.checked_neg(),
-            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.const_exact_i32(&args[0]),
+            ExprKind::Builtin { op: B::Neg, args } if args.len() == 1 => {
+                self.const_exact_i32_inner(&args[0], seen, depth + 1)?.checked_neg()
+            }
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.const_exact_i32_inner(&args[0], seen, depth + 1),
             _ => None,
         }
     }
@@ -750,14 +767,24 @@ impl<'a> TotalityChecker<'a> {
     /// True ONLY when `s` is statically guaranteed to evaluate to the exact set
     /// represented by its inferred element shape (no dynamic subsets, no integer gaps).
     pub(super) fn is_exact_static_set(&self, s: &Expr) -> bool {
+        self.is_exact_static_set_inner(s, &mut Vec::new(), 0)
+    }
+
+    fn is_exact_static_set_inner(&self, s: &Expr, seen: &mut Vec<ConstId>, depth: usize) -> bool {
+        if depth >= 32 {
+            return false;
+        }
         match &*s.kind {
             ExprKind::Builtin { op: B::Boolean, args } if args.is_empty() => true,
             ExprKind::Builtin { op: B::DotDot, args } if args.len() == 2 => {
                 self.const_exact_i32(&args[0]).is_some() && self.const_exact_i32(&args[1]).is_some()
             }
-            ExprKind::Builtin { op: B::Times, args } if args.len() >= 2 => args.iter().all(|a| self.is_exact_static_set(a)),
+            ExprKind::Builtin { op: B::Times, args } if args.len() >= 2 => {
+                args.iter().all(|a| self.is_exact_static_set_inner(a, seen, depth + 1))
+            }
             ExprKind::Builtin { op: B::Cup, args } if args.len() == 2 => {
-                if !self.is_exact_static_set(&args[0]) || !self.is_exact_static_set(&args[1]) {
+                if !self.is_exact_static_set_inner(&args[0], seen, depth + 1) || !self.is_exact_static_set_inner(&args[1], seen, depth + 1)
+                {
                     return false;
                 }
                 let mut steps = 500;
@@ -768,13 +795,21 @@ impl<'a> TotalityChecker<'a> {
                 // correlation (e.g. `({"a"} \X {"a"}) \cup ({"b"} \X {"b"})` would include `<<"a","b">>`).
                 shape_is_exact_cup_scalar(&sa) && shape_is_exact_cup_scalar(&sb) && !matches!(join_shape(&sa, &sb), Shape::Top)
             }
-            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.is_exact_static_set(&args[0]),
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.is_exact_static_set_inner(&args[0], seen, depth + 1),
             ExprKind::Const(c) => match self.consts.get(c) {
                 Some(ConstInfo::Value(CfgValue::Set(es))) => self.cfg_set_is_exact(es),
-                Some(ConstInfo::Subst(def_id)) => match &self.program.defs[def_id.idx()].kind {
-                    DefKind::Op(body) => self.is_exact_static_set(body),
-                    _ => false,
-                },
+                Some(ConstInfo::Subst(def_id)) => {
+                    if seen.contains(c) {
+                        return false;
+                    }
+                    seen.push(*c);
+                    let res = match &self.program.defs[def_id.idx()].kind {
+                        DefKind::Op(body) => self.is_exact_static_set_inner(body, seen, depth + 1),
+                        _ => false,
+                    };
+                    seen.pop();
+                    res
+                }
                 _ => false,
             },
             ExprKind::SetEnum(es) => {

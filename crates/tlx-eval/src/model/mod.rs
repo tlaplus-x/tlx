@@ -203,7 +203,8 @@ struct Possible {
 fn possible_preds(ip: &Interp, cfg: &Config) -> EResult<Vec<Possible>> {
     let mut out = Vec::new();
     for name in &cfg.possible {
-        let d = ip.root_def(name).ok_or_else(|| {
+        let target = subst_target(ip, name).unwrap_or(name);
+        let d = ip.root_def(target).ok_or_else(|| {
             EvalError::new(format!("The possible {name} specified in the configuration file is not defined in the specification."))
         })?;
         let def = &ip.prog.defs[ip.redirect_def(d).idx()];
@@ -229,10 +230,7 @@ fn possible_preds(ip: &Interp, cfg: &Config) -> EResult<Vec<Possible>> {
 /// The plain `<-` substitution `name` denotes, if any: TLC's `defns` holds the
 /// right-hand side's definition under the left-hand side's name.
 fn subst_target<'a>(ip: &'a Interp, name: &str) -> Option<&'a str> {
-    ip.cfg.constants.iter().find_map(|b| match b {
-        tlx_front::cfg::ConstBinding::Subst { name: n, op, module: None } if n == name => Some(op.as_str()),
-        _ => None,
-    })
+    ip.cfg.last_constant_subst(name)
 }
 
 /// A 0-ary use of the root definition `name` named by the cfg (after applying
@@ -256,11 +254,7 @@ fn def_refs(ip: &Interp, names: &[String]) -> EResult<Vec<Expr>> {
 /// PROPERTY or CONSTRAINT naming it is accepted (with a warning) and then
 /// dropped.
 fn cfg_true_const(ip: &Interp, name: &str) -> bool {
-    let valued_true = |n: &str| {
-        ip.cfg.constants.iter().any(|b| {
-            matches!(b, tlx_front::cfg::ConstBinding::Value { name: m, value: tlx_front::cfg::CfgValue::Bool(true), module: None } if m == n)
-        })
-    };
+    let valued_true = |n: &str| matches!(ip.cfg.last_constant_value(n), Some(tlx_front::cfg::CfgValue::Bool(true)));
     valued_true(name) || subst_target(ip, name).is_some_and(valued_true)
 }
 
@@ -485,9 +479,14 @@ impl InterpModel {
             .postconditions
             .iter()
             .map(|n| {
+                let target = subst_target(&ip, n).unwrap_or(n);
                 let d = ip
-                    .root_def(n)
+                    .root_def(target)
                     .ok_or_else(|| EvalError::new(format!("The configuration refers to `{n}`, which is not defined by the spec")))?;
+                let def = &ip.prog.defs[ip.redirect_def(d).idx()];
+                if !def.params.is_empty() {
+                    return Err(EvalError::new(format!("The postcondition {n} specified in the configuration file requires arguments.")));
+                }
                 Ok((n.clone(), d))
             })
             .collect::<EResult<Vec<_>>>()?;

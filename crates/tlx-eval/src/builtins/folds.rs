@@ -57,10 +57,20 @@ impl Interp {
     fn chooses_first(&self, op: &OpVal) -> bool {
         let (params, body): (&[LocalId], &Expr) = match op {
             OpVal::Lambda { params, body, .. } => (params, body),
-            OpVal::Ref(OpRef::Def(d)) => match &self.prog.defs[d.idx()].kind {
-                DefKind::Op(body) => (&self.prog.defs[d.idx()].params, body),
-                _ => return false,
-            },
+            OpVal::Ref(OpRef::Def(d)) => {
+                if self.has_def_value(*d) {
+                    return false;
+                }
+                let d = self.redirect_def(*d);
+                if self.has_def_value(d) {
+                    return false;
+                }
+                let def = &self.prog.defs[d.idx()];
+                match &def.kind {
+                    DefKind::Op(body) if def.builtin.is_none() => (&def.params, body),
+                    _ => return false,
+                }
+            }
             _ => return false,
         };
         let [p] = params else { return false };

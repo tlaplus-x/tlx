@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use tlx_front::cfg::{CfgValue, Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config};
 
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 
@@ -291,10 +291,7 @@ impl Domains {
         let mut total_const_atoms = HashMap::new();
         for (i, c) in program.consts.iter().enumerate() {
             let id = ConstId(i as u32);
-            let value = cfg.constants.iter().find_map(|b| match b {
-                ConstBinding::Value { name, value, module: None } if name == &*c.name && c.arity == 0 => Some(value),
-                _ => None,
-            });
+            let value = (c.arity == 0).then(|| cfg.last_constant_value(&c.name)).flatten();
             if let Some(v) = value {
                 let dom = config_value(v);
                 if let Some(atoms) = dom.atoms().filter(|s| s.len() == 1) {
@@ -351,19 +348,7 @@ impl Domains {
                     continue;
                 }
                 let id = ConstId(i as u32);
-                let has_value_binding = cfg.constants.iter().any(|b| {
-                    matches!(
-                        b,
-                        ConstBinding::Value { name, module: None, .. } if name == &*c.name
-                    )
-                });
-                if has_value_binding {
-                    continue;
-                }
-                let Some(target) = cfg.constants.iter().find_map(|b| match b {
-                    ConstBinding::Subst { name, op, module: None } if name == &*c.name => Some(op.as_str()),
-                    _ => None,
-                }) else {
+                let Some(target) = cfg.last_constant_subst(&c.name) else {
                     continue;
                 };
                 let (resolved, exact, atom) = match lookup_resolved_root(program, target) {

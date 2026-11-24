@@ -14,7 +14,7 @@ use crate::{builtins::Builtin as B, hir::*, Program};
 use shape::Shape;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use tlx_front::cfg::{CfgValue, Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config};
 
 /// Structural positions whose integers belong to one allocation family.
 /// Unlisted components remain exact. This is an analysis result, not user input.
@@ -101,10 +101,7 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observat
     let history = syntax::history(&initial, &steps, &families, program.vars.len());
     let mut constants = HashMap::new();
     for (i, c) in program.consts.iter().enumerate() {
-        let value = cfg.constants.iter().find_map(|b| match b {
-            ConstBinding::Value { name, value, module: None } if name == &*c.name => Some(value),
-            _ => None,
-        })?;
+        let value = (c.arity == 0).then(|| cfg.last_constant_value(&c.name)).flatten()?;
         constants.insert(ConstId(i as u32), config_shape(value)?);
     }
     let mut analysis = Analysis {

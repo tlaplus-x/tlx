@@ -511,3 +511,42 @@ fn examples_corpus() {
     eprintln!("parsed {parsed} of {} .cfg files under {}", files.len(), specs.display());
     assert!(failures.is_empty(), "{} failure(s):\n{}", failures.len(), failures.join("\n"));
 }
+
+#[test]
+fn effective_constant_last_wins_and_subst_precedence() {
+    use tlx_front::cfg::EffectiveConst;
+
+    let cfg = ok("
+        CONSTANT Delay = 0
+        CONSTANT Delay = 2
+        CONSTANT S = {a, b}
+        CONSTANT S = {}
+        CONSTANT Op <- First
+        CONSTANT Op <- Second
+        CONSTANT Both <- SubstTarget
+        CONSTANT Both = 99
+        CONSTANT M = [Mod] 7
+        CONSTANT Tbl = 1
+        CONSTANT Tbl(1) = 2
+    ");
+
+    assert_eq!(cfg.last_constant_value("Delay"), Some(&CfgValue::Int(2)));
+    assert_eq!(cfg.last_constant_subst("Delay"), None);
+
+    assert_eq!(cfg.last_constant_value("S"), Some(&CfgValue::Set(vec![])));
+
+    assert_eq!(cfg.effective_constant("Op"), Some(EffectiveConst::Subst("Second")));
+    assert_eq!(cfg.last_constant_subst("Op"), Some("Second"));
+    assert_eq!(cfg.last_constant_value("Op"), None);
+
+    // Subst applies after Value in TLC / bind_cfg regardless of file order.
+    assert_eq!(cfg.effective_constant("Both"), Some(EffectiveConst::Subst("SubstTarget")));
+    assert_eq!(cfg.last_constant_value("Both"), None);
+    assert_eq!(cfg.last_constant_subst("Both"), Some("SubstTarget"));
+
+    // Module-scoped bindings do not bind unqualified constants.
+    assert_eq!(cfg.effective_constant("M"), None);
+
+    // An OpValue table overwrites an earlier Value.
+    assert_eq!(cfg.effective_constant("Tbl"), None);
+}

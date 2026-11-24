@@ -8,7 +8,7 @@ use super::{ast_equiv, Domains, GroupMask};
 use crate::{builtins::Builtin as B, hir::*, Program};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use tlx_front::cfg::{CfgValue, Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config};
 
 pub(super) const I32_MIN: i128 = i32::MIN as i128;
 pub(super) const I32_MAX: i128 = i32::MAX as i128;
@@ -597,10 +597,7 @@ pub(super) fn infer_model_bounds(
         if c.arity != 0 {
             continue;
         }
-        if let Some(val) = cfg.constants.iter().find_map(|b| match b {
-            ConstBinding::Value { name, value, module: None } if name == &*c.name => Some(value),
-            _ => None,
-        }) {
+        if let Some(val) = cfg.last_constant_value(&c.name) {
             consts.insert(ConstId(i as u32), cfg_val_bound(val));
         }
     }

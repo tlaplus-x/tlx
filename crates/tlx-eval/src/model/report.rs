@@ -385,7 +385,7 @@ impl InterpModel {
         if !args.is_empty() {
             return None;
         }
-        let DefKind::Op(body) = &self.ip.prog.defs[d.idx()].kind else { return None };
+        let (_, body) = self.ip.plain_op_body(*d)?;
         match &*body.kind {
             ExprKind::Record(fs) => Some(fs.clone()),
             _ => None,

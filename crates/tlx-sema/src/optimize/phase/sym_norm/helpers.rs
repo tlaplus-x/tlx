@@ -64,31 +64,9 @@ pub(in crate::optimize::phase) fn mentions_local(e: &Expr, target: LocalId) -> b
 }
 
 /// Look up an already-resolved root definition or constant by name without
-/// mutating `Program`. Fails closed if ambiguous or still `Pending`.
+/// mutating `Program`. Fails closed if absent or still `Pending`.
 pub(in crate::optimize::phase) fn lookup_resolved_root(program: &Program, name: &str) -> Option<RootSymbol> {
-    let mut found_def = None;
-    for (i, d) in program.defs.iter().enumerate() {
-        let id = DefId(i as u32);
-        if &*d.name == name && program.def_instance(id).is_none() && !program.def_is_let(id) {
-            if found_def.is_some() {
-                return None;
-            }
-            found_def = Some(id);
-        }
-    }
-    if let Some(id) = found_def {
-        return (!matches!(program.defs[id.idx()].kind, DefKind::Pending)).then_some(RootSymbol::Def(id));
-    }
-    let mut found_const = None;
-    for (i, c) in program.consts.iter().enumerate() {
-        if &*c.name == name {
-            if found_const.is_some() {
-                return None;
-            }
-            found_const = Some(ConstId(i as u32));
-        }
-    }
-    found_const.map(RootSymbol::Const)
+    program.lookup_resolved_root(name)
 }
 
 /// Returns `Some(n)` only when every element of `set` is provably a tuple of

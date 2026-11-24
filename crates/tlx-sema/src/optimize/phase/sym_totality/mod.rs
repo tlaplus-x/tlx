@@ -193,31 +193,79 @@ pub(crate) enum ConstInfo<'a> {
 }
 
 pub(crate) fn collect_const_info<'a>(program: &Program, cfg: &'a Config) -> BTreeMap<ConstId, ConstInfo<'a>> {
-    let mut by_name: HashMap<&str, ConstInfo<'a>> = HashMap::new();
-    for b in &cfg.constants {
-        match b {
-            ConstBinding::Value { name, value, module: None } => {
-                by_name.insert(name.as_str(), ConstInfo::Value(value));
-            }
-            ConstBinding::Subst { name, op: target, module: None } => {
-                if let Some((idx, _)) =
-                    program.defs.iter().enumerate().find(|(_, d)| d.name.as_ref() == target.as_str() && d.params.is_empty())
-                {
-                    by_name.insert(name.as_str(), ConstInfo::Subst(DefId(idx as u32)));
-                }
-            }
-            _ => {}
-        }
-    }
+    use tlx_front::cfg::EffectiveConst;
     let mut out = BTreeMap::new();
     for (i, c) in program.consts.iter().enumerate() {
-        if c.arity == 0 {
-            if let Some(info) = by_name.get(c.name.as_ref()) {
-                out.insert(ConstId(i as u32), info.clone());
+        if c.arity != 0 {
+            continue;
+        }
+        let id = ConstId(i as u32);
+        match cfg.effective_constant(&c.name) {
+            Some(EffectiveConst::Value(value)) => {
+                out.insert(id, ConstInfo::Value(value));
             }
+            Some(EffectiveConst::Subst(target)) => {
+                if let Some(RootSymbol::Def(def_id)) = program.lookup_resolved_root(target) {
+                    if program.defs[def_id.idx()].params.is_empty() && !program.def_is_let(def_id) {
+                        out.insert(id, ConstInfo::Subst(def_id));
+                    }
+                }
+            }
+            None => {}
         }
     }
+    // Drop cyclic or overly deep `ConstInfo::Subst` chains so downstream
+    // checkers (`infer_expr`, `check_expr`, `const_exact_i32`, `is_exact_static_set`)
+    // never diverge on cyclic constant substitutions.
+    let cyclic: Vec<ConstId> = out
+        .keys()
+        .copied()
+        .filter(|&id| matches!(out.get(&id), Some(ConstInfo::Subst(_))) && !subst_is_acyclic(program, &out, id, &mut Vec::new(), 0))
+        .collect();
+    for id in cyclic {
+        out.remove(&id);
+    }
     out
+}
+
+fn expr_const_refs(program: &Program, e: &Expr, seen_defs: &mut Vec<DefId>, out: &mut Vec<ConstId>) {
+    match &*e.kind {
+        ExprKind::Const(c) => out.push(*c),
+        ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => {
+            if !seen_defs.contains(d) {
+                seen_defs.push(*d);
+                if let DefKind::Op(body) = &program.defs[d.idx()].kind {
+                    expr_const_refs(program, body, seen_defs, out);
+                }
+            }
+        }
+        _ => {}
+    }
+    crate::visit::children(e, &mut |child| expr_const_refs(program, child, seen_defs, out));
+}
+
+fn subst_is_acyclic(
+    program: &Program,
+    info: &BTreeMap<ConstId, ConstInfo<'_>>,
+    c: ConstId,
+    stack: &mut Vec<ConstId>,
+    depth: usize,
+) -> bool {
+    if depth >= 32 || stack.contains(&c) {
+        return false;
+    }
+    let Some(ConstInfo::Subst(def_id)) = info.get(&c) else {
+        return true;
+    };
+    let DefKind::Op(body) = &program.defs[def_id.idx()].kind else {
+        return false;
+    };
+    stack.push(c);
+    let mut refs = Vec::new();
+    expr_const_refs(program, body, &mut Vec::new(), &mut refs);
+    let ok = refs.into_iter().all(|next| subst_is_acyclic(program, info, next, stack, depth + 1));
+    stack.pop();
+    ok
 }
 
 pub(crate) struct TotalityChecker<'a> {
@@ -231,16 +279,21 @@ pub(crate) struct TotalityChecker<'a> {
 
 /// True if `cfg` contains any definition override (`Def = v`, `Def <- Other`, or module-scoped
 /// override) or operator constant table (`F(a) = v`), which symmetry normalizers do not model.
+///
+/// Mirrors `bind_cfg` (`tlx-eval/src/interp/cfg.rs`): detects overrides of operators imported
+/// via anonymous `INSTANCE` (visible in root scope) as well as named `INSTANCE` definitions.
 pub(crate) fn cfg_overrides_or_tables(program: &Program, cfg: &Config) -> bool {
-    let is_root_def = |target: &str| {
-        program
-            .defs
-            .iter()
-            .enumerate()
-            .any(|(i, d)| &*d.name == target && program.def_instance(DefId(i as u32)).is_none() && !program.def_is_let(DefId(i as u32)))
-    };
+    let any_non_let_def =
+        |target: &str| program.defs.iter().enumerate().any(|(i, d)| &*d.name == target && !program.def_is_let(DefId(i as u32)));
     cfg.constants.iter().any(|b| match b {
-        ConstBinding::Value { name, module, .. } | ConstBinding::Subst { name, module, .. } => module.is_some() || is_root_def(name),
+        ConstBinding::Value { name, module, .. } | ConstBinding::Subst { name, module, .. } => {
+            module.is_some()
+                || match program.lookup_resolved_root(name) {
+                    Some(RootSymbol::Const(_)) => false,
+                    Some(RootSymbol::Def(_)) => true,
+                    _ => any_non_let_def(name),
+                }
+        }
         ConstBinding::OpValue { .. } => true,
     })
 }

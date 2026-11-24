@@ -23,7 +23,7 @@ mod helpers;
 
 use std::collections::HashMap;
 
-use tlx_front::cfg::{Config, ConstBinding};
+use tlx_front::cfg::Config;
 
 use crate::{
     builtins::{Builtin as B, Effect},
@@ -206,11 +206,8 @@ impl<'a> SymNormalizer<'a> {
     fn const_subst_def(&self, c: ConstId) -> Option<DefId> {
         let cfg = self.cfg?;
         let name = &*self.program.consts[c.idx()].name;
-        let target = cfg.constants.iter().find_map(|b| match b {
-            ConstBinding::Subst { name: n, op, module: None } if n == name => Some(op.as_str()),
-            _ => None,
-        })?;
-        match lookup_resolved_root(self.program, target)? {
+        let target = cfg.last_constant_subst(name)?;
+        match self.program.lookup_resolved_root(target)? {
             RootSymbol::Def(id) => Some(id),
             _ => None,
         }

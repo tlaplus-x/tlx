@@ -119,12 +119,16 @@ impl Interp {
     /// `scan_action(body)` of an operator value's body, cached per arena
     /// expression (a body outside the arena is scanned every time).
     pub(crate) fn lambda_is_action(&self, body: &Expr) -> bool {
+        let compute = || {
+            let mut deps = Vec::new();
+            scan_action(&self.consts, body, &mut deps) || deps.iter().any(|d| self.def_by_name[d.idx()])
+        };
         let Some(slot) = self.prog.expr_id(body).and_then(|id| self.lambda_action.get(id.index())) else {
-            return scan_action(body, &mut Vec::new());
+            return compute();
         };
         match slot.load(Ordering::Relaxed) {
             0 => {
-                let r = scan_action(body, &mut Vec::new());
+                let r = compute();
                 slot.store(1 + r as u8, Ordering::Relaxed);
                 r
             }
@@ -232,11 +236,11 @@ impl Interp {
             .map(|i| {
                 let mut ds = Vec::new();
                 match &self.prog.defs[i].kind {
-                    DefKind::Op(e) => collect_def_refs(e, &mut ds),
+                    DefKind::Op(e) => collect_def_refs(&self.consts, e, &mut ds),
                     DefKind::Fn { bounds, body } => {
-                        collect_def_refs(body, &mut ds);
+                        collect_def_refs(&self.consts, body, &mut ds);
                         for b in bounds {
-                            collect_def_refs(&b.set, &mut ds);
+                            collect_def_refs(&self.consts, &b.set, &mut ds);
                         }
                     }
                     DefKind::Pending => {}
@@ -351,8 +355,14 @@ impl Interp {
         for i in 0..n {
             let ds = &mut deps[i];
             act[i] = match &self.prog.defs[i].kind {
-                DefKind::Op(e) => scan_action_in(e, ds, params),
-                DefKind::Fn { body, .. } => scan_action_in(body, ds, params),
+                DefKind::Op(e) => scan_action_in(&self.consts, e, ds, params),
+                DefKind::Fn { body, bounds } => {
+                    let mut found = scan_action_in(&self.consts, body, ds, params);
+                    for b in bounds {
+                        found |= scan_action_in(&self.consts, &b.set, ds, params);
+                    }
+                    found
+                }
                 DefKind::Pending => false,
             };
             if let Some(&t) = self.def_redirect.get(&DefId(i as u32)) {
@@ -398,10 +408,13 @@ impl Interp {
         let def = |d: DefId| self.def_value.contains_key(&d) || self.def_pure[self.redirect_def(d).idx()];
         let here = match &*e.kind {
             ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => def(*d),
-            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } => match &self.consts[c.idx()] {
-                Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => def(*d),
-                _ => true,
-            },
+            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+                match &self.consts[c.idx()] {
+                    Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => def(*d),
+                    Some(ConstVal::Op(OpRef::Builtin(op))) => constant_level_builtin(*op),
+                    _ => true,
+                }
+            }
             ExprKind::Let { defs, .. } => defs.iter().all(|d| def(*d)),
             ExprKind::Local(id) => match env.lookup(*id) {
                 None | Some(crate::env::Binding::Val(_)) => true,
@@ -475,11 +488,18 @@ impl Interp {
                 deps.push(*d);
                 true
             }
-            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } => {
-                if let Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) = &self.consts[c.idx()] {
-                    deps.push(*d);
+            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+                match &self.consts[c.idx()] {
+                    Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => {
+                        deps.push(*d);
+                        true
+                    }
+                    Some(ConstVal::Op(OpRef::Builtin(op))) => {
+                        !(matches!(op, B::Prime | B::Unchanged | B::Enabled)
+                            || (is_effectful_builtin(*op) && !(startup && op.cached_at_startup())))
+                    }
+                    _ => true,
                 }
-                true
             }
             ExprKind::Let { defs, .. } => {
                 deps.extend(defs.iter().copied());
@@ -521,13 +541,13 @@ fn scan_effects(e: &Expr, params: bool) -> bool {
 }
 
 /// Whether `e` itself can observe the next state; collects called definitions.
-fn scan_action(e: &Expr, deps: &mut Vec<DefId>) -> bool {
-    scan_action_in(e, deps, true)
+fn scan_action(consts: &[Option<ConstVal>], e: &Expr, deps: &mut Vec<DefId>) -> bool {
+    scan_action_in(consts, e, deps, true)
 }
 
 /// `scan_action`; `params`: an application of an operator parameter counts
 /// (the operator argument may be action-level).
-fn scan_action_in(e: &Expr, deps: &mut Vec<DefId>, params: bool) -> bool {
+fn scan_action_in(consts: &[Option<ConstVal>], e: &Expr, deps: &mut Vec<DefId>, params: bool) -> bool {
     let here = match &*e.kind {
         ExprKind::Builtin { op: B::Prime | B::Unchanged | B::Enabled, .. } | ExprKind::BoxAction { .. } | ExprKind::AngleAction { .. } => {
             true
@@ -538,6 +558,14 @@ fn scan_action_in(e: &Expr, deps: &mut Vec<DefId>, params: bool) -> bool {
             deps.push(*d);
             false
         }
+        ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => match &consts[c.idx()] {
+            Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => {
+                deps.push(*d);
+                false
+            }
+            Some(ConstVal::Op(OpRef::Builtin(B::Prime | B::Unchanged | B::Enabled))) => true,
+            _ => false,
+        },
         ExprKind::Let { defs, .. } => {
             deps.extend(defs.iter().copied());
             false
@@ -545,7 +573,7 @@ fn scan_action_in(e: &Expr, deps: &mut Vec<DefId>, params: bool) -> bool {
         _ => false,
     };
     let mut found = here;
-    tlx_sema::visit::children(e, &mut |c| found |= scan_action_in(c, deps, params));
+    tlx_sema::visit::children(e, &mut |c| found |= scan_action_in(consts, c, deps, params));
     found
 }
 
@@ -560,13 +588,18 @@ fn mentions_def(e: &Expr, d: DefId) -> bool {
 }
 
 /// The definitions `e` refers to (statically called, or a LET's local defs).
-fn collect_def_refs(e: &Expr, deps: &mut Vec<DefId>) {
+fn collect_def_refs(consts: &[Option<ConstVal>], e: &Expr, deps: &mut Vec<DefId>) {
     match &*e.kind {
         ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => deps.push(*d),
+        ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+            if let Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) = &consts[c.idx()] {
+                deps.push(*d);
+            }
+        }
         ExprKind::Let { defs, .. } => deps.extend(defs.iter().copied()),
         _ => {}
     }
-    tlx_sema::visit::children(e, &mut |c| collect_def_refs(c, deps));
+    tlx_sema::visit::children(e, &mut |c| collect_def_refs(consts, c, deps));
 }
 
 /// The definitions that lie on a cycle of the static call graph `deps` --

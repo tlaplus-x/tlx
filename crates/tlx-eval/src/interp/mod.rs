@@ -346,9 +346,16 @@ impl Interp {
     }
 
     /// The body of `d` (after cfg redirection) if it is an ordinary,
-    /// user-defined operator; `None` for built-ins and function definitions.
+    /// user-defined operator without a cfg value override; `None` for
+    /// value-overridden definitions, built-ins and function definitions.
     pub(crate) fn plain_op_body(&self, d: DefId) -> Option<(DefId, &Expr)> {
+        if self.def_value.contains_key(&d) {
+            return None;
+        }
         let d = self.redirect_def(d);
+        if self.def_value.contains_key(&d) {
+            return None;
+        }
         let def = &self.prog.defs[d.idx()];
         match &def.kind {
             DefKind::Op(body) if def.builtin.is_none() => Some((d, body)),
