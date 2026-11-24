@@ -12,6 +12,17 @@ use tlx_front::ast::Span;
 
 use crate::resolve::SourceFile;
 
+/// Where a source file was loaded from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleOrigin {
+    /// A user file (root module, `-I` search path, or `TLX_CLASSPATH`).
+    User,
+    /// A bundled TLA+ standard module (`<stdlib>/...`).
+    Stdlib,
+    /// A bundled CommunityModules module (`<community>/...`).
+    Community,
+}
+
 /// Byte offsets of the line starts of one file.
 #[derive(Clone, Debug)]
 pub struct LineIndex {

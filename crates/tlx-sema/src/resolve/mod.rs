@@ -40,6 +40,7 @@ use std::sync::Arc;
 use tlx_front::ast::{self, FileId, Span};
 
 use crate::hir::*;
+pub use crate::source::ModuleOrigin;
 pub use level::CfgLevelError;
 use subexpr::SelKey;
 
@@ -88,12 +89,17 @@ fn user_path(path: &Path) -> String {
 pub struct SourceFile {
     pub path: PathBuf,
     pub src: Arc<str>,
+    pub origin: ModuleOrigin,
     lines: std::sync::OnceLock<crate::source::LineIndex>,
 }
 
 impl SourceFile {
     pub fn new(path: PathBuf, src: Arc<str>) -> SourceFile {
-        SourceFile { path, src, lines: std::sync::OnceLock::new() }
+        Self::with_origin(path, src, ModuleOrigin::User)
+    }
+
+    pub fn with_origin(path: PathBuf, src: Arc<str>, origin: ModuleOrigin) -> SourceFile {
+        SourceFile { path, src, origin, lines: std::sync::OnceLock::new() }
     }
 
     /// The line index of the source (built on first use).
@@ -396,7 +402,7 @@ impl Program {
             level_memo: Vec::new(),
         };
         let src = std::fs::read_to_string(path).map_err(|e| vec![err(Span::default(), format!("cannot read {}: {e}", path.display()))])?;
-        let root = match p.add_module_source(path.to_path_buf(), src.into(), false) {
+        let root = match p.add_module_source(path.to_path_buf(), src.into(), ModuleOrigin::User) {
             Ok(root) => root,
             Err(es) => return Err(p.annotate_files(es)),
         };
@@ -454,6 +460,29 @@ impl Program {
 
     pub fn file(&self, id: FileId) -> &SourceFile {
         &self.files[id.0 as usize]
+    }
+
+    /// Whether `d` is a bundled standard- or community-module definition that
+    /// TLC overrides by a Java method taking eagerly evaluated arguments
+    /// (`TLC_STD_STRICT` / `TLC_OVERRIDES`).
+    ///
+    /// User modules (even if named after a bundled module such as `Bitwise.tla`)
+    /// and `LET`-local definitions always take their arguments lazily.
+    pub fn is_strict_call_def(&self, d: DefId) -> bool {
+        if self.def_is_let(d) {
+            return false;
+        }
+        let Some(def) = self.defs.get(d.idx()) else { return false };
+        let Some(src) = self.def_src.get(d.idx()) else { return false };
+        let Some(file) = self.files.get(def.span.file.0 as usize) else { return false };
+        let table = match file.origin {
+            ModuleOrigin::Stdlib => crate::builtins::TLC_STD_STRICT,
+            ModuleOrigin::Community => crate::builtins::TLC_OVERRIDES,
+            ModuleOrigin::User => return false,
+        };
+        let module = &*self.mods[src.module].name;
+        let name = def.name.rsplit('!').next().unwrap_or(&def.name);
+        table.iter().any(|(m, ops)| *m == module && ops.contains(&name))
     }
 
     /// The instance context definition `d` belongs to, if it was

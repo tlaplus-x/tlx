@@ -39,81 +39,14 @@ fn propagate(flags: &mut [bool], deps: &[&[Vec<DefId>]], to: bool) {
     }
 }
 
-/// Definitions of community modules that TLC overrides by Java methods (the
-/// `@TLAPlusOperator` annotations of tlc2.overrides in the CommunityModules
-/// jar), by module.
-const TLC_OVERRIDES: &[(&str, &[&str])] = &[
-    ("BagsExt", &["FoldBag"]),
-    ("Bitwise", &["And", "Not", "Or", "Xor", "shiftR"]),
-    ("CSV", &["CSVRead", "CSVRecords", "CSVWrite", "CSVWriteRecord"]),
-    ("Combinatorics", &["choose", "factorial"]),
-    ("DyadicRationals", &["Reduce"]),
-    ("FiniteSetsExt", &["FoldSet", "Quantify", "kSubset"]),
-    ("Functions", &["AntiFunction", "FoldFunction", "FoldFunctionOnSet", "IsInjective"]),
-    ("GraphViz", &["DotDiGraph"]),
-    ("Graphs", &["AreConnectedIn", "IsStronglyConnected", "SimplePath"]),
-    ("IOUtils", &["IODeserialize", "IOEnv", "IOEnvExec", "IOEnvExecTemplate", "IOExec", "IOExecTemplate", "IOSerialize", "atoi"]),
-    ("Json", &["JsonDeserialize", "JsonSerialize", "ToJson", "ToJsonArray", "ToJsonObject", "ndJsonDeserialize", "ndJsonSerialize"]),
-    ("SVG", &["NodeOfRingNetwork", "NodesOfDirectedMultiGraph", "PointOnLine", "SVGElemToString"]),
-    (
-        "SequencesExt",
-        &[
-            "AllSubSeqs",
-            "Contains",
-            "FoldLeft",
-            "FoldLeftDomain",
-            "FoldRight",
-            "FoldRightDomain",
-            "FoldSeq",
-            "IsPrefix",
-            "LongestCommonPrefix",
-            "RemoveFirst",
-            "RemoveFirstMatch",
-            "SelectInSeq",
-            "SelectInSubSeq",
-            "SelectLastInSeq",
-            "SelectLastInSubSeq",
-            "SetToSeq",
-            "SetToSeqs",
-            "Suffixes",
-        ],
-    ),
-    ("Statistics", &["ChiSquare"]),
-    ("UndirectedGraphs", &["AreConnectedIn", "ConnectedComponents", "SimplePath"]),
-    ("VectorClocks", &["CausalOrder"]),
-];
-
-/// Definitions of the standard modules that TLC overrides by Java methods
-/// taking evaluated arguments (`@TLAPlusOperator` in tlc2.module) and that
-/// tlx evaluates from their TLA+ text. The other overridden ones are native
-/// builtins here (their arguments are not bound by `bind_params`); the
-/// remaining standard-module definitions (`Bags!SubBag`, `TLCExt!AssertEq`,
-/// `TLCExt!TLCGetAndSet`, `Randomization!TestRandomSetOfSubsets`, `RealTime`,
-/// LET and LAMBDA operators inside them, ...) are evaluated by TLC like any
-/// TLA+ definition: arguments lazily (`@Evaluation` overrides such as
-/// `TLCExt!TLCDefer` receive the unevaluated arguments too).
-const TLC_STD_STRICT: &[(&str, &[&str])] = &[("TLCExt", &["TLCFP", "TLCGetOrDefault", "TLCModelValue", "TLCNoOp", "ToTrace"])];
-
 impl Interp {
-    /// The module name of `file` and whether it is a standard module.
-    fn file_module(&self, file: tlx_front::ast::FileId) -> (String, bool) {
-        let path = &self.prog.file(file).path;
-        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let std = path.starts_with("<stdlib>") || tlx_sema::builtins::STD_MODULES.iter().any(|(n, _)| *n == name);
-        (name, std)
-    }
-
     /// Whether an operator defined in `file` (named `name`, if a module-level
     /// definition) takes its arguments lazily in TLC: everything but the
-    /// definitions of standard and community modules with Java overrides,
-    /// which evaluate their arguments.
-    pub(crate) fn lazy_args_in(&self, file: tlx_front::ast::FileId, name: Option<&str>) -> bool {
-        let (module, std) = self.file_module(file);
-        let strict = if std { TLC_STD_STRICT } else { TLC_OVERRIDES };
-        match (strict.iter().find(|(m, _)| *m == module), name) {
-            (Some((_, ids)), Some(n)) => !ids.contains(&n.rsplit('!').next().unwrap_or(n)),
-            _ => true,
-        }
+    /// definitions of bundled standard and community modules with Java
+    /// overrides (`Program::is_strict_call_def`), which evaluate their
+    /// arguments eagerly.
+    pub(crate) fn lazy_args_in(&self, _file: tlx_front::ast::FileId, _name: Option<&str>) -> bool {
+        true
     }
 
     /// `scan_action(body)` of an operator value's body, cached per arena
@@ -227,7 +160,7 @@ impl Interp {
             })
             .collect();
         self.def_by_name = act;
-        self.def_defer_errors = (0..n).map(|i| self.lazy_args_in(self.prog.defs[i].span.file, Some(&self.prog.defs[i].name))).collect();
+        self.def_defer_errors = (0..n).map(|i| !self.prog.is_strict_call_def(DefId(i as u32))).collect();
         self.file_lazy_args = (0..self.prog.files.len()).map(|f| self.lazy_args_in(tlx_front::ast::FileId(f as u32), None)).collect();
         self.lambda_action = (0..self.prog.arena_len()).map(|_| AtomicU8::new(0)).collect();
         // Definitions on a cycle of the call graph: only these can recurse

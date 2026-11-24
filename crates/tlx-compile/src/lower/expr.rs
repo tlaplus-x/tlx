@@ -914,6 +914,15 @@ impl Lowerer<'_> {
                 let once = self.single_valued(&te, &tenv, 0);
                 c.deferred.push(if once { Deferred::Once(l, te) } else { Deferred::Thunk(l, te) });
             }
+            LBind::Op(LOp::Ref(OpRef::Def(d))) if self.ip.prog.def_is_let(d) => {
+                if let DefKind::Op(body) = &self.ip.prog.defs[d.idx()].kind {
+                    let params: Arc<[LocalId]> = self.ip.prog.defs[d.idx()].params.clone().into();
+                    self.capture_free(body, env, c);
+                    c.deferred.push(Deferred::Lambda(l, params, body.clone()));
+                } else {
+                    c.deferred.push(Deferred::OpRef(l, OpRef::Def(d)));
+                }
+            }
             LBind::Op(LOp::Ref(r)) => c.deferred.push(Deferred::OpRef(l, r)),
             LBind::Op(LOp::Lambda(params, body, lenv)) => {
                 self.capture_free(&body, &lenv, c);

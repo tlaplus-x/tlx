@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tlx_eval::env::{Binding, Env, OpVal, Thunk};
-use tlx_sema::hir::{self, DefId, LocalId};
+use tlx_sema::hir::{self, DefId, DefKind, LocalId, OpRef};
 use tlx_value::Value;
 
 use super::super::super::memo;
@@ -89,6 +89,14 @@ impl InterpNode {
                     let o = OpVal::Lambda { params: params.clone(), body: body.clone(), env: env.clone() };
                     env.bind(*l, Binding::Op(o))
                 }
+                Deferred::OpRef(l, OpRef::Def(d)) if fx.ip.prog.def_is_let(*d) => match &fx.ip.prog.defs[d.idx()].kind {
+                    DefKind::Op(body) => {
+                        let o =
+                            OpVal::Lambda { params: fx.ip.prog.defs[d.idx()].params.clone().into(), body: body.clone(), env: env.clone() };
+                        env.bind(*l, Binding::Op(o))
+                    }
+                    _ => env.bind(*l, Binding::Op(OpVal::Ref(OpRef::Def(*d)))),
+                },
                 Deferred::OpRef(l, r) => env.bind(*l, Binding::Op(OpVal::Ref(*r))),
             };
         }

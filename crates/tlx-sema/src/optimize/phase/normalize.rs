@@ -97,6 +97,9 @@ impl<'a> Normalizer<'a> {
                             if self.stack.contains(id) || d.params.len() != args.len() {
                                 return None;
                             }
+                            if self.program.is_strict_call_def(*id) && !strict_call_preserves_args(self.program, d) {
+                                return None;
+                            }
                             // TLA+ parameters are by name. Substitution keeps
                             // each actual read in the callee's control context;
                             // expansion above still refuses effectful actuals.
@@ -210,4 +213,66 @@ fn disjoint(a: &[ExceptKey], b: &[ExceptKey]) -> bool {
     // Different field names at the same path depth cannot alias, regardless
     // of whether earlier indices select the same entry. Prefixes may alias.
     a.iter().zip(b).any(|(a, b)| matches!((a, b), (ExceptKey::Field(a), ExceptKey::Field(b)) if a != b))
+}
+
+/// Whether call-by-name inlining of a strict call-by-value definition
+/// (`Program::is_strict_call_def`) is guaranteed to evaluate every value
+/// argument unconditionally, so partial or asymmetric arguments (such as
+/// `1 \div 0` or `CHOOSE`) are never erased before totality or dependency
+/// analysis.
+pub(in crate::optimize::phase) fn strict_call_preserves_args(program: &Program, d: &Def) -> bool {
+    let DefKind::Op(body) = &d.kind else {
+        return false;
+    };
+    d.params.iter().all(|&p| program.locals[p.idx()].arity > 0 || param_evaluated_unconditionally(program, body, p))
+}
+
+fn param_evaluated_unconditionally(program: &Program, e: &Expr, param: LocalId) -> bool {
+    use crate::builtins::Builtin as B;
+    match &*e.kind {
+        ExprKind::Local(l) => *l == param,
+        ExprKind::And(es) | ExprKind::Or(es) => es.first().is_some_and(|a| param_evaluated_unconditionally(program, a, param)),
+        ExprKind::If { cond, then, els } => {
+            param_evaluated_unconditionally(program, cond, param)
+                || (param_evaluated_unconditionally(program, then, param) && param_evaluated_unconditionally(program, els, param))
+        }
+        ExprKind::Quant { bounds, .. } | ExprKind::FnConstruct { bounds, .. } | ExprKind::SetMap { bounds, .. } => {
+            bounds.first().is_some_and(|b| param_evaluated_unconditionally(program, &b.set, param))
+        }
+        ExprKind::SetFilter { bound, .. } => param_evaluated_unconditionally(program, &bound.set, param),
+        ExprKind::Choose { set: Some(s), .. } => param_evaluated_unconditionally(program, s, param),
+        ExprKind::Builtin { op, args } => match op {
+            B::Implies | B::Not => args.first().is_some_and(|a| param_evaluated_unconditionally(program, a, param)),
+            _ if op.is_strict_value_op() => args.iter().any(|a| param_evaluated_unconditionally(program, a, param)),
+            _ => false,
+        },
+        ExprKind::Apply { op, args } => match op {
+            OpRef::Builtin(b) => match b {
+                B::Implies | B::Not => args.first().is_some_and(|a| param_evaluated_unconditionally(program, a, param)),
+                _ if b.is_strict_value_op() => args.iter().any(|a| param_evaluated_unconditionally(program, a, param)),
+                _ => false,
+            },
+            OpRef::Def(id) => {
+                let d = &program.defs[id.idx()];
+                if d.builtin.is_some_and(B::is_strict_value_op) || program.is_strict_call_def(*id) {
+                    args.iter().any(|a| param_evaluated_unconditionally(program, a, param))
+                } else {
+                    false
+                }
+            }
+            OpRef::Const(_) | OpRef::Param(_) => false,
+        },
+        ExprKind::Tuple(es) | ExprKind::SetEnum(es) => es.iter().any(|a| param_evaluated_unconditionally(program, a, param)),
+        ExprKind::Record(fs) | ExprKind::RecordSet(fs) => fs.iter().any(|(_, a)| param_evaluated_unconditionally(program, a, param)),
+        ExprKind::FnApp { func, args } => {
+            param_evaluated_unconditionally(program, func, param) || args.iter().any(|a| param_evaluated_unconditionally(program, a, param))
+        }
+        ExprKind::Field { record, .. } => param_evaluated_unconditionally(program, record, param),
+        ExprKind::Except { base, .. } => param_evaluated_unconditionally(program, base, param),
+        ExprKind::FnSet { domain, range } => {
+            param_evaluated_unconditionally(program, domain, param) || param_evaluated_unconditionally(program, range, param)
+        }
+        ExprKind::Let { body, .. } => param_evaluated_unconditionally(program, body, param),
+        _ => false,
+    }
 }

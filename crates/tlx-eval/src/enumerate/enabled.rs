@@ -64,6 +64,14 @@ impl<'a> Enumerator<'a> {
                 Some((d, body)) => self.unchanged(body, &ip.def_env(d, env), k),
                 None => self.unchanged_eval(e, env, k),
             },
+            ExprKind::Local(l) => match env.lookup(*l).and_then(|b| b.by_name(&ip.prog)) {
+                Some((inner, inner_env)) => self.unchanged(inner, inner_env, k),
+                None => self.unchanged_eval(e, env, k),
+            },
+            ExprKind::Let { defs, body } => {
+                let (env2, _frame) = ip.let_env(defs, env);
+                self.unchanged(body, &env2, k)
+            }
             _ => self.unchanged_eval(e, env, k),
         }
     }

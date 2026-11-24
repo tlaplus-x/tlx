@@ -6,25 +6,26 @@ use std::sync::Arc;
 
 use tlx_front::ast::{self, FileId};
 
-use super::{err, Env, ModIdx, ModInfo, Program, SemaError, SourceFile, Sym, ROOT_CTX};
+use super::{err, Env, ModIdx, ModInfo, ModuleOrigin, Program, SemaError, SourceFile, Sym, ROOT_CTX};
 use crate::builtins::{COMMUNITY_MODULES, STD_MODULES};
 use crate::hir::{DefId, RootSymbol};
 
 impl Program {
     /// Parse a source file and register all of its modules (and their nested
     /// modules). Returns the first top-level module.
-    pub(super) fn add_module_source(&mut self, path: PathBuf, src: Arc<str>, std: bool) -> Result<ModIdx, Vec<SemaError>> {
+    pub(super) fn add_module_source(&mut self, path: PathBuf, src: Arc<str>, origin: ModuleOrigin) -> Result<ModIdx, Vec<SemaError>> {
         let file = FileId(self.files.len() as u32);
-        self.files.push(SourceFile::new(path.clone(), src.clone()));
+        self.files.push(SourceFile::with_origin(path.clone(), src.clone(), origin));
         let ms =
             tlx_front::parse::parse_modules(&src, file).map_err(|ds| ds.into_iter().map(|d| err(d.span, d.message)).collect::<Vec<_>>())?;
         // SANY: the first module of a file must be named after the file.
         if let (Some(m), Some(stem)) = (ms.first(), path.file_stem().and_then(|s| s.to_str())) {
-            if !std && *m.name.name != *stem && !path.starts_with("<stdlib>") && !path.starts_with("<community>") {
+            if origin == ModuleOrigin::User && *m.name.name != *stem {
                 let msg = format!("File name '{stem}' does not match the name '{}' of the top level module it contains.", m.name.name);
                 return Err(vec![err(m.name.span, msg)]);
             }
         }
+        let std = origin == ModuleOrigin::Stdlib;
         let mut first = None;
         for m in ms {
             let idx = self.register_module(m, std, None);
@@ -67,10 +68,10 @@ impl Program {
             return m;
         }
         if let Some(&(_, src)) = STD_MODULES.iter().find(|(n, _)| **n == *name.name) {
-            return self.load_module_file(PathBuf::from(format!("<stdlib>/{file_name}")), Arc::from(src));
+            return self.load_module_file(PathBuf::from(format!("<stdlib>/{file_name}")), Arc::from(src), ModuleOrigin::Stdlib);
         }
         if let Some(&(_, src)) = COMMUNITY_MODULES.iter().find(|(n, _)| **n == *name.name) {
-            return self.load_module_file(PathBuf::from(format!("<community>/{file_name}")), Arc::from(src));
+            return self.load_module_file(PathBuf::from(format!("<community>/{file_name}")), Arc::from(src), ModuleOrigin::Community);
         }
         let late = self.late_paths.clone();
         if let Some(m) = self.load_from_dirs(&late, &file_name) {
@@ -86,14 +87,14 @@ impl Program {
         for dir in dirs {
             let p = Path::new(dir).join(file_name);
             if let Ok(src) = std::fs::read_to_string(&p) {
-                return Some(self.load_module_file(p, src.into()));
+                return Some(self.load_module_file(p, src.into(), ModuleOrigin::User));
             }
         }
         None
     }
 
-    fn load_module_file(&mut self, path: PathBuf, src: Arc<str>) -> Option<ModIdx> {
-        match self.add_module_source(path, src, false) {
+    fn load_module_file(&mut self, path: PathBuf, src: Arc<str>, origin: ModuleOrigin) -> Option<ModIdx> {
+        match self.add_module_source(path, src, origin) {
             Ok(m) => Some(m),
             Err(es) => {
                 self.errors.extend(es);

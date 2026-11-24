@@ -327,6 +327,60 @@ pub const COMMUNITY_NATIVE_MODULES: &[&str] = &[
     "VectorClocks",
 ];
 
+/// Definitions of community modules that TLC overrides by Java methods (the
+/// `@TLAPlusOperator` annotations of `tlc2.overrides` in the CommunityModules
+/// jar), by module. These evaluate their arguments eagerly (call-by-value).
+pub const TLC_OVERRIDES: &[(&str, &[&str])] = &[
+    ("BagsExt", &["FoldBag"]),
+    ("Bitwise", &["And", "Not", "Or", "Xor", "shiftR"]),
+    ("CSV", &["CSVRead", "CSVRecords", "CSVWrite", "CSVWriteRecord"]),
+    ("Combinatorics", &["choose", "factorial"]),
+    ("DyadicRationals", &["Reduce"]),
+    ("FiniteSetsExt", &["FoldSet", "Quantify", "kSubset"]),
+    ("Functions", &["AntiFunction", "FoldFunction", "FoldFunctionOnSet", "IsInjective"]),
+    ("GraphViz", &["DotDiGraph"]),
+    ("Graphs", &["AreConnectedIn", "IsStronglyConnected", "SimplePath"]),
+    ("IOUtils", &["IODeserialize", "IOEnv", "IOEnvExec", "IOEnvExecTemplate", "IOExec", "IOExecTemplate", "IOSerialize", "atoi"]),
+    ("Json", &["JsonDeserialize", "JsonSerialize", "ToJson", "ToJsonArray", "ToJsonObject", "ndJsonDeserialize", "ndJsonSerialize"]),
+    ("SVG", &["NodeOfRingNetwork", "NodesOfDirectedMultiGraph", "PointOnLine", "SVGElemToString"]),
+    (
+        "SequencesExt",
+        &[
+            "AllSubSeqs",
+            "Contains",
+            "FoldLeft",
+            "FoldLeftDomain",
+            "FoldRight",
+            "FoldRightDomain",
+            "FoldSeq",
+            "IsPrefix",
+            "LongestCommonPrefix",
+            "RemoveFirst",
+            "RemoveFirstMatch",
+            "SelectInSeq",
+            "SelectInSubSeq",
+            "SelectLastInSeq",
+            "SelectLastInSubSeq",
+            "SetToSeq",
+            "SetToSeqs",
+            "Suffixes",
+        ],
+    ),
+    ("Statistics", &["ChiSquare"]),
+    ("UndirectedGraphs", &["AreConnectedIn", "ConnectedComponents", "SimplePath"]),
+    ("VectorClocks", &["CausalOrder"]),
+];
+
+/// Definitions of the standard modules that TLC overrides by Java methods
+/// taking evaluated arguments (`@TLAPlusOperator` in `tlc2.module`) and that
+/// tlx may evaluate from their TLA+ text. The remaining standard-module
+/// definitions (`Bags!SubBag`, `TLCExt!AssertEq`, `TLCExt!TLCGetAndSet`,
+/// `Randomization!TestRandomSetOfSubsets`, `RealTime`, LET and LAMBDA
+/// operators inside them, ...) are evaluated by TLC like any TLA+ definition:
+/// arguments lazily (`@Evaluation` overrides such as `TLCExt!TLCDefer` receive
+/// unevaluated arguments too).
+pub const TLC_STD_STRICT: &[(&str, &[&str])] = &[("TLCExt", &["TLCFP", "TLCGetOrDefault", "TLCModelValue", "TLCNoOp", "ToTrace"])];
+
 /// Standard modules shipped with tlx (vendored sources in `modules/stdlib`,
 /// owner-relative so a packaged tlx-sema always carries them, ARCH-09).
 pub const STD_MODULES: &[(&str, &str)] = &[

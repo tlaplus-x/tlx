@@ -661,6 +661,9 @@ impl<'a> SymNormalizer<'a> {
         if self.stack.contains(&id) || d.params.len() != args.len() {
             return None;
         }
+        if self.program.is_strict_call_def(id) && !super::normalize::strict_call_preserves_args(self.program, d) {
+            return None;
+        }
         if self.mode == NormMode::Choose && !args.is_empty() {
             if let DefKind::Op(body) = &d.kind {
                 for (k, &s_local) in d.params.iter().enumerate() {

@@ -7,4 +7,4 @@ pub mod resolve;
 pub mod source;
 pub mod visit;
 
-pub use resolve::{CfgLevelError, CfgNameError, CfgSubstError, Program, SemaError, SourceFile};
+pub use resolve::{CfgLevelError, CfgNameError, CfgSubstError, ModuleOrigin, Program, SemaError, SourceFile};

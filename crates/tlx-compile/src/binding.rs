@@ -26,7 +26,9 @@
 //! not expressed here: their roots and policies differ, and folding them in
 //! is a separate question (`CODE-08`, `CODE-23`).
 
-use tlx_eval::env::{Binding, Env, OpVal};
+use std::sync::Arc;
+
+use tlx_eval::env::{Binding, Env, OpVal, Thunk};
 use tlx_eval::Interp;
 use tlx_sema::builtins::Builtin;
 use tlx_sema::hir::{self, ConstId, DefId, DefKind, ExprKind as H, LocalId, OpRef};
@@ -143,7 +145,8 @@ impl<'a> State<'a> {
     }
 
     /// Walk definition `d` (after the cfg's redirections), in a definition
-    /// scope, if the policy admits it.
+    /// scope (or in the enclosing scope for a `LET`-local definition), if the
+    /// policy admits it.
     pub(crate) fn def<P: Policy>(&mut self, p: &mut P, d: DefId) {
         let d = self.ip.redirect_def(d);
         if !p.def(self, d) {
@@ -152,7 +155,10 @@ impl<'a> State<'a> {
         // The body belongs to the interpreter's program, not to `self`, so
         // holding it across the mutable walk is fine.
         let ip = self.ip;
-        self.enter_def_scope();
+        let is_let = ip.prog.def_is_let(d);
+        if !is_let {
+            self.enter_def_scope();
+        }
         match &ip.prog.defs[d.idx()].kind {
             DefKind::Op(body) => self.walk(p, body, 0),
             DefKind::Fn { bounds, body } => {
@@ -163,7 +169,9 @@ impl<'a> State<'a> {
             }
             DefKind::Pending => p.pending_def(self, d),
         }
-        self.leave_def_scope();
+        if !is_let {
+            self.leave_def_scope();
+        }
         p.def_done(self, d);
     }
 
@@ -324,4 +332,36 @@ pub(crate) fn deferred_local(d: &Deferred) -> LocalId {
     match d {
         Deferred::Thunk(l, _) | Deferred::Once(l, _) | Deferred::Lambda(l, _, _) | Deferred::OpRef(l, _) => *l,
     }
+}
+
+/// Bind `deferred` arguments onto `base` in order, matching
+/// `InterpNode::eval_with`, so walks that resolve locals inside primed
+/// contexts see deferred bindings in their exact lexical environments.
+pub(crate) fn bind_deferred(ip: &Interp, base: &Env, deferred: &[Deferred]) -> Env {
+    let mut env = base.clone();
+    for d in deferred {
+        env = match d {
+            Deferred::Thunk(l, e) => {
+                let t = Thunk { expr: e.clone(), env: env.clone(), memo: None };
+                env.bind(*l, Binding::Thunk(Arc::new(t)))
+            }
+            Deferred::Once(l, e) => {
+                let t = Thunk { expr: e.clone(), env: env.clone(), memo: Some(Default::default()) };
+                env.bind(*l, Binding::Thunk(Arc::new(t)))
+            }
+            Deferred::Lambda(l, params, body) => {
+                let o = OpVal::Lambda { params: params.clone(), body: body.clone(), env: env.clone() };
+                env.bind(*l, Binding::Op(o))
+            }
+            Deferred::OpRef(l, OpRef::Def(def)) if ip.prog.def_is_let(*def) => match &ip.prog.defs[def.idx()].kind {
+                DefKind::Op(body) => {
+                    let o = OpVal::Lambda { params: ip.prog.defs[def.idx()].params.clone().into(), body: body.clone(), env: env.clone() };
+                    env.bind(*l, Binding::Op(o))
+                }
+                _ => env.bind(*l, Binding::Op(OpVal::Ref(OpRef::Def(*def)))),
+            },
+            Deferred::OpRef(l, r) => env.bind(*l, Binding::Op(OpVal::Ref(*r))),
+        };
+    }
+    env
 }

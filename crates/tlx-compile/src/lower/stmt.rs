@@ -491,6 +491,21 @@ impl Lowerer<'_> {
                     self.guarded(u, k, st)
                 }
             },
+            H::Local(l) => match env.lookup(*l, &self.ip.prog) {
+                Some(LBind::Thunk(te, tenv)) => self.go_unchanged(&te, &tenv, k, st),
+                _ => {
+                    let u = self.unchanged_expr(e, env, st);
+                    self.guarded(u, k, st)
+                }
+            },
+            H::Let { defs, body } => {
+                let (env2, lets) = self.let_temps(defs, body, env, st);
+                let mut s = self.go_unchanged(body, &env2, k, st)?;
+                for (t, v) in lets.into_iter().rev() {
+                    s = Stmt::Let { temp: t, value: v, body: Box::new(s) };
+                }
+                Ok(s)
+            }
             _ => {
                 let u = self.unchanged_expr(e, env, st);
                 self.guarded(u, k, st)
@@ -596,6 +611,12 @@ impl Lowerer<'_> {
             H::OpArg(OpRef::Param(l)) => match env.lookup(*l, &self.ip.prog) {
                 Some(LBind::Op(o)) => Ok(o),
                 _ => unsupported("operator parameter not bound to an operator"),
+            },
+            // A LET definition closes over the current lexical environment
+            // (matching `tlx_eval::Interp::op_val`).
+            H::OpArg(OpRef::Def(d)) if self.ip.prog.def_is_let(*d) => match &self.ip.prog.defs[d.idx()].kind {
+                DefKind::Op(body) => Ok(LOp::Lambda(self.ip.prog.defs[d.idx()].params.clone().into(), body.clone(), env.clone())),
+                _ => Ok(LOp::Ref(OpRef::Def(*d))),
             },
             H::OpArg(r) => Ok(LOp::Ref(*r)),
             H::Lambda { params, body } => Ok(LOp::Lambda(params.clone().into(), body.clone(), env.clone())),

@@ -140,7 +140,8 @@ impl Lowerer<'_> {
             active: HashSet::new(),
         };
         if let ExprKind::Interp { expr, deferred, env, .. } = &*e.kind {
-            let mut s = State::new(self.ip, Scope::Single, env.clone());
+            let full_env = crate::binding::bind_deferred(self.ip, env, deferred);
+            let mut s = State::new(self.ip, Scope::Single, full_env);
             s.walk(&mut p, expr, 0);
             s.walk_deferred(&mut p, deferred, 0);
         }
@@ -229,5 +230,59 @@ Live == ENABLED Next
         assert!(enabled.enabled && enabled.unknown);
         assert_eq!(enabled.reads, None);
         assert!(enabled.context.next.iter().all(|b| !b));
+    }
+
+    #[test]
+    fn fallback_facts_preserve_scope_across_let_and_track_primed_deferred() {
+        let source = tlx_testkit::module(
+            "SummaryLetDeferred",
+            r#"
+EXTENDS Naturals
+VARIABLE x
+Init == x = 0
+Next == x' = x
+UseLet(Op(_)) == LET y == Op(1) IN y = 2
+UsePrimed(a) == a' = 1
+"#,
+        );
+        let model = tlx_testkit::spec::load(&source, "INIT Init\nNEXT Next\n");
+        let lw = lowerer(&model);
+
+        // Operator bound in the fallback's `env`, referenced inside a `LET`:
+        // `Scope::Single` must NOT wipe `env` when entering `LET y == Op(1)`.
+        let use_let = model.ip.prog.defs.iter().find(|d| &*d.name == "UseLet").unwrap();
+        let DefKind::Op(use_let_body) = &use_let.kind else { panic!("operator") };
+        let op_param = use_let.params[0];
+        let lam_param = LocalId(999);
+        let lam_body = hir::Expr::new(
+            H::Builtin {
+                op: Builtin::Plus,
+                args: vec![
+                    hir::Expr::new(H::Local(lam_param), Default::default()),
+                    hir::Expr::new(H::Var(hir::VarId(0)), Default::default()),
+                ],
+            },
+            Default::default(),
+        );
+        let env = Env::default().bind(
+            op_param,
+            tlx_eval::env::Binding::Op(tlx_eval::env::OpVal::Lambda {
+                params: Arc::from([lam_param]),
+                body: lam_body,
+                env: Env::default(),
+            }),
+        );
+        let e = Expr::new(Ty::Bool, ExprKind::Interp { expr: use_let_body.clone(), binds: vec![], deferred: vec![], env });
+        assert_eq!(lw.fallback_facts(&e).reads, Some(Reads { cur: vec![0], next: vec![] }));
+
+        // Primed `Deferred::Thunk` local must record `reads.next`.
+        let use_primed = model.ip.prog.defs.iter().find(|d| &*d.name == "UsePrimed").unwrap();
+        let DefKind::Op(use_primed_body) = &use_primed.kind else { panic!("operator") };
+        let a_param = use_primed.params[0];
+        let deferred = vec![Deferred::Thunk(a_param, hir::Expr::new(H::Var(hir::VarId(0)), Default::default()))];
+        let e_primed =
+            Expr::new(Ty::Bool, ExprKind::Interp { expr: use_primed_body.clone(), binds: vec![], deferred, env: Env::default() });
+        let reads = lw.fallback_facts(&e_primed).reads.expect("reads");
+        assert!(reads.next.contains(&0), "primed deferred local must record reads.next: {reads:?}");
     }
 }
