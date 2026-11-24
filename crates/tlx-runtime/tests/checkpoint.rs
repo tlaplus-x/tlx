@@ -22,6 +22,9 @@ use tlx_runtime::{
 struct Layers {
     layers: u32,
     bad: Option<(u32, u32)>,
+    /// Optional layer that raises a `ModelError` during expansion (simulating
+    /// a layout miss to verify that `ResumePoint` keeps the archive intact).
+    error_level: Option<u32>,
     /// States are encoded (else serialized with `Persist`).
     coded: bool,
     /// Exercise a codec's rejection of externally restored word handles.
@@ -45,6 +48,7 @@ impl Layers {
         Layers {
             layers,
             bad,
+            error_level: None,
             coded,
             reject_words: false,
             live: false,
@@ -76,6 +80,9 @@ impl Model for Layers {
     }
     fn successors(&self, s: &(u32, u32), out: &mut dyn FnMut((u32, u32), u32) -> bool) -> Result<(), ModelError> {
         self.log.lock().unwrap().push(*s);
+        if Some(s.0) == self.error_level {
+            return Err(ModelError::new("simulated layout miss"));
+        }
         let (l, i) = *s;
         if l + 1 >= self.layers {
             return Ok(());
@@ -667,4 +674,349 @@ fn unencoded_checkpoint_writes_no_archive_for_idle_workers() {
         std::fs::read_dir(dir.join("checkpoint")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     assert!(!files.iter().any(|f| f.starts_with("archive-")), "{files:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Multi-worker positioned checkpoints (`coarse` = VIEW/SYMMETRY, or `coverage`)
+/// recovered with one worker preserve exact BFS expansion order, counts,
+/// coverage and traces under tight `maxmem`, `-spill always` (forcing
+/// multi-run external merge-sort) and `-spill off` (compact in-memory sort).
+#[test]
+fn positioned_single_worker_recovery_preserves_bfs_order_and_bounds_memory() {
+    for (coarse, coverage, bad) in [(true, false, None), (true, false, Some((50, 3))), (false, true, None), (false, true, Some((61, 5)))] {
+        for coded in [true, false] {
+            let make = || Layers { coarse, ..Layers::new(90, bad, coded) };
+            let reference = make();
+            let ref_opts = Options { coverage, ..opts(1, Spill::default(), None) };
+            let ref_report = explore(&reference, &ref_opts);
+            let want = summary(&ref_report, EXACT);
+            let want_order = reference.log.lock().unwrap().clone();
+
+            let cases: [(&str, SpillMode, usize); 3] = [
+                ("tight-maxmem", SpillMode::Auto, 1 << 20),
+                ("spill-always", SpillMode::Always, usize::MAX),
+                ("spill-off", SpillMode::Off, 64 << 20),
+            ];
+            for (label, mode, maxmem) in cases {
+                let scratch = tlx_testkit::TempDir::new(&format!("pos1-{coarse}-{coverage}-{coded}-{label}"));
+                let dir = scratch.child_path("meta");
+                let ck = stopping(300, 2);
+                let s1 = spill_in(&dir, mode, false);
+                let o1 = Options {
+                    coverage,
+                    queue: tlx_runtime::queue::Config { seg_bytes: 4096, ..Default::default() },
+                    ..opts(8, s1.clone(), Some(ck.clone()))
+                };
+                explore(&make(), &o1);
+                settle(&s1);
+                assert_eq!(ck.count(), 2, "{label}: checkpoint count");
+
+                let rec = Recovery::open(&dir).expect("checkpoint");
+                let m = make();
+                let s2 = spill_in(&dir, mode, true);
+                let o2 = Options {
+                    coverage,
+                    maxmem,
+                    fp: FpConfig::default().with_disk_slots(1024),
+                    queue: tlx_runtime::queue::Config { seg_bytes: 4096, ..Default::default() },
+                    ..opts(1, s2.clone(), Some(none()))
+                };
+                let (r, _) = explore_from(&m, &o2, Start::Recover(&rec), None);
+                settle(&s2);
+
+                assert_eq!(summary(&r, EXACT), want, "coarse={coarse} coverage={coverage} bad={bad:?} coded={coded} {label}");
+                let got_order = m.log.lock().unwrap().clone();
+                assert!(
+                    want_order.ends_with(&got_order) && !got_order.is_empty(),
+                    "coarse={coarse} coverage={coverage} bad={bad:?} coded={coded} {label}: expansion order diverged from exact BFS"
+                );
+                if coverage {
+                    assert_eq!(
+                        r.coverage, ref_report.coverage,
+                        "coarse={coarse} coverage={coverage} bad={bad:?} coded={coded} {label}: coverage mismatch"
+                    );
+                }
+                assert_eq!(s2.counters().used, 0, "{label}: leaked spill bytes");
+                match mode {
+                    SpillMode::Always => assert!(s2.counters().written > 0, "{label}: expected disk sort writes"),
+                    SpillMode::Off => assert_eq!(s2.counters().written, 0, "{label}: wrote to disk with SpillMode::Off"),
+                    SpillMode::Auto => {}
+                }
+                assert!(!dir.exists(), "{} left behind", dir.display());
+            }
+        }
+    }
+}
+
+/// Recovering a positioned checkpoint with one worker under `-spill off` and a
+/// generous budget keeps the layout-miss archive intact (does not trigger
+/// stage-1 relief to drop it while sorting).
+#[test]
+fn positioned_single_worker_recovery_keeps_archive_without_pressure() {
+    let make = |error_level| Layers { coarse: true, error_level, ..Layers::new(90, None, true) };
+    let scratch = tlx_testkit::TempDir::new("pos1-keep-archive");
+    let dir = scratch.child_path("meta");
+    let ck = stopping(300, 2);
+    let s1 = spill_in(&dir, SpillMode::Auto, false);
+    explore_from(&make(None), &opts(4, s1.clone(), Some(ck.clone())), Start::Init, Some(1 << 30));
+    settle(&s1);
+    assert_eq!(ck.count(), 2);
+
+    let rec = Recovery::open(&dir).expect("checkpoint");
+    let s2 = spill_in(&dir, SpillMode::Off, true);
+    let o2 = Options { maxmem: 512 << 20, ..opts(1, s2.clone(), Some(none())) };
+    let (r, resume) = explore_from(&make(Some(80)), &o2, Start::Recover(&rec), Some(1 << 30));
+    settle(&s2);
+    assert!(matches!(r.outcome, Outcome::Error(_)), "{:?}", r.outcome);
+    let rp = resume.expect("archive must remain intact when memory fits in budget");
+    assert!(!rp.is_empty());
+    assert_eq!(s2.counters().written, 0);
+    assert!(!dir.exists());
+}
+
+/// Wide encoded model for destination-frontier spilling regressions: 8 initial
+/// states fan out across multiple workers into `8 * fanout` (`< 1024`)
+/// high-entropy level-1 states of `WIDE_WORDS` words (~32 KiB raw each,
+/// sealing ~1 segment per state at `seg_bytes = 64 KiB`).
+struct WideLayers {
+    inits: u32,
+    fanout: u32,
+    inv: Vec<String>,
+    acts: Vec<String>,
+    log: Mutex<Vec<(u32, u32)>>,
+}
+
+const WIDE_WORDS: usize = 4096;
+
+impl WideLayers {
+    fn new(inits: u32, fanout: u32) -> WideLayers {
+        WideLayers { inits, fanout, inv: Vec::new(), acts: vec!["Fan".into()], log: Mutex::new(Vec::new()) }
+    }
+}
+
+impl Model for WideLayers {
+    type State = (u32, u32);
+    tlx_runtime::model_without_checks!(but coarse_fingerprint);
+    fn init_states(&self, out: &mut dyn FnMut((u32, u32))) -> Result<(), ModelError> {
+        for i in 0..self.inits {
+            out((0, i));
+        }
+        Ok(())
+    }
+    fn successors(&self, s: &(u32, u32), out: &mut dyn FnMut((u32, u32), u32) -> bool) -> Result<(), ModelError> {
+        self.log.lock().unwrap().push(*s);
+        if s.0 == 0 {
+            let base = s.1 * self.fanout;
+            for j in 0..self.fanout {
+                if !out((1, base + j), 0) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+    fn fingerprint(&self, s: &(u32, u32)) -> u64 {
+        ((s.0 as u64) << 32 | s.1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1357_9BDF
+    }
+    fn coarse_fingerprint(&self) -> bool {
+        true
+    }
+    fn check_invariants(&self, _: &(u32, u32)) -> Result<Option<usize>, ModelError> {
+        Ok(None)
+    }
+    fn invariant_names(&self) -> &[String] {
+        &self.inv
+    }
+    fn action_names(&self) -> &[String] {
+        &self.acts
+    }
+    fn render(&self, s: &(u32, u32)) -> String {
+        format!("/\\ l = {}\n/\\ i = {}", s.0, s.1)
+    }
+    fn caps(&self) -> Caps<'_, (u32, u32)> {
+        Caps { format: Some(StateFormat::Words(self)), ..Caps::default() }
+    }
+}
+
+impl StateCodec<(u32, u32)> for WideLayers {
+    fn words(&self) -> usize {
+        WIDE_WORDS
+    }
+    fn encode(&self, s: &(u32, u32), out: &mut [u64]) -> u64 {
+        out[0] = s.0 as u64;
+        out[1] = s.1 as u64;
+        // Fill remaining words deterministically with high entropy so XOR-varint
+        // records stay ~32-36 KiB and seal segments rapidly.
+        let mut x = ((s.0 as u64) << 32 | (s.1 as u64 + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for slot in &mut out[2..] {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *slot = x;
+        }
+        self.fingerprint(s)
+    }
+    fn decode(&self, w: &[u64], _depth: u32, fp: u64) -> (u32, u32) {
+        let s = (w[0] as u32, w[1] as u32);
+        assert_eq!(self.fingerprint(&s), fp);
+        s
+    }
+}
+
+/// Regression for destination frontier spilling during positioned single-worker
+/// recovery: recovering fewer than 1,024 wide encoded states (200 states x ~36 KiB
+/// at `seg_bytes = 64 KiB`, ~12.5 MiB total segments) must spill segments as they
+/// seal instead of waiting for 1,024 records to accumulate.
+#[test]
+fn positioned_single_worker_recovery_spills_wide_destination_segments() {
+    const INITS: u32 = 8;
+    const FANOUT: u32 = 25;
+    const WIDTH: u32 = INITS * FANOUT;
+    const SEG_BYTES: usize = 64 << 10;
+    let reference = WideLayers::new(INITS, FANOUT);
+    let ref_report = explore(&reference, &opts(1, Spill::default(), None));
+    let want = summary(&ref_report, EXACT);
+    let want_order = reference.log.lock().unwrap().clone();
+
+    for (label, mode, maxmem) in [("spill-always", SpillMode::Always, usize::MAX), ("auto-tight-maxmem", SpillMode::Auto, 4 << 20)] {
+        let scratch = tlx_testkit::TempDir::new(&format!("wide-dest-{label}"));
+        let dir = scratch.child_path("meta");
+        let ck = stopping(100, 1);
+        let s1 = spill_in(&dir, mode, false);
+        let o1 = Options {
+            queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+            ..opts(4, s1.clone(), Some(ck.clone()))
+        };
+        explore(&WideLayers::new(INITS, FANOUT), &o1);
+        settle(&s1);
+        assert_eq!(ck.count(), 1, "{label}: expected checkpoint after level 1");
+
+        let rec = Recovery::open(&dir).expect("checkpoint");
+        let recovered = WideLayers::new(INITS, FANOUT);
+        let s2 = spill_in(&dir, mode, true);
+        let o2 = Options {
+            maxmem,
+            queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+            ..opts(1, s2.clone(), Some(none()))
+        };
+        let (r, _) = explore_from(&recovered, &o2, Start::Recover(&rec), None);
+        settle(&s2);
+
+        assert_eq!(summary(&r, EXACT), want, "{label}: outcome/counts mismatch");
+        let got_order = recovered.log.lock().unwrap().clone();
+        assert_eq!(got_order.len(), WIDTH as usize, "{label}: expected all {WIDTH} level-1 states expanded after recovery");
+        assert!(want_order.ends_with(&got_order), "{label}: BFS expansion order diverged");
+        // Without per-segment spilling during recovery emission, all 200 wide
+        // states (~200 x 64 KiB = ~12.5 MiB) remain resident until `finish` ends.
+        // With immediate per-segment spilling, peak stays near the 8-segment
+        // read-ahead window (~576 KiB) plus active write/open segment overhead.
+        let queue_peak = r.frontier_peak;
+        assert!(
+            queue_peak <= 2 << 20,
+            "{label}: destination frontier peak {queue_peak} bytes exceeded 2 MiB (expected ~10 segments of 64 KiB, not all {WIDTH} segments)"
+        );
+        assert!(s2.counters().written > 0, "{label}: expected spilled destination segments");
+        assert_eq!(s2.counters().used, 0, "{label}: leaked spill bytes");
+        assert!(!dir.exists(), "{} left behind", dir.display());
+    }
+}
+
+/// Regression for slow and failing destination queue writes during wide-state
+/// recovery:
+/// 1. Slow background writes keep pending buffers counted in `frontier_peak`
+///    and apply backpressure so peak stays bounded near the read-ahead window.
+/// 2. Injecting a write failure specifically on destination queue writes aborts
+///    recovery on the first error, preserves `Outcome::Io` and the checkpoint,
+///    and never retains the rest of the level in RAM.
+#[test]
+fn positioned_single_worker_recovery_handles_slow_and_failing_destination_spills() {
+    const INITS: u32 = 8;
+    const FANOUT: u32 = 25;
+    const WIDTH: u32 = INITS * FANOUT;
+    const SEG_BYTES: usize = 64 << 10;
+    let reference = WideLayers::new(INITS, FANOUT);
+    let ref_report = explore(&reference, &opts(1, Spill::default(), None));
+    let want = summary(&ref_report, EXACT);
+    let want_order = reference.log.lock().unwrap().clone();
+
+    // 1. Slow destination writes: pending async buffers stay charged and
+    //    backpressure keeps `frontier_peak` bounded.
+    let scratch_slow = tlx_testkit::TempDir::new("wide-dest-slow");
+    let dir_slow = scratch_slow.child_path("meta");
+    let ck_slow = stopping(100, 1);
+    let s1 = spill_in(&dir_slow, SpillMode::Always, false);
+    let o1 = Options {
+        queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+        ..opts(4, s1.clone(), Some(ck_slow.clone()))
+    };
+    explore(&WideLayers::new(INITS, FANOUT), &o1);
+    settle(&s1);
+    assert_eq!(ck_slow.count(), 1);
+
+    let rec = Recovery::open(&dir_slow).expect("checkpoint");
+    let recovered_slow = WideLayers::new(INITS, FANOUT);
+    let s_slow = Spill::new(SpillConfig {
+        mode: SpillMode::Always,
+        dir: Some(dir_slow.clone()),
+        reused: true,
+        write_delay: Some(std::time::Duration::from_millis(2)),
+        ..Default::default()
+    });
+    let o_slow = Options {
+        queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+        ..opts(1, s_slow.clone(), Some(none()))
+    };
+    let (r_slow, _) = explore_from(&recovered_slow, &o_slow, Start::Recover(&rec), None);
+    settle(&s_slow);
+    assert_eq!(summary(&r_slow, EXACT), want);
+    let got_order = recovered_slow.log.lock().unwrap().clone();
+    assert_eq!(got_order.len(), WIDTH as usize);
+    assert!(want_order.ends_with(&got_order));
+    assert!(r_slow.frontier_peak <= 2 << 20, "slow-write destination frontier peak {} exceeded 2 MiB", r_slow.frontier_peak);
+    let total_written = s_slow.counters().written;
+    assert_eq!(s_slow.counters().used, 0);
+    assert!(!dir_slow.exists());
+
+    // 2. Failing destination writes: fail strictly inside destination `queue-`
+    //    writes (after all sorter runs succeed) and verify immediate `Outcome::Io`
+    //    propagation, bounded frontier peak, and preserved checkpoint.
+    let scratch_fail = tlx_testkit::TempDir::new("wide-dest-fail");
+    let dir_fail = scratch_fail.child_path("meta");
+    let ck_fail = stopping(100, 1);
+    let s1 = spill_in(&dir_fail, SpillMode::Always, false);
+    let o1 = Options {
+        queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+        ..opts(4, s1.clone(), Some(ck_fail.clone()))
+    };
+    explore(&WideLayers::new(INITS, FANOUT), &o1);
+    settle(&s1);
+    assert_eq!(ck_fail.count(), 1);
+
+    // Destination queue writes ~192 segments (~7.5+ MiB of payload bytes) at the
+    // tail of `total_written`; failing 5 MiB before the end guarantees all
+    // sorter runs succeed and the first failure hits a destination `queue-` write.
+    let fail_after = total_written.saturating_sub(5 << 20);
+    let rec = Recovery::open(&dir_fail).expect("checkpoint");
+    let recovered_fail = WideLayers::new(INITS, FANOUT);
+    let s_fail = Spill::new(SpillConfig {
+        mode: SpillMode::Always,
+        dir: Some(dir_fail.clone()),
+        reused: true,
+        fail_after: Some(fail_after),
+        ..Default::default()
+    });
+    let o_fail = Options {
+        queue: tlx_runtime::queue::Config { seg_bytes: SEG_BYTES, ..Default::default() },
+        ..opts(1, s_fail.clone(), Some(none()))
+    };
+    let (r_fail, _) = explore_from(&recovered_fail, &o_fail, Start::Recover(&rec), None);
+    settle(&s_fail);
+    match &r_fail.outcome {
+        Outcome::Io(msg) => {
+            assert!(msg.contains("fail_after") && msg.contains("queue-"), "expected destination queue spill failure, got: {msg}");
+        }
+        other => panic!("expected Outcome::Io from failed destination queue spill, got {other:?}"),
+    }
+    assert!(recovered_fail.log.lock().unwrap().is_empty(), "no states should be expanded after recovery I/O failure");
+    assert!(dir_fail.join("checkpoint/MANIFEST").is_file(), "checkpoint must be preserved on recovery I/O failure");
+    assert!(r_fail.frontier_peak <= 2 << 20, "failed destination spill retained too much frontier memory: {} bytes", r_fail.frontier_peak);
 }

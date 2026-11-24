@@ -523,9 +523,18 @@ checkpoint is kept (`DirHold::keep`).
   under the memory budget as they are read (`relieve` and `Local::spill` per chunk, as for the archive).
   With BFS positions and several workers they are queued in the order read and `Positions::of_places`
   gives each its recorded position (a state's position is looked up by its trace-log entry, not by its
-  place in the queue); with one worker, whose order of expansion is BFS order, they are decoded and sorted
-  by position first, the whole level held at once. Either way representatives are chosen in BFS order
-  whatever the worker count.
+  place in the queue); with one worker, whose order of expansion is BFS order, they are reordered by
+  position before queueing using a bounded external merge-sort (`explore/checkpoint/sort.rs`) charged to
+  the frontier gauge: states are buffered compactly (delta-XOR varints relative to each run's first state
+  for encoded models, raw serialized payloads otherwise, with oversized serialized payloads stored
+  out-of-line as external `BlockRef`s in a page-aligned `recover-ext-<n>.spill` store) with a 16-byte
+  `(position, offset)` index sorted in place, flushing sorted runs with page-aligned chunks and on-disk
+  block-tree indexes (`O(1)` RAM per run) to per-run `BlockStore` files (`recover-run-<n>.spill`) when
+  the buffer reaches its budget share (or under `-spill always`), compacting by size tier (punching
+  consumed page-aligned blocks mid-merge and unlinking each consumed run file at EOF so allocated disk
+  space stays within `-maxdisk`) and streaming back through a budget-bounded k-way merge sized by actual
+  block sizes into worker 0's queue while `relieve` and `Local::spill` spill each newly sealed segment.
+  Either way representatives are chosen in BFS order whatever the worker count.
 - **Liveness** uses the recorded edges, no re-exploration; a checkpoint written by the same binary always
   contains them when there are temporal properties and no VIEW/SYMMETRY.
 - **Compiled mode**: the CLI restores the string table before parsing; the driver restores the Dyn interner

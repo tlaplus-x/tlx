@@ -10,6 +10,7 @@ use tlx_base::frame::FrameReader;
 use tlx_value::ser::Reader;
 
 use super::manifest::Manifest;
+use super::sort::{QueueSorter, Record, SortConfig, SortFormat};
 use super::{K_ARCHIVE, K_EDGES, K_FPSET, K_MANIFEST, K_MODEL, K_QUEUE, K_TRACE, MANIFEST};
 use crate::explore::edges::{AtomBits, EdgeRec};
 use crate::explore::frontier::{Local, Task};
@@ -18,6 +19,7 @@ use crate::explore::resume::{BaseCounters, Pre};
 use crate::explore::tracelog::{TraceLog, NO_PARENT};
 use crate::explore::{fp_set_full, InitResult, Outcome, Shared, Stats};
 use crate::io::checkpoint_dirs;
+use crate::mem::Component;
 use crate::model::Model;
 use crate::queue::codec::{get_xor, XorPrev};
 
@@ -371,29 +373,46 @@ fn read_archive<S>(
     Ok(())
 }
 
-/// A queued state read from a checkpoint: encoded (queued as it is) or
-/// an object.
-enum Queued<S> {
-    Words { log: u64, fp: u64, words: Vec<u64> },
-    Task(Task<S>),
-}
+/// States emitted between budget relief and queue spill checks while draining
+/// a sorted positioned queue into `seed` (matches `worker::TICK`).
+const EMIT_TICK: u64 = 1024;
 
-impl<S> Queued<S> {
-    /// Its trace-log entry.
-    fn log(&self) -> u64 {
-        match self {
-            Queued::Words { log, .. } => *log,
-            Queued::Task(t) => t.log,
+/// Validate and skip `k` queue records in `c` starting at `at`, returning the
+/// byte offset immediately after the last record (where positions begin, or
+/// `c.len()` if there are none). Checking varints and bitmap masks up front
+/// ensures `get_xor` cannot panic on a corrupt chunk.
+fn skip_records(c: &[u8], mut at: usize, k: u64, words: bool, num_words: usize, bad: &dyn Fn(&str) -> String) -> Result<usize, String> {
+    if words {
+        let bmap_len = num_words.div_ceil(8);
+        let tail_mask = if num_words.is_multiple_of(8) { 0u8 } else { !((1u8 << (num_words % 8)) - 1) };
+        for _ in 0..k {
+            tlx_base::bytes::get_uvar(c, &mut at).map_err(|_| bad("short chunk"))?;
+            if at.checked_add(8 + bmap_len).is_none_or(|end| end > c.len()) {
+                return Err(bad("short chunk"));
+            }
+            at += 8;
+            let bmap = &c[at..at + bmap_len];
+            if tail_mask != 0 && (bmap[bmap_len - 1] & tail_mask) != 0 {
+                return Err(bad("corrupt bitmap"));
+            }
+            let changed: usize = bmap.iter().map(|b| b.count_ones() as usize).sum();
+            at += bmap_len;
+            for _ in 0..changed {
+                tlx_base::bytes::get_uvar(c, &mut at).map_err(|_| bad("short chunk"))?;
+            }
+        }
+    } else {
+        for _ in 0..k {
+            if at.checked_add(8).is_none_or(|end| end > c.len()) {
+                return Err(bad("short chunk"));
+            }
+            let mut r = Reader::new(&c[at + 8..]);
+            r.uvar().map_err(|e| bad(&e.to_string()))?;
+            r.bytes().map_err(|e| bad(&e.to_string()))?;
+            at += 8 + r.pos();
         }
     }
-
-    /// Queue it in `seed`'s next level, at depth `level`.
-    fn push(self, seed: &mut Local<'_, '_, S>, level: u32) {
-        match self {
-            Queued::Words { log, fp, words } => seed.push_words(log, fp, level, &words),
-            Queued::Task(t) => seed.push_new(t),
-        }
-    }
+    Ok(at)
 }
 
 /// Read the queued states into `seed` (in BFS order: by position if the
@@ -401,25 +420,30 @@ impl<S> Queued<S> {
 /// Encoded states are queued encoded (the compressed blocks of the queue),
 /// not decoded.
 ///
-/// With one worker the order of expansion is BFS order, so states with
-/// positions are sorted before they are queued: a whole level held at
-/// once. With several (`shared.order`), a state's place in BFS order is
+/// With several workers (`shared.order`), a state's place in BFS order is
 /// looked up by its trace-log entry (`Positions::pos`), not by its place
 /// in the queue: each is queued as it is read, and only its entry and
 /// position are kept, so the level stays compressed and within the memory
 /// budget as it grows (`relieve`, as for the archive).
+///
+/// With one worker, whose order of expansion is BFS order, positioned states
+/// are reordered by [`QueueSorter`] (compact delta-XOR or raw byte runs
+/// charged to `Component::Frontier`, spilling sorted runs to a temporary
+/// `BlockStore` under memory pressure or `-spill always`) before being pushed
+/// into `seed` under `relieve` and `seed.spill()`.
 fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::State>, rec: &Recovery) -> Result<(), String> {
     let model = shared.model;
     let m = &rec.m;
     let level = m.level;
     let bad = |what: &str| format!("corrupt queue ({what})");
     let mut prev = XorPrev::new(m.words);
-    // (With positions and one worker: the states, sorted before they are queued.)
-    let mut sorted: Vec<(u64, Queued<M::State>)> = Vec::new();
+    let mut sorter: Option<QueueSorter<'_>> = None;
+    let mut saw_unpositioned = false;
     // The trace-log entries of the states queued and their positions in BFS
     // order (choosing representatives): by the order read, else as recorded.
     let mut places: Vec<(u64, u64)> = Vec::new();
     let ordered = shared.order.is_some();
+    let frontier_gauge = shared.budget.meters().gauge(Component::Frontier);
     let mut n = 0u64;
     for name in &m.queue_files {
         let mut f = rec.input(name, K_QUEUE)?;
@@ -428,62 +452,204 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
             let e = |e: tlx_value::ser::DecodeError| bad(&e.to_string());
             let words = r.u8().map_err(e)? != 0;
             let positions = r.u8().map_err(e)? != 0;
-            // (Not while sorting: the budget cannot shrink what is held to
-            // be sorted, and its stages would drop the archive instead.)
-            if !positions || ordered {
+            let sorting = positions && !ordered;
+            if sorting && saw_unpositioned || !sorting && sorter.is_some() {
+                return Err(bad("mixed positions"));
+            }
+            if !sorting {
+                saw_unpositioned |= !positions;
                 shared.relieve();
             }
             let k = r.uvar().map_err(e)?;
-            if words && model.caps().codec().is_none() {
-                return Err(bad("encoded states"));
-            }
-            let mut items = Vec::with_capacity(k.min(1 << 16) as usize);
+            let codec = if words { Some(model.caps().codec().ok_or_else(|| bad("encoded states"))?) } else { None };
+            let persist = if !words { Some(model.caps().persist().ok_or_else(|| bad("states as bytes"))?) } else { None };
             let mut at = r.pos();
+            let end = skip_records(&c, at, k, words, m.words, &bad)?;
+            let mut pos_r = Reader::new(&c[end..]);
+            if !positions {
+                pos_r.finish().map_err(e)?;
+            }
+            if sorting {
+                let format = if words { SortFormat::Words(m.words) } else { SortFormat::Bytes };
+                let s = match &mut sorter {
+                    Some(s) => {
+                        if s.format() != format {
+                            return Err(bad("mixed state format"));
+                        }
+                        s
+                    }
+                    None => {
+                        let total = shared.budget.total();
+                        if shared.budget.limited() {
+                            shared.budget.sample();
+                        }
+                        let other = shared.budget.used(shared.accounted());
+                        let room = total.saturating_sub(other);
+                        let cfg = SortConfig::for_budget(format, total, room, shared.opts.queue.seg_bytes, shared.opts.spill.mode());
+                        sorter.insert(QueueSorter::new(cfg, &shared.opts.spill, frontier_gauge))
+                    }
+                };
+                if s.can_spill() && shared.budget.limited() {
+                    shared.budget.sample();
+                    let total = shared.budget.total();
+                    let other = shared.budget.used(shared.accounted()).saturating_sub(s.charged_bytes());
+                    if other >= total {
+                        shared.relieve();
+                        seed.spill();
+                    }
+                    let room = total.saturating_sub(other);
+                    s.refresh_budget(total, room, shared.opts.queue.seg_bytes)?;
+                }
+            }
             prev.reset();
             for _ in 0..k {
-                if at >= c.len() {
-                    return Err(bad("short chunk"));
-                }
-                items.push(if words {
-                    let fp = get_xor(&c, &mut at, &mut prev);
-                    model.caps().codec().expect("checked above").validate(&prev.words).map_err(|e| bad(&e))?;
-                    Queued::Words { log: prev.log, fp, words: prev.words.clone() }
-                } else {
-                    let p = model.caps().persist().ok_or_else(|| bad("states as bytes"))?;
-                    let fp = u64::from_le_bytes(c.get(at..at + 8).ok_or_else(|| bad("short chunk"))?.try_into().expect("8 bytes"));
-                    let mut r = Reader::new(&c[at + 8..]);
-                    let log = r.uvar().map_err(e)?;
-                    let state = p.read_state(r.bytes().map_err(e)?, level, fp)?;
-                    at += 8 + r.pos();
-                    Queued::Task(Task { state, log, depth: level })
-                });
-            }
-            let mut r = Reader::new(&c[at..]);
-            for q in items {
-                let pos = if positions { r.uvar().map_err(e)? } else { n };
+                let pos = if positions { pos_r.uvar().map_err(e)? } else { n };
                 n += 1;
-                if positions && !ordered {
-                    sorted.push((pos, q));
-                    continue;
+                if words {
+                    let fp = get_xor(&c, &mut at, &mut prev);
+                    codec.expect("checked above").validate(&prev.words).map_err(|e| bad(&e))?;
+                    if sorting {
+                        sorter.as_mut().expect("initialized above").push_words(pos, prev.log, fp, &prev.words)?;
+                    } else {
+                        if ordered {
+                            places.push((prev.log, pos));
+                        }
+                        let sealed = seed.sealed_blocks();
+                        seed.push_words(prev.log, fp, level, &prev.words);
+                        if shared.opts.spill.enabled() && seed.sealed_blocks() != sealed {
+                            relieve_and_spill(shared, seed)?;
+                        }
+                    }
+                } else {
+                    let fp = u64::from_le_bytes(c[at..at + 8].try_into().expect("8 bytes"));
+                    let mut rec_r = Reader::new(&c[at + 8..]);
+                    let log = rec_r.uvar().map_err(e)?;
+                    let payload = rec_r.bytes().map_err(e)?;
+                    at += 8 + rec_r.pos();
+                    if sorting {
+                        sorter.as_mut().expect("initialized above").push_bytes(pos, log, fp, payload)?;
+                    } else {
+                        let state = persist.expect("checked above").read_state(payload, level, fp)?;
+                        if ordered {
+                            places.push((log, pos));
+                        }
+                        let sealed = seed.sealed_blocks();
+                        seed.push_new(Task { state, log, depth: level });
+                        if shared.opts.spill.enabled() && seed.sealed_blocks() != sealed {
+                            relieve_and_spill(shared, seed)?;
+                        }
+                    }
                 }
-                if ordered {
-                    places.push((q.log(), pos));
-                }
-                q.push(seed, level);
             }
-            r.finish().map_err(e)?;
-            seed.spill();
+            if positions {
+                pos_r.finish().map_err(e)?;
+            }
+            if !sorting {
+                seed.spill();
+                if let Some(e) = shared.opts.spill.error() {
+                    return Err(e.0);
+                }
+            }
         }
     }
     if n != m.queued {
         return Err(format!("the queue holds {n} states, the manifest says {}", m.queued));
     }
-    sorted.sort_by_key(|(p, _)| *p);
-    for (_, q) in sorted {
-        q.push(seed, level);
+    if let Some(sorter) = sorter {
+        emit_sorted_queue(shared, seed, sorter, level)?;
+    }
+    if shared.frontier.queue_spilling() {
+        shared.opts.spill.wait_for_writes();
+        if let Some(e) = shared.opts.spill.error() {
+            return Err(e.0);
+        }
     }
     if let Some(o) = &shared.order {
         o.start(Arc::new(Positions::of_places(&places).map_err(bad)?));
+    }
+    Ok(())
+}
+
+/// Drain `sorter` in ascending BFS position order into `seed`, checking that
+/// positions form a dense `0..n` prefix, spilling sealed destination segments
+/// under budget relief, and deferring `-spill off` relief until `sorter` has
+/// dropped its transient buffer.
+fn emit_sorted_queue<M: Model>(
+    shared: &Shared<'_, M>,
+    seed: &mut Local<'_, '_, M::State>,
+    sorter: QueueSorter<'_>,
+    level: u32,
+) -> Result<(), String> {
+    let bad = |what: &str| format!("corrupt queue ({what})");
+    let can_spill = sorter.can_spill();
+    let persist = shared.model.caps().persist();
+    let mut emitted = 0u64;
+    sorter.finish(|rec| {
+        let pos = match &rec {
+            Record::Words { pos, .. } | Record::Bytes { pos, .. } => *pos,
+        };
+        if pos < emitted {
+            return Err(bad("a position twice"));
+        }
+        if pos > emitted {
+            return Err(bad("a position past the level"));
+        }
+        emitted += 1;
+        let sealed = seed.sealed_blocks();
+        match rec {
+            Record::Words { log, fp, words, .. } => seed.push_words(log, fp, level, words),
+            Record::Bytes { log, fp, payload, .. } => {
+                let p = persist.ok_or_else(|| bad("states as bytes"))?;
+                let state = p.read_state(payload, level, fp)?;
+                seed.push_new(Task { state, log, depth: level });
+            }
+        }
+        if can_spill && (seed.sealed_blocks() != sealed || emitted.is_multiple_of(EMIT_TICK)) {
+            relieve_and_spill(shared, seed)?;
+        }
+        Ok(())
+    })?;
+    // Under `-spill off`, run budget relief only after `sorter` has been
+    // dropped so its transient buffer never causes a spurious archive drop.
+    if !can_spill {
+        shared.relieve();
+    }
+    seed.spill();
+    Ok(())
+}
+
+/// Apply budget relief, offer newly sealed `seed` segments to disk, bound
+/// in-flight pending write buffers on slow disks, and propagate the first spill
+/// I/O error immediately instead of retaining failed writes in memory.
+///
+/// No monitor thread runs during recovery, so when `SpillMode::Auto` exceeds
+/// a finite budget while emitting wide encoded states, advance relief stages
+/// immediately until usage drops within budget or the frontier starts spilling.
+fn relieve_and_spill<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::State>) -> Result<(), String> {
+    if let Some(e) = shared.opts.spill.error() {
+        return Err(e.0);
+    }
+    shared.relieve();
+    if shared.budget.limited() && shared.opts.spill.enabled() && shared.frontier.words() > 0 {
+        for _ in 0..5 {
+            if shared.frontier.queue_spilling() || shared.budget.used(shared.accounted()) <= shared.budget.total() {
+                break;
+            }
+            shared.relieve();
+        }
+    }
+    seed.spill();
+    if let Some(e) = shared.opts.spill.error() {
+        return Err(e.0);
+    }
+    if shared.frontier.queue_spilling() {
+        let max_resident = (shared.frontier.queue_window() + 2).saturating_mul(shared.opts.queue.seg_bytes.max(4096));
+        if shared.frontier.queue_mem().bytes() > max_resident {
+            shared.opts.spill.wait_for_writes();
+            if let Some(e) = shared.opts.spill.error() {
+                return Err(e.0);
+            }
+        }
     }
     Ok(())
 }

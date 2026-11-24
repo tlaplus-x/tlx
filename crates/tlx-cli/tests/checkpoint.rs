@@ -532,3 +532,85 @@ fn checkpoints_leave_nothing_behind() {
     assert_eq!(code, 13, "{out}");
     assert!(!out.contains("Checkpointing"), "{out}");
 }
+
+/// Symmetry-reduced spec with enough levels and distinct states to trigger
+/// multiple checkpoints and an invariant violation whose trace depends on
+/// exact BFS representative order.
+const SYM: &str = r#"---- MODULE CkSym ----
+EXTENDS Naturals, TLC
+CONSTANT Nodes
+VARIABLES owner, stage
+Init == owner = [n \in Nodes |-> 0] /\ stage = 0
+Assign(n) == stage < 24 /\ owner[n] < 5 /\ owner' = [owner EXCEPT ![n] = @ + 1] /\ stage' = stage + 1
+Reset(n) == owner[n] = 3 /\ owner' = [owner EXCEPT ![n] = 0] /\ stage' = stage + 1
+Next == \E n \in Nodes : Assign(n) \/ Reset(n)
+Sym == Permutations(Nodes)
+Inv == ~(stage = 22 /\ \E n \in Nodes : owner[n] = 5)
+====
+"#;
+const SYM_CFG: &str = "CONSTANTS Nodes = {n1, n2, n3, n4}\nSYMMETRY Sym\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+
+/// Multi-action spec for `-coverage` checkpoint/recovery tests (distinct
+/// action credits depend on exact BFS discovery order).
+const COV: &str = r#"---- MODULE CkCov ----
+EXTENDS Naturals
+VARIABLES x, y
+Init == x = 0 /\ y = 0
+StepX == x < 35 /\ x' = x + 1 /\ y' = y
+StepY == y < 35 /\ y' = y + 1 /\ x' = x
+Diag == x < 35 /\ y < 35 /\ x' = x + 1 /\ y' = y + 1
+Next == StepX \/ StepY \/ Diag
+Inv == ~(x = 30 /\ y = 30)
+====
+"#;
+const COV_CFG: &str = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+
+/// Multi-worker checkpoints under VIEW, SYMMETRY and `-coverage` recovered
+/// with `-workers 1` under tight `-maxmem` and `-spill always` match the
+/// uninterrupted single-worker run (verdict, counts, depth, trace, coverage)
+/// and keep the layout-miss archive intact on disk.
+#[test]
+fn multi_worker_to_single_worker_positioned_recovery() {
+    let cases: [(&str, &str, &str, &[&str], &str); 3] =
+        [("CkView", VIEW, VIEW_CFG, &[], "200"), ("CkSym", SYM, SYM_CFG, &[], "80"), ("CkCov", COV, COV_CFG, &["-coverage", "1"], "200")];
+    for (name, src, cfg, extra, every) in cases {
+        let dir = tlx_testkit::TempDir::with_spec(&format!("pos1-{name}"), src, cfg);
+        for tier in [&[][..], &["-compile"]] {
+            let base1 = [tier, extra, &["-workers", "1"]].concat();
+            let base4 = [tier, extra, &["-workers", "4"]].concat();
+            let (want_code, want) = run(&dir, name, &base1, &[]);
+            let want_cov = extra.contains(&"-coverage").then(|| crate::common::coverage_lines(&want));
+
+            let recover_modes: [(&str, &[&str], &[(&str, &str)]); 2] = [
+                ("tight-maxmem", &["-maxmem", "1"], &[("TLX_SEG_BYTES", "4096")]),
+                ("spill-always", &["-spill", "always"], &[("TLX_SEG_BYTES", "4096"), ("TLX_FP_SPILL_SLOTS", "1024")]),
+            ];
+            for (label, rflags, renv) in recover_modes {
+                let recover_args = [&base1[..], rflags].concat();
+                let (code, out, _) = interrupted(&dir, name, &base4, &recover_args, renv, every, "2");
+                assert_eq!(code, want_code, "{name} {tier:?} {label}:\n{out}");
+                assert_eq!(results(&out, true, true), results(&want, true, true), "{name} {tier:?} {label}:\n{out}");
+                if let Some(ref wcov) = want_cov {
+                    assert_eq!(crate::common::coverage_lines(&out), *wcov, "{name} {tier:?} {label} coverage:\n{out}");
+                }
+            }
+        }
+    }
+
+    // Compiled `-coverage` checkpoint taken by 4 workers, recovered by 1 worker
+    // under tight `-maxmem 1`: the layout-miss archive spills cleanly instead
+    // of being dropped, so the late layout miss on `y` still resumes from it.
+    let dir = tlx_testkit::TempDir::with_spec("pos1-miss-archive", REG, REG_CFG);
+    let env = [("TLX_PRERUN", "1"), ("TLX_RETAIN_MB", "1024"), ("TLX_SEG_BYTES", "4096")];
+    let kill = ["-compile", "-coverage", "1", "-workers", "4"];
+    let recover = ["-compile", "-coverage", "1", "-workers", "1", "-maxmem", "1", "-stats"];
+    let (want_code, want) = run(&dir, "CkReg", &["-compile", "-coverage", "1", "-workers", "1"], &env);
+    assert_eq!(want_code, 0, "{want}");
+    let (code, out, _) = interrupted(&dir, "CkReg", &kill, &recover, &env, "300", "2");
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("layout miss on y"), "{out}");
+    assert!(out.contains("compile: resuming the search at depth"), "{out}");
+    assert!(!out.contains("archived states (for resuming)       dropped"), "{out}");
+    assert_eq!(results(&out, false, true), results(&want, false, true), "{out}");
+    assert_eq!(crate::common::coverage_lines(&out), crate::common::coverage_lines(&want), "{out}");
+}

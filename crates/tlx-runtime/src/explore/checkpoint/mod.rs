@@ -48,6 +48,7 @@
 
 mod manifest;
 mod recover;
+mod sort;
 mod write;
 
 pub(super) use self::recover::recover_phase;
