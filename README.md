@@ -7,7 +7,32 @@
 
 tlx reads TLA+ specifications (`.tla`) and TLC configuration files (`.cfg`), explores their
 reachable states, and checks safety and liveness properties. It compiles models to native code
-and uses an interpreter for expressions or actions it cannot compile. Java is not needed to run it.
+(using an interpreter for expressions or actions it cannot compile) and supports
+Lean-certified [state reductions](#state-reduction-and-lean-certificates) — automatic symmetry
+in default mode and opt-in state projections under `-optimize` — for safety checking. Java is
+not needed to run it.
+
+Core design and architecture:
+
+- **Compilation specialized to each specification.** Once configuration constants are fixed,
+  tlx folds constant expressions and compiles supported actions and expressions using
+  model-specific value representations, reducing interpretation and dynamic dispatch while
+  retaining guarded interpreter fallbacks.
+- **Modular typed-IR optimization passes.** Before targeting the closure, Cranelift JIT and C
+  backends, compiled-tier passes share repeated element ranks, hoist loop invariants, shape
+  mixed-mode host regions, materialize shared state predicates and plan alias-checked in-place
+  updates, checked by a compile-time IR verifier.
+- **Compact state representations.** Where value shapes permit, flat word arrays, bitsets and
+  specialized collection layouts reduce allocation and make equality and fingerprinting cheaper.
+- **Parallel state-space exploration.** Level-synchronous workers share an atomic fingerprint
+  table, supporting concurrent successor generation and duplicate detection.
+- **Lean-certified state reduction.** Safety runs apply automatic symmetry over interchangeable
+  model-value orbits in default mode and opt-in state projections under `-optimize`, each
+  gated on a compiler-generated Lean certificate while preserving concrete counterexamples.
+
+[docs/design.md](docs/design.md), [docs/optimization.md](docs/optimization.md) and
+[docs/reductions.md](docs/reductions.md) explain these mechanisms and the guarded interpreter
+fallback.
 
 The initial benchmark snapshot shows a **9.27× median speedup over TLC in single-worker
 default mode**, across 184 completed configurations with matching TLC baselines.
@@ -25,29 +50,14 @@ the batch, rather than isolated per configuration, so the discarded run is not a
 measurement. Each ratio uses the same input, machine class and worker count as its TLC baseline,
 and the report names, per row, the optimization the tlx record states - a row that states one
 ran with it, so its counts are those of that reduced search; the row does not assert what the
-TLC side was configured with. The mode cohorts differ.
-Incomplete runs and expectation mismatches are excluded. See the
-[full performance report](docs/performance.md) and [open issues](docs/issues.md)
-for coverage, slower cases and unresolved results.
+TLC side was configured with. The mode cohorts differ, and the measurements compare complete
+implementations (separate from later Lean gating and `-optimize` projections) rather than
+isolating each mechanism's contribution. Incomplete runs and expectation mismatches are excluded;
+see the [full performance report](docs/performance.md) and [open issues](docs/issues.md).
 
-The main sources of this performance are:
-
-- **Compilation specialized to each specification.** Once configuration constants are fixed,
-  tlx folds constant expressions and compiles supported actions and expressions using
-  model-specific value representations, reducing interpretation and dynamic dispatch while
-  retaining guarded interpreter fallbacks.
-- **Compact state representations.** Where value shapes permit, flat word arrays, bitsets and
-  specialized collection layouts reduce allocation and make equality and fingerprinting cheaper.
-- **Parallel state-space exploration.** Level-synchronous workers share an atomic fingerprint
-  table, supporting concurrent successor generation and duplicate detection.
-
-[docs/design.md](docs/design.md) explains these mechanisms and the guarded interpreter fallback.
-The measurements compare complete implementations; they do not isolate each mechanism's contribution.
-
-TLC is the semantic oracle. In TLC-compatible mode (`-tlc`), verdicts, violated names, state counts,
-depth and shortest safety-counterexample length must match the compatibility contract. The default
-mode may use optimizations TLC does not have; it preserves verdicts and the validity of
-counterexamples. [docs/compat.md](docs/compat.md) section 0 owns this distinction and its exceptions.
+TLC is the semantic oracle: `-tlc` enforces TLC-identical verdicts and state-space statistics,
+while the default mode preserves verdicts and counterexample validity ([Compatibility with TLC](#compatibility-with-tlc),
+[docs/compat.md](docs/compat.md) section 0).
 
 ## Quick start
 
@@ -162,7 +172,9 @@ tlx check Counter.tla -config Counter-spec.cfg # another configuration file (use
 tlx check Spec.tla -workers auto               # level-synchronous parallel BFS on all cores
 tlx check Spec.tla -interp                     # the interpreter only (tlx's semantic reference)
 tlx check Spec.tla -tlc                        # TLC-compatible results (counts, depth, traces)
-tlx check Spec.tla -optimize                   # opt-in state reduction and Lean output
+tlx check Spec.tla -noautosymmetry             # disable default-mode automatic symmetry
+tlx check Spec.tla -optimize                   # opt-in state projection and Lean output
+tlx optimize Spec.tla -output DIR              # export a reduced scalar model + Lean proof
 tlx check Spec.tla -simulate num=100 -depth 50 -seed 1   # random simulation
 tlx check Spec.tla -checkpoint 10 -metadir DIR           # checkpoint every 10 minutes
 tlx check Spec.tla -recover DIR                          # continue an interrupted run
@@ -184,48 +196,44 @@ environment variable).
 ## State reduction and Lean certificates
 
 Automatic state reductions require a compiler-generated Lean certificate connected to
-that application. Currently enabled rules remove unobserved variables with literal/copy
-updates, summarize supported append-only histories, cap relative timestamp ages (including
-finite age-filtered sets), combine supported age and history reductions, and reduce a
-scalar or fixed nested allocation frontiers. The [nested allocation example](proofs/ordered/README.md)
-reduces an unbounded model with two allocation families to 13 states; the
-[immutable-version example](proofs/ordered/LiveVersions.tla) completes with 89 states. A connected sequence-length certificate can
-merge different sequence contents when every use depends only on current lengths.
-[Phase-field certificates](proofs/field/README.md) erase record fields in phases where
-they are overwritten before their next use. Lean checks the generated liveness tables. A history
-summary over a finite event domain can turn unbounded history into a finite state component,
-including when prefix predicates control guards, retained updates or later events.
-The [history feedback example](proofs/history/README.md) finishes with six states.
-The [relative-age example](proofs/age/README.md)
-reduces an unbounded clock model to four states, and a model with both an unbounded clock
-and history to 15 states. A two-slot model that combines history predicates with
-age-filtered set values finishes with 113 states. The
-[dependent transfer example](proofs/age/DependentHistory.tla) adds dynamic filter domains,
-history-dependent timestamp choices and payloads, and age-dependent events; it finishes
-with 135 states. Each certificate proves initialization,
-successor correspondence, observations, counterexample lifting and deadlock preservation.
+that application:
 
-[Counter export](proofs/counter/README.md) emits closed Lean proofs for each actual
-cleanup and saturation pass, plus their composition. The generated finite model
-can be checked separately; export does not itself check safety.
+1. **[Automatic symmetry](proofs/symmetry/README.md) (default mode).** Applies disjoint
+   products of full permutation groups (up to order 720) when backed by a connected Lean
+   certificate across keyed state (`KeyedCertificate`: fixed/mixed maps, scalar or optional
+   key slots, sets of keys, single-key tagged record sets, and fixed records), recursive
+   equivariant finite values (`EquivSymCertificate`: key-valued and nested maps, multi-key
+   records, bounded sequences/tuples, set comprehensions, `KSubset`, `IsInjective`), or
+   choice-irrelevant `CHOOSE` (`ChooseSymCertificate`: unique-witness `CHOOSE`, projected
+   uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer
+   set-sum folds).
+2. **Opt-in state projections (`-optimize`).** Installs a certified `VIEW` key while keeping
+   concrete states and transitions intact for counterexample replay; each certificate proves
+   initialization, successor correspondence, observations, counterexample lifting and deadlock
+   preservation:
+   - *Unobserved variables:* erases dead variables with literal/copy/frame updates (and can
+     [compose with keyed symmetry](proofs/symmetry/README.md) through one shared source model).
+   - *Phase-dependent fields:* [erases record or map fields](proofs/field/README.md) in phases
+     where they are overwritten before their next use, with Lean-checked finite liveness tables.
+   - *Sequence lengths:* merges sequences when every consumer depends only on current lengths.
+   - *Ordered allocation and live versions:* reduces scalar or fixed nested allocation frontiers
+     ([nested allocation example](proofs/ordered/README.md), 13 states across two families) and
+     immutable version tables ([LiveVersions.tla](proofs/ordered/LiveVersions.tla), 89 states).
+   - *Finite history summaries and relative ages:* summarizes append-only event histories over
+     finite domains including prefix-predicate feedback ([history example](proofs/history/README.md),
+     6 states), caps relative timestamp ages ([age example](proofs/age/README.md), 4 states),
+     and combines supported age and history reductions (15 states; 113 states with two slots and
+     age-filtered sets; 135 states in [DependentHistory.tla](proofs/age/DependentHistory.tla)
+     with dynamic filter domains and dependent transfers).
+3. **[Counter export](proofs/counter/README.md) (`tlx optimize`).** Emits closed Lean proofs
+   for each actual cleanup and threshold-saturation pass plus their composition. The generated
+   finite model can be checked separately; export does not itself check safety.
 
-[Automatic symmetry](proofs/symmetry/README.md) runs in default mode for disjoint
-products of full permutation groups (up to order 720) when backed by a connected
-Lean certificate across keyed state (`KeyedCertificate`: fixed/mixed maps, scalar
-or optional key slots, sets of keys, single-key tagged record sets, and fixed
-records), recursive equivariant finite values (`EquivSymCertificate`: key-valued
-and nested maps, multi-key records, bounded sequences/tuples, set comprehensions,
-`KSubset`, `IsInjective`), or choice-irrelevant `CHOOSE` (`ChooseSymCertificate`:
-unique-witness `CHOOSE`, projected uniform/constant-value `CHOOSE`, and
-commutative-associative recursive `CHOOSE` integer set-sum folds).
-
-Every implemented reduction family now has connected rule-IR certificates for its
-enabled subset. [Variable erasure can compose with keyed symmetry](proofs/symmetry/README.md)
-through one shared source model. Broader age/history combinations, dynamic allocation
-containers, identifier-containing version payloads and other symmetry combinations remain
-unavailable without connected certificates.
-Unsupported candidates stay unapplied; another certified rule may still apply. Explicit user `VIEW` and `SYMMETRY` declarations
-retain their TLC behavior.
+Every implemented reduction family has connected rule-IR certificates for its enabled subset.
+Broader age/history combinations, dynamic allocation containers, identifier-containing version
+payloads and other symmetry combinations remain unavailable without connected certificates.
+Unsupported candidates stay unapplied; another certified rule may still apply. Explicit user
+`VIEW` and `SYMMETRY` declarations retain their TLC behavior.
 See [the coverage inventory](docs/optimization.md#proof-coverage).
 
 Optimized checking and certified automatic symmetry always write standalone Lean
@@ -294,28 +302,34 @@ Raw run histories, superseded data and backup snapshots are archived outside the
 ## How it works
 
 ```
- .tla ─► tree-sitter-tlaplus ─► surface AST ─► semantic analysis ─► HIR     (tlx-front, tlx-sema)
- .cfg ─► cfg parser ───────────────────────────────────────────────┘
-                                                                    │
-              ┌─────────────────────────────────────────────────────┴────────────┐
-              ▼                                                                  ▼
-   interpreter (tlx-eval), -interp                           compiled tier (default): pre-run infers value shapes
-   reference semantics                                       ─► fixed-size layout ─► typed IR (tlx-layout, tlx-compile)
-              │                                              ─► closure executor │ Cranelift JIT │ C via cc + dlopen
-              │                                              ─► per-(state, action) fallback to the interpreter
-              └───────────────────────────┬──────────────────────────────────────┘
-                                          ▼
+ .tla ─► tree-sitter-tlaplus ─► surface AST ─► semantic analysis ─► HIR      (tlx-front, tlx-sema)
+ .cfg ─► cfg parser (tlx-front) ───► constant binding & model ◄──────┘       (tlx-value, tlx-eval)
+                                                ▼
+        state reduction: certified symmetry / -optimize VIEW ─► Lean proof   (tlx-sema, tlx-eval; safety, non -tlc)
+                                                │
+              ┌─────────────────────────────────┴──────────────────────────┐
+              ▼                                                            ▼
+   interpreter (tlx-eval), -interp                     compiled tier (default): pre-run infers value shapes
+   reference semantics over Value (tlx-value)          ─► fixed-size layout ─► typed IR (tlx-layout, tlx-compile)
+              │                                        ─► closure executor │ Cranelift JIT │ C + dlopen (tlx-native)
+              │                                        ─► mixed-mode host regions & per-(state, action) fallback
+              └─────────────────────────────────┬──────────────────────────┘
+                                                ▼
           tlx-runtime: BFS / parallel workers / fingerprint set / traces / checkpoints / simulation
-                       liveness (tlx-live) ─► TLC-style report (tlx-cli)
+                       liveness (tlx-live) ─► POSTCONDITION, ALIAS & TLC-style report (tlx-cli)
 ```
 
 - The front end uses [tree-sitter-tlaplus](https://github.com/tlaplus-community/tree-sitter-tlaplus);
   a semantic layer re-implements SANY's name resolution, scoping and level checking.
+- Before safety exploration (unless `-tlc` is given), semantic state reduction (`tlx-sema`,
+  `tlx-eval`) applies certified automatic symmetry in default mode and certified `-optimize`
+  projections via `VIEW`, writing standalone Lean certificates while keeping concrete transitions
+  for counterexample reconstruction ([State reduction and Lean certificates](#state-reduction-and-lean-certificates)).
 - The interpreter (`-interp`) is the reference implementation of TLC's semantics.
 - The compiled tier is the default (`-compile` selects it explicitly): a short interpreted pre-run
-  infers variable shapes; the spec is lowered to a typed IR over fixed-size encoded states. A layout
-  miss widens the layout and resumes or restarts the search; anything that cannot be lowered runs
-  in the interpreter.
+  infers variable shapes; the spec is lowered to a typed IR over fixed-size encoded states,
+  optimized and checked by a compile-time IR verifier. A layout miss widens the layout and resumes
+  or restarts the search; anything that cannot be lowered runs in the interpreter.
 - Three executors share one IR and one ABI: a closure executor, a Cranelift JIT, and generated C built by
   `cc` in the background and loaded with `dlopen`. The generated library can replace JIT code
   during the search and is cached for later runs.
@@ -325,13 +339,14 @@ Raw run histories, superseded data and backup snapshots are archived outside the
   share the same parallel BFS, counterexample reconstruction and liveness checker.
 
 Details: [docs/design.md](docs/design.md) (executor tiering in section 6.6),
+[docs/optimization.md](docs/optimization.md), [docs/reductions.md](docs/reductions.md),
 [docs/mixed-mode.md](docs/mixed-mode.md), [docs/scale.md](docs/scale.md) (memory and disk).
 
 ## Project status
 
-Version 0.1.0 ([Cargo.toml](Cargo.toml)). TLC is the semantic oracle: results are compared with TLC on the
-`tests/specs` suite (small specs, each targeting one semantic point) and on the tlaplus/Examples
-corpus (see Testing). Expect rough edges: some error messages are worded differently from TLC's
+Version 0.1.0 ([Cargo.toml](Cargo.toml)). Results are tested against TLC on the `tests/specs`
+suite (small specs, each targeting one semantic point) and on the tlaplus/Examples corpus (see
+[Testing](#testing)). Expect rough edges: some error messages are worded differently from TLC's
 and some TLC options are missing.
 
 ## Testing
@@ -374,6 +389,7 @@ above. Changes must not alter results (tiers 1 and 2) or performance without say
   `crates/tlx-sema/modules/community`; the standard modules are under `crates/tlx-sema/modules/stdlib`.
 - The Apalache modules (`Apalache.tla`, `Variants.tla`, `Option.tla`), used in tests.
 - [Cranelift](https://cranelift.dev/) for the JIT backend.
+- [Lean 4](https://lean-lang.org/) for verifying generated state-reduction certificates.
 
 ## Security
 
