@@ -40,7 +40,7 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
         && tlx_base::knobs::Env::process().string_or_default("TLX_AUTOSYM_FORCE").trim().is_empty()
         && model.live.is_empty()
         && not_applicable(model, &an).is_none()
-        && an.sets.iter().any(|s| matches!(&s.verdict, autosym::Verdict::Rejected { what, .. } if what == "CHOOSE"))
+        && an.sets.iter().any(|s| matches!(&s.choose_verdict, Some(autosym::Verdict::Proven { .. })))
     {
         precertified = promote_certified_choices(model, &mut an);
     }
@@ -197,16 +197,22 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
     let t0 = Instant::now();
     let check = symcheck::check_perms(model, gens.clone(), &bounds);
     stats::phase("auto symmetry cross-check", t0.elapsed());
-    if let Ok(r) = &check {
-        if let Some(w) = &r.witness {
-            out::error(
-                code::GENERAL,
-                &format!(
-                    "Internal error: the symmetry {text} that tlx proved does not hold ({}; permutation {}). Run with -noautosymmetry.",
-                    w.part, w.permutation
-                ),
-            );
-            return Err(ExitCode::from(101));
+    match check {
+        Ok(r) => {
+            if let Some(w) = r.witness {
+                out::error(
+                    code::GENERAL,
+                    &format!(
+                        "Internal error: the symmetry {text} that tlx proved does not hold ({}; permutation {}). Run with -noautosymmetry.",
+                        w.part, w.permutation
+                    ),
+                );
+                return Err(ExitCode::from(101));
+            }
+        }
+        Err(e) => {
+            note(&format!("not applied: cross-check failed ({})", e.message));
+            return Ok(None);
         }
     }
     model.apply_symmetry(gens);
@@ -511,6 +517,10 @@ fn certify_groups<'a>(model: &InterpModel, chosen: &[&'a autosym::SetResult]) ->
     certify_groups_by(chosen, 16_384, 1_024, |groups| model.symmetry_certificate(groups))
 }
 
+fn certify_choose_groups<'a>(model: &InterpModel, chosen: &[&'a autosym::SetResult]) -> Option<(Vec<&'a autosym::SetResult>, String)> {
+    certify_groups_by(chosen, 16_384, 1_024, |groups| model.choose_symmetry_certificate(groups))
+}
+
 fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
     chosen: &[&'a autosym::SetResult],
     max_pops: usize,
@@ -577,23 +587,38 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
 
 fn promote_certified_choices(model: &InterpModel, an: &mut Analysis) -> Option<Precertified> {
     let mut trial = an.clone();
+    let mut has_promotable = false;
     for s in &mut trial.sets {
-        if matches!(&s.verdict, autosym::Verdict::Rejected { what, .. } if what == "CHOOSE") {
-            s.verdict = autosym::Verdict::Proven { classes: vec![s.candidate.elems.clone()], pinned_by: Vec::new() };
+        if let Some(v @ autosym::Verdict::Proven { .. }) = &s.choose_verdict {
+            s.verdict = v.clone();
+            has_promotable = true;
         }
+    }
+    if !has_promotable {
+        return None;
     }
     let eligible = eligible_proven(&trial);
-    let (selected, certificate) = certify_groups(model, &eligible)?;
+    let (selected, certificate) = certify_choose_groups(model, &eligible)?;
     let names: Vec<String> = selected.iter().map(|s| s.candidate.name.clone()).collect();
-    let group_text = selected.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
     let certified_names: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mut promoted_any = false;
     for s in &mut an.sets {
-        if certified_names.contains(s.candidate.name.as_str())
-            && matches!(&s.verdict, autosym::Verdict::Rejected { what, .. } if what == "CHOOSE")
-        {
-            s.verdict = autosym::Verdict::Proven { classes: vec![s.candidate.elems.clone()], pinned_by: Vec::new() };
+        if certified_names.contains(s.candidate.name.as_str()) {
+            if let Some(v @ autosym::Verdict::Proven { .. }) = &s.choose_verdict {
+                s.verdict = v.clone();
+                promoted_any = true;
+            }
         }
     }
+    if !promoted_any {
+        return None;
+    }
+    let all_eligible_covered =
+        an.proven().filter(|s| s.group_order() <= MAX_ORDER && s.full()).all(|s| certified_names.contains(s.candidate.name.as_str()));
+    if !all_eligible_covered {
+        return None;
+    }
+    let group_text = selected.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
     Some(Precertified { names, group_text, certificate })
 }
 
@@ -674,6 +699,7 @@ mod tests {
         autosym::SetResult {
             candidate: autosym::Candidate { name: name.into(), elems: vals.clone() },
             verdict: autosym::Verdict::Proven { classes: vec![vals], pinned_by: Vec::new() },
+            choose_verdict: None,
         }
     }
 

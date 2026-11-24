@@ -210,3 +210,46 @@ fn cascading_constants_converge_or_refuse_at_the_stage_budget() {
         }
     }
 }
+
+#[test]
+fn post_saturation_passes_emit_split_capable_closed_proofs() {
+    // Two natural counters saturated in Step0, followed by SimplifyPredicates and
+    // DeadActions in Step1/Step2 so `Step1.closed` must prove `Domain::Interval`
+    // closure across multiple `Update::SaturatingIncrement` branches.
+    let mut source = model();
+    let v0 = source.variables[0].clone();
+    let a0 = source.actions[0].clone();
+    let p0 = source.properties[0].clone();
+    source.variables = vec![Variable { name: "c0".into(), ..v0.clone() }, Variable { name: "c1".into(), ..v0 }];
+    source.initial = vec![0, 0];
+    source.actions = vec![
+        Action {
+            guard: Predicate::And(vec![
+                Predicate::Compare { var: 0, op: Comparison::Le, value: 4 },
+                Predicate::Compare { var: 1, op: Comparison::Le, value: 5 },
+            ]),
+            updates: vec![Update::Increment, Update::Increment],
+            ..a0.clone()
+        },
+        Action { guard: Predicate::Compare { var: 0, op: Comparison::Lt, value: 0 }, updates: vec![Update::Reset, Update::Keep], ..a0 },
+    ];
+    source.properties = vec![Property {
+        predicate: Predicate::And(vec![
+            Predicate::Compare { var: 0, op: Comparison::Le, value: 3 },
+            Predicate::Compare { var: 1, op: Comparison::Le, value: 4 },
+        ]),
+        ..p0
+    }];
+
+    let (result, remarks, certificate) =
+        Pipeline::new(vec![Box::new(CounterSaturation), Box::new(SimplifyPredicates), Box::new(DeadActions)]).run(source).unwrap();
+    verify::finite(&result).unwrap();
+    assert_eq!(result.actions.len(), 1, "dead post-saturation action should be removed: {remarks:?}");
+    assert!(remarks.iter().any(|r| r.starts_with("threshold-counter-saturation/")), "{remarks:?}");
+    assert!(remarks.iter().any(|r| r.starts_with("dead-action-elimination/")), "{remarks:?}");
+    assert!(certificate.contains("namespace Step1"), "expected a post-saturation certificate step:\n{certificate}");
+    assert!(
+        certificate.contains("repeat' (first | omega | apply And.intro | split)"),
+        "expected split-capable closed proof tactic in certificate"
+    );
+}

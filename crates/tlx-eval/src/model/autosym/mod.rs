@@ -64,6 +64,10 @@ pub enum Verdict {
 pub struct SetResult {
     pub candidate: Candidate,
     pub verdict: Verdict,
+    /// When `verdict` is `Rejected { what: "CHOOSE", .. }` and no other
+    /// breaker applied to this candidate, the verdict that atom partitioning
+    /// produces if the `CHOOSE` expressions are separately certified.
+    pub choose_verdict: Option<Verdict>,
 }
 
 /// The result of the analysis.
@@ -256,23 +260,34 @@ pub fn analyze(model: &InterpModel) -> Analysis {
     let state_mask = an.vars.iter().fold(0, |a, s| a | s.mask());
     let mut sets = Vec::new();
     for (i, c) in cands.iter().enumerate() {
-        let verdict = match analyzed.iter().position(|&j| j == i) {
-            None if c.elems.iter().all(|e| is_declared(e, &declared)) => Verdict::Declared,
-            None => Verdict::Rejected { what: "too many candidate sets".into(), at: String::new() },
+        let (verdict, choose_verdict) = match analyzed.iter().position(|&j| j == i) {
+            None if c.elems.iter().all(|e| is_declared(e, &declared)) => (Verdict::Declared, None),
+            None => (Verdict::Rejected { what: "too many candidate sets".into(), at: String::new() }, None),
             Some(bit) => {
                 let bit: Mask = 1 << bit;
                 if an.overflow {
-                    Verdict::Rejected { what: "the analysis (the spec is too large for it)".into(), at: String::new() }
-                } else if let Some(b) = an.breakers.iter().filter(|b| b.mask & bit != 0).min_by_key(|b| (b.span.file.0, b.span.start)) {
-                    Verdict::Rejected { what: b.what.clone(), at: location(ip, b.span) }
+                    (Verdict::Rejected { what: "the analysis (the spec is too large for it)".into(), at: String::new() }, None)
+                } else if let Some(b) =
+                    an.breakers.iter().filter(|b| b.mask & bit != 0).min_by_key(|b| (b.what == "CHOOSE", b.span.file.0, b.span.start))
+                {
+                    let choose_verdict = if b.what == "CHOOSE" {
+                        if state_mask & bit == 0 || !model.has_behavior {
+                            Some(Verdict::Unused)
+                        } else {
+                            Some(classes(ip, c, &an.atoms))
+                        }
+                    } else {
+                        None
+                    };
+                    (Verdict::Rejected { what: b.what.clone(), at: location(ip, b.span) }, choose_verdict)
                 } else if state_mask & bit == 0 || !model.has_behavior {
-                    Verdict::Unused
+                    (Verdict::Unused, None)
                 } else {
-                    classes(ip, c, &an.atoms)
+                    (classes(ip, c, &an.atoms), None)
                 }
             }
         };
-        sets.push(SetResult { candidate: c.clone(), verdict });
+        sets.push(SetResult { candidate: c.clone(), verdict, choose_verdict });
     }
     let mut effects: Vec<String> = an.effects.iter().map(|e| format!("{} at {}", e.what, location(ip, e.span))).collect();
     effects.dedup();

@@ -36,7 +36,11 @@ impl Builder {
         writeln!(out, "theorem closed (s t : State) (hs : valid s) (hn : {b}.system.next s t) : valid t := by").unwrap();
         split_actions(out, &b, before.actions.len(), "hn");
         for i in 0..before.actions.len() {
-            writeln!(out, "  · rcases h with ⟨hg, rfl⟩\n    simp_all [valid, {b}.guard{i}, {b}.update{i}] <;> omega").unwrap();
+            writeln!(
+                out,
+                "  · rcases h with ⟨hg, rfl⟩\n    simp_all [valid, {b}.guard{i}, {b}.update{i}] <;> repeat' (first | omega | apply And.intro | split)"
+            )
+            .unwrap();
         }
         let retained: Vec<usize> = match evidence {
             Evidence::DeadActions { retained } => retained.clone(),

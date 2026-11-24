@@ -364,3 +364,49 @@ fn subseteq_assignment_propagates_set_shape_and_detects_breakers() {
     let body = "VARIABLE s\nInit == s \\subseteq Proc\nNext == UNCHANGED s /\\ (s = {} \\/ (CHOOSE x \\in s : TRUE) \\in s)\n";
     assert_rejected(body, "CHOOSE", line_of(body, "CHOOSE"));
 }
+
+#[test]
+fn non_choose_breakers_override_earlier_choose_breakers() {
+    let with_max = "VARIABLE owner\n\
+        Init == owner \\in Proc\n\
+        Next == (CHOOSE p \\in Proc : TRUE) \\in Proc /\\ owner' = Max(Proc)\n";
+    assert_rejected(with_max, "Max", line_of(with_max, "Max"));
+    let an = analysis(with_max);
+    let proc_res = an.sets.iter().find(|s| s.candidate.name == "Proc").unwrap();
+    assert!(proc_res.choose_verdict.is_none(), "non-CHOOSE breaker must suppress choose_verdict: {proc_res:?}");
+
+    let with_to_string = "VARIABLES owner, s\n\
+        Init == owner \\in Proc /\\ s = \"\"\n\
+        Next == (CHOOSE p \\in Proc : TRUE) \\in Proc /\\ owner' = owner /\\ s' = ToString(owner)\n";
+    assert_rejected(with_to_string, "ToString", line_of(with_to_string, "ToString"));
+    let an = analysis(with_to_string);
+    let proc_res = an.sets.iter().find(|s| s.candidate.name == "Proc").unwrap();
+    assert!(proc_res.choose_verdict.is_none(), "ToString must suppress choose_verdict: {proc_res:?}");
+}
+
+#[test]
+fn choose_only_rejection_retains_atom_partitioned_choose_verdict() {
+    let body = "VARIABLE owner\n\
+        Ignore(x) == TRUE\n\
+        Init == owner = Leader\n\
+        Next == Ignore(CHOOSE p \\in Proc : TRUE) /\\ (\\E q \\in Proc : owner' = q)\n";
+
+    // Two-element Proc pinned by Leader = p1: choose_verdict must be Pinned.
+    let an2 = analysis_with(body, "CONSTANTS\n  Proc = {p1, p2}\n  Leader = p1\nINIT Init\nNEXT Next\n");
+    let res2 = an2.sets.iter().find(|s| s.candidate.name == "Proc").unwrap();
+    assert!(matches!(&res2.verdict, Verdict::Rejected { what, .. } if what == "CHOOSE"), "{res2:?}");
+    assert!(matches!(&res2.choose_verdict, Some(Verdict::Pinned { .. })), "expected Pinned choose_verdict, got {res2:?}");
+
+    // Three-element Proc pinned by Leader = p1: choose_verdict must partition into {p2, p3}, not full Proc.
+    let an3 = analysis_with(body, "CONSTANTS\n  Proc = {p1, p2, p3}\n  Leader = p1\nINIT Init\nNEXT Next\n");
+    let res3 = an3.sets.iter().find(|s| s.candidate.name == "Proc").unwrap();
+    assert!(matches!(&res3.verdict, Verdict::Rejected { what, .. } if what == "CHOOSE"), "{res3:?}");
+    match &res3.choose_verdict {
+        Some(Verdict::Proven { classes, pinned_by }) => {
+            assert_eq!(classes.len(), 1);
+            assert_eq!(classes[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), ["p2", "p3"]);
+            assert_eq!(pinned_by, &["Leader (the cfg)".to_string()]);
+        }
+        other => panic!("expected partial Proven choose_verdict, got {other:?}"),
+    }
+}

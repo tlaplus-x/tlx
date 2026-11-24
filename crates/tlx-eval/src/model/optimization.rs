@@ -71,8 +71,7 @@ impl InterpModel {
         None
     }
 
-    /// Certify a disjoint product of full key permutation groups. This does not install it.
-    pub fn symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
+    fn symmetry_cert_next(&self) -> Option<Expr> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
             || (self.has_view() && !self.state_projection)
@@ -94,6 +93,13 @@ impl InterpModel {
             return None;
         }
         let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
+        Some(next)
+    }
+
+    /// Certify a disjoint product of full key permutation groups. This does not install it.
+    pub fn symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
+        let next = self.symmetry_cert_next()?;
+        let cfg = &self.ip.cfg;
         if self.state_projection {
             tlx_sema::optimize::symmetry_projection_certificate(
                 &self.ip.prog,
@@ -107,6 +113,17 @@ impl InterpModel {
         } else {
             tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, groups)
         }
+    }
+
+    /// Certify a disjoint product of full key permutation groups via the
+    /// choice-symmetry certificate (`ChooseSymCertificate`), which proves
+    /// `Init` equivariance as well as `CHOOSE` invariance. This does not install it.
+    pub fn choose_symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
+        if self.state_projection {
+            return None;
+        }
+        let next = self.symmetry_cert_next()?;
+        tlx_sema::optimize::choose_symmetry_certificate(&self.ip.prog, &self.ip.cfg, &self.init, &next, &self.invariants, groups)
     }
 
     /// Retain the proof of the automatic group actually installed by the caller.

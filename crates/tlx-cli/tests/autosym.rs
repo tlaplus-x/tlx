@@ -836,3 +836,130 @@ fn subseteq_assign_and_empty_map_except_guard_behave_soundly_in_both_tiers() {
         assert!(r.stdout.contains("4 distinct states found, 0 states left on queue (symmetry-reduced)."), "{tier}: {}", r.text());
     }
 }
+
+#[test]
+fn pinned_choose_and_asymmetric_init_do_not_crash_or_suggest_invalid_symmetry() {
+    // S-3 (`Bug2`): `Leader = p1` breaks `Proc = {p1, p2}` in `Init`, while `Next`
+    // has an unused `CHOOSE`. Must neither crash with exit 101 in default mode nor
+    // print a false `SYMMETRY` suggestion under `-tlc`.
+    let bug2_dir = tlx_testkit::TempDir::with_spec(
+        "Bug2",
+        "---- MODULE Bug2 ----\n\
+         CONSTANT Proc, Leader\n\
+         VARIABLE owner\n\
+         Ignore(x) == TRUE\n\
+         Init == owner = Leader\n\
+         Next == Ignore(CHOOSE p \\in Proc : TRUE) /\\ (\\E q \\in Proc : owner' = q)\n\
+         Inv == owner \\in Proc\n\
+         ====\n",
+        "CONSTANT Proc = {p1, p2}\nCONSTANT Leader = p1\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
+    );
+    let tlc = tlx_testkit::tlx_default!().args(["check", "Bug2.tla", "-tlc", "-interp"]).dir(&bug2_dir).run();
+    assert_eq!(tlc.code, 0, "Bug2 -tlc: {}", tlc.text());
+    assert!(!tlc.stdout.contains("Symmetry: "), "Bug2 -tlc must not suggest invalid SYMMETRY:\n{}", tlc.text());
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "Bug2.tla", tier])
+            .env("TLX_PROOF_DIR", bug2_dir.join("proofs"))
+            .dir(&bug2_dir)
+            .run();
+        assert_eq!(r.code, 0, "Bug2 {tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: none applicable."), "Bug2 {tier}: {}", r.text());
+        assert!(!r.stdout.contains("(symmetry-reduced)"), "Bug2 {tier}: {}", r.text());
+        assert!(r.stdout.contains("2 distinct states found, 0 states left on queue."), "Bug2 {tier}: {}", r.text());
+    }
+
+    // Asymmetric `Init` via `CHOOSE` (with no pinning `CONSTANT`): `promote_certified_choices`
+    // must require `ChooseSymCertificate` (which rejects asymmetric `Init`), never falling
+    // back to `KeyedCertificate` (which omits `Init` equivariance).
+    let asym_init = "VARIABLE owner\n\
+        Ignore(x) == TRUE\n\
+        Init == owner = (CHOOSE p \\in Proc : TRUE)\n\
+        Next == Ignore(CHOOSE p \\in Proc : TRUE) /\\ (\\E q \\in Proc : owner' = q)\n\
+        Inv == owner \\in Proc";
+    let tlc = run(asym_init, "INVARIANT Inv", &["-tlc", "-interp"], &[]);
+    assert_eq!(tlc.code, 0, "asym_init -tlc: {}", tlc.text());
+    assert!(!tlc.stdout.contains("Symmetry: "), "asym_init -tlc must not suggest invalid SYMMETRY:\n{}", tlc.text());
+    for tier in ["-interp", "-compile"] {
+        let r = run(asym_init, "INVARIANT Inv", &[tier], &[]);
+        assert_eq!(r.code, 0, "asym_init {tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: none applicable."), "asym_init {tier}: {}", r.text());
+        assert!(!r.stdout.contains("(symmetry-reduced)"), "asym_init {tier}: {}", r.text());
+    }
+}
+
+#[test]
+fn choose_does_not_mask_non_choose_breakers() {
+    // A certifiable `CHOOSE` earlier in `Next` must not mask a later `Max(Proc)` breaker.
+    let dir = tlx_testkit::TempDir::with_spec(
+        "MultiBreaker",
+        "---- MODULE MultiBreaker ----\n\
+         EXTENDS Naturals, FiniteSetsExt\n\
+         CONSTANT Proc\n\
+         VARIABLES pc, msgs\n\
+         Ignore(x) == TRUE\n\
+         Init == pc = [p \\in Proc |-> 0] /\\ msgs = {[from |-> p, val |-> 7] : p \\in Proc}\n\
+         Next == (CHOOSE m \\in msgs : TRUE).val = 7\n\
+                 /\\ Ignore(Max(Proc))\n\
+                 /\\ \\E p \\in Proc : pc[p] < 1 /\\ pc' = [pc EXCEPT ![p] = 1] /\\ UNCHANGED msgs\n\
+         Inv == (CHOOSE m \\in msgs : TRUE).val = 7\n\
+         ====\n",
+        "CONSTANT Proc = {p1, p2, p3}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
+    );
+    let tlc = tlx_testkit::tlx_default!().args(["check", "MultiBreaker.tla", "-tlc", "-interp"]).dir(&dir).run();
+    assert_eq!(tlc.code, 0, "MultiBreaker -tlc: {}", tlc.text());
+    assert!(!tlc.stdout.contains("Symmetry: "), "MultiBreaker -tlc must not suggest SYMMETRY:\n{}", tlc.text());
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "MultiBreaker.tla", tier, "-stats"])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
+            .dir(&dir)
+            .run();
+        assert_eq!(r.code, 0, "MultiBreaker {tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: none applicable."), "MultiBreaker {tier}: {}", r.text());
+        assert!(!r.stdout.contains("(symmetry-reduced)"), "MultiBreaker {tier}: {}", r.text());
+        assert!(r.text().contains("Proc: not provable (Max at "), "expected Max breaker in stats:\n{}", r.text());
+    }
+}
+
+#[test]
+fn symcheck_error_refuses_automatic_symmetry_and_runs_unreduced() {
+    // 1. S-1 defense-in-depth (`Bitwise.tla`): evaluation error on a permuted initial state
+    //    must never be swallowed by `autosym::apply` and must exit 75 in default mode.
+    let bitwise_dir = tlx_testkit::TempDir::with_spec(
+        "Bitwise",
+        "---- MODULE Bitwise ----\n\
+         EXTENDS Naturals\n\
+         CONSTANT Proc\n\
+         VARIABLE owner\n\
+         Xor(a, b) == TRUE\n\
+         Init == owner \\in Proc\n\
+         Next == owner' \\in Proc\n\
+         Inv == \\E p \\in Proc : p = owner \\/ Xor(1 \\div 0, 0)\n\
+         ====\n",
+        "CONSTANT Proc = {p1, p2}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
+    );
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "Bitwise.tla", tier])
+            .env("TLX_PROOF_DIR", bitwise_dir.join("proofs"))
+            .dir(&bitwise_dir)
+            .run();
+        assert_eq!(r.code, 75, "Bitwise {tier} must report division by zero:\n{}", r.text());
+        assert!(!r.stdout.contains("(symmetry-reduced)"), "Bitwise {tier}: {}", r.text());
+    }
+
+    // 2. When `symcheck::check_perms` returns `Err` (here exceeding the 10,000-edge cross-check
+    //    cap on a certified symmetric model), `autosym::apply` must refuse automatic symmetry,
+    //    record the reason in `-stats`, and run the unreduced search.
+    let big_branch = "VARIABLES x, n\n\
+        Init == x \\in Proc /\\ n = 0\n\
+        Next == n = 0 /\\ x' = x /\\ n' \\in 0..10005\n\
+        Inv == n = 0";
+    let r = run(big_branch, "INVARIANT Inv", &["-interp", "-stats"], &[]);
+    assert_eq!(r.code, 12, "big_branch: {}", r.text());
+    assert!(r.stdout.contains("Optimizations: none applicable."), "big_branch: {}", r.text());
+    assert!(!r.stdout.contains("(symmetry-reduced)"), "big_branch: {}", r.text());
+    assert!(r.text().contains("not applied: cross-check failed"), "big_branch stats:\n{}", r.text());
+    assert!(r.stdout.contains("Error: Invariant Inv is violated."), "big_branch: {}", r.text());
+}
