@@ -589,7 +589,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tlx-base"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "mimalloc",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "mimalloc",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-compile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-eval"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-base",
  "tlx-front",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-front"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-testkit",
  "tree-sitter",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-base",
  "tlx-testkit",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-live"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-base",
  "tlx-testkit",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "libloading",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "parking_lot",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-sema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-front",
  "tlx-testkit",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "tlx-value"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tlx-base",
  "tlx-testkit",

@@ -39,7 +39,7 @@ cargo install --path crates/tlx-cli   # optional: install into ~/.cargo/bin/tlx
 arm64 are tested (the generated library is a `.so` there). Windows is not supported.
 
 `tlx check -h` (also `-help`, `--help`) prints the complete option help to stdout and exits with 0.
-There is no `--version`: the version is the first line of every run (`tlx version 0.1.0`), and an
+There is no `--version`: the version is the first line of every run (`tlx version 0.1.1`), and an
 invalid command line prints a one-line usage to stderr and exits with 2.
 
 ---
@@ -116,8 +116,8 @@ names one temporal formula. A configuration file may use one or the other, never
 `compile:` progress lines ([section 5.2](#52-the-compile-log)) to the TLC-style output:
 
 ```
-tlx version 0.1.0
-Running breadth-first search Model-Checking with fp 0 and seed 0 with 1 worker on 18 cores with 32768MB fingerprint memory [pid: 83926] (macos aarch64, tlx 0.1.0).
+tlx version 0.1.1
+Running breadth-first search Model-Checking with fp 0 and seed 0 with 1 worker on 18 cores with 32768MB fingerprint memory [pid: 83926] (macos aarch64, tlx 0.1.1).
 Optimizations: none applicable.
 Starting... (2026-10-08 16:58:42)
 Computing initial states...
@@ -160,7 +160,7 @@ INVARIANT Bounded
 ```
 
 ```
-tlx version 0.1.0
+tlx version 0.1.1
 ... (the start-up and compile: lines of section 2.2) ...
 Error: Invariant Bounded is violated.
 Error: The behavior up to this point is:
@@ -830,7 +830,7 @@ followed by the state (or the `ALIAS` value), the final statistics (generated / 
 queue, search depth, average out-degree) and `Finished in ...`. Scripts that parse TLC's output
 line by line usually work unchanged. Differences:
 
-- The version line is `tlx version 0.1.0`; `fp 0` in the mode line is only a placeholder, `seed` is
+- The version line is `tlx version 0.1.1`; `fp 0` in the mode line is only a placeholder, `seed` is
   the seed actually used (0 for BFS without `-seed`).
 - Compiled mode adds `compile:` lines ([section 5.2](#52-the-compile-log)).
 - Parse and semantic errors carry the file name, as `file:line:col: message` (on stderr): a path
