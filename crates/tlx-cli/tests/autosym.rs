@@ -371,11 +371,13 @@ fn read_only_cwd_succeeds_without_polluting_working_directory() {
 
     // Without -proofdir, TLX_PROOF_DIR, or TLX_CACHE, an unwritable HOME cache
     // falls back to a private 0700 per-user directory `$TMPDIR/tlx-proofs-<uid>`.
+    // Explicitly remove TLX_CACHE because tlx_testkit::cli::scrub preserves it.
     let fake_home = tlx_testkit::TempDir::new("autosym-bad-home");
     std::fs::write(fake_home.join(".cache"), "not a directory").unwrap();
     let fake_tmp = tlx_testkit::TempDir::new("autosym-tmp");
     let r = tlx_testkit::tlx_default!()
         .args(["check", "Spec.tla", "-interp"])
+        .env_remove("TLX_CACHE")
         .env("HOME", fake_home.path())
         .env("TMPDIR", fake_tmp.path())
         .dir(&dir)
@@ -398,6 +400,7 @@ fn read_only_cwd_succeeds_without_polluting_working_directory() {
     std::fs::set_permissions(fallback_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let loose = tlx_testkit::tlx_default!()
         .args(["check", "Spec.tla", "-interp"])
+        .env_remove("TLX_CACHE")
         .env("HOME", fake_home.path())
         .env("TMPDIR", fake_tmp.path())
         .dir(&dir)
@@ -414,6 +417,7 @@ fn read_only_cwd_succeeds_without_polluting_working_directory() {
     std::os::unix::fs::symlink(&decoy, fallback_dir).unwrap();
     let linked = tlx_testkit::tlx_default!()
         .args(["check", "Spec.tla", "-interp"])
+        .env_remove("TLX_CACHE")
         .env("HOME", fake_home.path())
         .env("TMPDIR", fake_tmp.path())
         .dir(&dir)
