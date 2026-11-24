@@ -154,12 +154,16 @@ remain part of the [raw handle boundary](#raw-encoded-handle-boundary) review.
 
 | Location | What | Why it is sound |
 |---|---|---|
-| `tlx-eval/src/interp/mod.rs`: `REGISTERS` thread-local | per-thread `TLCSet` registers | keyed by `Interp::uid` (never reused), not by the interpreter's address, so a later `Interp` allocated at a dropped one's address cannot inherit stale registers |
+| `tlx-eval/src/interp/mod.rs`: `REGISTERS` thread-local; `tlx-eval/src/interp/local.rs`: `LOCAL` thread-local; `tlx-eval/src/memo.rs`: `TABLE` thread-local | per-thread `TLCSet` registers, per-thread constant copies and constant-level operator memo | keyed by `Interp::uid` (monotonic, never reused), not by the interpreter's address, so a later `Interp` allocated at a dropped one's address cannot inherit stale state |
 | `tlx-eval/src/interp/local.rs`: `SymTable` | cache keyed by `Arc<str>` address | the keys are strings owned by the program, which the interpreter owns: no other live allocation can share the address |
 | `tlx-compile/src/lower/analysis.rs`: `const_cache` | cache keyed by `Arc<ExprKind>` address | the value holds a clone of the `Arc`, so the address is not reused while it is a key |
-| `tlx-eval/src/model/mod.rs`: `MEMOS` thread-local | memo keyed by (interpreter uid, state `Arc`) | the state `Arc` is kept in the entry |
+| `tlx-eval/src/model/mod.rs`: `MEMOS` thread-local | state-definition memo keyed by (interpreter uid, state `Arc<[Value]>`) | the state `Arc` is kept in the entry, so its address cannot be reused while cached |
+| `tlx-eval/src/model/liveness.rs`: `STEPS` thread-local | enumerated `<<A>>_v` action-atom steps from one source state | keyed by `(Arc<()>, Arc<()>)` generation tokens cloned from `LiveSpec` (mutations and clones allocate fresh tokens), a `Weak<Interp>` whose live `Arc` allocation prevents `Interp` address reuse without keeping a finished model alive, `level` and full `src` values |
+| `tlx-eval/src/model/symmetry.rs`: `BagCache` (in `LEAST_BUF` thread-local) | candidate symmetry permutations for record-keyed function bags | keyed by monotonic `Group::id` and `Arc::ptr_eq` on `Arc<[(Value, Value)]>`; `BagEntry` retains a clone of the bag `Arc`, so the slice address is not reused while cached |
+| `tlx-compile/src/exec/mod.rs`: `DEF_MEMOS` thread-local | state-definition memos for encoded current and next states | keyed by `Interp::uid`, `Arc::ptr_eq` on `Arc<Layout>` (cloned into `DefMemo` so the layout address cannot be reused) and the state's exact words |
+| `tlx-compile/src/exec/memo.rs`: `MEMO` thread-local | pure `Interp` fallback and mixed-mode host-region memo keyed by IR node address and exact encoded inputs | scoped to `MemoScope::id` (monotonic `SCOPE_IDS`, owned by the model that owns the IR); `Memo::enter` clears `nodes` and `slots` whenever the scope id changes |
 | `Binding::Name(ExprId, Env)` (`tlx-sema` arena, `tlx-eval`) | name bindings referencing HIR | no `unsafe`: see section 2 |
-| other thread-locals (`fmt.rs` `EXPANDING`, `enc/model/symmetry.rs` `ORBIT_BUF`, `enc/model/fingerprint.rs` `VIEW_BUF`, `live.rs` `ACTION`/`GENERATE`/`HAS_STATES`, the `Sym` cache in `tlx-value`) | plain `Cell`/`RefCell` values | no pointers; nothing to audit |
+| other thread-locals (`tlx-value/src/fmt.rs` `EXPANDING`, `tlx-value/src/intern.rs` `Sym::new` `CACHE` verified against the append-only interner, `tlx-layout/src/store/mod.rs` `SYMBOLS`/`THAWED`/`ROOTS` keyed by `Sym` id or monotonic `Store::uid`, `tlx-layout/src/permute.rs` `DYN_MEMO` keyed by monotonic plan id, `enc/model/symmetry.rs` `ORBIT_BUF`, `enc/model/fingerprint.rs` `VIEW_BUF`, `live.rs` `ACTION`/`GENERATE`/`HAS_STATES`) | plain `Cell`/`RefCell` scratch buffers or monotonic-id caches | no reusable raw addresses |
 
 ### Checking the inventory
 
@@ -386,11 +390,14 @@ cargo +nightly miri test -p tlx-runtime --lib -- --skip <the tests listed below>
 
 A run of the three crates reported no undefined behavior. Miri runs roughly 1000 times slower
 than native and cannot emulate `mmap`, `flock`, `proc_pid_rusage`, a panic crossing a pthread, or
-the stack switching in `stack.rs`, so the runtime run skips (`--skip`) the tests below; a skip is
-a limit of Miri, not a verdict about the code.
+platform pthread stack queries and alternate signal stacks, so the `tlx-runtime` run skips (`--skip`)
+the tests below (the stack-guard module `stack.rs` and its `deep_recursion_reports_low_stack` test
+moved from `tlx-runtime` to `tlx-base/src/stack.rs`, where native `cargo test -p tlx-base --lib`
+runs them and Miri requires `--skip deep_recursion_reports_low_stack --skip borrowed_work_and_panics_cross_the_stack_thread`);
+a skip is a limit of Miri, not a verdict about the code.
 
 - tests using files, disk or FFI: `mem::tests` (this substring also filters `cache_mem::tests`,
-  which has no `unsafe`), `io::tests`, `deep_recursion_reports_low_stack`,
+  which has no `unsafe`), `io::tests`,
   `rotating_to_disk_matches_a_hash_set`, `sections_rebuild_the_set`, `rotating_without_the_old_table`,
   `a_large_table_written_in_ranges`, `a_failed_rotation_leaves_the_set_full`,
   `concurrent_inserts_while_rotating`, `concurrent_inserts_while_growing`,
@@ -406,15 +413,16 @@ Heavy loops are reduced under `cfg!(miri)` (same code paths, smaller scale) in `
 `#[cfg_attr(miri, ignore)]` with a comment: `random::agrees_with_brute_force` (exponential brute
 force), `tlx-base::frame::frame_round_trip_and_checks` and
 `tlx-base::frame::frame_refuses_other_build` (`frame::build_id` hashes the executable; the tests
-moved with the framing code out of `tlx-value`'s `ser` into `tlx-base`, which this run does not
-cover), and `fpset::tests::watermarks` (filling to the 90%
+moved with the framing code out of `tlx-value`'s `ser` into `tlx-base`, alongside
+`tlx-base/src/stack.rs`, which the three-crate run above does not cover), and `fpset::tests::watermarks` (filling to the 90%
 watermark takes thousands of probe-heavy inserts). `grow_serially_up_to_the_limit` and
 `grow_with_helper_threads` still exercise the rehash-and-swap path and the helper threads, growing
 explicitly at low load.
 
 Not covered by Miri (it cannot run them; audited by hand above): `io/` (`mmap`, files, `flock`),
-`mem.rs`, `explore/checkpoint/` (files), `stack.rs` (stack switching), and the queue's disk and
-spill paths. `tlx-value` and `tlx-live` are covered in full. Miri did exercise the string
+`mem.rs`, `explore/checkpoint/` (files), `tlx-base/src/stack.rs` and `tlx-base/src/stack/overflow.rs`
+(pthread stack-bounds queries, evaluation-stack threads and alternate-stack signal handling), and the
+queue's disk and spill paths. `tlx-value` and `tlx-live` are covered in full. Miri did exercise the string
 interner's append-only table (single-threaded and concurrent), the fingerprint table's
 insert/probe/grow paths including concurrent inserts, the safepoint spin/park protocol, and the
 `transmute` plus raw-pointer deref in `live.rs`.

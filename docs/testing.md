@@ -89,8 +89,13 @@ scripts/fetch-deps.sh          # third_party/: tla2tools.jar (TLC), Examples/, c
 
 `corpus/out/` holds the TLC oracle `tlc.json`, tlx result files `tlx*.json`, the SANY cache
 `sany.json` and the benchmark TLC cache `bench-tlc.json`. Section 6 shows how to produce `tlc.json`
-(needs Java; takes a while). Tests that need `third_party/` or `corpus/out/` print a note and skip
-when they are missing.
+(needs Java; takes a while). Rust front-end corpus tests print a note and skip when `third_party/`
+is missing. Python oracle drivers (`scripts/tlc.py`, `scripts/sanydiff.py`) invoke `TLX_JAVA` with
+`third_party/tla2tools.jar` and `third_party/community/modules.jar` on `-cp`: if `scripts/fetch-deps.sh`
+has not installed the jars (`scripts/dependencies.py verify-jar` checks the pinned `tla2tools.jar`
+SHA-256 and manifest revision, reporting `no tla2tools.jar` when absent) or `TLX_JAVA` is missing,
+Java/subprocess launch fails and the driver reports a collection or `no verdict` infrastructure
+error rather than silently passing.
 
 Scripts pass `-I third_party/community -I third_party/tlapm/library -I third_party/apalache` to tlx
 and put the same directories on TLC's classpath. Tests find the two directories through
@@ -199,7 +204,7 @@ The JIT tier is tested as the native tier of the differential harness with
 ### Python driver tests
 
 ```sh
-python3 -m unittest discover -s scripts -p 'test_*.py'     # 1185 tests; duration depends on shared load
+python3 -m unittest discover -s scripts -p 'test_*.py'     # discover and run all Python driver tests
 ```
 
 They cover the shared policy in `scripts/tlxlib.py` (paths, environment stripping, subprocess
@@ -209,27 +214,13 @@ any cloud API, and `test_no_cloud_ids.py`, which fails if a tracked file contain
 identity (account IDs, ARNs, instance IDs, e-mail addresses; documented placeholders excepted).
 The `cargo-test` suite of `verify.py` runs them before the Rust tests.
 
-The measurement store is not part of the published tree (docs/benchmarking.md section 6.2), so a test
-that reads a store input owns the data it reads: it builds the one file it needs under a temporary
-root and points the reader at that root, the way `test_bench_records.py`'s `StoreCoherenceTest` does
-for the records check. A test that leaned on `bench/` instead would pass on a machine that keeps the
-store on disk and cover nothing on one that does not. The three cases below are what that rule costs,
-recorded rather than hidden:
-
-* `test_drivers.py`'s `test_bench_fixed_stress_selection` checks that the `bench/<name>` id family
-  resolves to a configuration file and that a property is read out of it; it builds
-  `bench/stress/ClockSettles.cfg` itself, so the resolution and the property read are still covered.
-  What it cannot check without the store is the *content* of the shipped configuration - that the
-  file declares the property the model is run for;
-* `test_bench_scale_helpers` used to require every key of the hand-written `bench_models.SCALE_CFGS`
-  to have a `.cfg` under `bench/scaling/`. "Our list and the files on disk have not drifted" is a
-  statement about the store and cannot exist without it, so the check keeps what still means
-  something - every key is a well-formed `bench/<name>` id the parser resolves - and the drift
-  itself is caught where the store is derived, not here;
-* `test_bench_suite.py`'s `test_shipped_manifest_is_valid` was deleted rather than rewritten: its
-  subject was the manifest *we ship*, which a checkout of the published sources does not carry and a
-  fixture cannot stand in for. `test_validation` still pins the shape
-  (`bench_suite.validate_manifest`) that every manifest must have.
+Unit tests for the benchmark store and suite (`test_bench_records.py`, `test_bench_suite.py`,
+`test_drivers.py`) construct temporary fixtures under scratch directories rather than mutating or
+assuming the working tree's `bench/` contents, while `test_release_tree.py`,
+`test_bench_report_evidence.py`, `python3 scripts/bench.py suite-check`, and
+`python3 scripts/bench.py report --check` verify the tracked `bench/suite.json`, `bench/records/`,
+`bench/tlc-baselines/`, and `docs/performance.md` shipped with the repository
+([benchmarking.md](benchmarking.md) section 6.2).
 
 Other driver commands: `python3 scripts/matrix.py --list`, `python3 scripts/fuzz_expr.py --show
 --seed 1 --count 5`. The drivers' default parallelism is 3 jobs; TLC runs are capped at 2 JVMs at
@@ -347,7 +338,7 @@ that writes files still runs in a scratch copy of its directory, so concurrent r
 not collide and the shared checkout stays untouched.
 
 ```sh
-scripts/corpus.py list --max-runtime 60              # models whose manifest runtime is <= 60 s (157 models)
+scripts/corpus.py list --max-runtime 60              # models whose manifest runtime is <= 60 s
 scripts/corpus.py tlc --max-runtime 60 -j 4          # run TLC, write/merge corpus/out/tlc.json
 scripts/corpus.py tlc --max-runtime 60 --only-failed # re-run only the models whose TLC result was an error
 scripts/corpus.py tlc --ids ewd998/EWD998ChanTrace   # re-collect one model's row (see below)
@@ -359,7 +350,7 @@ scripts/corpus.py list --tier huge
 scripts/corpus.py tlc --tier huge --tlc-workers 16 --timeout 90000     # corpus/out/tlc-huge.json
 ```
 
-`--max-runtime` defaults to 10 (134 models). The results file is saved after every model, so an
+`--max-runtime` defaults to 10 seconds (run `python3 scripts/corpus.py list` or `python3 scripts/corpus.py list --max-runtime 60` for the current manifest counts). The results file is saved after every model, so an
 interrupted run keeps what finished. TLC is run by `scripts/tlc.py` (also usable alone:
 `scripts/tlc.py SPEC.tla -config X.cfg -workers 1` prints JSON statistics), with its state
 directory under `target/tlc-states/<pid>`.
@@ -405,9 +396,9 @@ scripts/difftest.py --extra=-compile --recover 1               # end each run af
   (`--tag` defaults to empty for 1 worker, `-w<N>` otherwise).
 - The script copies the binary to `target/tlx-difftest-<pid>` first, so you can keep editing and
   rebuilding while it runs.
-- Recorded reference: the compiled tier passes 155 of 156 models; the failure is SpanTreeRandom
-  (TLC's default seed is random, see compat.md D-4). The interpreter times out on a few large
-  models at 120 s.
+- In the default Examples selection, `SpanningTree/SpanTreeRandom` is an expected nondeterministic
+  failure in `tests/expected_failures.json` (TLC's default seed is random, see compat.md D-4). The
+  interpreter times out on a few large models at 120 s.
 
 **Pitfalls**
 
@@ -499,8 +490,9 @@ back; copy them into `corpus/out/`. A linked worktree refreshes its private orac
 | `mongo-repl-models` | will62794/mongo-repl-tla-models `48ef5d7e7d13` | none: fetched only | William Schultz |
 | `paxosstore` | Disalg-ICS-NJU/PaxosStore-TLA `0188955e7023`, `experiment/TPaxos` (our wrappers and cfg files from its `.ini` models) | none: fetched only | Disalg-ICS-NJU |
 
-Integrated models: `corpus.py list --source external --tier small,medium,large,huge` (123 models of
-18 repositories: 73 small, 14 medium, 30 large, 6 huge). Industrial protocol models: MongoDB
+Integrated models: query the live inventory across the 18 repositories above with
+`python3 scripts/corpus.py list --source external --tier small,medium,large,huge` (or pass a single
+`--tier` to inspect each tier). Industrial protocol models: MongoDB
 replication and sharding, CCF consensus and consistency, Neon safekeeper, Kafka KRaft and data
 replication, Viewstamped Replication, BookKeeper, Raft variants (Vanlightly, MongoDB's logless
 reconfiguration, etcd), ZooKeeper Zab, Cassandra Accord, Elasticsearch, Tencent PaxosStore,
@@ -539,7 +531,9 @@ are translated with `pcal.trans` and the test's own options first (in a private 
 directory; this prepares the input for both checkers), `-lncheck` is dropped, and a `-config
 X.tla` (the config is a `---- CONFIG ----` section of the module) becomes a cfg file. Tests with
 `@Ignore` or non-literal arguments are skipped; a case whose TLC run does not finish in 120 s
-has missing oracle evidence and fails the gate. A historical run (before the structured gate) (TLC `rev 1813307`, commit `94d0c5070852`): 538 test
+has missing oracle evidence and fails the gate. In the pre-`v0.1.0` baseline run against TLC
+`rev 1813307` (before the structured gate; run `python3 scripts/tlcsuite.py --list` for the current
+case inventory): 538 test
 classes, 483 cases run, 52 skipped, 3 without a TLC result; **382 pass, 101 are expected
 failures, 0 unexpected**; the JUnit expectations agree with TLC on 459 of the 483 cases.
 
@@ -579,7 +573,10 @@ python3 scripts/oracles.py sync --source /path/to/main/corpus/out --destination 
 This merges shared TLC caches by entry key and provenance date, prints added and updated counts, and
 preserves newer local evidence. A matching branch-specific config digest takes precedence over stale
 main evidence; records of unknown age never overwrite local records. The command writes only the
-destination worktree's private cache. Missing oracle errors in difftest and verify include this hint.
+destination worktree's private cache. Missing or incomplete oracle entries fail `difftest.py` and
+`verify.py` as coverage errors (`scripts/oracle.py` prints `missing or incomplete TLC oracle` with a
+legacy local-setup hint; in a public checkout, sync from the main worktree with `scripts/oracles.py sync`
+above or collect the missing cache entries with `scripts/corpus.py tlc`).
 
 ## 7. Feature matrix and expression fuzzing
 
@@ -589,7 +586,7 @@ tlx across execution tiers and worker counts, by the same tiers as spectest (val
 `tracecheck.py`; cache in `tests/matrix/expected.json`).
 
 ```sh
-python3 scripts/matrix.py --list                  # 275 combinations
+python3 scripts/matrix.py --list                  # list generated combinations and current count
 python3 scripts/matrix.py --list --filter mutex   # subset by substring
 python3 scripts/matrix.py --filter M003 -v        # run a subset
 ```
@@ -769,7 +766,8 @@ scripts/sanydiff.py --refresh            # ignore the SANY cache
 ```
 
 SANY results are cached in `corpus/out/sany.json` by (path, mtime). Exit code 1 means differences.
-On `tests/specs` the current run reports `327 files (3 rejected by SANY), 2 differences`: `BG1.tla`
+On `tests/specs` (run `python3 scripts/sanydiff.py -j 4 tests/specs` for the current file and
+rejection counts) the run reports 2 differences: `BG1.tla`
 and `SM5.tla` (`Unknown operator CopiesIn`). This is a known artifact of the harness: the `check`
 example searches the `-I` directories before the bundled standard modules, and
 `third_party/tlapm/library/Bags.tla` is an older `Bags` without `CopiesIn`. `tlx check` itself
@@ -950,7 +948,8 @@ ids), `--strict` (also fail on a FIXED cargo test; case drivers always reject XP
 | `cargo-test-jit` | quick, full | `TLX_JIT=1` tests of `tlx-compile` with `--features tlx-testkit/jit` |
 | `spectest`, `spectest-compile` | quick, full | spectest (`-tlc`): interpreter; compiled (default tiering: JIT, then C) |
 | `spectest-paranoid`, `spectest-jit-paranoid` | quick, full | with `TLX_PARANOID=1`: C tier; JIT only |
-| `corpus-compile`, `corpus-interp` | quick (curated subset in `tests/quick_corpus.json`), full (whole corpus) | difftest: compiled; interpreter |
+| `corpus-compile`, `corpus-interp` | quick (curated subset in `tests/quick_corpus.json`), full (whole corpus) | difftest (`-tlc`): compiled; interpreter |
+| `spectest-default`, `corpus-default` | quick (`corpus-default` uses `tests/quick_corpus.json`), full | default mode (no `-tlc`), compared with TLC by verdict and optimization-preserved fields |
 | `spectest-c`, `spectest-compile-w8`, `corpus-compile-w8` | full | C tier only without reusing the pre-run's result; 8 workers |
 | `tlcsuite` | full | TLC's regression suite against tlx (section 6.4; failures are classified with `tests/tlcsuite_expected_failures.json`) |
 | `corpus-paranoid`, `corpus-recover`, `corpus-interp-recover`, `corpus-recover-w8` | only with `--suites` | paranoid corpus run; checkpoint then recover |

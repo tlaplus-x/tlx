@@ -107,12 +107,12 @@ fn run_check(
             }
         },
     };
-    // The value store (on for `Dyn` slots by default) has no checkpoint
-    // format yet: it is off when recovering or when checkpoints were asked
-    // for; with TLC's default interval only, the run takes no checkpoints
-    // instead. `TLX_ESCAPE` replaces the layouts the store slots would sit
-    // in, so the store is off with it (the pair is not refused: the escape
-    // experiment runs as it did before the store became the default).
+    // The value store (`TLX_VALUE_STORE`, experimental, default off) has no
+    // checkpoint format yet: it is disabled when recovering or when explicit
+    // checkpoints were asked for; with TLC's default interval only, the run
+    // takes no checkpoints instead. `TLX_ESCAPE` replaces the layouts the
+    // store slots would sit in, so the store is off with it (the pair is not
+    // refused).
     if settings.value_store && settings.escape {
         log("value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout");
     }

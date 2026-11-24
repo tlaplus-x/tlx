@@ -1,5 +1,12 @@
 # Post-fix validation, 2026-10-11
 
+> [!NOTE]
+> **Historical point-in-time validation record** — not an active normative specification. This
+> document captures the 2026-10-11 post-freeze validation runs (`e59632b1` and `d2a36005`) on
+> Tencent `SA5.4XLARGE32` x86_64 spot instances (`bench/validation/2026-10-11/`). Current benchmark
+> protocol and published performance numbers on `main` are owned by
+> [benchmarking.md](../benchmarking.md) and [performance.md](../performance.md).
+
 Source identifiers below name reachable, source-equivalent commits in this history.
 The original measurement and reproduction identifiers remain in the evidence files; [source-equivalents.toml](../../bench/environment/source-equivalents.toml)
 maps those original identities to revisions with identical Rust/workspace inputs.

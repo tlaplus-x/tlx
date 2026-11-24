@@ -111,7 +111,7 @@ builds another revision (optionally with tlx-cli cargo features) into
 to `target/bench/<time>-<rev>-<provider>/`; copy files you want to commit into `bench/`.
 
 ```sh
-python3 scripts/cloud_verify.py --bench "table --measure-tlc --repeat 3" --max-minutes 60
+python3 scripts/cloud_verify.py --bench "tlcbase --missing --collect --workers 1,16 --no-large" --bench "run --tlc --repeat 3" --max-minutes 60
 python3 scripts/cloud_verify.py --bench-bin nostats=HEAD:no-stats --bench-bin base=<rev> \
     --bench "ab --bin main=target/release/tlx --bin nostats=target/bench-bins/nostats/tlx --models X,Y --repeat 10 --out bench/ab.json"
 ```
@@ -251,8 +251,11 @@ verification start carries a per-pass token and a remote lock: retrying a start 
 was lost never starts the pass twice or erases its results. Stream reconnects and required final
 result copies tolerate an hour of transport outage, still capped by the cleanup reserve. In the
 worst case a result transfer waits up to 60 minutes, and that time counts against the instance's
-`--max-minutes`; budget the launch accordingly. A stream
-that repeatedly ends while SSH answers has its own twenty-reconnect limit.
+`--max-minutes`; budget the launch accordingly. Output-stream reconnects carry no fixed attempt
+cap: while the remote `verify.rc` exit file is absent and the provider does not report the
+instance `gone` or `stopped`, `run_remote_verify` reconnects every five seconds until five
+minutes before the dead-man's switch (or the one-hour transfer window when no switch deadline is
+set), reserving the remaining margin for the final result fetch.
 
 Provider diagnosis/repair requests and the repair-lock wait share a monotonic deadline. CLI,
 public-IP HTTP and AWS SDK requests use the remaining time; a repair is skipped when less

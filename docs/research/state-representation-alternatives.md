@@ -1,5 +1,13 @@
 # State representation alternatives
 
+> [!NOTE]
+> **Historical point-in-time research record** — not an active normative specification. This
+> document captures the pre-`v0.1.0` 21-model state-representation prototype survey (`B+A`, `D`,
+> `E`, `repr-b2`) measured on an AMD EPYC 9754 (`SA5.4XLARGE32`) cloud host prior to repository
+> history consolidation at `5dc582bde9`. Current value-store representation and native coverage
+> contracts on `main` are owned by [value-store.md](../value-store.md) and
+> [native-coverage.md](../native-coverage.md).
+
 **M** denotes a measurement; **A** denotes an architectural estimate.
 
 M: direct native lowering D is the strongest measured near-term change:
@@ -757,29 +765,31 @@ that staged combination, not a representation-wide rollout of either prototype.
 
 ## Reproduction and evidence
 
-M: none of the measurement artifacts this document names is part of the released
-tree. The raw records under `bench/repr-alternatives/` and the attribution,
-correctness, verification and command artifacts under `work/notes/` are the evidence
-behind the tables above; each is one `scripts/bench.py ab` or `profile` pass, a
-correctness or verification campaign, or the manifest of those commands, on the
-revisions named here. The `ab` and `profile` records carry their own
-`measurement_command`, and the other artifacts record their command and revision
-the same way, so any number above is reproduced by re-running that command on that
-revision. The lanes and their protocol are [benchmarking.md](../benchmarking.md);
-the store inventory of the sources it was imported from — and the archive
-locator of a source retired from the tree — is `bench/migration.json` (section 6.5).
+M: none of the raw measurement artifacts or pre-consolidation prototype branches
+this document names is part of the released tree. The six prototype commit SHAs
+(`17dcf775`, `bfe7daf3`, `beea1f2b`, `facd6658`, `bbaf9920`, `c4d2c45c`) and the
+raw JSON artifacts under `bench/repr-alternatives/`, `work/notes/`, and
+`bench/migration.json` came from the pre-`v0.1.0` design survey archived before
+repository history was rooted at `5dc582bde9`; they are historical provenance
+identifiers rather than live checkout paths or reachable commits in this
+repository ([DOC-06](../development-standards.md#doc-06)). During that survey, each
+artifact recorded one `scripts/bench.py ab` or `profile` pass, a correctness or
+verification campaign, or the command manifest on its named prototype revision.
+Current benchmark lanes, canonical store layout (`bench/records/`,
+`bench/tlc-baselines/`) and reproduction rules on `main` are owned by
+[benchmarking.md](../benchmarking.md) and [bench/README.md](../../bench/README.md).
 
-M: the original attribution runs code and profile driver `17dcf775`.
-The large comparison runs main `bfe7daf3`, with both prototype switches in
-`beea1f2b`. The final small comparison uses corrected B+A `facd6658`,
+M: in that pre-consolidation survey, the original attribution ran code and profile driver `17dcf775`.
+The large comparison ran main `bfe7daf3`, with both prototype switches in
+`beea1f2b`. The final small comparison used corrected B+A `facd6658`,
 D `beea1f2b`, main `bfe7daf3` for both the baseline and batch-1 hybrid,
-and repr-b2 `c4d2c45c`. The latter is a separately developed branch, so its
-ratio against main includes unrelated compiler changes. A same-revision
-store-off/store-on diagnostic separates the store toggle from those changes.
-Every arm disables pre-run result reuse; timing uses one worker and TLC mode
+and repr-b2 `c4d2c45c`. The latter was a separately developed branch, so its
+ratio against main included unrelated compiler changes. A same-revision
+store-off/store-on diagnostic separated the store toggle from those changes.
+Every arm disabled pre-run result reuse; timing used one worker and TLC mode
 unless explicitly labeled as the default-mode supplement. Each timing table
-uses three complete interleaved rounds after discarded warmups; instrumented
-counter tables use separate single passes.
+used three complete interleaved rounds after discarded warmups; instrumented
+counter tables used separate single passes.
 
 M: the committed verification artifact records 937 passing Rust tests,
 zero failures and seven ignored tests from

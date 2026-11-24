@@ -77,13 +77,24 @@ can be derived from (a mask per shape), which effects the specification performs
 values (atoms) it reads. A set is proven when no *breaker* applies to its elements and every atom the
 specification reads is fixed by the permutation.
 
-Breakers reject the set and report the location: `CHOOSE` (unless it is provably unique or a
-commutative fold), `SetToSeq`, `SetMax`/`SetMin`, `ToString` and the JSON/FP writers, `CausalOrder`,
-`ChiSquare`, `TLCModelValue`, the `RandomElement` family, IO and serialization, and a constant whose
-value is unknown or unrepresentable. Effects — `Print`/`PrintT`, `TLCGet`/`TLCSet`, `JavaTime`,
-`Trace`, IO and JSON — do not break the proof by themselves but rule out any count-changing reduction
-for that specification. The proof covers safety checking only: initial states, successors,
-invariants, constraints, action constraints, action properties and deadlock.
+Breakers reject the set and report the location: `SetToSeq`, `SetMax`/`SetMin`, `ToString` and the
+JSON/FP writers, `CausalOrder`, `ChiSquare`, `TLCModelValue`, the `RandomElement` family, IO and
+serialization, a constant whose value is unknown or unrepresentable, and `CHOOSE` outside the
+choice-irrelevant forms below. Within the scalarset pass (`tlx-eval/src/model/autosym/analyze/choices.rs`),
+`CHOOSE` is admitted directly when its predicate syntactically forces a unique witness (`x = e` or
+`Q(x) /\ \A y \in S : Q(y) => y = x`) or drives a commutative-associative recursive set fold (`+`,
+`*`, `\cup`, `\cap`). When another `CHOOSE` over a candidate's elements rejects the set and no
+non-`CHOOSE` breaker applies, `autosym::analyze` records the atom-partitioned candidate group in
+`choose_verdict`. Before suggesting or applying symmetry (`crates/tlx-cli/src/autosym.rs`),
+`tlx` promotes `choose_verdict` candidates if and only if a connected `ChooseSymCertificate` proves
+every `CHOOSE` in the model choice-irrelevant — covering unique-witness key selections (including
+inductively proved at-most-one active key in a key set or Boolean flag map), projected
+uniform/constant-value selections, and commutative-associative recursive `CHOOSE` integer set-sum
+folds (`chooseFoldAdd`) — while preserving empty-witness `CHOOSE` errors; uncertified `CHOOSE`
+forms remain rejected at their source span. Effects — `Print`/`PrintT`, `TLCGet`/`TLCSet`,
+`JavaTime`, `Trace`, IO and JSON — do not break the proof by themselves but rule out any
+count-changing reduction for that specification. The proof covers safety checking only: initial
+states, successors, invariants, constraints, action constraints, action properties and deadlock.
 
 The analysis is bounded, and a bound is not a proof of the contrary: it stops at shape depth 6, 256
 frames, 4,000,000 steps and 12 passes, analyzes at most 64 candidates, and marks itself *incomplete*
@@ -91,13 +102,16 @@ when a bound is reached, in which case nothing is applied.
 
 ### 2.3 The bounded cross-check
 
-Before a group is applied, a bounded cross-check of the group runs as a cross-check of the proof
-(`symcheck::check_perms`) on the **unreduced** system: for each of at most 1000 states, up to 10
-levels deep, at most 100 permutations and 10000 edges, it compares `Init` membership, invariants,
-VIEW commutation, state constraints, successor sets in both directions, action constraints and
-action properties. The check has a 20 ms wall-clock budget and is reported as its own phase in
-`-stats`. A witness from a group that was *proven* is an internal error and exits 101, because the
-certificate and the bounded check disagree.
+Before a certified group is applied, `crates/tlx-cli/src/autosym.rs` runs `symcheck::check_perms`
+on the **unreduced** system over the selected group's adjacent-transposition generators using
+`symcheck::Bounds::default()` (at most 1,000 states, depth 10, 100 permutations and 10,000 edges)
+plus a **20 ms wall-clock budget** (`time: Some(Duration::from_millis(20))`), reported under
+`-stats` as `auto symmetry cross-check`. On each visited state it compares `Init` membership,
+invariants, `VIEW` commutation, state constraints, successor sets in both directions, action
+constraints and action properties. A violation witness (`Ok` with `witness`) on a group that was
+*proven* and certified is an internal error and exits 101, because the certificate and the bounded
+check disagree. An evaluation or resource-limit error (`Err`) during `check_perms` refuses automatic
+symmetry (`not applied: cross-check failed (...)` under `-stats`) and leaves the run unreduced.
 
 A group larger than 720 elements is not applied: the search tries every element of the group on each
 state it finds, so the cost of the canonical form grows with the group. Skipped groups are named
@@ -108,28 +122,34 @@ under `-stats`.
 Application happens once, after the model is built and before the search, and only in the default
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
 unchanged except for that line. A group is not applied when the specification has a declared
-`SYMMETRY`, a `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis — each
-reason is reported under `-stats`. Connected certificate coverage further excludes
-constraints, action/initial properties, aliases and unsupported key operations.
-Only certified unobserved-variable erasure can compose with an automatic keyed group. Mandatory Lean is written before exploration; it is not
-verified automatically. `-noautosymmetry` turns the whole reduction off.
+`SYMMETRY`, a user `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis —
+each reason is reported under `-stats`. Connected certificate coverage further excludes constraints,
+action/initial properties, aliases and unsupported key operations. Certified unobserved-variable
+erasure can compose with certified automatic keyed symmetry (including disjoint products of full
+keyed groups) through `ErasedKeyedCertificate`
+([optimization.md](optimization.md#composing-projection-with-symmetry)); other projections stay
+standalone. Mandatory Lean is written before exploration; it is not verified automatically.
+`-noautosymmetry` turns the whole reduction off.
 
-`-checksymmetry` is the separate declared-symmetry diagnostic: it looks for a genuine violation of a
-declared `SYMMETRY` within its bounds on an unreduced breadth-first search in the interpreter, and
-reports `No symmetry violation found within bounds (...). This is not a proof of symmetry.` A
-successful bounded run is evidence, never a proof, and a run that hit a bound says
-`Symmetry check incomplete` and exits 2 instead of reporting either. `-checksymmetry -suggest` runs
-the same check for the candidates the analysis could not prove.
+`-checksymmetry` (`crates/tlx-cli/src/symcheck.rs`, `crates/tlx-eval/src/model/symcheck.rs`) is the
+separate declared-symmetry diagnostic: unlike `autosym`'s 20 ms generator cross-check, it runs an
+unreduced breadth-first search in the interpreter with `symcheck::Bounds::default()` (1,000 states,
+depth 10, 100 permutations via `-symmetryperms`, 10,000 edges via `-symmetryedges`, and no
+wall-clock limit) and reports `No symmetry violation found within bounds (...). This is not a proof
+of symmetry.` A successful bounded run is evidence, never a proof, and a run that hits a generator,
+edge, or evaluation error (`Err`) prints `Symmetry check incomplete: ...` and exits 2 instead of
+claiming either. `-checksymmetry -suggest` runs the same bounded check on every candidate set.
 
 ### 2.5 Guarantees
 
-The connected symmetry certificates (`KeyedCertificate`, `EquivSymCertificate`, and
-`ChooseSymCertificate`) preserve **V-safe** and **CEX** within their supported
-observation set: state invariants and deadlocks. Initialization and successors
-correspond, and every reduced violation has a concrete witness. Counts and depths
-describe the quotient. Temporal properties exclude automatic application. See
-[the certificate scope](optimization.md#certified-keyed-symmetry) for the
-distinction between formal orbit keys and trusted runtime canonicalization.
+The connected symmetry certificates (`KeyedCertificate`, `EquivSymCertificate`,
+`ChooseSymCertificate`, and erasure-composed `ErasedKeyedCertificate`) preserve **V-safe** and
+**CEX** within their supported observation set: state invariants and deadlocks. Initialization and
+successors correspond from every orbit representative, and every reduced violation lifts to a
+concrete witness. Counts and depths describe the quotient. Temporal properties exclude automatic
+application. [optimization.md](optimization.md#proof-coverage) owns the certificate inventory and
+[certified automatic symmetry](optimization.md#certified-keyed-symmetry) details the lowered rule IR
+and the trust boundary between formal orbit keys and runtime canonicalization.
 
 ## 3. The labelling contract
 
@@ -169,8 +189,7 @@ not options (an unknown option is rejected with exit 2), and there is no sleep s
 reduction, bounded search, swarm mode, bitstate storage or incremental re-check in any crate. The
 incomplete-search exit code 4 that a class B technique would use is likewise a proposal: it is unused
 by TLC and by tlx, and no code produces it. Sleep sets, partial-order reduction and bounded search
-were measured and ranked; the ranking and the reasons are in the archived proposal named in
-[README.md](README.md), not in current documentation.
+were measured and ranked in an archived design study, not in current documentation.
 
 ## 6. Tests
 

@@ -695,7 +695,7 @@ ndJson*`; no effect on state counts. tlx: `tlx-eval/src/natives/json.rs`.
     argument never evaluated); Java overrides that need an operator error out: `BagOfAll`
     ("should be an operator"), the Folds, `SortSeq`, `SelectSeq`, `SelectInSubSeq` (OpValue cast
     fails), even for empty sets or bags; `MapThenFoldSet` is an exception. tlx:
-    `Interp::native_op_val` (`tlx-eval/src/builtins.rs`; test `tests/specs/SN13`).
+    `Interp::native_op_val` (`tlx-eval/src/eval.rs`; test `tests/specs/SN13`).
 
 ---
 
@@ -752,13 +752,18 @@ The CONSTANT section has three tables: root-module values `name = v`, module-qua
    overridden aliases; tests `tests/specs/OvrInst*`, `OvrEntry*` (compat.md D-23).
 
 tlx: `Program::check_cfg_constants` and `Program::check_cfg_substitutions`
-(`tlx-sema/src/resolve/mod.rs`) implement 1, 2 and 4 (left side, arity, right side also replaced,
-unknown module: 2223/2224/2225/2226/2245, exit 151); `bind_value`
-(`tlx-eval/src/interp/cfg.rs`) binds values. The other name checks (INVARIANT/INIT/NEXT/SPECIFICATION/
-PROPERTY/CONSTRAINT must name 0-ary operator definitions: 2228/2230/2233, undefined: 2229; neither
-Init nor Next: 2231/2232; SPECIFICATION together with INIT/NEXT: 2227) run in `load_model`
-(`tlx-cli/src/main.rs`) in TLC's order. With INIT but no NEXT, TLC computes the initial states
-first and reports 2115 / exit 75 if there are any.
+(`tlx-sema/src/resolve/mod.rs`) implement 1, 2 and 4 (left side, declared `CONSTANT` and
+operator definition arity as of `v0.1.1`, right side also replaced, unknown module:
+2223/2224/2225/2226/2245, exit 151); `bind_value` (`tlx-eval/src/interp/cfg.rs`) binds values.
+Repeated unqualified `CONSTANT` directives resolve with last-directive-wins precedence (`<-`
+after `=`) via `Config::last_constant_subst` and `Config::last_constant_value`
+(`tlx-front/src/cfg/mod.rs`). `Program::check_cfg_defs` (`tlx-sema/src/resolve/mod.rs`) checks
+that INVARIANT/INIT/NEXT/SPECIFICATION/PROPERTY/CONSTRAINT/ACTION_CONSTRAINT name 0-ary operator
+definitions after `last_constant_subst` resolution (2228/2230/2233, undefined: 2229,
+SPECIFICATION together with INIT/NEXT: 2227); `load_model` (`tlx-cli/src/load.rs`) runs these
+checks together with missing INIT/NEXT (2231/2232) and `Program::check_cfg_levels` in TLC's
+order. With INIT but no NEXT (`model.no_next` in `tlx-cli/src/check.rs`), TLC computes the
+initial states first and reports 2115 / exit 75 if there are any.
 
 ---
 
@@ -778,4 +783,4 @@ first and reports 2115 / exit 75 if there are any.
 | Standard modules (§7) | `tlx-sema/src/builtins.rs`, `tlx-eval/src/builtins.rs`, `natives.rs`, `bags.rs`, `natives/json.rs` |
 | Random streams (§7) | `tlx-eval/src/random.rs` (`JavaRandom`) |
 | Lazy evaluation (§8, item 11) | `Ctx::keep_lazy` in `tlx-eval/src/eval/context.rs`, `force_kept` in `tlx-eval/src/apply.rs`; `tlx-eval/src/lazy.rs` |
-| cfg binding (§9) | `tlx-sema/src/resolve/mod.rs`, `tlx-eval/src/interp/cfg.rs`, `load_model` in `tlx-cli/src/main.rs` |
+| cfg binding (§9) | `tlx-front/src/cfg/mod.rs`, `tlx-sema/src/resolve/mod.rs`, `tlx-eval/src/interp/cfg.rs`, `load_model` in `tlx-cli/src/load.rs`, `no_next` in `tlx-cli/src/check.rs` |

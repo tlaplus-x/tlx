@@ -112,7 +112,7 @@ RSS sample shows the effect of the previous one:
 
 | Stage | Component | Action | Why this order |
 |---|---|---|---|
-| 1 | Archive (levels kept for layout-miss resume) | Spill to disk; dropped if `-spill off` or the archive holds objects (interpreter models) | Used only on a layout miss |
+| 1 | Archive (levels kept for layout-miss resume) and evaluation caches | Spill archive to disk (dropped if `-spill off` or the archive holds interpreter objects); halve the per-thread memo cache allowance via `cache_mem::shrink()` (down to `MIN_SHARE` = 1 MiB; threads clear their tables when they next exceed it, and `relieve` returns for the cycle if halving the current cache bytes brings usage within budget) | Used only on a layout miss, or recomputable caches |
 | 2 | Trace log | Full blocks to disk | Never read on the success path |
 | 3 | Liveness edge log | Full blocks to disk | Read once, sequentially, after the search |
 | 4 | Frontier, representatives' candidates | Compress new blocks and write the candidates' full segments to disk (VIEW/SYMMETRY with several workers); next cycle still over, spill queue segments (back to normal below 7/8 of budget; with `-spill off` only compress) | Sequential write, sequential read-ahead |
@@ -124,6 +124,21 @@ in "budget minus other components", it first applies stages 1-4 and otherwise gr
 runs say "rerun with a larger -fpmem", others "-maxmem". Stage 1 does not credit the archive bytes until
 the next sample, because spilling is done by the workers on their next tick and segments shared with
 liveness edge records cannot be freed by dropping the archive.
+
+Once stages 1–4 are all active (including while queue segments are already spilling) and usage remains
+over budget, `relieve` applies two last-resort actions (`explore/mod.rs`, `explore/safepoint.rs`):
+
+- **Drop the disk-backed old table (`SP_DROP_OLD`).** If the fingerprint set has rotated to disk and still
+  holds `old_bytes() > 0` (the read-only in-memory copy of its newest disk run), `relieve` sets
+  `SP_DROP_OLD` on the safepoint control word so `serve_safepoint` calls `FpSet::drop_old()` at the next
+  safepoint.
+- **Checkpoint-preserving ceiling stop (`over_ceiling`).** If unspillable memory (such as wide-level
+  VIEW/SYMMETRY candidates or interpreter state objects) keeps `used` above `-maxmem` and within
+  `max(limit / 16, 2 GiB).min(limit / 4)` of `mem::physical_bytes()` (the cgroup or machine limit),
+  `over_ceiling` stops the search with `Outcome::Io` (`out of memory: ...`, exit 255) before the kernel
+  kills the process. When a checkpoint has already been committed, `Checkpointer::keep_last` preserves it
+  on exit (`recovering the last checkpoint, which is kept`) so the run can resume with `-recover` under a
+  larger memory limit.
 
 `-stats` prints each component's current and peak bytes, the RSS peak, `budget (-maxmem)` and
 `budget pressure stage`.

@@ -80,22 +80,10 @@ baseline and candidate, discarded warmup and at least three complete repetitions
 including unaffected controls. Report coverage separately from time and preserve
 incomplete runs as incomplete evidence.
 
-The atom-comparison and set-inclusion specialization retains its
-correctness receipt (`native-lowering-correctness.json`) and its
-reduced-configuration coverage data (`native-lowering-coverage-small.json.gz`).
-Neither artifact is part of the released tree: a coverage census is reproduced with
-`scripts/coverage.py --dynamic`
-([testing.md §10](testing.md#10-compiled-tier-coverage-scriptscoveragepy)).
-The compressed JSON preserves both arms and their binary revisions; its instrumented
-times are diagnostic only. The
-original-model coverage (`native-lowering-coverage-cloud.json.gz`) retains the
-complete campaign before the interval-cost followup; the
-final focused coverage (`native-lowering-coverage-final.json.gz`) records the
-followup on CCF, Mongo, original Accord and Lamport. Both complete A/B campaigns
-are in the canonical benchmark store and [generated report](performance.md).
-The initial cloud campaign's
-partial receipt (`native-lowering-cloud-incomplete.json.gz`) records its SSH
-failure and missing passes; it is not accepted performance evidence.
+Current corpus-wide native evaluation share and remaining host-region families are tracked in
+[native-coverage.md](native-coverage.md) (reproduced with `scripts/coverage.py --dynamic`, see
+[testing.md §10](testing.md#10-compiled-tier-coverage-scriptscoveragepy)). Accepted A/B timing
+campaigns live in the canonical benchmark store and [generated report](performance.md).
 
 ## 2. ABI
 
@@ -279,9 +267,12 @@ no fingerprints, hence no collisions, and a hit needs no decoding.
   `Interp` nodes through definitions, constant substitution, by-name arguments and operator
   parameters, and from the bodies of the compiled functions it calls (`Call`, e.g. a RECURSIVE
   operator whose function is not native: the call's arguments need not mention the state it
-  reads; a function still being compiled makes the read set unknown). `ReadScan::ir` matches
-  every IR node kind explicitly, so a new kind that evaluates code kept elsewhere must be followed. Purity is as in §4 (primed variables, `UNCHANGED`, `ENABLED`, temporal operators and
-  cfg-overridden builtins are also excluded).
+  reads; a function still being compiled makes the read set unknown).
+  `Lowerer::expression_summary` (`tlx-compile/src/lower/summary.rs`, with HIR fallback walking in
+  `tlx-compile/src/lower/summary_hir.rs`) computes fixed-point summaries across `Call` edges, and
+  `summary::scan` matches every `ir::ExprKind` variant explicitly so a new kind that evaluates code
+  kept elsewhere must be handled. Purity is as in §4 (primed variables, `UNCHANGED`, `ENABLED`,
+  temporal operators and cfg-overridden builtins are also excluded).
 - **Table.** One direct-mapped table per thread (a collision replaces the older entry), starting
   at 1024 slots and doubling when over half full up to `TLX_MEMO_SLOTS`. The byte budget is the
   thread's share of `TLX_MEMO_MB`, further capped by the memory budget's cache allowance

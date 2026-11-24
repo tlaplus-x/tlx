@@ -1,5 +1,16 @@
 # Auditing the published speedups above 100x
 
+> [!NOTE]
+> **Historical point-in-time audit record** — not an active normative specification. This document
+> records an audit of the 2026-10-11 frozen initial benchmark store (`5dc582bde9`, collected on
+> Tencent `SA5.4XLARGE32` x86_64 instances with local count/digest cross-checks). Current state
+> reductions and certificate requirements on `main` are owned by [reductions.md](../reductions.md)
+> and [optimization.md](../optimization.md) (benchmark reporting is owned by
+> [benchmarking.md](../benchmarking.md) and [performance.md](../performance.md)). In particular,
+> the pre-`v0.1.0` `proof: static` and `runtime guard` (`PaxosCommit`) symmetry mechanisms recorded
+> in the frozen baseline were subsequently replaced on `main` by mandatory compiler-generated Lean
+> certificates (`proof: "generated-lean"`).
+
 Source identifiers below name reachable, source-equivalent commits in this history.
 The original measurement and reproduction identifiers remain in the evidence files; [source-equivalents.toml](../../bench/environment/source-equivalents.toml)
 maps those original identities to revisions with identical Rust/workspace inputs.
@@ -24,8 +35,12 @@ PYTHONPATH=scripts python3 -m benchmarking.speedup_audit --threshold 100 --verif
 ```
 
 The command prints the table below; `--verify-digests` recomputes each candidate's input digest from
-the resolved spec, configuration and module closure and compares it with both stored keys. All 13
-digests recompute **exactly** (tlx key and TLC key), so the two sides of every ratio were measured
+the resolved spec, configuration and module closure and compares it with both stored keys (requiring
+the fetched corpus, external repositories and `third_party/community` modules from
+`scripts/fetch-deps.sh` and `scripts/fetch-external.py` to match the baseline snapshot; missing
+checkouts report `unresolved`, and drifted unpinned `community` modules report a digest mismatch).
+At the 2026-10-11 freeze, all 13
+digests recomputed **exactly** (tlx key and TLC key), so the two sides of every ratio were measured
 on the same bytes. The 13 candidates reproduce the seed inventory in full; no row was added or lost.
 
 ## 1. Cross-cutting findings
@@ -88,8 +103,8 @@ cloud instance and the `-tlc` re-runs this audit could produce ran on a differen
 dividing them would mix machines. A like-for-like timing ratio needs both sides measured on one
 instance (section 3), and this audit does not quote one.
 
-The reduction itself checks out. `-stats json` reports `proof: static`, `scope: safety`, `preserved: [V-safe, CEX, D, L]`
-for the applied group; the bounded cross-check finds no violation in 1000 states at depth 7 for
+The reduction itself checks out. On the frozen pre-`v0.1.0` revision, `-stats json` reported `proof: static`, `scope: safety`, `preserved: [V-safe, CEX, D, L]`
+for the applied group (subsequently replaced on `main` by mandatory connected Lean certificates with `proof: "generated-lean"`, see [reductions.md](../reductions.md)); the bounded cross-check finds no violation in 1000 states at depth 7 for
 each candidate set; and a compatible-mode run with the equivalent declared
 `SYMMETRY Perms == Permutations(Acceptor) \cup Permutations(Value)` reproduces the same 17153
 distinct states, which is the documented identity ("the state counts ... equal TLC's counts with the
@@ -351,8 +366,8 @@ time at the recorded times, and most of it is dominated by four rows):
 * It does not claim any of the 13 rows has a wrong verdict, a wrong state count under its mode
   contract, or a wrong input digest: those all check out, including the two reduced searches, which
   match TLC exactly under `-tlc`.
-* It does not claim the reductions are unsound: their proof is static, documented, cross-checked in
-  bounds and reproducible as declared `SYMMETRY`.
+* It does not claim the reductions are unsound: in the frozen baseline their proof was static, documented, cross-checked in
+  bounds and reproducible as declared `SYMMETRY` (and on `main` every applied reduction now requires a connected compiler-generated Lean certificate, `proof: "generated-lean"`).
 * It does not claim the large ratios are fabricated. `ElevatorLivenessLarge`, `RaftMongoT4`,
   `MCRaftMongo` and `Accord` are genuine end-to-end differences on the same inputs and counts
   (`MCReachable` too, now that its TLC phase is attributed).
@@ -364,8 +379,7 @@ time at the recorded times, and most of it is dominated by four rows):
 ## Appendix: published rows whose records name an optimization
 
 Every row the generated report publishes carries a `tlx optimizations` cell; these are the 39 rows
-whose recorded samples name one (all of them the automatic reduction of `docs/usage.md` section 6.3:
-`proven` groups, or the `runtime guard` group of `transaction_commit/PaxosCommit`). The list is
+whose recorded samples name one in the 2026-10-11 frozen baseline (the pre-`v0.1.0` `proven` static groups, or the pre-`v0.1.0` `runtime guard` group of `transaction_commit/PaxosCommit`; both were subsequently replaced on `main` by mandatory connected Lean certificates, `proof: "generated-lean"`, per [reductions.md](../reductions.md)). The list is
 produced from the store with the report's own selection, so it is the annotation the report shows,
 not a second inference. Each row's record file is the one named in the report's Evidence column.
 

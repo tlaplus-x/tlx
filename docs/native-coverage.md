@@ -266,20 +266,26 @@ missing evidence.
 The coverage target for an external configuration is a host time share below
 20% (the threshold was adjusted on 2026-10-09: the native share is reported and
 was previously also required to reach 80%, but it counts each evaluation as
-fully native or not, so it moves in steps and does not measure speed). 15 of the
-92 external configurations with a complete measurement miss it (under the older
-two-part rule, 19 missed at least one of the two: 13 on the native share, 15 on
-the host time share, 9 on both), and their interpreter time totals 10.741s:
+fully native or not, so it moves in steps and does not measure speed). Of the
+92 external configurations with a complete measurement, 15 miss the `< 20%`
+host-time target, while **19 miss at least one of the two thresholds** (`< 80%`
+native evaluations or `>= 20%` host time: 13 below 80% native share, 15 at or
+above 20% host time share, 9 missing both, and 4 missing only `< 80%` native
+share while staying below 20% host time — `ext/ccf/MCccfraft_1C3N`,
+`ext/mongo/MCTxnsMoveRange`, `ext/vanlightly-raft/pull-raft-KRaft` and
+`ext/vanlightly-raft/raft-and-fsync-RaftFsync`). The table below lists all 19
+union configurations, whose interpreter time totals 10.741s:
 `ValOp >` 2.429s (22.6%); `ValOp \in` 2.074s (19.3%); `Eq` 1.546s (14.4%);
 `ValOp @@` 1.367s (12.7%); `ValOp DOMAIN` 0.745s (6.9%) and `Interp Except`
-0.697s (6.5%). The same list against the preceding record held 41 configurations
-(36 over the host line) totalling 1278.124s, so the interpreter time of the
-configurations that miss the target fell by 119x, but the populations differ:
-the revisions differ, one completion pass has run against each record, and seven
-of the fifteen are over the line by less than 10 ms of interpreter time — six of
-them under 2 ms each, on searches of 101 to 2,743 evaluations whose whole
-denominator is a few milliseconds — so the fall is a statement about the wave
-and not a like-for-like comparison of the same configurations. The operations listed below are up to three per configuration,
+0.697s (6.5%). The same union list against the preceding record held 41
+configurations (36 over the 20% host-time line) totalling 1278.124s, so the
+interpreter time of the below-threshold union fell by 119x, but the populations
+differ: the revisions differ, one completion pass has run against each record,
+and seven of the fifteen configurations over the 20% host-time line exceed it by
+less than 10 ms of interpreter time — six of them under 2 ms each, on searches
+of 101 to 2,743 evaluations whose whole denominator is a few milliseconds — so
+the fall is a statement about the wave and not a like-for-like comparison of the
+same configurations. The operations listed below are up to three per configuration,
 the ones that spent the most host time there; they are one entry per region, so
 a configuration can repeat an operation with different argument shapes. A
 configuration without a complete measurement is absent here rather than counted
@@ -509,8 +515,9 @@ orders of magnitude.
 
 The families above are not what is left to do. The lowerings that this record
 measures the effect of were delivered against the preceding one, whose failing
-set carried 1278.124s of interpreter time; this one carries 10.741s, in 15
-configurations, and most of that is not a missing lowering. What the evidence
+union carried 1278.124s of interpreter time; this one carries 10.741s across the
+19-configuration union (15 over the 20% host-time line), and most of that is not
+a missing lowering. What the evidence
 supports now, in order of the interpreter time it can move:
 
 1. **Make the measurement decide, before another lowering batch is dispatched.**

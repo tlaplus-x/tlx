@@ -13,7 +13,7 @@ modules; [design.md](design.md) describes the architecture.
 
 Contents: [1 Installation](#1-installation) · [2 First run](#2-first-run) ·
 [3 Command line overview](#3-command-line-overview) · [4 Execution tiers](#4-execution-tiers) ·
-[5 Compiled mode](#5-compiled-mode--compile) · [6 Multiple workers](#6-multiple-workers) ·
+[5 Compiled mode](#5-compiled-mode--compile) · [6 Multiple workers, symmetry and state reductions](#6-multiple-workers-symmetry-and-state-reductions) ([6.1](#61-checking-a-symmetry-declaration)–[6.4](#64-certified-state-projections--optimize-and-tlx-optimize)) ·
 [7 Simulation and generation](#7-simulation-and-generation) ·
 [8 Checkpoint and recovery](#8-checkpoint-and-recovery) ·
 [9 Dumping states and traces, coverage](#9-dumping-states-and-traces-coverage) ·
@@ -357,17 +357,25 @@ in [section 10.3](#103-exit-codes).
 
 ```
 tlx check Spec.tla [options]
+tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...
+tlx parse Spec.tla
 ```
 
-Options keep TLC's spelling and meaning (single dash; `-deadlock` *disables* deadlock checking).
-All options and defaults are listed in [configuration.md](configuration.md); `tlx check -h` prints
-the same list. An unknown option (including TLC options tlx does not implement, such as
-`-continue`) prints a usage line and exits with 2.
+`tlx check` runs model checking, simulation, or bounded symmetry diagnostics; options keep TLC's
+spelling and meaning (single dash; `-deadlock` *disables* deadlock checking). `tlx optimize` emits a
+certified finite abstraction and its standalone Lean proof into `DIR` without exploring states
+([section 6.4](#64-certified-state-projections--optimize-and-tlx-optimize)). `tlx parse Spec.tla`
+parses the modules in `Spec.tla` without resolving imports, reading a configuration, or running
+model checking (exits 0 on success, 1 on syntax errors, and 2 on argument or file errors). All
+options and defaults are listed in [configuration.md](configuration.md); `tlx check -h` and
+`tlx optimize -h` print the same lists. An unknown option (including TLC options tlx does not
+implement, such as `-continue`) prints a usage line and exits with 2.
 
 | You want to | Use |
 |---|---|
 | choose the configuration file | `-config F` |
-| run on several cores | `-workers N` or `-workers auto` ([section 6](#6-multiple-workers)) |
+| run on several cores | `-workers N` or `-workers auto` ([section 6](#6-multiple-workers-symmetry-and-state-reductions)) |
+| apply certified state projections | `-optimize`, `-proofdir DIR`, or `tlx optimize` ([section 6.4](#64-certified-state-projections--optimize-and-tlx-optimize)) |
 | run the interpreter instead of the compiled tier (the default) | `-interp` ([section 4](#4-execution-tiers)) |
 | TLC-identical counts, depth and traces | `-tlc` ([section 4](#4-execution-tiers)) |
 | random simulation instead of exhaustive search | `-simulate`, `-generate`, `-depth`, `-seed` ([section 7](#7-simulation-and-generation)) |
@@ -498,13 +506,13 @@ meanings are in the environment variable table of [configuration.md](configurati
 
 ---
 
-## 6. Multiple workers
+## 6. Multiple workers, symmetry and state reductions
 
 `-workers N` (or `-workers auto`, one worker per logical CPU available to the process) runs a
 **level-synchronous parallel BFS**: all workers expand the states of one BFS level, wait at a
 barrier, and continue with the next level. As a result the search depth, the length of the shortest
 counterexample and, for a run that finishes without error, the generated and distinct state counts
-equal TLC's. `-workers 0` is rejected.
+equal TLC's. `-workers 0` is rejected. Sections [6.1](#61-checking-a-symmetry-declaration)–[6.4](#64-certified-state-projections--optimize-and-tlx-optimize) cover symmetry verification, automatic symmetry, and certified state projections.
 
 What is not deterministic with several workers (all tier 3 of the [compatibility contract](compat.md)):
 
@@ -562,8 +570,17 @@ Many models bind a constant to a set of interchangeable model values (`RM = {r1,
 do not declare the symmetry. Before the search, tlx looks for such sets (a CONSTANT whose cfg
 value is a set of at least two model values, also through a `<-` substitution of a constant
 definition) that the cfg's SYMMETRY does not cover, and tries to prove statically that every
-permutation of them is an automorphism of the checked state graph. A candidate group is applied automatically only when it also receives a connected Lean certificate
-(section 6.3). Under `-tlc`, tlx prints a suggestion:
+permutation of them is an automorphism of the checked state graph. A candidate group is applied
+automatically only when it also receives a connected Lean certificate
+([section 6.3](#63-automatic-symmetry-in-the-default-mode)). Under `-tlc`, tlx prints a
+suggestion: when the proven group also receives a Lean certificate for default-mode automatic
+symmetry, it notes both options:
+
+```
+Symmetry: Permutations(RM) is provable for safety checking and not declared; to use it, run without -tlc, or define Perms == Permutations(RM) and add "SYMMETRY Perms" to the cfg.
+```
+
+(When default mode certifies a proper subset `G` of the proven group, it prints `run without -tlc to use G, or define Perms == ... and add "SYMMETRY Perms" to the cfg for the full group.`) When the proven group lacks a Lean certificate for automatic application, it omits `run without -tlc`:
 
 ```
 Symmetry: Permutations(RM) is provable for safety checking and not declared; to use it, define Perms == Permutations(RM) and add "SYMMETRY Perms" to the cfg.
@@ -573,22 +590,26 @@ For a run that checks temporal properties the line warns instead that a reductio
 them.
 
 The proof is a scalarset analysis of everything the safety checks evaluate (the initial
-predicate, the next-state relation, invariants, constraints, action constraints and action
-properties). It tracks which values may contain elements of the set, and accepts the set only
+predicate, the next-state relation, invariants, constraints, action constraints, action
+properties, initial-state `PROPERTY` predicates, `_POSSIBLE` predicates, and `POSTCONDITION`s).
+It tracks which values may contain elements of the set, and accepts the set only
 when those values are used through operations that treat all elements alike: equality and
 membership, set, function, record, tuple, sequence and bag operators, quantifiers, IF/CASE,
 `Permutations`, and folds with `+`, `*`, `\cup` or `\cap`. These break the symmetry when applied
 to such values and reject the set, naming the location: `CHOOSE` (TLC chooses by value order, so
 the choice depends on the elements' names, unless the predicate fixes the element by an
-equality `x = e`), `SetToSeq`, `ToString`, `Max`/`Min` of FiniteSetsExt, JSON conversion,
-`TLCModelValue`, `RandomElement`, folds over a set or a function's domain with another operator,
-and order-dependent CommunityModules operators. A constant whose value singles out elements
-(`Leader = r1` in the cfg, or a constant definition `Leader == CHOOSE r \in RM : TRUE`)
-restricts the group to the permutations that fix it, for example `Permutations(RM \ {r1})`.
-The analysis is conservative: it can reject a symmetric spec, but a proven group maps initial
-states to initial states, successors to successors, and preserves every invariant, constraint
-and action property. It does not cover temporal properties: under SYMMETRY, TLC's liveness
-checking can both miss violations and report spurious ones.
+equality `x = e` or a connected `ChooseSymCertificate` proves the `CHOOSE` idiom choice-irrelevant —
+unique witness, uniform/constant projected value, or commutative-associative recursive `CHOOSE`
+integer set-sum fold — in which case the candidate is promoted rather than rejected), `SetToSeq`,
+`ToString`, `Max`/`Min` of FiniteSetsExt, JSON conversion, `TLCModelValue`, `RandomElement`, folds
+over a set or a function's domain with another operator, and order-dependent CommunityModules
+operators. A constant whose value singles out elements (`Leader = r1` in the cfg, or a constant
+definition `Leader == CHOOSE r \in RM : TRUE`) restricts the group to the permutations that fix it,
+for example `Permutations(RM \ {r1})`. The analysis is conservative: it can reject a symmetric
+spec, but a proven group maps initial states to initial states, successors to successors, and
+preserves every invariant, constraint, action property, initial-state property, `_POSSIBLE`
+predicate and `POSTCONDITION`. It does not cover temporal properties: under SYMMETRY, TLC's
+liveness checking can both miss violations and report spurious ones.
 
 With `-stats`, the report's `auto symmetry` section lists every candidate set with the proven
 group or the reason it is not proven; specs that print, use TLCGet/TLCSet registers, randomness
@@ -621,6 +642,12 @@ supported shapes, expressions, and trusted layers. The Rust candidate analysis a
 bounded checks cannot substitute for this certificate; the development force
 setting cannot bypass the gate.
 
+Before installing a certified group, tlx also runs a bounded 20 ms generator
+cross-check (`symcheck::check_perms`) on concrete initial states and transitions:
+a symmetry witness there is an internal error (exit 101), while an evaluation error
+or incomplete check refuses automatic symmetry (`not applied: cross-check failed (...)`)
+rather than applying it.
+
 Other candidates remain available through analysis and `-checksymmetry -suggest`.
 Their refusal is recorded in the `auto symmetry` section of `-stats`. Explicit user
 `SYMMETRY` declarations keep their TLC behavior and responsibility.
@@ -630,6 +657,40 @@ and records an `optimizations` array in JSON statistics. A certified symmetry is
 labelled `certificate generated`, with `proof: "generated-lean"`, and its counts
 are marked `symmetry-reduced`. With no certified automatic reduction, it reports
 `Optimizations: none applicable.` and explores the full graph.
+
+### 6.4. Certified state projections (`-optimize` and `tlx optimize`)
+
+`tlx check Spec.tla -optimize [-proofdir DIR]` enables rule-based certified state projections for
+safety and deadlock checking:
+
+```sh
+tlx check Spec.tla -optimize
+tlx check Spec.tla -optimize -proofdir proofs/
+```
+
+- **Rules applied when certified**: unobserved-variable erasure, relative ages, finite histories,
+  phase-dependent fields, sequence lengths, and scalar or fixed-nested ordered allocation with
+  supported immutable-version collection. Concrete state values are retained for execution and
+  counterexample traces; certified unobserved-variable erasure can compose with automatic keyed
+  symmetry (including disjoint products of keyed groups).
+- **Lean certificate output**: every `-optimize` run writes standalone `Optimization.lean` under
+  `-proofdir` (default `$TLX_CACHE/proofs/<hash>/Optimization.lean` or
+  `~/.cache/tlx/proofs/<hash>/Optimization.lean`, including a no-pass record when no rule applies)
+  and prints its path without invoking Lean.
+- **Scope and exclusions**: disabled by `-tlc` (regardless of argument order); skipped when the
+  configuration uses constraints, action or initial properties, `ALIAS`, `_POSSIBLE`,
+  `POSTCONDITION`, temporal properties, or declared `VIEW`/`SYMMETRY`; incompatible with simulation
+  (`-simulate`, `-generate`), `-checksymmetry`, `-coverage`, and checkpoints or `-recover` (exit 2).
+
+To export a standalone finite TLA+ abstraction without running model checking, use `tlx optimize`:
+
+```sh
+tlx optimize Spec.tla -output DIR [-config FILE] [-I DIR]...
+```
+
+This writes `Optimized.tla`, `Optimized.cfg`, `Optimization.lean`, and `optimization.txt` into a new
+directory `DIR` (requiring `INIT`, `NEXT`, at least one `INVARIANT`, and `CHECK_DEADLOCK FALSE`);
+supported fragments, rules, and trust boundaries are in [optimization.md](optimization.md).
 
 ---
 
@@ -719,8 +780,9 @@ tlx check Spec.tla -workers 8 -recover states/26-10-05-12-00-00
 The continued run starts at the level of the checkpoint; verdict, generated and distinct counts,
 depth and counterexample length equal those of an uninterrupted run (with one worker the
 counterexample is identical too). `-workers` may differ from the original run. The tlx binary, the
-spec and cfg (contents), the execution tier (interpreter or compiled), the mode (`-tlc` or not), `-deadlock` and `-seed`
-must be the same, otherwise tlx refuses and says which one differs (exit code 255).
+spec and cfg (contents), the execution tier (interpreter or compiled), the mode (`-tlc` or not),
+`-deadlock`, `-seed` and any automatic symmetry applied to the run must be the same, otherwise tlx
+refuses and says which one differs (exit code 255).
 
 Things to know:
 
@@ -730,9 +792,11 @@ Things to know:
 - Checkpoints are taken only at level boundaries: if a level takes longer than the interval, the
   checkpoint waits for the end of the level.
 - Size: about 24 bytes per distinct state (fingerprint plus trace log), plus the states of the
-  current level (compressed in compiled mode), plus the edges of the behavior graph when liveness
+  current level (compressed in compiled mode), plus the edges of the liveness graph when liveness
   is checked.
-- `-recover` cannot be combined with `-simulate`, `-generate` or `-dump`.
+- `-recover` cannot be combined with `-simulate`, `-generate` or `-dump`. `-optimize` (without
+  `-tlc`) disables the default checkpoint interval and rejects explicit `-checkpoint` (`> 0`) and
+  `-recover` (exit code 2).
 
 ---
 
@@ -864,6 +928,7 @@ Same as TLC (`EC.ExitStatus`):
 | Exit code | Meaning |
 |---|---|
 | 0 | Success (also a successful simulation) |
+| 1 | `-checksymmetry` found a symmetry witness, or `tlx parse` found syntax errors |
 | 2 | Command-line error (tlx specific) |
 | 10 | An `ASSUME` is false; the `POSTCONDITION` is false |
 | 11 | Deadlock |
@@ -872,10 +937,11 @@ Same as TLC (`EC.ExitStatus`):
 | 14 | `Assert` failed |
 | 75 | Evaluation error (division by zero, overflow, out of domain, ...) |
 | 76 | An invariant failed to evaluate, or is not a state predicate |
+| 77 | A temporal `PROPERTY` is a tautology (or quantified over an empty set) |
 | 150 | Parse or semantic error, spec or cfg file unreadable, cfg syntax error |
 | 151 | Configuration error (for example an action-level formula used as a `PROPERTY`) |
 | 255 | Other errors: system or resource limits (integer literal beyond 32 bits, no initial state satisfies Init and the constraints, fingerprint set full, disk budget exceeded, some errors during simulation, differing checkpoint on `-recover`) |
-| 101 | Internal panic of tlx (including a mismatch found by `TLX_PARANOID`): please report a bug |
+| 101 | Internal panic or invariant failure of tlx (including a mismatch found by `TLX_PARANOID`, or an internal symmetry proof/witness mismatch under `-checksymmetry -suggest`, the startup cross-check of automatic symmetry, or `TLX_SYMMETRY_PARANOID`): please report a bug |
 
 The error class (and therefore the exit code) of a failing run is tier 3 of the compatibility
 contract: tlx and TLC agree that it fails, not always on the code ([compat.md](compat.md) section 0).
@@ -944,7 +1010,9 @@ Command-line options are not part of the compatibility contract, but tlx follows
 | `-continue`, `-difftrace`, `-fp`, `-maxSetSize`, `-terse`, `-view`, `-userFile`, `-inv`, `-postCondition`, `-dfid`, `-lncheck`, `-debugger`, ... | not implemented; usage error, exit code 2 |
 | `-DTLA-Library` | `-I dir` or `TLX_PATH` |
 
-tlx-only options: `-I`, `-progress`, `-compile`, `-interp`, `-tlc`, `-maxmem`, `-spill`, `-maxdisk`, `-stats`. The
+tlx-only options: `-I`, `-progress`, `-compile`, `-interp`, `-tlc`, `-optimize`, `-proofdir`,
+`-noautosymmetry`, `-checksymmetry`, `-suggest`, `-symmetrystates`, `-symmetrydepth`,
+`-symmetryperms`, `-symmetryedges`, `-maxmem`, `-spill`, `-maxdisk`, `-stats`. The
 full matrix is [features.md](features.md) section 1; the contract, the intentional differences
 (random numbers D-4, several workers D-3, liveness counterexamples under VIEW D-10, `-coverage`
 D-12, checkpoints D-16, ...) and the known limitations (unimplemented options, real numbers and

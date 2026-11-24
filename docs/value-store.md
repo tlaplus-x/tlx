@@ -140,16 +140,17 @@ payload bytes, index estimate, budget and the operation counts per executor.
 
 ## 6. Ownership, lifetime and memory
 
-The store belongs to a run. It is created when the encoding is built, with a byte budget of a quarter
-of `-maxmem`, or 4 GiB when no memory budget is given (`Settings::value_store_bytes`,
-`crates/tlx-compile/src/settings.rs`). A handle stays valid for as long as that run's store lives —
-nothing else keeps it alive, and nothing reclaims it.
+The store belongs to a run. It is created when the encoding is built, with the run's full memory
+budget (`-maxmem`, or `mem::default_budget()` when `-maxmem` is not set; unlimited when the run has
+no memory budget, `Settings::value_store_bytes` in `crates/tlx-compile/src/settings.rs`). A handle
+stays valid for as long as that run's store lives — nothing else keeps it alive, and nothing
+reclaims it.
 
 The store is not a process-wide interner, so two runs in one process have two stores even when they
 share one cached native library: the library calls back into the store of its per-call context, not
 into one of its own (`tlx-compile/tests/value_store_runs.rs`).
 
-There is **no reclamation**. The budget is the run's own `-maxmem`
+There is **no reclamation**. The budget is the run's own memory budget
 (`Settings::value_store_bytes`), never a fraction of it: the store replaces the process-wide `Dyn`
 interner for its slots, and that interner had no limit of its own, so a budget below the run's would
 end a run the run's memory guard lets finish. Insertion charges the node word plus its payload bytes
@@ -157,8 +158,9 @@ against the budget (the index is counted separately, for the report). Exceeding 
 exhausting the page table — marks the store full and ends the run with an error naming the budget
 and the way out (`raise -maxmem or turn the store off (TLX_VALUE_STORE=0)`,
 `enc/driver.rs::check_store`); values the store refused were neither stored nor fingerprinted, so
-this is a hard stop and not a degraded mode. Without a `-maxmem` the page table is the store's only
-limit, as the interner's growth was (section 10, gap 1).
+this is a hard stop and not a degraded mode. When a run has no memory budget (`usize::MAX`, such as
+simulation or unbudgeted library `Options`), the page table is the store's only limit, as the
+interner's growth was (section 10, gap 1).
 
 ## 7. Checkpoint and recovery
 
@@ -172,10 +174,12 @@ cannot be resumed, and a stored run takes none of TLC's default interval checkpo
 
 ## 8. Limits and known deviations
 
-- **One experiment at a time.** The store cannot be combined with `TLX_ESCAPE`; a run with it logs
-  `value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout` and runs as the
-  escape experiment did (the pair is not refused, because the store is the default and the escape
-  switch must keep working alone).
+- **One experiment at a time.** `TLX_VALUE_STORE` is experimental and off by default. It cannot be
+  combined with `TLX_ESCAPE`: when both are set, the driver logs
+  `value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout` and runs the escape
+  layout rather than refusing the environment (`crates/tlx-compile/src/enc/driver.rs`). When
+  `TLX_VALUE_STORE` is enabled without `-recover` or an explicit `-checkpoint`, it suppresses the
+  default 30-minute checkpoint timer (section 7).
 - **Still boxed.** Applying a fixed-domain function to a key that comes from a stored value (the
   `currentTerm[m.dest]` shape), and EXCEPT of a fixed-domain function at such a key, convert to boxed
   values. `Merge` rebuilds the merged node, which costs O(n log n) in the size of the function.
@@ -229,7 +233,7 @@ the store's operation set (section 4) but a property of the experiment it still 
 |---|---|---|---|---|---|
 | 1 | **No reclamation** (section 6) | A `Dyn` variable's values accumulate for the whole run; past the run's `-maxmem` the run *stops with an error*, where the `Dyn` interner it replaced grew until the machine ran out of memory. Long runs on bag-like state are the ones that reach it. The budget is the run's own `-maxmem`, not a fraction of it | raise `-maxmem`, or `TLX_VALUE_STORE=0` | reclamation (reference counting, or mark-and-sweep rooted in the live states) plus a budget policy that matches the other representations — the "stable state root slots" step of the design record | a full batch: it needs the set of live state roots (queue, archive, spill, memo) to be enumerable, which is a change to the search, not to the store |
 | 2 | **No checkpoint format** (section 7) | (a) `-recover` or an explicit `-checkpoint N`: the store is off (logged) — as before. (b) With only TLC's default interval, the run takes **no checkpoints at all** (logged): a crash costs the whole search, where the same run without the store would leave a resumable checkpoint. This is what a run with the store on does today. | `TLX_VALUE_STORE=0` restores the checkpoint | a checkpoint format for the store (serialize its nodes, remap handles on recovery), which belongs with the stable-root work: an encoding is only stable across a recovery if the slots are | a full batch |
-| 3 | **Not combined with `TLX_ESCAPE`** | `TLX_ESCAPE=1` runs with the store off (logged). The settings used to refuse the pair by name, so setting the escape switch alone had to be made to keep working | none needed | done: escape wins, the pair is no longer an error | none |
+| 3 | **Not combined with `TLX_ESCAPE`** | With both `TLX_ESCAPE=1` and `TLX_VALUE_STORE=1`, the driver runs with the store off (logged) rather than refusing the pair | none needed | escape wins when both switches are set | none |
 | 4 | **Crude slot selection** | A slot that merely *contains* a `Dyn` part becomes one handle, so its other, already-encoded components (a bitset field of a tuple, say) stop using their encodings; and a materialized definition with a `Dyn` part stays unmaterialized (`enc/driver.rs`). Only models with a `Dyn` slot are affected. | `TLX_VALUE_STORE=0` | promote per component, or choose per slot by measured benefit | half a batch: it needs a per-slot read/write and representation analysis, and the recorded regressions of the earlier broader promotion policy are the evidence that guessing is worse than not promoting |
 | 5 | **Still boxed** (section 8) | Operations whose operands arrive as boxed values (a fixed-domain function applied to a key from a handle, `@@`/`:>` on a handle in the boxed expression path, a higher-order operator call over a handle) keep an interpreter boundary; native share stays below 100% on the analysis configurations. Results are unaffected | none | separate lowering batches (the operations themselves, not the representation) | a batch per operation family |
 
@@ -304,26 +308,10 @@ noise):
 | `bench/ReprRaft` | 0.425 → 0.389 | 0.915 | 0.425 → 0.391 | 0.920 |
 
 The three samples of one arm spread by up to 1.9% on these runs (3.8% on the 0.24 s
-`bench/PullRaftMsg3`), and every control ratio is 0.994-1.004: the four configurations the earlier
-representation experiments regressed are unchanged within their own noise, while the bag
-configurations are 15-20% faster. `bench/PullRaftMsg3` itself moves by +0.006 s, inside its own
-spread.
+`bench/PullRaftMsg3`), and every non-bag control ratio is 0.994–1.004 while the message-bag
+configurations are 8–20% faster (`bench/PullRaftMsg3` moves by +0.006 s, inside its own spread).
+Promoting only `Dyn`-bearing slots keeps fixed-layout configurations on their compact sequence, set
+and map encodings rather than replacing them with handle indirection (section 3, section 10 gap 4).
 
-On the fixed reduced representation suite (`bench/repr-models.toml`, 21 configurations, macOS arm64,
-one discarded warm-up and three rotating interleaved rounds) the store is 5-16% faster on the
-message-bag configurations (`bench/ReprRaft` 0.889, `bench/ReprRaftAddRemove` 0.848,
-`bench/ReprRaftFsync` 0.843) and every other configuration is inside the range of its own samples
-(the two largest medians, `bench/ReprBakery` and `bench/ReprLamportMutex`, move by one 10 ms tick at
-three samples). In the default mode the same suite gives `bench/ReprRaft` 0.688,
-`bench/ReprRaftAddRemove` 0.691, `bench/ReprRaftFsync` 0.771 and `bench/ReprKRaft` 0.854, with every
-other configuration inside ±4% at three samples on runs of 50-400 ms. The regressions the earlier,
-wider promotion policy recorded (`ReprCCFMulti` 1.22,
-`ReprCCFReads` 1.36, `ReprCCFMedium` 2.01 in its same-revision toggle) do not reappear: that policy
-promoted sequences, non-bitset sets and functions over eight words, which this store does not.
-
-Correctness with the store on: the 21 reduced configurations pass the compiled
-`TLX_PARANOID` arm against the interpreter (recorded representation-suite validation); the six
-`ext/vanlightly-raft` configurations match the TLC oracle in the compiled tier and under
-`TLX_PARANOID`; the spectest modes (the default interpreter run, `-interp`, `-compile` and
-`-compile` under `TLX_PARANOID`) report the same 442 cases; and one, four and eight search workers
-agree on a message-bag configuration.
+Correctness with `TLX_VALUE_STORE` enabled — including `TLX_PARANOID` cross-checking against the
+interpreter and multi-worker store sharing — is enforced by the test targets listed in section 9.

@@ -236,7 +236,7 @@ the rule or claim that a proposed mechanism already exists.
 
 - **Rule:** Test semantic changes through the interpreter including fast paths, closure executor, C, JIT and supported fallbacks, separating compatibility identity from default-mode verdict soundness.
 - **Rationale:** A successful model run can delegate all operations and conceal an untested backend or fast path.
-- **Checked by:** [Testing procedures](testing.md) and tlx-verify; [operation_matrix.rs](../crates/tlx-compile/tests/operation_matrix.rs) builds the per-family consumer matrix (`ran`, `delegated`, `gap`, plus a negative control that must report a gap) from the lowered IR, the generated C and the native plan and refuses a silent zero; [coverage.py](../scripts/coverage.py) is the measured native census; the families it does not reach and every compatibility-mode claim stay a review judgment.
+- **Checked by:** [Testing procedures](testing.md) and [verify.py](../scripts/verify.py); [operation_matrix.rs](../crates/tlx-compile/tests/operation_matrix.rs) builds the per-family consumer matrix (`ran`, `delegated`, `gap`, plus a negative control that must report a gap) from the lowered IR, the generated C and the native plan and refuses a silent zero; [coverage.py](../scripts/coverage.py) is the measured native census; the families it does not reach and every compatibility-mode claim stay a review judgment.
 - **Example:** Good: a lookup regression reaches `code.rs` and native callbacks; bad: one EncModel verdict claimed as C/JIT coverage.
 
 ### CODE-20
@@ -309,7 +309,7 @@ the rule or claim that a proposed mechanism already exists.
 
 - **Rule:** Publish performance claims only from canonical measurements identifying statistic, cohort, revision, machine, mode and relevant cache conditions.
 - **Rationale:** Different cohorts and summary statistics produce incompatible headlines.
-- **Checked by:** Canonical record/report checks and tlx-perf; manual claim-to-record review outside the generated report.
+- **Checked by:** Canonical record/report checks via [bench.py](../scripts/bench.py) (`report --check`) and [doccheck.py](../scripts/doccheck.py), with measurement procedures in [benchmarking.md](benchmarking.md); manual claim-to-record review outside the generated report.
 - **Example:** Good: a linked scoped median from the report; bad: an unqualified speedup copied from another cohort.
 
 ### DOC-06
@@ -382,14 +382,14 @@ the rule or claim that a proposed mechanism already exists.
 
 - **Rule:** Keep reusable domain libraries independent of command entrypoints and test modules, separating parsing, policy, execution and rendering by responsibility.
 - **Rationale:** Imports back into an executed CLI create cycles, duplicate module identities and hidden global state.
-- **Checked by:** [check_imports.py](../scripts/check_imports.py) reads the whole AST of `scripts/`, function bodies included, and refuses a production module importing a test module and a cycle outside a declared cluster (a cluster that gains a member or stops cycling fails as stale); the pre-commit hook runs it, and import-time side effects stay a manual review.
+- **Checked by:** [check_imports.py](../scripts/check_imports.py) reads the whole AST of `scripts/`, function bodies included, and refuses a production module importing a test module and a cycle outside a declared cluster (a cluster that gains a member or stops cycling fails as stale); [test_release_tree.py](../scripts/tests/test_release_tree.py) and the public checks in [testing.md](testing.md) run it, and import-time side effects stay a manual review.
 - **Example:** Good: CLI imports a measurement library; bad: the record library imports the CLI or a test helper module.
 
 ### HARNESS-04
 
 - **Rule:** Update concurrent persistent state in locked transactions with atomic replacement and durable stable event identities.
 - **Rationale:** Separate read/overwrite and append/rewrite paths lose interleaved updates or receipts.
-- **Checked by:** [doccheck.py](../scripts/doccheck.py) checks public links, references, documented paths and environment names, and `--require-examples` requires parsing complete TLA+ examples. [cli_contract.py](../scripts/cli_contract.py) checks its declared command coverage and reports missing inputs. A link check alone does not verify examples.
+- **Checked by:** [scripts/harness/storage.py](../scripts/harness/storage.py) (`file_lock`, `atomic_json_replace`, `locked_json_update`) serializes read-modify-replace JSON updates and fsyncs unique temporaries before replacement, and [test_storage.py](../scripts/tests/test_storage.py) exercises concurrent cross-process updates, interrupted publication and callback failures; non-JSON or append-log state stays a manual review.
 - **Example:** Good: resolve a message ID under the same lock as append; bad: overwrite a live JSONL log from an old snapshot.
 
 ### HARNESS-05
@@ -501,7 +501,7 @@ the rule or claim that a proposed mechanism already exists.
 
 - **Rule:** Follow the current shared-machine/cloud resource policy and reuse valid keyed TLC timings instead of recollecting them for comparisons.
 - **Rationale:** Local heavy runs, artificial load and duplicate oracle timing consume shared capacity and distort evidence.
-- **Checked by:** [cloud-verification.md](cloud-verification.md) section 1 owns what may run locally (AGENTS.md keeps the pointer), [test_cloud_admission.py](../scripts/tests/test_cloud_admission.py) exercises the admission refusals, a local `bench.py --hog` run is refused, tlx-perf owns the measurement recipe, and [benchmarking/baselines.py](../scripts/benchmarking/baselines.py) is the keyed TLC baseline cache that makes a recollection unnecessary.
+- **Checked by:** [cloud-verification.md](cloud-verification.md) section 1 owns what may run locally (AGENTS.md keeps the pointer), [test_cloud_admission.py](../scripts/tests/test_cloud_admission.py) exercises the admission refusals, a local `bench.py --hog` run is refused, [benchmarking.md](benchmarking.md) and [bench.py](../scripts/bench.py) own the measurement recipe, and [benchmarking/baselines.py](../scripts/benchmarking/baselines.py) is the keyed TLC baseline cache that makes a recollection unnecessary.
 - **Example:** Good: reduced bounded local correctness checks and cloud large-model A/B; bad: large local TLC because the machine looks idle.
 
 ### HARNESS-21
@@ -613,6 +613,6 @@ ID. Remove obsolete rule bodies and index entries, update incoming references, a
 record retirement/replacement in the change commit; do not leave obsolete requirements
 as active checklist items. When rules merge, keep the surviving ID and update all
 references. Each update verifies index/body agreement, all four fields, links and
-anchors, and runs the applicable staged-tree gate and completion check. Reviewers
+anchors, and runs [doccheck.py](../scripts/doccheck.py), [dependency_check.py](../scripts/dependency_check.py) and [verify.py](../scripts/verify.py). Reviewers
 record justified exceptions with scope, evidence and an expiry or removal condition;
 exceptions do not silently create a competing standard.

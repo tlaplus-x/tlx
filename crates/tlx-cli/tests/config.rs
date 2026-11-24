@@ -237,6 +237,7 @@ const ACCEPTED_CHECK_OPTIONS: &[&str] = &[
     "-noGenerateSpecTE",
     "-noautosymmetry",
     "-nowarning",
+    "-optimize",
     "-progress",
     "-proofdir",
     "-recover",

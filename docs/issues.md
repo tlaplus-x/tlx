@@ -1,9 +1,23 @@
 # Open issues
 
 This document tracks unresolved work. Fixed defects are removed; their changes and regression
-coverage remain in Git history and the relevant design and testing documentation.
+coverage remain in Git history and the relevant design and testing documentation. Documented
+TLC compatibility differences and the open compiled-tier function-domain representation bug
+(`D-13`, including empty enumerated functions in `tests/fuzz/specs/FzEmptyFcnExcept` and the
+planned cutover in [value-store.md](value-store.md) section 8) are tracked in
+[compat.md](compat.md#3-documented-differences).
 [bench/README.md](../bench/README.md#frozen-snapshot-provenance) preserves the initial snapshot's
 provenance and historical failures. Fixes and later validation do not rewrite that frozen baseline.
+
+## Compiled function-domain representation (`D-13`)
+
+In the compiled tier's fixed encodings (`Shape::Fcn` / `Map`), decoding does not record whether a
+function's domain was built from an interval/tuple or from an enumerated set (`[k \in {0, 1} |-> e]`,
+`[i \in {} |-> e]`), so an out-of-domain non-integer `EXCEPT` key raises a type error instead of
+leaving the function unchanged as TLC and `-interp` do (for example
+`tests/fuzz/specs/FzEmptyFcnExcept`). Store-backed `Ref` slots (`TLX_VALUE_STORE`) preserve the
+construction witness; full details and reproduction cases live in [compat.md](compat.md) `D-13`
+and [value-store.md](value-store.md) section 8.
 
 ## Full-model validation and performance follow-up
 

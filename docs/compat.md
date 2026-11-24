@@ -120,12 +120,16 @@ The following may differ; whether to change them is tlx's own decision (tlx's sc
 `scripts/tlc.py parse()` parses tlx's output, so changing the format means changing it too):
 
 - names and syntax of command-line options;
-- configuration syntax extensions: tlx accepts signed integers in constant assignments
-  (`CONSTANT C = -1` and `CONSTANT C = {-1, 0}`). TLC's `tlc2.tool.impl.ModelConfig.parseValue`
-  has no unary-minus production and rejects both; its fallback consumes `-` as a model
-  value and leaves the numeral as an unexpected token. This is a configuration-format
-  limitation, not a TLA+ semantic defect. The same values can be supplied to TLC through
-  a definition override (`CONSTANT C <- Negative`, with `Negative == -1` in the module);
+- configuration syntax extensions and lexical differences: tlx accepts signed integers
+  (`CONSTANT C = -1` and `CONSTANT C = {-1, 0}`), tuple literals (`<<1, 2>>`), and the
+  parameterized operator replacement form `F(_, _) <- G` (recorded as a substitution `F <- G`
+  whose declared arity is still checked by `check_cfg_substitutions`), and decodes string
+  escapes (`\"`, `\\`, `\n`, `\t`, `\r`, `\f`) whereas TLC keeps raw text between quotes. TLC's
+  `tlc2.tool.impl.ModelConfig.parseValue` has no unary-minus or tuple production and rejects
+  them (its fallback consumes `-` as a model value and leaves the numeral as an unexpected
+  token). These are configuration-format differences, not TLA+ semantic defects; the same values
+  can be supplied to TLC through a definition override (`CONSTANT C <- Negative`, with
+  `Negative == -1` in the module);
 - text, order and position of messages, message codes and levels of `-tool`, warnings;
 - the format of progress and statistics lines, the contents of the version and mode lines;
 - exit codes (except the error classes of section 1);
@@ -138,7 +142,7 @@ The following may differ; whether to change them is tlx's own decision (tlx's sc
 
 | ID | Difference | Evidence / handling |
 |---|---|---|
-| D-1 | **Choice of the liveness counterexample lasso**: TLC's choice depends on its random fingerprint function (every run uses a random `-fp`). For example L3 gives lassos of 4 or 5 states under different `-fp`. TLC's successor order comes from the `SetOfStates` ordered by fingerprint hash and the tableau nodes are also produced in hash order, so for tableau properties such as `~>` and `[](p => <>q)` the lasso changes with `-fp` even on a single-cycle graph. tlx builds the lasso by TLC's `printTrace` rules and can agree with only one of them | spectest runs TLC with five values of `-fp` (0, 1, 2, 3, 5); if the counterexamples disagree they are marked `trace-random` in the cache. When tlx's lasso differs from the first one, TLC validates it (tier 3). Currently: L3, L8 |
+| D-1 | **Choice of the liveness counterexample lasso**: TLC's choice depends on its random fingerprint function (every run uses a random `-fp`). For example L3 gives lassos of 4 or 5 states under different `-fp`. TLC's successor order comes from the `SetOfStates` ordered by fingerprint hash and the tableau nodes are also produced in hash order, so for tableau properties such as `~>` and `[](p => <>q)` the lasso changes with `-fp` even on a single-cycle graph. tlx builds the lasso by TLC's `printTrace` rules and can agree with only one of them | spectest runs TLC with five values of `-fp` (0, 1, 2, 3, 5); if the counterexamples disagree they are marked `trace-random` in the cache. When tlx's lasso differs from the first one, TLC validates it (tier 3). Currently: `CKP1`, `CMP80Net`, `L3`, `L8`, `RT44View`, `SPL2` |
 | D-2 | **Random choices of simulation / `-generate`**: TLC's and tlx's random number generators differ, so the same `-seed` gives different behaviors | Only verdict and names are compared; specs whose behaviors do not depend on random choices are additionally compared on generated (`# deterministic`) |
 | D-3 | **Races with several workers**: with several workers TLC's counts **and search depth** after a deadlock, violation or evaluation error, the counterexample (not necessarily shortest) and the counts after an error in simulation are racy. Search depth is the largest level written by any worker, not the error state's level; other workers can advance while the error is reported | `-workers 1` is the basis; with several workers early-stop counts, depth and trace length are tier 3, and the choice of valid safety violation (kind/name and trace) among violations at the same BFS level is also tier 3: TLC itself with `-workers 4` can report a different one, including an invariant instead of an action property. Each trace must really violate the reported property. Single-worker verdicts/names remain exact; this is not permission to accept an arbitrary different verdict. Completed searches still compare counts and depth. Fixed `-fp 0`, `tests/specs/ParallelDeadlockDepth`: six single-worker runs report depth 3; six eight-worker runs report 19, 16, 20, 21, 21, 21, all with a three-state deadlock trace. Source and reduced Raft reproduction: [tlc-semantics.md §5.5](tlc-semantics.md#55-bfs-order) |
 | D-4 | **Values of `RandomElement` / Randomization**: tlx reproduces TLC's `java.util.Random` stream and selection algorithm, so random choices made at start-up (constant definitions, ASSUME, Init) are bit-for-bit those of TLC under the same `-seed` (for example `SpanTreeRandom -seed 1/3` has TLC's state counts). Differences: (a) **without `-seed` tlx uses seed 0** (deterministic) while TLC picks a random seed; (b) **state-level choices** (during BFS, reseeded with `seed ^ state fingerprint`) differ because the fingerprint function differs (D-5); (c) `RandomSubset` on a set of functions or records numbers elements by tlx's canonical order, TLC by a mixed-radix numbering of the product | Specs that depend on random numbers are compared with TLC under `-seed N` (spectest RN1); SpanTreeRandom in the corpus (TLC uses a random seed) can only be compared on the verdict |

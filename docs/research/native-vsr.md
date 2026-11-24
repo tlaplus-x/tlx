@@ -1,5 +1,14 @@
 # The `messages` bag in the vanlightly-vsr configurations
 
+> [!NOTE]
+> **Historical point-in-time diagnostic record** — not an active normative specification. This
+> document captures pre-`v0.1.0` profiling of `ext/vanlightly-vsr/*` on a shared macOS arm64
+> development workstation. All wall and search times reported here are local workstation
+> diagnostics under shared load, **not** isolated cloud benchmarks of record
+> ([DOC-05](../development-standards.md#doc-05)). Current value-store representation and native
+> coverage contracts on `main` are owned by [value-store.md](../value-store.md) and
+> [native-coverage.md](../native-coverage.md).
+
 **M** denotes a measurement (a command was run and its numbers are reported here);
 **A** denotes analysis, an estimate or a proposal. This analysis explains why
 `ext/vanlightly-vsr/*` spends most of its time in the interpreter, measures the
@@ -334,15 +343,15 @@ cargo build --release
 cd third_party/external/vanlightly-vsr
 
 # the slot decision and the boxed-node histogram
-TLX_COVERAGE=1 TLX_CGEN_DEBUG=1 timeout 200 ../../target/release/tlx check VSR.tla \
+TLX_COVERAGE=1 TLX_CGEN_DEBUG=1 timeout 200 ../../../target/release/tlx check VSR.tla \
   -config VSR.cfg -tlc -workers 1 -stats json=/tmp/vsr-stats.json
 
 # the region subtree behind a region root
-TLX_IR_DUMP=ReceiveMatchingSVC timeout 60 ../../target/release/tlx check VSR.tla \
+TLX_IR_DUMP=ReceiveMatchingSVC timeout 60 ../../../target/release/tlx check VSR.tla \
   -config VSR.cfg -tlc -workers 1
 
 # one arm of the A/B; the other is TLX_VALUE_STORE=0
-TLX_MIXED_ADAPT=0 TLX_VALUE_STORE=1 timeout 600 ../../target/release/tlx check VSR.tla \
+TLX_MIXED_ADAPT=0 TLX_VALUE_STORE=1 timeout 600 ../../../target/release/tlx check VSR.tla \
   -config VSR.cfg -tlc -workers 1 -stats json=/tmp/vsr-store.json
 ```
 

@@ -134,7 +134,7 @@ gives the models where tlx is slower or within 10% a `-stats` run for the phase 
 binaries run once (a default tier without a native cache). `ttfr-report FILE` imports the raw measurements and regenerates `docs/performance.md`. Output
 `bench/ttfr*.json` is rewritten after every model; cold/default and warm-cache records remain distinct.
 `cold` is the first run with an empty native cache (`TLX_CACHE`) and `warm` the minimum of the runs
-after it; a tlx run is cut off at `max(1.25 × TLC, 20 s)`, so an entry at the cut-off is a lower
+after it; a tlx run is cut off at `max(2.0 × TLC, 20 s)`, so an entry at the cut-off is a lower
 bound, never a time.
 
 Three further lanes have their own rules, without which their numbers are not readable:
@@ -149,7 +149,7 @@ Three further lanes have their own rules, without which their numbers are not re
   states, stuttering and weak fairness, `ClockSettles` over `n` atoms). A separate construction
   probe compiles each revision's tableau source verbatim with the same shared interner, so
   construction cost is compared without a whole-model run. Peak RSS comes from `wait4`, every
-  process is limited to 45 s, and the probe and the whole model get different address-space caps; a
+  model/probe run is limited to 60 s by default (`--timeout`), and the probe and the whole model get different address-space caps; a
   run stopped by its limit is an incomplete sample, not a time or a completed peak allocation.
   Compare revisions within one phase — probe against probe, release binary against release binary —
   never probe against whole model: they are different compilations.
@@ -206,9 +206,11 @@ python3 scripts/cloud_verify.py --provider tencent --instance-type <type> \
 
 ## 3. TLC baseline
 
-TLC's version is pinned (`third_party/tla2tools.jar` + `community/modules.jar`), so its times need
-measuring once per machine type; later tlx benchmarks compare against that file instead of
-re-running TLC.
+TLC's baseline jar (`third_party/tla2tools.jar`) is pinned by version, manifest revision and
+SHA-256 in `scripts/dependencies.py` (`scripts/fetch-deps.sh`), while `third_party/community/modules.jar`
+is fetched from upstream `CommunityModules` `releases/latest` and recorded by SHA-256 in each
+baseline header. TLC times therefore need measuring once per machine type and input digest; later
+tlx benchmarks compare against the stored baseline instead of re-running TLC.
 
 ```sh
 scripts/bench.py tlcbase --slice 1/8                 # whole corpus, TLC -workers 1 and 16
@@ -227,8 +229,9 @@ counts, result and violated name; a timeout (default 1800 s) is recorded as `tim
 header records machine, JVM version, TLC revision, community-modules hash, timeout and worker
 counts. `--slice I/N` splits the models into slices of similar estimated cost for parallel
 machines; `tlcbase-merge` joins them. A baseline is meaningful only on the machine type it was
-measured on (a warning is printed for a different CPU model). The baseline is
-retained under `bench/history/`; its measurements are indexed in the store (`bench/records/`). A
+measured on (a warning is printed for a different CPU model). Raw collector outputs write to
+`bench/history/` during a run (archived under ignored `work/` outside the published tree), while
+canonical per-key baselines ship in `bench/tlc-baselines/` (section 6.2). A
 baseline name resolves to its merged file, not to its slices: `tlc-<rev>` still matches
 `tlc-<rev>-lane<s>.json`, and the canonical file wins while two slices without one stay an error
 (reporting a slice as the whole baseline would silently report a fraction of the corpus).
@@ -273,11 +276,10 @@ instrumented counters, but is excluded from public performance headlines.
 Use repeated `bench.py ab` or suite measurements for a performance comparison.
 A/B stats passes are also marked diagnostic, including when stats output is absent.
 
-**Instrumented adapters** (`bench/memo-inputs/profile.py` is one) are `ab` binaries that count
-something the ordinary binary cannot: process-wide Rust allocator calls and encoded fallback input
-decodes, in that case. They are run under `--env LABEL:K=V` (`MEMO_PROFILE_REV`, `MEMO_PROFILE_BIN`,
-`MEMO_PROFILE_IR`, `MEMO_PROFILE_TOOLS` for an instrumented one; the module doc is the owner of the
-switch list). A counted binary's time includes its atomic counters, so it must never be compared for
+**Instrumented adapters** are custom `ab` wrapper binaries or scripts that count
+something the ordinary binary cannot — for example, process-wide Rust allocator calls and encoded fallback input
+decodes. They are run under `--env LABEL:K=V` (such as `MEMO_PROFILE_REV`, `MEMO_PROFILE_BIN`,
+`MEMO_PROFILE_IR`, `MEMO_PROFILE_TOOLS` when driving a custom adapter). A counted binary's time includes its atomic counters, so it must never be compared for
 timing: run the ordinary A/B first, then the adapter, at least three interleaved rounds after a
 discarded warm-up, with the worker count, `TLX_*` settings and native-cache conditions identical.
 Save the ordinary binaries outside `target/release/tlx` first — an instrumented build reuses
@@ -336,26 +338,24 @@ Local use is limited to what is cheap: `bench.py suite --sizes small --models Si
 
 ## 5. Canonical records and TLC baseline reuse
 
-`bench/schema.json` defines the versioned measurement schema. Each measurement records the
+`scripts/benchmarking/records.py` defines the versioned measurement schema (`VERSION`, `FIELDS`,
+`validate`). Each measurement records the
 model, categories, tool, execution mode and workers, revision, instance/architecture and date,
 input digest, verdict and counts, wall/CPU/RSS/instructions and a matching TLC measurement ID.
 Null means unknown or unmeasured. Repeated timings use medians in the report; the existing A/B
-regression judge retains its minimum-based comparison. Records link back to the original file
-and its JSON pointer (or markdown line). The migration inventory is `bench/migration.json`: the sources each container was imported from,
-the frozen hashes of the historical documents, and the **archive locator** — `archived_sources`
-names the revision and the SHA-256 of every artifact retired from the tree. A retired source is read
-back through `git show <revision>:<path>` and must hash to the recorded digest, so its canonical
-rows keep a reader and the gate can still tell a live source from a vanished one; a locator that
-does not resolve is refused rather than read as an absent source. The digest covers the artifact's
-own bytes, including the counters, prose and per-sample detail the canonical schema does not carry,
-so a citation of a retired raw measurement is checkable without trusting this repository's current
-tree. `suite-report` re-ingests the suite histories and regenerates that report; the historical trend
+regression judge retains its minimum-based comparison. Canonical records in the published repository
+(`bench/records/` and `bench/tlc-baselines/`) carry embedded per-sample data and point to their own
+canonical store files, while retaining original collection pointers in `provenance` ([bench/README.md](../bench/README.md)).
+When raw runner outputs or an optional maintainer archive inventory are present during a re-import,
+`benchmarking.legacy` resolves retired raw sources through `<revision>:<path>` in git history and
+verifies their SHA-256 digests rather than treating a broken locator as an absent source.
+`suite-report` re-ingests present suite histories and regenerates the report; the historical trend
 view in `bench_suite.trend_markdown` is a renderer, not a document, and no command writes one — the
 report of record is `docs/performance.md`. Where a trend view is rendered, its `vs prev` column uses
 the minimum wall time of the repeats, unlike the canonical report's medians.
 
 ```sh
-python3 scripts/bench.py migrate             # idempotent import; keeps all original files
+python3 scripts/bench.py migrate             # idempotent re-import when raw sources are present
 python3 scripts/bench.py report --refresh-ages
 python3 scripts/bench.py report --check
 python3 scripts/bench.py tlcbase --missing --workers 1,16 --no-large --instance-type SA5.4XLARGE32
@@ -374,7 +374,7 @@ while a changed staging or a changed trace is a different key and a missing decl
 reusable key at all. A model that runs next to its spec and declares no input hashes exactly as
 before, so the frozen report's pinned input keys stay valid.
 
-TLC is collected once per key in the store (`bench/records/`, section 6): TLC revision, model ID, digest of
+TLC is collected once per key in `bench/tlc-baselines/` (section 6): TLC revision, model ID, digest of
 spec/config/local module dependencies, semantic flags and run layout, worker count and instance type.
 Memory-constrained experiments additionally key their heap/direct-memory/cgroup settings.
 A valid completed key is reused even with a runner's force option. `run`, `scale`, disk
@@ -385,12 +385,10 @@ An incomplete key still keeps one row, the strongest record of why it has none: 
 measured at a longer bound outranks a shorter one, otherwise the newer record is the current
 evidence, and a completed measurement supersedes either - so re-running a key at a longer
 timeout replaces the shorter bound it outgrew instead of leaving a stale row behind.
-The store is derived, so a commit that changes a source must re-run `bench.py migrate`; `check`
-re-derives the sources and fails a stored row no source produces, and a stored row that is weaker
+When raw measurement sources are modified in a working tree, re-run `bench.py migrate`; `bench.py report --check`
+re-derives every present or archived source and fails a stored row no source produces, or a stored row weaker
 than the row its key derives. Migration validation compares the previous store with the migrated store: every retained row
 must preserve its measurements, and every previous measurement key must remain represented.
-The maintainer-only migration checker lives with the local tooling because it also inspects
-archived stores and their historical provenance.
 Missing keys are listed explicitly; they are collected only by an explicitly requested TLC
 measurement, with normal cloud/local resource guards still applied.
 
@@ -404,13 +402,15 @@ so regeneration and gates need no oracle timings or cloud access. `--refresh-age
 that reference; `track` does this automatically. The stale threshold defaults to the revision
 count in `bench/report-policy.json`.
 
-`doccheck` calls the standalone performance check, so `merge_gate` and `done_check` reject an
-edited/outdated generated report, malformed records/baseline keys, a stored measurement whose source
-is gone without a resolvable archive locator, and new ad hoc markdown under `bench/`. The frozen
-allowlist names the historical documents that were retired, so the only Markdown the check accepts
-there is a copy whose bytes still match the recorded hash. Re-importing cannot silently re-adopt
-changed inputs or unfreeze old tables. Add a suite configuration and record the resulting measurement
-instead of starting another report.
+`scripts/doccheck.py` calls `bench_records.check(..., sources=False)`, validating every stored
+record and baseline key in `bench/records/` and `bench/tlc-baselines/`, checking that
+`docs/performance.md` matches a fresh render from `bench/report-policy.json` and `bench/suite.json`,
+and rejecting ad hoc Markdown under `bench/` (outside `bench/README.md`). `python3 scripts/bench.py report --check`
+runs `bench_records.check(..., sources=True)`, which additionally checks source locators — re-deriving
+any present raw sources and verifying archived source digests when an archive inventory is present —
+and fails if a stored row's source is missing or no longer produces that row. Re-importing cannot
+silently re-adopt changed inputs or unfreeze old tables. Add a suite configuration and record the
+resulting measurement instead of starting another report.
 
 ## 6. Record format and conventions
 
@@ -420,7 +420,7 @@ above says how a number is produced; this section says what a stored number is.
 ### 6.1 A measurement
 
 `scripts/benchmarking/records.py` is the single validator (`VERSION`, `validate`) and every reader
-goes through it; migration can also write a schema dump as `bench/schema.json`. The validator is strict: a field the
+goes through it. The validator is strict: a field the
 schema does not name is refused, and a field that does not apply to a row is *absent* - so "carried
 no census" and "carried a census of zero" cannot be confused. One measurement carries:
 
@@ -501,11 +501,12 @@ A row the store does not keep is not lost: it stays readable in its own source u
 
 A TLC baseline key has no revision dimension: the TLC revision pins it, and a key changes only when
 its input digest, worker count, machine or TLC revision changes. TLC's mode, arguments, variant and
-environment are that tool's constants. Sources are ingested by `bench.py migrate` - 105 of them
-today, mostly under `bench/ab/` (40) and `bench/history/` (36), plus the alternative-representation
-and value-store lanes and a few single files, all listed in `bench/migration.json`. Migration
-rewrites the store; it is therefore derived, and a hand edit to a file does not survive the next
-`migrate`.
+environment are that tool's constants. Tracked files under `bench/` consist of `bench/README.md`,
+`bench/suite.json`, `bench/repr-models.toml`, `bench/repr-configs/`, `bench/stress/`,
+`bench/scaling/`, `bench/report-policy.json`, `bench/records/`, `bench/tlc-baselines/`,
+`bench/environment/` and `bench/validation/`. Raw runner outputs (such as `bench.py run`, `scale` or
+`ab` JSON files) are ingested into the canonical store via `ingest` or `bench.py migrate` and
+archived under ignored `work/`, so hand edits to derived rows do not survive a re-import.
 
 ### 6.3 Key dimensions
 
@@ -569,12 +570,13 @@ adaptive chooser produced.
 - Staleness is 20 revisions, relative to the pinned reference in `bench/report-policy.json`. A
   baseline expires only when its key changes, never because time passes, and an unknown revision
   age counts as stale rather than recent.
-- `bench/migration.json` carries the sources the store was imported from, the frozen hashes of the
-  historical documents, and the archive locator; a retired source is read back through
-  `git show <revision>:<path>` and must hash to its recorded digest.
+- Published canonical records in `bench/records/` and `bench/tlc-baselines/` carry embedded
+  samples and point `provenance.source` at their own canonical files; when an optional maintainer
+  archive inventory is used during migration, retired raw sources are verified by git revision and
+  SHA-256 digest (`benchmarking.records.archived_bytes`).
 - Migration is idempotent: running `bench.py migrate` twice changes nothing. A file is written only
   when its bytes would change, so a fold that re-derives the same store leaves
   `bench/report-policy.json` and `docs/performance.md` alone.
 - A new field is added only together with the reader that consumes it, and a `schema_version` bump
-  updates the validator, the readers, the migration and `bench/schema.json` in one change.
+  updates the validator (`scripts/benchmarking/records.py`), the readers and the migration in one change.
 

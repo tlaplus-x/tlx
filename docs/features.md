@@ -131,7 +131,7 @@ ACTION_CONSTRAINT 2, POSTCONDITION 2.
 | `SYMMETRY` | supported | native permutations; the same warning as TLC when used with liveness. Without a declaration, tlx screens sets of model values the cfg binds to constants: under `-tlc` it suggests the declaration; in the default mode it applies a disjoint product of full groups to safety-only runs when a connected Lean certificate is generated ([usage.md](usage.md) sections 6.2, 6.3; `-noautosymmetry` turns it off) |
 | `VIEW` | supported | VIEW with liveness reproduces TLC's algorithm; lasso counterexamples are only valid "modulo VIEW" (compat.md D-10; TLC's own are too) |
 | `ALIAS` | partial | as TLC normally; when evaluating ALIAS fails TLC prints an `_ALIASEvalError = "..."` field and tlx silently falls back to printing the original state |
-| `POSTCONDITION(S)` | partial | a list, checked in order (the first false one is reported); a constant-level one is an error, as in TLC; **evaluated only after the search ends normally**, while TLC also evaluates it after finding a violation (for use with `CounterExample`) |
+| `POSTCONDITION(S)` | partial | a list, checked in order (the first false one is reported); a constant-level one is an error, as in TLC; in BFS evaluated after normal completion and after `Deadlock` (not after invariant, action or temporal violations, where TLC also evaluates it for use with `CounterExample`), and in `-simulate`/`-generate` also evaluated after non-initial violations and errors |
 | `CHECK_DEADLOCK TRUE/FALSE` | supported | |
 | `_POSSIBLE` | supported | as TLC: each predicate must hold in some state (state level) or step (action level) of the model, tracked after the CONSTRAINTs (ACTION_CONSTRAINTs); checked after the search before the POSTCONDITIONs; the counts are in the named register `"s:_possible"` of each worker |
 | `_PERIODIC`, `_RL_REWARD` (TLC internal) | partial | parsed and ignored |
@@ -202,12 +202,12 @@ TLC has Java overrides for 12 of its operators (all but `AssertEq` and `TLCGetAn
 | `Trace` | native | (`TLCExt.getTrace`) the sequence of records of the variables from an initial state to the current one: in the next-state relation and action properties the path to the state expanded, in invariants, constraints and the ALIAS of a counterexample the path to the state checked or shown (BFS: the path the search found; in simulation the current behavior, each record with the field `_action`). The search keeps the paths only when the spec uses `Trace`. In a CONSTRAINT TLC's path lacks the predecessor's (compat.md D-24) |
 | `CounterExample` | unsupported | Java-only: placeholder `TRUE`; in TLC the `[state: ..., action: ...]` graph inside POSTCONDITION |
 | `ToTrace(CE)` | unsupported | Java-only: placeholder `TRUE` |
-| `TLCModelValue(str)` | unsupported | unbounded `CHOOSE` |
+| `TLCModelValue(str)` | supported | implemented natively (`tlx-eval/src/builtins.rs`, `TLCExt.tlcModelValue`): the model value named by `str` (including typed `T_...` prefixes; the `.tla` definition is an unbounded `CHOOSE`) |
 | `TLCDefer(e)` | supported | defined as `TRUE`; its argument is passed by name, so `TLCDefer(Assert(FALSE, ...))` is TRUE as in TLC |
 | `TLCNoOp(v)` | definition | |
 | `PickSuccessor(e)` | partial | agrees when `e` is true; when `e` is false TLC chooses a successor interactively (no plans) |
 | `TLCCache(e, closure)` | native | as TLCExt.java `tlcEval2`: a constant-level `e` is evaluated once per closure value (observable through side effects such as TLCSet); other expressions are evaluated each time |
-| `TLCFP(v)` | unsupported | `CHOOSE i \in Int` |
+| `TLCFP(v)` | supported | implemented natively (`tlx-eval/src/builtins.rs`, `TLCExt.tlcFingerprint`): 32-bit signed integer from tlx's fingerprint of `v` (differs from TLC's FP64, compat.md D-5; equal values have equal results; the `.tla` definition is `CHOOSE i \in Int : TRUE`) |
 | `TLCEvalDefinition(name)` | unsupported | Java-only: placeholder `TRUE` |
 
 ### 3.6 Randomization
@@ -419,8 +419,8 @@ The Apalache `.tla` files are not bundled with tlx; put them on `-I` or `TLX_CLA
 
 In the TLC ecosystem many operators have `.tla` definitions that are mere placeholders (`TRUE`, `CHOOSE val : TRUE`) whose real implementation is in Java. tlx never silently returns the placeholder value for these:
 
-- **Implemented natively** (9): `Json!ToJson`/`ToJsonArray`/`ToJsonObject` (`crates/tlx-eval/src/natives/json.rs`, reproducing Gson's output byte for byte), `SequencesExt!AllSubSeqs`/`SelectInSubSeq`/`SelectLastInSubSeq` (`crates/tlx-eval/src/natives.rs`), `Statistics!ChiSquare` (`crates/tlx-eval/src/natives/stats.rs`, reproducing Commons Math's p-value algorithm), `TLCExt!Trace` (the path the search provides, `tlx_runtime::live::current_path`) and `VectorClocks!CausalOrder` (`crates/tlx-eval/src/builtins.rs`, TLC's topological sort with its `-fp 0` node order). Tests: `tests/specs/PH1.tla`, `PH2.tla`, `PH3.tla` (TLC is the oracle; PH3 includes the boundary p = alpha and the rescaling path).
-- **Explicit error** (10 operators: `GraphViz!DotDiGraph`, `IOUtils!IOSerialize`/`IODeserialize`/`Serialize`/`Deserialize`, `SVG!SVGElemToString`/`NodeOfRingNetwork`, `TLCExt!CounterExample`/`ToTrace`/`TLCEvalDefinition`): the `(module, operator)` table is the `java_only` section of `tlx-sema/src/builtins.rs`; applying one reports `"<Module>!<Op> is implemented by TLC in Java and is not supported by tlx"`. The compiled tier falls back to the interpreter for these operators through `is_strict_value_op` (`tlx-compile/src/lower/expr.rs`). The CLI regression test `crates/tlx-cli/tests/java_only.rs` covers 6 operators on 4 tiers.
+- **Implemented natively** (11): `Json!ToJson`/`ToJsonArray`/`ToJsonObject` (`crates/tlx-eval/src/natives/json.rs`, reproducing Gson's output byte for byte), `SequencesExt!AllSubSeqs` (`crates/tlx-eval/src/natives.rs`), `SequencesExt!SelectInSubSeq`/`SelectLastInSubSeq` (`crates/tlx-eval/src/builtins.rs`), `Statistics!ChiSquare` (`crates/tlx-eval/src/natives/stats.rs`, reproducing Commons Math's p-value algorithm), `TLCExt!TLCModelValue`/`TLCFP` (`crates/tlx-eval/src/builtins.rs`), `TLCExt!Trace` (the path the search provides, `tlx_runtime::live::current_path`) and `VectorClocks!CausalOrder` (`crates/tlx-eval/src/builtins.rs`, TLC's topological sort with its `-fp 0` node order). Tests: `tests/specs/PH1.tla`, `PH2.tla`, `PH3.tla` (TLC is the oracle; PH3 includes the boundary p = alpha and the rescaling path).
+- **Explicit error** (10 operators: `GraphViz!DotDiGraph`, `IOUtils!IOSerialize`/`IODeserialize`/`Serialize`/`Deserialize`, `SVG!SVGElemToString`/`NodeOfRingNetwork`, `TLCExt!CounterExample`/`ToTrace`/`TLCEvalDefinition`): the `(module, operator)` table is the `java_only` section of `tlx-sema/src/builtins.rs`; applying one reports `"<Module>!<Op> is implemented by TLC in Java and is not supported by tlx"`. The compiled tier falls back to the interpreter for these operators through `is_strict_value_op` (`tlx-compile/src/lower/expr.rs`). The CLI regression test `crates/tlx-cli/tests/java_only.rs` covers 5 operators on 3 tiers.
 
 `ChiSquare`'s p-value uses the platform `exp`/`log` rather than `FastMath`, differing from Commons Math by at most one ulp; end to end, its verdicts agree with TLC on 2000+ random and boundary cases (the verdict only compares `p < alpha`).
 
@@ -428,7 +428,7 @@ Side effect: the corpus model `KnuthYao/SimKnuthYao` has `ChiSquare(..., "0.2")`
 
 ### 6.2 Output and diagnostic differences (minor)
 
-- POSTCONDITION is not evaluated after a violation is found (TLC does, and `CounterExample` only makes sense there).
+- In BFS, POSTCONDITION is evaluated on normal completion and after `Deadlock`, not after an invariant, action or temporal violation is found (TLC evaluates it there too, and `CounterExample` only makes sense there; in `-simulate`/`-generate`, tlx also evaluates POSTCONDITION after non-initial violations and errors).
 - When evaluating ALIAS fails, TLC prints an `_ALIASEvalError` field and tlx silently falls back to the original state.
 - A function whose domain is `{1, ..., n}` is normalized to a tuple and `DOMAIN` prints as `1..n` (TLC prints `{1, 2}`); this affects trace text but not values.
 - Strings TLC creates on the Java side (the keys of `TLCGet("stats")`, ...) are interned in a different order, so sets print in a different order.

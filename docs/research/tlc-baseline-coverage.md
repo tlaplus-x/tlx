@@ -1,5 +1,12 @@
 # TLC baseline coverage
 
+> [!NOTE]
+> **Historical point-in-time campaign record** — not an active normative specification. This
+> document captures the 2026-10-08 to 2026-10-10 TLC `1813307` baseline collection campaign on
+> Tencent `SA5.4XLARGE32` x86_64 spot instances (1 and 16 workers). Current baseline collection,
+> keying and report rules on `main` are owned by [benchmarking.md](../benchmarking.md) and
+> [performance.md](../performance.md).
+
 How much of the benchmark corpus has a usable TLC timing baseline in the store
 [benchmarking.md](../benchmarking.md) section 5 defines, and the recorded cause of every key
 that has none. A baseline key is TLC revision + model id + input digest + worker count +
@@ -9,15 +16,17 @@ outcomes of the collector, and the two are easy to confuse: `tlcbase --missing` 
 that was never tried exactly like a key whose TLC run timed out. This report separates them.
 
 TLC times for the corpus are collected once and reused: a later performance run reads the
-store instead of launching TLC for a baseline, so the records in the measurement store
-(`bench/records/`, one file per key) are
+store instead of launching TLC for a baseline, so the TLC baseline files in the measurement store
+(`bench/tlc-baselines/`, one file per key) are
 meant to be the last TLC measurement of this revision on this instance type.
 
 The campaign collected the baselines for TLC revision
 `1813307068bbc5759a441df820f3f548948d6b7a` on instance type `SA5.4XLARGE32`, at 1 and 16
 workers, between 2026-10-08 and 2026-10-10, on cloud instances of that type (a baseline is
-meaningful only on the machine type it was measured on). TLC's version is pinned by
-`third_party/tla2tools.jar` and `community/modules.jar`, so these times are reused by later
+meaningful only on the machine type it was measured on). TLC's baseline jar (`third_party/tla2tools.jar`)
+is pinned by SHA-256 and manifest revision in `scripts/dependencies.py` (`scripts/fetch-deps.sh`),
+while `third_party/community/modules.jar` is fetched from `CommunityModules` `releases/latest` and
+recorded by SHA-256 in each baseline header, so matching keys are reused by later
 tlx benchmarks instead of re-running TLC.
 
 ## Method
@@ -142,12 +151,15 @@ recoverable without changing the model's output; it is recorded here rather than
 
 ## Not measurable by TLC (2 keys)
 
-`ewd998/EWD998ChanTrace` (1 and 16 workers) cannot be run by TLC at all: TLC's own oracle
-(`corpus/out/tlc.json`) records the same `error` with
+At the time of this campaign, `ewd998/EWD998ChanTrace` (1 and 16 workers) failed in TLC: TLC's own oracle
+(`corpus/out/tlc.json`) recorded the same `error` with
 `Error: Evaluating assumption line 11, col 23 to line 11, col 37 of module EWD998Chan failed.`
-The model reads a relative ndjson input this harness does not provide, so the failure is in
-the model's input, not in the run. There is no configuration of these two keys that produces a
-TLC timing, and they stay out of the target set instead of being re-run.
+Because the spec reads `specifications/ewd998/EWD998ChanTrace.ndjson` relative to the Examples
+corpus root rather than its own directory, those two keys produced no TLC timing during this
+campaign. Subsequent root-relative staging (`cwd: root` in `scripts/corpus.py`, [testing.md](../testing.md)
+section 6.1) resolved the upstream module/input path alongside the 2026-10-11 validation wave
+documented in [post-fix-validation.md](post-fix-validation.md) and
+[ewd998-chantrace-oracle.json](../../bench/validation/2026-10-11/ewd998-chantrace-oracle.json).
 
 ## Infrastructure failures and tooling changes
 
@@ -173,11 +185,12 @@ under owner grants, each a bounded launch with a slot share and a spend allowanc
 ## Reproducing and reading back
 
 ```sh
-python3 scripts/bench.py migrate                        # re-derive the store from bench/records/
+python3 scripts/bench.py migrate                        # re-derive bench/records/ and bench/tlc-baselines/ when raw sources are present
 python3 scripts/bench.py tlcbase-report tlc-1813307     # totals, distribution, slowest, oracle mismatches
 python3 scripts/bench.py tlcbase --missing --workers 1,16 --instance-type SA5.4XLARGE32
 ```
 
 `tlcbase-report` prints the 1- and 16-worker totals, the wall-time distribution, the slowest
-models and every count mismatch against the TLC oracle. The per-key records are indexed in
-the store; the slice files that produced them are retained under `bench/history/`.
+models and every count mismatch against the TLC oracle. The per-key TLC baselines ship in
+`bench/tlc-baselines/`; raw slice files from collection runs are archived outside the published
+`bench/` directory under ignored `work/`.

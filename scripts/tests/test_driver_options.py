@@ -570,7 +570,7 @@ DOCUMENTED_EXAMPLES = {
     "cloud_verify": [
         '--then "--suites build,corpus-compile --env TLX_JIT=0"',
         '--suites build,fuzz-campaign --fuzz-minutes 40 --max-minutes 60',
-        '--bench "table --measure-tlc --repeat 3" --bench "run --tlc"',
+        '--bench "tlcbase --missing --collect" --bench "run --tlc --repeat 3"',
         '--bench-bin nostats=HEAD:no-stats --bench "ab --bin default=target/release/tlx '
         '--bin nostats=target/bench-bins/nostats/tlx --models ... --repeat 10"',
         # A before/after comparison on one instance: the previous revision's

@@ -24,14 +24,13 @@ Where each topic is documented (every topic has one home):
 | Reductions and the guarantee contract of the default mode | [reductions.md](reductions.md) |
 | Rule-based optimization, verification IR and pass contracts | [optimization.md](optimization.md) |
 
-The rule-based optimizer is documented separately from execution-tier lowering.
-Two other documents have an experimental subject: the value store is off by default and incomplete
-(no reclamation, no checkpoint format), and several proposed default-mode reductions remain
-unimplemented. Their **design records** — the store's roadmap (stable state root slots, complete
-collection lowering, spill) and the reductions this contract was written for but that are not
-implemented (sleep sets, partial-order reduction, bounded and swarm search, bitstate storage,
-incremental re-checking) — are process material, not current documentation: [README.md](README.md)
-names the pinned revision that holds them (DOC-03).
+The [rule-based optimizer](optimization.md) is documented separately from execution-tier lowering.
+Two other documents cover experimental or bounded subjects: the value store
+([value-store.md](value-store.md)) is off by default (`TLX_VALUE_STORE`, no reclamation or
+checkpoint format), and unimplemented default-mode search reductions (sleep sets, partial-order
+reduction, bounded and swarm search, bitstate storage, incremental re-checking;
+[reductions.md](reductions.md) section 5) together with earlier state-representation surveys were
+archived outside current documentation.
 
 ---
 
@@ -47,8 +46,11 @@ names the pinned revision that holds them (DOC-03).
 ### 1.2 Non-goals
 
 - General proof checking (TLAPS) and symbolic checking (Apalache style). The separate
-  [rule-based optimizer](optimization.md) checks instances of restricted rewrite rules
-  in Rust; it does not implement a proof kernel or transfer model-checking verdicts.
+  [rule-based optimizer](optimization.md) emits per-instance Lean 4 certificates connected to its
+  state projections (`-optimize`), default-mode automatic symmetry (`KeyedCertificate`,
+  `EquivSymCertificate`, `ChooseSymCertificate`), and finite counter export
+  (`PipelineCertificate`), without embedding a proof kernel at run time or transferring
+  model-checking verdicts from exported abstractions.
 - Distributed (multi-machine) checking; tlx is single machine, multi-core.
 - A Java or SANY dependency at run time. The syntax layer is tree-sitter-tlaplus, the semantic layer is written in Rust. SANY and TLC are test oracles only.
 - NUMA-aware fingerprint-set sharding (§7.7).
@@ -93,191 +95,12 @@ The central idea is **whole-spec specialisation**. Once the `.cfg` fixes every C
               fingerprint set, trace reconstruction, checkpoint/resume, simulation,
               -dump, live statistics, liveness orchestration (behavior graph → tlx-live)
                                             ▼
-              tlx-cli: TLC-style report; liveness counterexample rendering; POSTCONDITION
+              tlx-cli: TLC-style report; -dumpTrace; liveness counterexample rendering; POSTCONDITION
 ```
 
 The key point: **the runtime is generic over the `Model` trait** (§7.1). Both models use the same parallel runtime, the same reporting and the same liveness path. The compiled tier is the default (`-interp` selects the interpreter; with no possible native code, no JIT and no C compiler, the default is the interpreter); the interpreter is the differential baseline for the compiled tier, and its fallback.
 
 ### 2.1 Crate map and dependency edges
-
-The rule-based optimizer is owned by `tlx-sema::optimize`. Its primary objective is to
-reduce the explored state graph while preserving checked verdicts and genuine counterexamples.
-Every automatic state-reducing application must carry a connected Lean certificate.
-`tlx-eval::model::optimization::project_state` enforces this before installing a VIEW.
-Candidates without certificates cannot preempt certified candidates. Accepted checking
-currently covers unobserved-variable erasure, relative ages, a subset of finite history
-summaries, phase-dependent fields, exact sequence lengths, and scalar or fixed nested ordered allocation. Checked invariants are observations, never
-assumptions; source actions and concrete state values remain intact for replay.
-
-`phase/keyed.rs` separately certifies automatic symmetry for disjoint products of
-full permutation groups (each 2–6 model values, total order at most 720) across
-fixed-domain maps, mixed fixed-domain maps, scalar/optional key slots, sets of
-keys, sets of single-key tagged records, and fixed records of those shapes. The
-emitter exposes key/slot/fixed equality, group membership, quantifiers, finite
-key cardinalities, map and slot-indexed reads, conditional values/slots,
-point/whole-map writes (including multi-writer updates), and slot writes in
-`KeyedCertificate.lean`'s rule IR. The shared proof establishes equivariance
-under `GroupPerm` and constructs a permutation-quotient certificate with
-successor lifting from every representative. Candidate shape analysis cannot
-authorize application alone: `autosym` requires this certificate before
-installing the largest certifiable product subset and emits Lean before the
-search. When `KeyedCertificate.lean` declines a specification, `phase/equiv_sym/`
-(`EquivSymCertificate.lean`) and `phase/choose_sym/` (`ChooseSymCertificate.lean`)
-provide fallback permutation-quotient certificates over closed recursive finite
-values and certified choice-irrelevant `CHOOSE` idioms, gated by shared forward
-domain and totality analysis (`phase/sym_totality/`). Source lowering, inferred
-domains and shape splitting, semantic leaves, totality, permutation closure and
-runtime canonicalization remain trusted.
-`keyed/erasure.rs` additionally connects the actual installed retained-variable
-tuple to explicit hidden literal/copy/frame transfers. `ErasedKeyedCertificate.lean`
-shares branch choices with the keyed operations, proves erasure, and composes that
-certificate with the orbit certificate for the same intermediate system. Runtime
-canonicalization applies after erasure. Other projection/symmetry combinations stay gated.
-
-`phase/erasure.rs` emits each hidden variable's literal assignment or old-state copy,
-including copy cycles. Guards, retained updates and observations are interpreted over
-retained state only. `ErasureCertificate.lean` constructs initialization and successor
-correspondence from every representative, observation preservation, safety, concrete
-counterexample lifting and deadlock preservation, without preservation premises.
-
-`phase/history/lean.rs` emits actual seeds, append/reset transfers, prefix predicates and
-observations. `HistoryCertificate.lean` relates indexed concrete histories to seen sets
-and accumulated prefix results. Universal and existential observations reuse one fold.
-`phase/history/lean/feedback.rs` replaces supported history predicates in retained
-consumers with explicit Boolean holes. Guards, retained updates, event values and
-conditional transfers receive these results. The concrete relation uses indexed
-prefixes and the reduced relation uses summary bits; the shared proof equates them
-before establishing successor correspondence. Branch bounds and initialization
-remain history-independent. Dependent binders and next-state history reads refuse.
-
-`phase/ordered/lean.rs` emits a scalar frontier's initial anchor, literal nonnegative
-increments, guards and observations. `OrderedCertificate.lean` additionally connects
-formal projection equality to runtime rank-key equality. `phase/ordered/nested` lowers
-fixed records, tuples and maps into explicit numeric paths, retained leaves, finite branch
-choices and conditional transfers for multiple independent families. `NestedCertificate.lean`
-proves the order-pattern quotient; `NestedRank.lean` connects positive ranks and exact
-nonpositive sentinels to that quotient. Fixed shapes, lowering, domain inference and the
-runtime structural walker remain trusted. `nested/live.rs` adds one immutable version table
-with singleton initialization and fresh append/frame updates. Only explicit live-root payloads
-reach guards, transfers, observations and new payload construction. `LiveCertificate.lean`
-proves this feedback commutes and connects the retained table graph to the quotient key.
-Dynamic shapes and identifier-containing history payloads remain uncertified candidates.
-
-`phase/age/lean.rs` lowers fixed-domain timestamp maps to explicit per-key keep/reset/erase
-updates and deadline tests, using the same inferred caps as the runtime VIEW.
-`AgeCertificate.lean` retains payloads and timestamp presence, proves capped-age ticks and
-all observed comparisons commute, then constructs successor and observation correspondence.
-`phase/age/lean/filters.rs` expands finite filter domains and quantified deadline tests.
-The Lean `Test.select` continuation receives the exact selected source positions, so
-retained record updates, unions, and other consumers see the same set after projection.
-Filter predicates remain explicit proof terms; consumer HIR contains set placeholders
-with recorded atom mappings. A consumer can also contain history-summary predicates:
-`Test.bind` passes their exact Boolean decisions alongside the selected sets. Boolean
-and set placeholders share fresh local IDs and have separate, ordered argument mappings.
-The concrete/reduced bind and selection lemmas connect those arguments to the original
-predicates. Semantic leaves cannot inspect absolute time, age magnitudes or raw history.
-`phase/age/lean/history.rs` connects one history to the same retained core and branch witness.
-`AgeHistoryCertificate.lean` proves the product transfer and observation correspondence;
-the generated `GeneratedAgeHistory` model contains both actual transfers.
-`phase/age/lean/decisions.rs` lifts quotient-observable Boolean values and conditions
-into `Decision` trees. Their concrete and reduced evaluations are proved equal;
-continuation lemmas connect nested event construction to the evaluated branch.
-This supports history-dependent timestamp choices, age-dependent event values and
-conditions, and dependent retained payloads without exposing raw time or history to
-semantic leaves. Dynamic filter domains are enumerated from inferred finite upper
-bounds, with explicit membership tests. Universal quantification uses membership
-implication; existential quantification and filters use conjunction. Multiple finite
-binders retain their scopes. Domain inference remains trusted and never assumes
-selected invariants. Next-state inputs, unenumerable dependent binders and multiple
-histories still refuse composition. Unsupported compositions retain a standalone fallback.
-Lowering, independent-leaf interpretation and runtime VIEW execution remain trusted.
-
-`phase/sequence/lean.rs` connects multiple sequence-length projections to explicit
-append/reset/frame transfers. Semantic leaves receive only retained state and current
-lengths. `LengthCertificate.lean` proves their transfer commutation and constructs
-initialization, successor, observation, counterexample and deadlock correspondence.
-Next-state length inputs remain unsupported.
-
-`phase/liveness/lean.rs` connects inferred phase liveness to explicit record and
-fixed-map updates. `FieldCertificate.lean` proves masked reads, transfer commutation
-and the resulting certificate. Generated finite tables discharge read, frame and
-observation liveness obligations with kernel-checked `decide`; preservation is not
-assumed. Primed projected reads and nonconstant initial phases are refused. Source
-lowering, domain/totality inference, leaf interpretation and runtime remain trusted.
-Automatic symmetry requires one of the connected symmetry certificates above;
-uncertifiable candidates remain available only as suggestions and in the bounded
-diagnostic. Counter-export emits closed
-per-pass certificates through `certify.rs` and `PipelineCertificate.lean`. Each proof
-uses the actual before/after guards, updates, initial values and invariants. Constant
-propagation first proves its required domain inductive; comparison and transfer
-obligations are discharged with Lean arithmetic, then certificates compose over
-reachable systems. The final theorem concerns the unrestricted source and result
-IR safety predicates. Source lowering and TLA+ emission/runtime remain trusted.
-The [coverage inventory](optimization.md#proof-coverage) distinguishes proof work from
-enabled behavior. Explicit user VIEW/SYMMETRY retain their existing contract; automatic
-projections decline both. Compatibility mode bypasses automatic projection.
-
-Proof generation belongs in `tlx-sema` beside the rule. `tlx-eval` carries its certificate;
-`tlx-cli` only persists it and reports coverage. Ordinary optimized checking emits Lean
-before exploration and never invokes a verifier. New or changed reductions require
-explicit development verification, axiom audits and negative tests.
-
-These certificates concern the lowered rule model. Unchanged independent HIR leaves are
-universally interpreted over retained state and branch-local bindings, and cannot read
-forgotten information. Source lowering, domain/totality analysis, the actual key path and
-runtime execution remain trusted. Recorded HIR strings alone are not formal semantics.
-See [Lean coverage](optimization.md#lean-output-for-checking).
-The [blob case study](../proofs/blob/README.md) additionally provides a manual typed
-formalization of all concrete protocol actions and reachable lookup definedness.
-
-A frontend rule should justify its cost with actual state reduction on a real specification.
-Expression cleanup alone is not evidence of that goal. Retain local cleanup here when it
-normalizes a reduction's input or enables its proof; evaluation-only improvements belong in the
-execution compiler unless a measured need establishes another owner. Compare distinct states
-as well as timings, and do not claim that a rule match necessarily reduces a particular graph.
-Prioritize external configurations that time out, have large reachable graphs, or have a proved
-infinite state space. Small specifications provide focused correctness regressions. Keep the
-selected properties and existing reductions in performance comparisons; an improvement obtained
-only by removing them does not establish a useful optimization of that configuration. Distinguish
-a proved infinite graph from a timeout, and record incomplete runs separately from completed timings.
-
-Optimization ownership follows the information available in each IR. The semantic optimizer
-should focus on facts about the configured transition system: initialization, preservation by
-all transitions, reachable domains, and the observations a transformation must preserve. For
-example, proving that a state variable never changes requires more than folding a constant
-expression inside one generated action. The execution compiler owns representation and local
-code improvements: encoded sets and records, direct updates, expression folding, repeated
-computation elimination, and loop-invariant hoisting (§6.3).
-
-The domain analysis direction is observational: retain distinctions that guards, checked
-properties and future transitions can detect. A threshold may merge many reachable numeric
-values into one class. The same reasoning extends to elements, fields and keys of arrays,
-sequences, sets and maps, with separate obligations for structure, cardinality and definedness.
-Finite element domains alone do not bound sequence length or map domains. Length-only sequence
-analysis is implemented but reduction awaits a connected certificate; more general partitions within live structured values are future extensions.
-[optimization.md](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics) records their proof requirements and the narrower rules currently implemented.
-
-This is a division of responsibility, not a claim that a backend could never perform semantic
-analysis. The current execution IR does not expose the transition-system proof obligations as
-such; lowering or separately compiling actions can obscure them. Semantic results benefit both
-the interpreter and compiled tiers. Keep a transformation where its required facts are explicit,
-and avoid reconstructing source-level proofs in generated C or machine code.
-
-Some local cleanup exists at both levels today. The semantic optimizer folds Boolean identities
-and constant comparisons and expands first-order calls/LETs to expose its restricted IR. The
-compiler also folds eligible constants and inlines operators. Such overlap is justified when
-normalization exposes a semantic proof or consumes its result; it is not a reason to grow a
-second general-purpose algebraic, CSE, or loop optimizer in `tlx-sema`. Keep this cleanup small,
-reuse existing mechanisms when their IR and semantic contracts fit, and require evidence before
-claiming an additional speedup. Do not introduce a shared framework merely to unify a few rules.
-[optimization.md](optimization.md#overlap-with-execution-optimization) records the current overlap.
-
-LLVM provides a useful analogy: general IR transforms live in its
-[target-independent optimizer](https://www.llvm.org/docs/Passes.html), while the
-[SelectionDAG backend](https://www.llvm.org/docs/CodeGenerator.html#selectiondag-instruction-selection-process)
-combines operations again after lowering and legalization expose new opportunities. Repeated
-simplification at different representations is normal. tlx's semantic optimizer is a
-model-specific middle-end stage, not a replacement for execution-IR or native-code optimization.
 
 tlx is a Cargo workspace of twelve crates: eleven that build a `tlx` binary or library, plus the
 dev-only `tlx-testkit`.
@@ -286,15 +109,15 @@ dev-only `tlx-testkit`.
 |---|---|
 | `tlx-base` | Leaf crate with shared infrastructure that knows nothing about TLA+: `bytes` (varint/zigzag), `counter` (a statistics counter many threads add to without sharing a cache line), `diag` (diagnostic topics enabled by `TLX_*` switches, printed as `topic: text` lines), `format`, `frame` (generic binary framing of checkpoint files: magic/version/kind/build-id header, checksummed chunks, end marker), `hash` (Fx-style hashers, stable finalizers, insertion-ordered interning tables, `fpmap` for fingerprint-keyed maps), `knobs` (the table of all `TLX_*` variables), `padded` (values on cache lines of their own), `par` (ordered `Pool`, panic abort/join, periodic monitors, `OneShot`), `rng` (resumable SplitMix64), `stack` (big-stack threads and the stack-overflow report), `time` (clocks that measure work done rather than the machine's load, including process CPU time) |
 | `tlx-front` | tree-sitter parsing, CST → surface AST (`ast.rs`, `parse/`, `parse/lower/`); SANY operator-precedence conflict check (`parse/lower/prec.rs`); `.cfg` parser (`cfg/`); string escapes (`escape.rs`) |
-| `tlx-sema` | Module loading and search (`resolve/modules.rs`), name resolution and INSTANCE expansion (`resolve/`, `resolve/names.rs`), subexpression selectors (`resolve/subexpr.rs`), SANY-style scope/arity and level checks (`resolve/level.rs`), cfg level checks; emits the HIR (`hir.rs`); the builtin operator table with its metadata and per-module native overrides (`builtins.rs`); source positions (`source.rs`); the bundled standard modules and CommunityModules it embeds (`modules/`) |
+| `tlx-sema` | Module loading and search (`resolve/modules.rs`), name resolution and INSTANCE expansion (`resolve/`, `resolve/names.rs`), subexpression selectors (`resolve/subexpr.rs`), SANY-style scope/arity and level checks (`resolve/level.rs`), cfg level checks; emits the HIR (`hir.rs`); the builtin operator table with its metadata and per-module native overrides (`builtins.rs`); source positions (`source.rs`); the bundled standard modules and CommunityModules it embeds (`modules/`); the semantic middle-end optimizer (`optimize/`: verification IR, state-reducing projections, and connected Lean certificate emitters for projections, automatic symmetry and finite counter export) |
 | `tlx-value` | The dynamic `Value` (`value.rs`) under TLC's total order (`order.rs`) and equality; the operations (`ops/`); the operation policy more than one representation reads (`plan.rs`); representation views (`repr.rs`); 32-bit overflow checks (`arith.rs`); fingerprints (`fingerprint.rs`); TLC-style printing (`fmt.rs`); the global string intern table (`intern.rs`); lazy sets and functions (`lazy.rs`); serialisation (`ser/`) |
-| `tlx-eval` | The interpreter: cfg binding and intern order (`interp/cfg.rs`), the run state and registers (`interp/run.rs`), expression evaluation (`eval.rs`, `eval/context.rs`), TLC-style Init/Next enumeration and action splitting (`enumerate/`), native operators (`builtins/`, `natives/`), the string-creation analysis (`strings/`), the sequence-set filter (`seqfilter.rs`), and the interpreted model (`model/`: `mod.rs`, `runtime_adapter.rs` (the `Model` adapter), `startup.rs`, `spec.rs`, `symmetry.rs`, `autosym/` and `symcheck.rs` (undeclared symmetry), `print_order.rs`, `liveness.rs`, `spec_info.rs`, `checkpoint.rs`, `report.rs`) |
-| `tlx-layout` | Compiled-tier shapes (`shape.rs`), shape inference from observed values (`infer.rs`), fixed-size layouts and canonical encode/decode (`layout.rs`, `layout_tree.rs`), SYMMETRY permutation plans (`permute.rs`), the `Dyn` value interner (`dynval.rs`), the handle scalar schema the C and JIT backends derive from (`scalar.rs`), the run-owned `Ref` value store (`store/`, experimental), recorded shape decisions (`decisions.rs`), state serialisation (`ser.rs`) |
-| `tlx-compile` | HIR → typed IR lowering (`lower/`), the IR (`ir.rs`, `ir/encoding.rs`), the closure-compiled IR executor (`exec/fast/`; `exec/encops.rs` sorted-array set operations, `exec/memo.rs` memo tables for fallbacks and regions, `exec/refops.rs` the value-store operation table), C generation (`cgen/`), the Cranelift JIT (`jit/`, cargo feature `jit`, default on), the native plan shared by both backends (`native_plan.rs`), IR verification (`verify.rs`), the cross-check against the interpreter (`paranoid.rs`), the encoded-state model and its driver (`enc/`: `model` with `checks`, `codec`, `fingerprint`, `liveness`, `symmetry`, `view`; `speculate`, `driver`, `native`, `mixed`, `adapt`, `region_eq`, `diag`), the HIR walk the summary, materialization and memo policies share (`binding.rs`), environment switches (`settings.rs`), coverage statistics (`coverage.rs`). Expression dispatch is split by responsibility: `exec/fast/expr/` (`mod.rs` scalars and control flow, `encoded.rs` encoded-value operators, `family.rs` equality, conversion, quantifiers, CHOOSE, calls and set builders, plus `maps`, `sets`, `sequences`, `refs` and the interpreter fallback `interp.rs`), `cgen/expr/` and `jit/expr/`, and `jit/gen/` (`memory`, `calls`, `loops`, `fingerprint`) |
+| `tlx-eval` | The interpreter: cfg binding and intern order (`interp/cfg.rs`), the run state and registers (`interp/run.rs`), expression evaluation (`eval.rs`, `eval/context.rs`), TLC-style Init/Next enumeration and action splitting (`enumerate/`), native operators (`builtins/`, `natives/`), the string-creation analysis (`strings/`), the sequence-set filter (`seqfilter.rs`), and the interpreted model (`model/`: `mod.rs`, `runtime_adapter.rs` (the `Model` adapter), `startup.rs`, `spec.rs`, `symmetry.rs`, `autosym/` and `symcheck.rs` (undeclared symmetry), `optimization.rs` and `ordered.rs` (certified state projections and rank-key evaluation), `print_order.rs`, `liveness.rs`, `spec_info.rs`, `checkpoint.rs`, `report.rs`) |
+| `tlx-layout` | Compiled-tier shapes (`shape.rs`), shape inference from observed values (`infer.rs`), fixed-size layouts and canonical encode/decode (`layout.rs`, `layout_tree.rs`), SYMMETRY permutation plans (`permute.rs`), the `Dyn` value interner (`dynval.rs`), the handle scalar schema the C and JIT backends derive from (`scalar.rs`), the run-owned `Ref` value store (`store/`, `escape.rs`, experimental), recorded shape decisions (`decisions.rs`), state serialisation (`ser.rs`) |
+| `tlx-compile` | HIR → typed IR lowering (`lower/`), the IR (`ir.rs`, `ir/encoding.rs`), in-place update planning (`inplace.rs`), TLC-order iteration over encoded sets (`encoded_order.rs`), the closure-compiled IR executor (`exec/fast/`; `exec/encops.rs` sorted-array set operations, `exec/memo.rs` memo tables for fallbacks and regions, `exec/refops.rs` the value-store operation table), C generation (`cgen/`), the Cranelift JIT (`jit/`, cargo feature `jit`, default on), the native plan shared by both backends (`native_plan.rs`), IR verification (`verify.rs`), the cross-check against the interpreter (`paranoid.rs`), the encoded-state model and its driver (`enc/`: `model` with `checks`, `codec`, `fingerprint`, `liveness`, `symmetry`, `view`; `speculate`, `driver`, `native`, `mixed`, `adapt`, `region_eq`, `diag`), the HIR walk the summary, materialization and memo policies share (`binding.rs`), environment switches (`settings.rs`), coverage statistics (`coverage.rs`). Expression dispatch is split by responsibility: `exec/fast/expr/` (`mod.rs` scalars and control flow, `encoded.rs` encoded-value operators, `family.rs` equality, conversion, quantifiers, CHOOSE, calls and set builders, plus `maps`, `sets`, `sequences`, `refs` and the interpreter fallback `interp.rs`), `cgen/expr/` and `jit/expr/`, and `jit/gen/` (`memory`, `calls`, `loops`, `fingerprint`) |
 | `tlx-native` | The C ABI header (`tlx_abi.h`), invoking the C compiler with a content-hash cache (`build.rs`), `dlopen` loading and ABI-version checks (`native.rs`), the host side of mixed mode: region table, value handles and the state-decode cache (`mixed.rs`). The C source itself is generated by `tlx-compile::cgen`. |
 | `tlx-runtime` | The `Model` trait (`model.rs`), the lock-free fingerprint set (`fpset/`), parallel BFS, trace reconstruction, the behavior-graph edge log and resumable search (`explore/`: the `mod` facade with `run` (preparation, initial states, worker scope), `finish`, `worker`, `levels`, `frontier`, `tracelog`, `resume`, `observer`, `order`, `edges`, `history`, `coverage`, `safepoint`, `checkpoint/`), spillable queues (`queue/`: facade plus `block`, `codec`, `reader`, `writer`, `seg`), the memory budget (`mem.rs`), cache-budget accounting (`cache_mem.rs`), the disk I/O layer (`io/`), random simulation (`simulate.rs`), `-dump` (`dump.rs`), live statistics (`live.rs`, `stats/`), post-search liveness orchestration (`liveness/`: recorded, concrete, trace, search, shape, expand), size estimation (`size.rs`) |
 | `tlx-live` | Liveness decision procedures: LTL (`lib.rs`), normal forms (`normal.rs`), recurrence conditions and generalized Büchi tableau (`recurrence.rs`, `tableau.rs`), SCC search on the product with the behavior graph and WF/SF handling, lasso counterexamples (`search/`), the TLC-algorithm path for VIEW/SYMMETRY (`tlc/`) |
-| `tlx-cli` | The `tlx check` command: process setup — allocator, signals, panic reporting (`process.rs`), arguments (`args.rs`), loading the spec and cfg into a model (`load.rs`), the phase order of a run (`check.rs`), automatic symmetry (`autosym.rs`) and the declared-symmetry check (`symcheck.rs`), dispatch (`main.rs`), checkpoint recovery (`recovery.rs`), simulation progress (`simulation.rs`), `-dump trace` (`dump_trace.rs`), coverage (`coverage.rs`), the end-of-run report with its diagnostics and exit codes (`report.rs`, `report/diagnostic.rs`, `report/presentation.rs`; the `Tier` trait in `tier.rs` lets the report take the interpreter and the compiled model alike), TLC-style messages and `-tool` wrapping (`out.rs`), liveness results and counterexample rendering (`live.rs`), statistics (`stats.rs`), environment reading (`settings.rs`) |
+| `tlx-cli` | The `tlx check` and `tlx optimize` commands: process setup — allocator, signals, panic reporting (`process.rs`), arguments (`args.rs`), loading the spec and cfg into a model (`load.rs`), the phase order of a run (`check.rs`), automatic symmetry (`autosym.rs`) and the declared-symmetry check (`symcheck.rs`), mandatory Lean certificate persistence (`proofs.rs`), finite-model counter export (`optimization.rs`), dispatch (`main.rs`), checkpoint recovery (`recovery.rs`), simulation progress (`simulation.rs`), `-dumpTrace` (`dump_trace.rs`), coverage (`coverage.rs`), the end-of-run report with its diagnostics and exit codes (`report.rs`, `report/diagnostic.rs`, `report/presentation.rs`; the `Tier` trait in `tier.rs` lets the report take the interpreter and the compiled model alike), TLC-style messages and `-tool` wrapping (`out.rs`), liveness results and counterexample rendering (`live.rs`), statistics (`stats.rs`), environment reading (`settings.rs`) |
 | `tlx-testkit` | Dev-only (not published): locating `third_party/` and `corpus/out/`, temp dirs, a deterministic PRNG, bounded subprocess helpers and the comparison policies for runtime reports (`cli.rs`, `report.rs`), all from `tlx-base` alone. Its features add tiers one at a time: `values` (random values of a layout shape, no model tier), `interpreted` (load a spec from a string and run the interpreter, plus the corpus state sampler), `compiled` (the differential harness of the IR executor against generated C on encoded states, with the interpreter as reference), `models` (both tiers), `jit` (the Cranelift tier of that harness), `runtime` (the runtime helpers, which `tlx-runtime` enables for its own tests). The `microbench` binary requires `models`. Which tier brings which prerequisite is asserted per package by `crates/tlx-testkit/tests/feature_policy.rs` and `scripts/dependency_check.py` (ARCH-04, ARCH-05) |
 
 The edges between the crates are part of the architecture, not an accident of what compiled
@@ -329,6 +152,36 @@ The layers ARCH-01 asks for are visible in the normal column: `tlx-base` depends
 liveness algorithms are independent of the runtime; `tlx-runtime` sees a model only through `Model`
 (§7.1); and the representation and native-build crates (`tlx-value`, `tlx-layout`, `tlx-native`)
 never depend on the evaluator or the compiler, so their work cannot reach up into execution.
+
+**Semantic middle-end vs. execution compiler.** Optimization ownership follows the facts exposed by
+each representation:
+
+1. **Semantic middle-end (`tlx-sema::optimize`).** Reasons over the complete configured transition
+   system (`Init`, all `Next` alternatives, reachable domains, and preserved observations) rather
+   than individual lowered actions. It produces state-reducing projections (`-optimize`: unobserved
+   variables, relative ages and combined age/history, finite history summaries, phase-dependent
+   fields, sequence lengths, and scalar/nested/live-version ordered allocation), automatic symmetry
+   quotients (`KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`, and erasure-composed
+   `ErasedKeyedCertificate`), and finite counter exports (`PipelineCertificate`). Both the
+   interpreter (`InterpModel`) and the compiled tier (`EncModel`) consume the resulting projections
+   and symmetry groups, while concrete actions and stored states remain intact for replay. Small
+   normalization rewrites in `tlx-sema` exist only to expose or discharge transition-system proofs,
+   not as a second algebraic or loop optimizer; `tlx-compile` owns layout representation, in-place
+   updates, constant folding, CSE, loop-invariant hoisting, and native C/JIT code generation (§6.3,
+   [optimization.md](optimization.md#overlap-with-execution-optimization)).
+2. **Connected Lean certificate contract.** Every automatic state-reducing projection, symmetry
+   application, or counter export must carry a compiler-generated Lean 4 certificate connected to
+   the actual lowered instance — proving initialization correspondence, successor lifting from every
+   equivalent representative, observation preservation, counterexample lifting, and deadlock
+   preservation without correctness premises. `tlx-eval` (`crates/tlx-eval/src/model/optimization.rs`
+   `InterpModel::project_state`) and `tlx-cli` (`crates/tlx-cli/src/autosym.rs`) enforce this gate
+   before installing a projection or symmetry group and persist the mandatory Lean file (`proofs.rs`)
+   before exploration without invoking a Lean process at run time. Explicit user `VIEW`/`SYMMETRY`
+   declarations keep TLC's contract, and `-tlc` bypasses automatic reductions. See
+   [optimization.md](optimization.md#proof-coverage),
+   [Lean output](optimization.md#lean-output-for-checking),
+   [compiler-derived reductions](optimization.md#deriving-reductions-from-compiler-analysis-and-mathematics),
+   and [reductions.md](reductions.md).
 
 ### 2.2 Pipeline phases: artifact, owner and tests
 
@@ -562,7 +415,7 @@ A `Shape` statically describes a value precisely enough to give it a fixed-lengt
 - **Encoded set iteration.** `OrderedSet` keeps records and tuples containing scalar-universe bitsets encoded while enumerating in TLC order (`encoded_order.rs`). A shared prefix comparison plan orders sets by cardinality, then their least differing element; record/tuple fields are compared recursively, and compatible union arms follow their tags. Sorted-array sources sort indices rather than rewriting their canonical encoding. Finite bitset sources use precomputed rank-to-order keys and sort only the present ranks. C, JIT and the IR executor follow the same plan; unsupported or potentially incomparable shapes remain boxed. Order-independent quantifiers retain encoding-order iteration.
 - **Constant folding.** Closed constant-level subexpressions (constant LETs and constant local quantifiers included) are evaluated by the interpreter at compile time into literals and cached. **Non-deterministic or side-effecting builtins (Random*, TLCGet/TLCSet, Print, JavaTime, CSV/IOExec, ...) and their users are never folded** (`tests/volatile.rs`). A constant `\E` in action position is not folded (it would change the duplicate-successor count). Expressions that may create strings are not folded either, because strings are ordered by creation order; the decision is described in §6.5.1 (folding uses the variable-agnostic typed analysis `StringMakers::typed`, so `Tail`, `SubSeq` and `\o` on sequences of numbers still fold).
 - **Recursion.** RECURSIVE operators and recursive function definitions compile to function calls when the parameters can be typed (`lower/calls.rs`). Otherwise (a RECURSIVE operator inside LET, untypeable parameters) the recursion is unrolled linearly to `RECURSION_UNROLL = 6` levels; deeper calls and self-calls of non-linear recursion become `Interp` nodes (host regions), so the whole action does not fall back.
-- **ENABLED** in the IR is a statement tree run on a temporary next state (supported by the IR executor and C).
+- **ENABLED** in the IR is a statement tree run on a temporary next state (supported by the closure IR executor, C backend, and Cranelift JIT).
 - **In-place update** (`inplace.rs`). Updates of encoded values (EXCEPT chains, nested paths `![a].x`, sorted-array insertion chains, bitset union/intersection/difference) are computed straight into the target according to an `inplace::Plan` (the next-state slot of an `Assign`, or the update expression's own buffer): the base value is copied once, each update writes only its slot, a LET temporary whose value is an update points at the target directly, and values the target already holds on the path (the `f[a]` of `![a].x`) are not copied again. A plan is generated only when legal: an expression evaluated after a write must not read a temporary that lives in the target, was bound and then written (that subtree falls back to evaluating the whole value and copying). C, JIT and the closure executor run the same plan; `Assign` does not save/restore the next-state slot (words of unassigned variables are never read). `x = c1 \/ x = c2 \/ ...` with adjacent, consecutive constants merges into a range comparison (`lower/mod.rs::int_ranges`).
 - **Post-lowering passes** (`lower/regions.rs::hoist_typed`, `lower/cse.rs`). Typed loop invariants in strict positions of binding constructs (each conjunct of a `CHOOSE` body) that themselves contain a loop or call (like `Max(S)` in the body of `PreviousLeader`'s `CHOOSE`) are hoisted before the construct and computed once when the source is non-empty (also for compiled function bodies). Repeated element ranks in one expression (`RankFlat`/`RankUnion` over temporaries or variable slices) are computed once, bound before the smallest subexpression containing all occurrences.
 - **Debugging.** `TLX_IR_DUMP=name` prints compact IR (`ir_fmt.rs`; `TLX_IR_DUMP_RAW` prints the Debug form); `TLX_COVERAGE=1` prints typed coverage and a histogram of boxed nodes (`coverage.rs`, `enc/diag.rs`).
@@ -803,7 +656,7 @@ Behavior is added to the search not by wrapping the model but by a search observ
 
 - **States are not resident**: a state is dropped after expansion. Every distinct state appends `(parent LogRef, fingerprint)` to its worker's trace log (`LogRef` = 16-bit worker number plus 48-bit index). When a violation is found the trace is reconstructed by **re-executing the model** from the initial states along the fingerprint chain. Under VIEW/SYMMETRY, reconstruction uses bounded, iterative backtracking within the logged classes to find a real behavior whose final state or step violates the reported property. The extra work happens only when printing the counterexample; search-time logging still uses the cached class fingerprints. Replay depth is bounded by the recorded path; its worst-case work is the product of the numbers of matching class members at each level, and re-enumeration can add quadratic work within a level. Only the current path and hashes of tried alternatives are retained. Runtime-dependent predicates may prevent replay (compat.md D-30); an explicit reason accompanies a genuine prefix.
 - **One worker**: exact BFS (all initial states before any successor is expanded), matching TLC's counts, early stop and `TLCGet` behavior point by point.
-- **Several workers: level-synchronous BFS** (`run_levels`). Each level's frontier is split in parallel: worker-local FIFO deque + global injector + mutual stealing (crossbeam), with a barrier between levels; depth and shortest counterexample equal TLC's for any worker count. **Narrow levels** (expected expansion time below the synchronisation cost of a parallel level; per-task time and sync cost are estimated online, `CostEstimate`) are expanded by the barrier leader alone as an exact BFS, over any number of consecutive levels, while the other workers wait once at the barrier. The barrier spins first (adaptive budget of 64 to 4096 iterations, doubled when the spin sufficed, halved when it had to park), then yields a few times, then parks (`thread::park`, the leader wakes workers directly one by one, avoiding serialised hand-offs through a condition-variable mutex). The last worker to arrive (the leader) prepares the next level before releasing (installs the frontier, decides narrow-level exclusivity, re-joins the safepoint on behalf of all workers), so a level needs one barrier (two when representatives are chosen). When oversubscribed (more threads than cores) each barrier costs about one reschedule of the slowest worker; on a cloud machine with 64 cores, 64 workers and 64 competing busy processes, fewer barriers made wall time 11-22% faster.
+- **Several workers: level-synchronous BFS** (`run_levels`). Each level's frontier is a set of per-worker block lists (`queue/`): workers claim blocks via atomic cursors — first from their own list for cache locality, then from other workers' lists in order, taking partial block tails at the end of a level by guided self-scheduling — with a barrier between levels; depth and shortest counterexample equal TLC's for any worker count. **Narrow levels** (expected expansion time below the synchronisation cost of a parallel level; per-task time and sync cost are estimated online, `CostEstimate`) are expanded by the barrier leader alone as an exact BFS, over any number of consecutive levels, while the other workers wait once at the barrier. The barrier spins first (adaptive budget of 64 to 4096 iterations, doubled when the spin sufficed, halved when it had to park), then yields a few times, then parks (`thread::park`, the leader wakes workers directly one by one, avoiding serialised hand-offs through a condition-variable mutex). The last worker to arrive (the leader) prepares the next level before releasing (installs the frontier, decides narrow-level exclusivity, re-joins the safepoint on behalf of all workers), so a level needs one barrier (two when representatives are chosen). When oversubscribed (more threads than cores) each barrier costs about one reschedule of the slowest worker; on a cloud machine with 64 cores, 64 workers and 64 competing busy processes, fewer barriers made wall time 11-22% faster.
 - **Representatives under VIEW/SYMMETRY** (`explore/order.rs`). When the fingerprint does not identify the state (`Model::coarse_fingerprint`), which concrete state represents a fingerprint class (checked for invariants, expanded, entered in the trace) can change the result (e.g. when VIEW omits a variable the guard reads). With one worker the first in BFS order is taken, as in TLC. With several workers the same order is selected: each candidate (a successor of a new class in this level) carries the key `(position of the parent in the level, which successor of the parent)`, and the class keeps the smallest key in the sharded table `best` (updated atomically under the same shard lock as the seen-set insert, so "in seen but not in `best`" means a class of an earlier level). Most successors are of classes found at earlier levels; they are told apart without taking a lock or writing shared memory: a per-level bit filter on the fingerprints of the classes inserted into the seen set at this level (`NewClasses`, a bit set before the seen-set insert, about 16 bits per state of the level) is read after a seen-set lookup, and a class that is in the seen set with its bit clear is dropped at once (a set bit, also another class's, takes the locked path). Locking a shard for every successor moved its cache line between the cores on each one: with KVSSafetyMedium on a 16-core x86 instance it was the largest part of the CPU time added per state from 1 to 8 workers. A worker's cache keeps the candidate it proposed when it was minimal; after the level is fully expanded (one more barrier; a worker that took a narrow level exclusively proceeds directly) each keeps those whose key is still minimal, sorts by key, then writes the trace log, checks invariants, enqueues, and corrects the parents' out-degree statistics. The position is the rank in BFS order: each worker's keepers are contiguous in its log and are noted as `(parent position, rank among that parent's keepers)`; the per-parent counts are prefix-summed on entering the next level to get the position of each parent's first child (`Positions`); the resume point carries the positions of the interrupted level. This is used only with several workers and a coarse fingerprint (without behavior-graph recording; under VIEW/SYMMETRY liveness takes the `ConcreteChecker` replay path instead); otherwise the "first inserter wins" fast path stays. `-coverage` with several workers also uses it (a new state is attributed to the action of the first candidate in BFS order); there the fingerprint is the state, the behavior graph is recorded as usual, a state's out-edges do not depend on the representative, and tableau atoms are evaluated when the level ends for the kept candidates, as with one worker when a new state is found.
 - **States outside the constraints** are not added to the seen set and are checked against the invariants every time they are generated, as in TLC (each check appends a trace log entry). When the invariants are a pure function of the state (no volatile builtins) and the fingerprint identifies the state, the model gives a key (`Model::invariant_key`, the compiled tier: its fingerprint) and each worker remembers the keys it already checked without a violation in a direct-mapped cache (2^18 slots), skipping those checks and log entries (-11% instructions on a Neon ProposerAcceptor model without SYMMETRY; under VIEW/SYMMETRY hashing the state costs about what the native invariants save, so there is no key).
 - **Violations**: the first failure is recorded and the stop bit of the control word set; initial states are processed on the main thread (constraint → seen set → invariants → implied-init).

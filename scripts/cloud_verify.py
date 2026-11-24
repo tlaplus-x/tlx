@@ -74,8 +74,8 @@ still tagged Project=tlx in the regions used.
 
 Bench mode (--bench, repeatable): instead of verify.py, run
 scripts/bench.py on the instance with each --bench argument string in turn
-(shell words, e.g. --bench "table --measure-tlc --repeat 3" --bench "run
---tlc"), for benchmarks of record on a quiet machine. Java 21 is installed
+(shell words, e.g. --bench "tlcbase --missing --collect" --bench "run
+--tlc --repeat 3"), for benchmarks of record on a quiet machine. Java 21 is installed
 for TLC and tla2tools.jar and community/modules.jar are uploaded; the TLC
 -workers N cache that came with corpus/out is dropped (measured elsewhere);
 this tree's bench.py and tlc.py are used. TLX_BENCH_MACHINE names the
