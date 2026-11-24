@@ -1,18 +1,28 @@
-# Connected keyed-symmetry certificates
+# Connected symmetry certificates
 
-The automatic symmetry emitter supports disjoint products of full permutation
-groups (2–6 model values per group, total group order at most 720) across:
+The automatic symmetry pipeline supports disjoint products of full permutation
+groups (2–6 model values per group, total group order at most 720) through three
+connected Lean certificate emitters:
 
-- Fixed-domain maps (`[K -> V]`) and mixed fixed-domain maps (`[K \cup Fixed -> V]`)
-  with key-free, mutually comparable payloads.
-- Scalar and optional key variables (`K` or `K \cup Fixed`), including slot-indexed
-  map lookups and writes.
-- Sets of keys (`SUBSET K` or `SUBSET (K \cup Fixed)`), set equalities/subsets,
-  and finite key cardinalities.
-- Sets of single-key and key-free tagged records (each record shape has at most
-  one pure-key field).
-- Fixed-shape records whose fields are core values, fixed-domain maps, or
-  scalar/optional key slots.
+1. **`KeyedCertificate.lean` (`phase/keyed/`):**
+   - Fixed-domain maps (`[K -> V]`) and mixed fixed-domain maps (`[K \cup Fixed -> V]`)
+     with key-free, mutually comparable payloads.
+   - Scalar and optional key variables (`K` or `K \cup Fixed`), including slot-indexed
+     map lookups and writes.
+   - Sets of keys (`SUBSET K` or `SUBSET (K \cup Fixed)`), set equalities/subsets,
+     and finite key cardinalities.
+   - Sets of single-key and key-free tagged records (each record shape has at most
+     one pure-key field).
+   - Fixed-shape records whose fields are core values, fixed-domain maps, or
+     scalar/optional key slots.
+2. **`EquivSymCertificate.lean` (`phase/equiv_sym/`):** closed recursive finite
+   values and formulas when `KeyedCertificate` declines (key-valued and nested
+   maps, multi-key records, bounded sequences/tuples, set comprehensions,
+   `KSubset`, `IsInjective`).
+3. **`ChooseSymCertificate.lean` (`phase/choose_sym/`):** choice-irrelevant
+   `CHOOSE` specifications (unique-witness key `CHOOSE` including `ChooseOne` and
+   inductively proved at-most-one active key, projected uniform/constant-value
+   `CHOOSE`, and commutative-associative recursive `CHOOSE` integer set-sum folds).
 
 ## Examples
 
@@ -29,6 +39,18 @@ groups (2–6 model values per group, total group order at most 720) across:
   maps, a set of keys (`acked \subseteq Client \cup Server`) with `Cardinality`
   observation, and a set of single-key/key-free tagged records (`msgs`).
   39 concrete states become 17 classes.
+- [MultiKeyMsgs.tla](MultiKeyMsgs.tla) ([MultiKeyMsgs.cfg](MultiKeyMsgs.cfg)):
+  set and bounded sequence of two-key `[src, dst, ...]` records certified by
+  `EquivSymCertificate`. 450 concrete states become 78 classes.
+- [KeyValMaps.tla](KeyValMaps.tla) ([KeyValMaps.cfg](KeyValMaps.cfg)):
+  key-valued map `[Proc -> Proc]`, set-valued map `[Proc -> SUBSET Proc]`, and
+  nested matrix `[Proc -> [Proc -> BOOLEAN]]` certified by `EquivSymCertificate`.
+  27 concrete states become 7 classes.
+- [ChooseSym.tla](ChooseSym.tla) ([ChooseSym.cfg](ChooseSym.cfg)):
+  inductively unique leader `CHOOSE`, projected uniform-value message `CHOOSE`
+  (direct and `LET`-bound), and recursive `CHOOSE` integer set-sum fold
+  (`TotalVotes`) certified by `ChooseSymCertificate`. 81 concrete states become
+  22 classes.
 
 From the repository root:
 
@@ -37,6 +59,9 @@ cargo build --release
 ./target/release/tlx check proofs/symmetry/Keyed.tla -interp
 ./target/release/tlx check proofs/symmetry/ScalarSlot.tla -compile
 ./target/release/tlx check proofs/symmetry/ProductSets.tla -compile
+./target/release/tlx check proofs/symmetry/MultiKeyMsgs.tla -compile
+./target/release/tlx check proofs/symmetry/KeyValMaps.tla -compile
+./target/release/tlx check proofs/symmetry/ChooseSym.tla -compile
 python3 proofs/check_generated.py --lean lean --negative \
   /path/to/Optimization.lean
 ```
@@ -44,28 +69,30 @@ python3 proofs/check_generated.py --lean lean --negative \
 Use the actual Lean path printed by the check. Automatic symmetry emits it even
 without `-optimize`. Normal checking never invokes Lean.
 
-Six theorem audits cover initialization/successor/observation correspondence,
-safety, stuttering specifications, concrete counterexamples, deadlocks and
-formal orbit-key equivalence. Eight mutation checks reject missing bound-key
-renaming, missing map permutation, missing scalar-slot permutation, missing
-key-value renaming, order-dependent cardinality replacement, deleted
-initial/successor classes and changed reduced observations. No custom
+Six theorem audits (seven when inductive `ChooseSymCertificate` obligations are
+present) cover initialization/successor/observation correspondence, safety,
+stuttering specifications, concrete counterexamples, deadlocks and formal
+orbit-key equivalence. Negative mutation checks in `proofs/check_generated.py`
+verify that Lean rejects broken key/map/slot/value renaming, order-dependent
+cardinality replacement, broken `CHOOSE` uniqueness/projection/fold premises,
+deleted initial/successor classes and changed reduced observations. No custom
 correctness axiom is permitted.
 
 ## Trusted computing base and refusals
 
-The theorem quantifies over key-independent core (`C`), fixed-atom (`A`),
-branch-local (`W`), and payload (`V`) interpretations; key operations, group
-masks, finite cardinalities and slot transfers are explicit. Source lowering,
-inferred domains and shape splitting, leaf interpretation, totality, runtime
-group closure and minimum-key representative selection remain trusted. Formal
-orbit equality is not a proof of the Rust minimum-key implementation.
+For `KeyedCertificate`, the theorem quantifies over key-independent core (`C`),
+fixed-atom (`A`), branch-local (`W`), and payload (`V`) interpretations; for
+`EquivSymCertificate` and `ChooseSymCertificate`, normalized `Init`, `Next`, and
+`INVARIANT` formulas are lowered into closed finite value and formula IRs.
+Across all three, source parsing and HIR lowering, forward domain and totality
+checking (`sym_totality`), shape bijections, runtime group closure and
+minimum-key representative selection remain trusted. Formal orbit equality is
+not a proof of the Rust minimum-key implementation.
 
 Unsupported shapes refuse cleanly: overlapping or unused groups, partial/pinned
-subsets, multi-key record shapes, key-bearing map payloads, multi-actor partial
-field patches that could alias, primed non-core reads, `CHOOSE` over keys, and
-unknown domains. Other projection/symmetry combinations remain disabled;
-variable erasure is covered below.
+subsets, unproved order-dependent `CHOOSE` or `SetToSeq` uses, partial/overflowing
+operations rejected by `sym_totality`, and unknown or unbounded domains. Other
+projection/symmetry combinations remain disabled; variable erasure is covered below.
 
 ## External corpus coverage
 

@@ -121,8 +121,13 @@ under `GroupPerm` and constructs a permutation-quotient certificate with
 successor lifting from every representative. Candidate shape analysis cannot
 authorize application alone: `autosym` requires this certificate before
 installing the largest certifiable product subset and emits Lean before the
-search. Source lowering, inferred domains and shape splitting, semantic leaves,
-totality, permutation closure and runtime canonicalization remain trusted.
+search. When `KeyedCertificate.lean` declines a specification, `phase/equiv_sym/`
+(`EquivSymCertificate.lean`) and `phase/choose_sym/` (`ChooseSymCertificate.lean`)
+provide fallback permutation-quotient certificates over closed recursive finite
+values and certified choice-irrelevant `CHOOSE` idioms, gated by shared forward
+domain and totality analysis (`phase/sym_totality/`). Source lowering, inferred
+domains and shape splitting, semantic leaves, totality, permutation closure and
+runtime canonicalization remain trusted.
 `keyed/erasure.rs` additionally connects the actual installed retained-variable
 tuple to explicit hidden literal/copy/frame transfers. `ErasedKeyedCertificate.lean`
 shares branch choices with the keyed operations, proves erasure, and composes that
@@ -199,8 +204,9 @@ and the resulting certificate. Generated finite tables discharge read, frame and
 observation liveness obligations with kernel-checked `decide`; preservation is not
 assumed. Primed projected reads and nonconstant initial phases are refused. Source
 lowering, domain/totality inference, leaf interpretation and runtime remain trusted.
-Automatic symmetry is gated off;
-its Rust analysis and bounded diagnostic remain available. Counter-export emits closed
+Automatic symmetry requires one of the connected symmetry certificates above;
+uncertifiable candidates remain available only as suggestions and in the bounded
+diagnostic. Counter-export emits closed
 per-pass certificates through `certify.rs` and `PipelineCertificate.lean`. Each proof
 uses the actual before/after guards, updates, initial values and invariants. Constant
 propagation first proves its required domain inductive; comparison and transfer

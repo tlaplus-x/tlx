@@ -209,9 +209,15 @@ successor correspondence, observations, counterexample lifting and deadlock pres
 cleanup and saturation pass, plus their composition. The generated finite model
 can be checked separately; export does not itself check safety.
 
-[Automatic keyed symmetry](proofs/symmetry/README.md) emits a connected certificate
-for fixed-domain maps with identifier-free payloads. It runs in default mode and
-merges states differing only by a permutation of their map keys.
+[Automatic symmetry](proofs/symmetry/README.md) runs in default mode for disjoint
+products of full permutation groups (up to order 720) when backed by a connected
+Lean certificate across keyed state (`KeyedCertificate`: fixed/mixed maps, scalar
+or optional key slots, sets of keys, single-key tagged record sets, and fixed
+records), recursive equivariant finite values (`EquivSymCertificate`: key-valued
+and nested maps, multi-key records, bounded sequences/tuples, set comprehensions,
+`KSubset`, `IsInjective`), or choice-irrelevant `CHOOSE` (`ChooseSymCertificate`:
+unique-witness `CHOOSE`, projected uniform/constant-value `CHOOSE`, and
+commutative-associative recursive `CHOOSE` integer set-sum folds).
 
 Every implemented reduction family now has connected rule-IR certificates for its
 enabled subset. [Variable erasure can compose with keyed symmetry](proofs/symmetry/README.md)
@@ -222,8 +228,10 @@ Unsupported candidates stay unapplied; another certified rule may still apply. E
 retain their TLC behavior.
 See [the coverage inventory](docs/optimization.md#proof-coverage).
 
-Optimized checking always writes standalone Lean and prints its path; it never invokes
-Lean. If no certified rule applies, the file records that no reduction was applied.
+Optimized checking and certified automatic symmetry always write standalone Lean
+(cached under `~/.cache/tlx/proofs` or `-proofdir`) and print its path; they never
+invoke Lean. If `-optimize` finds no certified rule, the file records that no
+reduction was applied.
 Development of a new or changed reduction requires explicit Lean verification, an axiom
 audit and negative tests. Verification is optional during ordinary checking.
 

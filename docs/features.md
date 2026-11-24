@@ -44,7 +44,7 @@ temporal operators) is not listed here: see [design.md](design.md) and the diffe
 
 ## 1. TLC command-line options
 
-tlx usage: `tlx check Spec.tla [-config X.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem X] [-spill auto|off|always] [-metadir DIR] [-maxdisk X] [-checkpoint MIN] [-recover DIR] [-fpmem X] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]` (`-h`/`-help`/`--help` print the full help). An unrecognized option prints the usage and exits with 2.
+tlx usage: `tlx check Spec.tla [-config X.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem X] [-spill auto|off|always] [-metadir DIR] [-maxdisk X] [-checkpoint MIN] [-recover DIR] [-fpmem X] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]` (`-h`/`-help`/`--help` print the full help). An unrecognized option prints the usage and exits with 2.
 
 Each row is the support matrix: what TLC's option means, and whether (and how far) tlx accepts it. An
 option's spelling, default and effect are specified once in [configuration.md](configuration.md); the
@@ -100,8 +100,9 @@ behavior behind them is in [usage.md](usage.md), [scale.md](scale.md) and [desig
 | Java `-Dtlc2.TLC.stopAfter=sec` | stop after the given number of seconds | unsupported | occasionally used by benchmarks and CI |
 | Java `-Dtlc2.tool.fp.FPSet.impl=...` etc. | choose fingerprint set / queue implementation | n/a | tlx has only one implementation |
 
-tlx-only: `-I dir`, `-progress` (progress every 10 s), `-compile` (the default tier), `-interp`, `-tlc`, `-maxmem`, `-spill`,
-`-maxdisk`, `-stats`, the `TLX_*` environment variables (inventory in [configuration.md](configuration.md)).
+tlx-only: `-I dir`, `-progress` (progress every 10 s), `-compile` (the default tier), `-interp`, `-tlc`, `-optimize`,
+`-proofdir`, `-noautosymmetry`, `-checksymmetry` (`-suggest`), `-maxmem`, `-spill`, `-maxdisk`, `-stats`, the `TLX_*`
+environment variables (inventory in [configuration.md](configuration.md)).
 
 ---
 
@@ -127,7 +128,7 @@ ACTION_CONSTRAINT 2, POSTCONDITION 2.
 | `PROPERTY` / `PROPERTIES`: state-level / action-level `[][A]_v` / temporal (`<>`, `[]<>`, `~>`) | supported | liveness with tableau and SCC; TLC's warnings for state-level formulas are reproduced; split as TLC's SpecProcessor (through LET, operators applied to arguments, bounded `\A`), the parts checked during the search named as TLC names them (innermost definition, `Inv` of `[]Inv`, or the location of a conjunct) |
 | `CONSTRAINT(S)` | supported | counting semantics as TLC |
 | `ACTION_CONSTRAINT(S)` | supported | |
-| `SYMMETRY` | supported | native permutations; the same warning as TLC when used with liveness. Without a declaration, tlx proves the symmetry of sets of model values the cfg binds to constants: under `-tlc` it suggests the declaration; in the default mode it applies the proven group to runs that check only safety (usage.md sections 6.2, 6.3; `-noautosymmetry` turns it off) |
+| `SYMMETRY` | supported | native permutations; the same warning as TLC when used with liveness. Without a declaration, tlx screens sets of model values the cfg binds to constants: under `-tlc` it suggests the declaration; in the default mode it applies a disjoint product of full groups to safety-only runs when a connected Lean certificate is generated ([usage.md](usage.md) sections 6.2, 6.3; `-noautosymmetry` turns it off) |
 | `VIEW` | supported | VIEW with liveness reproduces TLC's algorithm; lasso counterexamples are only valid "modulo VIEW" (compat.md D-10; TLC's own are too) |
 | `ALIAS` | partial | as TLC normally; when evaluating ALIAS fails TLC prints an `_ALIASEvalError = "..."` field and tlx silently falls back to printing the original state |
 | `POSTCONDITION(S)` | partial | a list, checked in order (the first false one is reported); a constant-level one is an error, as in TLC; **evaluated only after the search ends normally**, while TLC also evaluates it after finding a violation (for use with `CounterExample`) |

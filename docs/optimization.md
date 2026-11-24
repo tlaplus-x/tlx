@@ -908,15 +908,20 @@ concrete reconstruction and validation are implemented.
 
 ### Lean output for checking
 
-Opt-in checking emits standalone Lean 4 source before exploring states. The output location
-and failure behavior are specified in [configuration.md](configuration.md#command-line-options-tlx-check-spectla-options).
+Opt-in checking (`-optimize`) and certified default-mode automatic symmetry emit standalone
+Lean 4 source before exploring states. The output location (`-proofdir` / `TLX_PROOF_DIR`,
+defaulting to the user cache) and failure behavior are specified in
+[configuration.md](configuration.md#command-line-options-tlx-check-spectla-options).
 No verifier is run during emission. Verification is an explicit, separate user action:
 `lean /path/to/Optimization.lean`. No Lake project or external Lean package is required.
 
-The compiler embeds shared `Rules.lean`, `ErasureCertificate.lean` for unobserved variables, and, for supported history applications,
-`HistoryCertificate.lean`; accepted ordered-allocation applications embed
-`OrderedCertificate.lean`; relative-age applications embed `AgeCertificate.lean`. The generated section also records the actual source files,
-parsed configuration, definition HIR and selected VIEW as escaped Lean strings.
+The compiler embeds shared `Rules.lean` together with the certificate module for the active
+reduction (`ErasureCertificate.lean`, `HistoryCertificate.lean`, `OrderedCertificate.lean`,
+`NestedCertificate.lean` / `NestedRank.lean`, `LiveCertificate.lean`, `AgeCertificate.lean`,
+`AgeHistoryCertificate.lean`, `LengthCertificate.lean`, `FieldCertificate.lean`,
+`KeyedCertificate.lean`, `EquivSymCertificate.lean`, `ChooseSymCertificate.lean`, or
+`ErasedKeyedCertificate.lean`). The generated section also records the actual source files,
+parsed configuration, definition HIR and selected VIEW or symmetry group as escaped Lean strings.
 
 **Supported history applications now generate a parametric rule-IR certificate.**
 The generator consumes the same normalized branches and prefix predicates as the rule.
