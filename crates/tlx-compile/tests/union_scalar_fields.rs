@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use tlx_layout::Shape;
-use tlx_testkit::diff::{Consumer, DiffReport, Harness};
+use tlx_testkit::diff::{Backend, Consumer, DiffReport, Harness};
 use tlx_testkit::{module, seed, Rng};
 use tlx_value::{Sym, Value};
 
@@ -121,10 +121,10 @@ fn union_field_universes_stay_inline_in_c() {
     assert!(c.contains("static const uint64_t"), "the re-encode has no static code table");
     assert!(c.contains("if (c_ >= "), "the re-encode has no code bound");
     assert!(c.contains("== (uint64_t)-1) return TLX_ERR;"), "the re-encode has no unmapped-code error");
-    // The family runs in the C tier and nowhere is it delegated to the host.
-    h.consumers("union scalar fields", &["Recode"], &[])
-        .assert_ok()
-        .assert_lowered()
-        .assert_executed(Consumer::C)
-        .assert_gap(Consumer::Host);
+    // The family runs in the active native tier and nowhere is it delegated to the host.
+    let native = match h.backend {
+        Backend::C => Consumer::C,
+        Backend::Jit => Consumer::Jit,
+    };
+    h.consumers("union scalar fields", &["Recode"], &[]).assert_ok().assert_lowered().assert_executed(native).assert_gap(Consumer::Host);
 }

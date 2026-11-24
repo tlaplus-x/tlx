@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use tlx_layout::Shape;
-use tlx_testkit::diff::{Consumer, Harness};
+use tlx_testkit::diff::{Backend, Consumer, Harness};
 use tlx_testkit::{module, seed, Rng};
 use tlx_value::Value;
 
@@ -95,10 +95,14 @@ fn the_iteration_stays_encoded() {
     let pick = h.dump("Pick");
     assert!(!pick.contains("ValField"), "the element is boxed again:\n{pick}");
     assert!(h.not_native().is_empty(), "needs a host region: {:?}", h.not_native());
+    let native = match h.backend {
+        Backend::C => Consumer::C,
+        Backend::Jit => Consumer::Jit,
+    };
     h.consumers("ordered function sets", &["OrderedSet"], &[])
         .assert_ok()
         .assert_lowered()
-        .assert_executed(Consumer::C)
+        .assert_executed(native)
         .assert_gap(Consumer::Host);
     let c = &h.c_src;
     assert!(c.contains("switch (x_[0]) {") || c.contains("tlx_order_"), "the plan is not a static comparison: {c}");
