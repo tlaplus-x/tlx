@@ -259,6 +259,9 @@ impl Lowerer<'_> {
         if ds.len() > MAX_COERCED_ENTRIES {
             return None;
         }
+        if !ds.iter().all(|d| typed::comparable(key, d)) {
+            return None;
+        }
         let mut mask = vec![0u64; bw];
         let mut ranks = Vec::new();
         for d in &ds {
@@ -286,7 +289,7 @@ impl Lowerer<'_> {
         let dl = self.expr_into(d, env, st, dsid);
         let (xs, bx) = self.share(x);
         let dom_x = self.map_domain(xs.clone(), &key);
-        let same_dom = eq(dom_x.clone(), dl);
+        let same_dom = to_bool(self.typed_eq(dl, dom_x.clone()));
         let (it, ety) = self.typed_iter_in(dom_x, true);
         if !it.is_typed_source() {
             return None;

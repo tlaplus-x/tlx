@@ -198,11 +198,9 @@ pub fn eq_tlc(a: &Value, b: &Value) -> Result<bool> {
             Value::ModelValue(m) => mv_eq_rev(*m, b, a),
             _ => err(format!("Attempted to check equality of the function {a} with the value:\n{b}")),
         },
-        Value::LazyFcn(f) => {
-            match b {
-                Value::ModelValue(m) => return mv_eq_rev(*m, b, a),
-                Value::LazyFcn(g) if Arc::ptr_eq(f, g) => return Ok(true),
-                _ => {}
+        Value::LazyFcn(_) => {
+            if let Value::ModelValue(m) = b {
+                return mv_eq_rev(*m, b, a);
             }
             let mut slot = None;
             eq_tlc(force_fcn(a, &mut slot)?, b)

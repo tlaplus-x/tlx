@@ -74,7 +74,8 @@ impl Lowerer<'_> {
         if let (ExprKind::Const(v), Some(Shape::Set { elem, .. })) = (&*x.kind, self.shape_of(set.ty)) {
             if let Ok(n) = v.normalize() {
                 if !elem.contains(&n) && typed::shapes_comparable(&Shape::of(&n), elem) {
-                    return bool_lit(false);
+                    let (_, bind) = self.share(set);
+                    return let_in(bind, bool_lit(false));
                 }
             }
         }
@@ -357,22 +358,62 @@ impl Lowerer<'_> {
                     }
                 }
                 H::Builtin { op: B::Cup, args } if !self.ip.is_builtin_overridden(B::Cup) && x.ty != Ty::Val => {
-                    let (tx, bind) = self.share(x);
-                    let mut binds = Vec::new();
-                    let mut parts = Vec::new();
-                    for a in args {
-                        let m = to_bool(self.member_of(tx.clone(), a, &senv, st));
-                        let tm = self.temp(Ty::Bool);
-                        binds.insert(0, (tm, m));
-                        parts.push(temp_ref(Ty::Bool, tm));
+                    if let Some(m) = self.member_cup(x.clone(), args, &senv, st) {
+                        return m;
                     }
-                    return let_in(binds.into_iter().chain(bind), or(parts));
                 }
                 _ => {}
             }
         }
         let s = self.expr(set, env, st);
         self.member_lowered(x, None, s, env, st)
+    }
+
+    /// `x \in (A \cup B)` without building `A \cup B`, when both operands are
+    /// reducible sets whose elements are pairwise comparable with each other
+    /// and with `x` (so neither merging `A \cup B` nor testing `x \in A` and
+    /// `x \in B` can raise a comparability/type error).
+    fn member_cup(&mut self, x: Expr, args: &[hir::Expr], senv: &LEnv, st: &St) -> Option<Expr> {
+        let [a, b] = args else { return None };
+        let xs = match x.ty {
+            Ty::Enc(_) => self.shape_of(x.ty)?.clone(),
+            Ty::Int => Shape::Int { lo: 0, hi: 0 },
+            Ty::Bool => Shape::Bool,
+            Ty::Val => return None,
+        };
+        let mark = self.frame.snapshot();
+        let (tx, bind) = self.share(x);
+        let la = self.expr(a, senv, st);
+        let lb = self.expr(b, senv, st);
+        let elem_shape = |e: &Expr| -> Option<Shape> {
+            if let Some(Shape::Set { elem, .. }) = self.shape_of(e.ty) {
+                return Some((**elem).clone());
+            }
+            if let ExprKind::Const(v @ (Value::Set(_) | Value::Interval(..))) = &*e.kind {
+                if let Shape::Set { elem, .. } = Shape::of(v) {
+                    return Some(*elem);
+                }
+            }
+            None
+        };
+        let Some((ea, eb)) = elem_shape(&la).zip(elem_shape(&lb)) else {
+            self.frame.restore(mark);
+            return None;
+        };
+        if !typed::shapes_comparable(&ea, &eb)
+            || !typed::shapes_comparable(&ea, &ea)
+            || !typed::shapes_comparable(&eb, &eb)
+            || !typed::shapes_comparable(&xs, &ea)
+            || !typed::shapes_comparable(&xs, &eb)
+        {
+            self.frame.restore(mark);
+            return None;
+        }
+        let ma = to_bool(self.member_lowered(tx.clone(), None, la, senv, st));
+        let mb = to_bool(self.member_lowered(tx, None, lb, senv, st));
+        let ta = self.temp(Ty::Bool);
+        let tb = self.temp(Ty::Bool);
+        Some(let_in([(tb, mb), (ta, ma)].into_iter().chain(bind), or(vec![temp_ref(Ty::Bool, ta), temp_ref(Ty::Bool, tb)])))
     }
 
     /// `a = b` for expressions in different environments, with `a` evaluated
@@ -532,30 +573,46 @@ impl Lowerer<'_> {
                 LazySet::FcnSet(dom, range) if matches!(shape, Shape::Map { .. }) => self.map_in_fcn_set(x, &shape, dom, range, depth),
                 LazySet::FcnSet(dom, range) => {
                     let slots = self.slots(&shape)?;
-                    let want = tlx_value::ops::enumerate_normalized(dom).ok()?;
-                    if !slots.iter().map(|(k, _, _)| k).eq(want.iter()) {
+                    let actual_dom = match &shape {
+                        Shape::Tuple(_) => Value::Interval(1, slots.len() as i64),
+                        _ => Value::set_from(slots.iter().map(|(k, _, _)| k.clone()).collect()).ok()?,
+                    };
+                    let dom_ok = match &shape {
+                        Shape::Tuple(_) => tlx_value::order::eq_tlc(&actual_dom, dom).ok()?,
+                        _ => tlx_value::order::eq_tlc(dom, &actual_dom).ok()?,
+                    };
+                    if !dom_ok {
                         return Some(bool_lit(false));
                     }
                     let parts = slots.iter().map(|(_, off, sh)| self.slot_member(x, *off, sh, range, depth)).collect::<Option<_>>()?;
                     Some(and_all(parts))
                 }
                 LazySet::RecordSet(fields) => {
+                    if let Shape::Tuple(es) = &shape {
+                        return es.is_empty().then(|| bool_lit(fields.is_empty()));
+                    }
+                    if !matches!(shape, Shape::Record(_)) {
+                        return None;
+                    }
                     let slots = self.slots(&shape)?;
-                    if !matches!(shape, Shape::Record(_)) || slots.len() != fields.len() {
+                    if slots.len() != fields.len() {
                         return Some(bool_lit(false));
                     }
                     let mut parts = Vec::new();
                     for ((k, off, sh), (name, fset)) in slots.iter().zip(fields.iter()) {
                         if *k != Value::Str(*name) {
-                            return Some(bool_lit(false));
+                            return parts.is_empty().then(|| bool_lit(false));
                         }
                         parts.push(self.slot_member(x, *off, sh, fset, depth)?);
                     }
                     Some(and_all(parts))
                 }
                 LazySet::Product(sets) => {
+                    if !matches!(shape, Shape::Tuple(_)) {
+                        return None;
+                    }
                     let slots = self.slots(&shape)?;
-                    if !matches!(shape, Shape::Tuple(_)) || slots.len() != sets.len() {
+                    if slots.len() != sets.len() {
                         return Some(bool_lit(false));
                     }
                     let parts = slots

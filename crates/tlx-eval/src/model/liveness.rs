@@ -181,8 +181,8 @@ impl LiveSpec {
             bits(self.state_atoms.len(), |i| match &self.state_atoms[i] {
                 StateAtom::Pred(a) => {
                     if let Some(t) = self.enabled_steps.get(i).copied().flatten() {
-                        steps.from(self, ip, s);
-                        if let Some(b) = steps.enabled(self, ip, t as usize, s) {
+                        steps.from(self, ip, s, level);
+                        if let Some(b) = steps.enabled(self, ip, t as usize, s, level) {
                             return Ok(b);
                         }
                     }
@@ -225,7 +225,7 @@ impl LiveSpec {
         let ExprKind::AngleAction { sub, .. } = &*a.expr.kind else { return None };
         let vs = ip.eval(sub, &a.env, &Ctx::state(s, level)).ok()?;
         let vt = ip.eval(sub, &a.env, &Ctx::state(t, level + 1)).ok()?;
-        Some(vs != vt)
+        Some(!tlx_value::order::eq_tlc(&vs, &vt).ok()?)
     }
 
     /// The `<<A>>_v` atoms whose A is a union of the model's `actions`
@@ -288,14 +288,14 @@ impl LiveSpec {
         let mut t1: Option<Vec<Option<Value>>> = None;
         STEPS.with(|steps| {
             let mut steps = steps.borrow_mut();
-            steps.from(self, ip, s);
+            steps.from(self, ip, s, level);
             let th = std::cell::OnceCell::new();
             let skip = |i: usize| mask.is_some_and(|m| m[i / 64] >> (i % 64) & 1 == 0);
             bits(self.action_atoms.len(), |i| {
                 match skip(i)
                     .then_some(false)
                     .or_else(|| self.step_atom(ip, i, s, t, level))
-                    .or_else(|| steps.angle(self, ip, i, s, t, &th))
+                    .or_else(|| steps.angle(self, ip, i, s, t, level, &th))
                 {
                     Some(b) => Ok(b),
                     None => {
@@ -335,6 +335,8 @@ struct Steps {
     spec: Option<(Arc<()>, Arc<()>)>,
     ip: std::sync::Weak<Interp>,
     src: Vec<Value>,
+    /// BFS level of `src` (`TLCGet("level")`).
+    level: u32,
     /// Per action atom.
     atoms: Vec<AngleSteps>,
     /// Per action atom: its enumeration failed once (do not try again).
@@ -403,8 +405,8 @@ fn state_hash(vals: &[Value]) -> u64 {
 }
 
 impl Steps {
-    /// Steps from `s` next (of the atoms of `spec`).
-    fn from(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, s: &[Value]) {
+    /// Steps from `s` (at BFS `level`) next (of the atoms of `spec`).
+    fn from(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, s: &[Value], level: u32) {
         let same = self.spec.as_ref().is_some_and(|(atoms, policies)| {
             Arc::ptr_eq(atoms, &spec.action_atoms.generation) && Arc::ptr_eq(policies, &spec.from_steps.generation)
         }) && self.ip.as_ptr() == Arc::as_ptr(ip);
@@ -413,16 +415,18 @@ impl Steps {
             self.ip = Arc::downgrade(ip);
             self.off = vec![false; spec.action_atoms.len()];
             self.over = vec![0; spec.action_atoms.len()];
-        } else if self.src[..] == *s {
+        } else if self.level == level && self.src[..] == *s {
             return;
         }
         self.src = s.to_vec();
+        self.level = level;
         self.atoms = vec![AngleSteps::Unknown; spec.action_atoms.len()];
     }
 
-    /// Atom `i` on the step `s -> t` (`s` the state of `from`), if it is an
-    /// `<<A>>_v` atom whose A-steps from `s` are known.
+    /// Atom `i` on the step `s -> t` (`s` the state of `from`, at `level`),
+    /// if it is an `<<A>>_v` atom whose A-steps from `s` are known.
     /// `th`: the hash of `t`, once computed.
+    #[allow(clippy::too_many_arguments, reason = "threads BFS level into cached step lookup")]
     fn angle(
         &mut self,
         spec: &LiveSpec,
@@ -430,6 +434,7 @@ impl Steps {
         i: usize,
         s: &[Value],
         t: &[Value],
+        level: u32,
         th: &std::cell::OnceCell<u64>,
     ) -> Option<bool> {
         let atom = &spec.action_atoms[i];
@@ -437,18 +442,21 @@ impl Steps {
         if spec.from_steps.get(i).copied().unwrap_or_default() == FromSteps::No {
             return None;
         }
-        self.enumerate(spec, ip, i, s);
+        self.enumerate(spec, ip, i, s, level);
         match &self.atoms[i] {
             AngleSteps::None => Some(false),
             AngleSteps::Steps(succ, _) if !succ.contains(t, th) => Some(false),
-            AngleSteps::Steps(_, v) => ip.eval(sub, &atom.env, &Ctx::state(t, 0)).ok().map(|vt| vt != *v),
+            AngleSteps::Steps(_, v) => {
+                let vt = ip.eval(sub, &atom.env, &Ctx::state(t, level + 1)).ok()?;
+                Some(!tlx_value::order::eq_tlc(v, &vt).ok()?)
+            }
             _ => None,
         }
     }
 
-    /// Enumerate the A-steps from `s` (the state of `from`) of the
+    /// Enumerate the A-steps from `s` (the state of `from`, at `level`) of the
     /// `<<A>>_v` atom `i` (a `from_steps` one), unless done.
-    fn enumerate(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, i: usize, s: &[Value]) {
+    fn enumerate(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, i: usize, s: &[Value], level: u32) {
         if !matches!(self.atoms[i], AngleSteps::Unknown) {
             return;
         }
@@ -462,13 +470,13 @@ impl Steps {
         let steps = if self.off[i] {
             None
         } else {
-            match partial_successors_at_most(ip, s, 0, action, &atom.env, bound) {
+            match partial_successors_at_most(ip, s, level, action, &atom.env, bound) {
                 // (Often: A is not enabled.)
                 Ok(Some(succ)) if succ.is_empty() => {
                     self.atoms[i] = AngleSteps::None;
                     return;
                 }
-                Ok(Some(succ)) => ip.eval(sub, &atom.env, &Ctx::state(s, 0)).ok().map(|v| (succ, v)),
+                Ok(Some(succ)) => ip.eval(sub, &atom.env, &Ctx::state(s, level)).ok().map(|v| (succ, v)),
                 Ok(None) => {
                     // Too many steps from this state: on each step.
                     self.over[i] += 1;
@@ -488,14 +496,14 @@ impl Steps {
         };
     }
 
-    /// `ENABLED <<A>>_v` on `s` (the state of `from`), for the `<<A>>_v`
-    /// atom `i` (a `from_steps` one), from the enumeration of A's steps:
-    /// whether one of them changes `v`. None where that is not
+    /// `ENABLED <<A>>_v` on `s` (the state of `from`, at `level`), for the
+    /// `<<A>>_v` atom `i` (a `from_steps` one), from the enumeration of A's
+    /// steps: whether one of them changes `v`. None where that is not
     /// known: A could not be enumerated, a step leaves a variable
     /// undetermined, or `v` fails on a step; the predicate is then
     /// evaluated (TLC's ENABLED, with its errors).
-    fn enabled(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, i: usize, s: &[Value]) -> Option<bool> {
-        self.enumerate(spec, ip, i, s);
+    fn enabled(&mut self, spec: &LiveSpec, ip: &Arc<Interp>, i: usize, s: &[Value], level: u32) -> Option<bool> {
+        self.enumerate(spec, ip, i, s, level);
         let (set, v) = match &self.atoms[i] {
             AngleSteps::None => return Some(false),
             AngleSteps::Steps(set, v) => (set, v),
@@ -507,7 +515,8 @@ impl Steps {
             return None;
         }
         for t in set.groups.iter().flat_map(|(_, steps)| steps.values().flatten()) {
-            if ip.eval(sub, env, &Ctx::state(t, 0)).ok()? != *v {
+            let vt = ip.eval(sub, env, &Ctx::state(t, level + 1)).ok()?;
+            if !tlx_value::order::eq_tlc(v, &vt).ok()? {
                 return Some(true);
             }
         }
@@ -606,9 +615,8 @@ impl Builder<'_> {
             return (self.spec.state_atoms.len() as u32 - 1, t);
         }
         let covered = matches!(self.spec.from_steps.get(t as usize), Some(FromSteps::Covered));
-        let via = covered || primes_expression(self.ip, action, &mut Vec::new());
-        let atom = if via { StateAtom::EnabledVia(t, enabled) } else { StateAtom::Pred(enabled) };
-        if !via {
+        let atom = if covered { StateAtom::EnabledVia(t, enabled) } else { StateAtom::Pred(enabled) };
+        if !covered {
             // (Decided by the enumeration of A's steps where it can be.)
             let k = self.spec.state_atoms.len();
             self.spec.enabled_steps.resize(k + 1, None);
@@ -879,47 +887,6 @@ fn leaves(ip: &Arc<Interp>, e: &Expr, env: &Env, out: &mut Vec<(Expr, Env)>) {
     }
 }
 
-/// Whether action `e` primes an expression other than a variable (through
-/// definitions; `seen`: those already looked through). ENABLED cannot
-/// assign such a primed expression: fairness of such an action is decided
-/// by the behavior graph's steps. (Fairness within an INSTANCE that
-/// substitutes expressions for variables does not get here: its ENABLED
-/// quantifies over the instantiated module's variables, see
-/// `ExprKind::Fairness`.)
-fn primes_expression(ip: &Interp, e: &Expr, seen: &mut Vec<DefId>) -> bool {
-    fn unchanged_expression(ip: &Interp, e: &Expr) -> bool {
-        match &*e.kind {
-            ExprKind::Var(_) => false,
-            ExprKind::Tuple(es) => es.iter().any(|c| unchanged_expression(ip, c)),
-            ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => match ip.plain_op_body(*d) {
-                Some((_, body)) => unchanged_expression(ip, body),
-                None => true,
-            },
-            _ => true,
-        }
-    }
-    let here = match &*e.kind {
-        ExprKind::Builtin { op: B::Prime, args } => !matches!(&*args[0].kind, ExprKind::Var(_)),
-        ExprKind::Builtin { op: B::Unchanged, args } => unchanged_expression(ip, &args[0]),
-        ExprKind::Apply { op: OpRef::Def(d), .. } => {
-            let d = ip.redirect_def(*d);
-            if seen.contains(&d) {
-                false
-            } else {
-                seen.push(d);
-                match &ip.prog.defs[d.idx()].kind {
-                    DefKind::Op(body) => primes_expression(ip, body, seen),
-                    _ => false,
-                }
-            }
-        }
-        _ => false,
-    };
-    let mut found = here;
-    tlx_sema::visit::children(e, &mut |c| found = found || primes_expression(ip, c, seen));
-    found
-}
-
 fn neg(f: Ltl) -> Ltl {
     Ltl::Not(Box::new(f))
 }
@@ -1159,5 +1126,30 @@ mod tests {
         let (ip2, _) = fixture("x' = 2");
         assert_eq!(edge(&live, &ip2, 0, 1), [0]);
         assert_eq!(edge(&live, &ip2, 0, 2), [1]);
+    }
+
+    #[test]
+    fn steps_cache_tracks_bfs_level() {
+        let dir = tlx_testkit::TempDir::new("live-level");
+        let body = "EXTENDS Naturals, TLC\nVARIABLE x\nA == x' = TLCGet(\"level\")\nAtom == <<A>>_x\n";
+        let path = dir.write("M.tla", &tlx_testkit::module("M", body));
+        let mut prog = tlx_sema::Program::load(&path, &[]).unwrap();
+        let Some(RootSymbol::Def(d)) = prog.lookup_root("Atom") else { panic!("missing Atom") };
+        let DefKind::Op(expr) = &prog.defs[d.idx()].kind else { panic!("not an operator") };
+        let atom = Atom { expr: expr.clone(), env: Env::default() };
+        let ip = Interp::new(prog, Default::default()).unwrap();
+        let mut live = LiveSpec::default();
+        live.action_atoms.push(atom.clone());
+        live.from_steps.push(FromSteps::Bounded);
+        let enabled = Expr::new(ExprKind::Builtin { op: B::Enabled, args: vec![atom.expr] }, Span::default());
+        live.state_atoms.push(StateAtom::Pred(Atom { expr: enabled, env: Env::default() }));
+        live.enabled_steps.push(Some(0));
+
+        // Same state `x = 1`, different BFS levels: at level 1, A steps to x' = 1 (no change);
+        // at level 2, A steps to x' = 2 (changes x).
+        assert_eq!(live.action_bits(&ip, &[Value::Int(1)], &[Value::Int(2)], 1).unwrap(), [0]);
+        assert_eq!(live.state_bits(&ip, &[Value::Int(1)], 1, &[]).unwrap(), [0]);
+        assert_eq!(live.action_bits(&ip, &[Value::Int(1)], &[Value::Int(2)], 2).unwrap(), [1]);
+        assert_eq!(live.state_bits(&ip, &[Value::Int(1)], 2, &[]).unwrap(), [1]);
     }
 }

@@ -435,13 +435,17 @@ impl Eval<'_> {
                 None => {
                     let (a, b) = (self.node(&ite.1)?, self.node(&ite.2)?);
                     match (a, b) {
-                        (V::K(x), V::K(y)) if x == y => V::K(x),
+                        (V::K(x), V::K(y)) if order::certainly_equal(&x, &y) => V::K(x),
+                        (a, b) if self.check.is_none() => V::U(None),
                         (a, b) => {
                             let mut vs = cases(&a)?;
                             for y in cases(&b)? {
-                                if !vs.contains(&y) {
+                                if !vs.iter().any(|v| order::certainly_equal(v, &y)) {
                                     vs.push(y);
                                 }
+                            }
+                            if vs.len() > MAX_CASES {
+                                return None;
                             }
                             self.unknown(|| vs)
                         }
@@ -548,7 +552,12 @@ impl Eval<'_> {
     fn boolean(&mut self, e: &Node) -> Option<Option<bool>> {
         match self.node(e)? {
             V::K(Value::Bool(b)) => Some(Some(b)),
-            V::U(vs) if vs.as_ref().is_none_or(|vs| vs.iter().all(|v| matches!(v, Value::Bool(_)))) => Some(None),
+            V::U(Some(vs)) => match vs.as_slice() {
+                [Value::Bool(b)] => Some(Some(*b)),
+                vs if vs.iter().all(|v| matches!(v, Value::Bool(_))) => Some(None),
+                _ => None,
+            },
+            V::U(None) => Some(None),
             _ => None,
         }
     }
@@ -572,7 +581,7 @@ impl Eval<'_> {
         let mut args: Vec<&Value> = Vec::with_capacity(cs.len());
         if !combinations(&cs, &mut args, &mut |a| {
             let Some(r) = apply(op, a) else { return false };
-            if !out.contains(&r) {
+            if !out.iter().any(|v| order::certainly_equal(v, &r)) {
                 out.push(r);
             }
             out.len() <= MAX_CASES

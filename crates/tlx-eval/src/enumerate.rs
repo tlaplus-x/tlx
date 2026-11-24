@@ -679,7 +679,18 @@ impl ActionRunner<'_> {
 /// `s0`: the successors of A (`e`), each variable A leaves undetermined
 /// with its value in `s0`.
 pub(crate) fn composition_mids(ip: &Arc<Interp>, s0: &[Value], level: u32, e: &Expr, env: &Env) -> EResult<Vec<Vec<Value>>> {
-    let succ = partial_successors_at_most(ip, s0, level, e, env, usize::MAX)?.unwrap_or_default();
+    composition_mids_for(ip, s0, level, e, env, false)
+}
+
+pub(super) fn composition_mids_for(
+    ip: &Arc<Interp>,
+    s0: &[Value],
+    level: u32,
+    e: &Expr,
+    env: &Env,
+    enabled: bool,
+) -> EResult<Vec<Vec<Value>>> {
+    let succ = partial_successors_for(ip, s0, level, e, env, usize::MAX, enabled)?.unwrap_or_default();
     Ok(succ.into_iter().map(|t| t.into_iter().zip(s0).map(|(v, old)| v.unwrap_or_else(|| old.clone())).collect()).collect())
 }
 
@@ -694,6 +705,18 @@ pub(crate) fn partial_successors_at_most(
     env: &Env,
     max: usize,
 ) -> EResult<Option<Vec<Vec<Option<Value>>>>> {
+    partial_successors_for(ip, s0, level, e, env, max, false)
+}
+
+pub(super) fn partial_successors_for(
+    ip: &Arc<Interp>,
+    s0: &[Value],
+    level: u32,
+    e: &Expr,
+    env: &Env,
+    max: usize,
+    enabled: bool,
+) -> EResult<Option<Vec<Vec<Option<Value>>>>> {
     let mut out = Vec::new();
     let mut over = false;
     {
@@ -706,6 +729,11 @@ pub(crate) fn partial_successors_at_most(
             Ok(true)
         };
         let mut en = Enumerator::new(ip, Some(s0), level, &mut emit);
+        if enabled {
+            en.enabled = true;
+            en.s1.resize(ip.prog.vars.len() + ip.prog.inst_vars.len(), None);
+            en.unassigned = en.s1.len();
+        }
         en.run(e, env)?;
     }
     Ok((!over).then_some(out))
