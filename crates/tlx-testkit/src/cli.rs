@@ -76,6 +76,10 @@ impl Tlx {
         self.command.env(name, value);
         self
     }
+    pub fn env_remove(&mut self, name: impl AsRef<OsStr>) -> &mut Self {
+        self.command.env_remove(name);
+        self
+    }
     pub fn envs(&mut self, env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>) -> &mut Self {
         self.command.envs(env);
         self
