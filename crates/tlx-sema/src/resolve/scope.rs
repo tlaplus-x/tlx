@@ -200,7 +200,7 @@ impl Program {
     /// (ctx, m) with the given extra params. Instances of modules without
     /// declarations (and parameters) share the root context.
     fn instance_ctx(&mut self, ctx: CtxId, m: ModIdx, inst: &ast::Instance, captured: Option<super::Captured>) -> Option<(CtxId, ModIdx)> {
-        let target = self.find_module(&inst.module)?;
+        let target = self.find_instance_module(m, &inst.module)?;
         if inst.params.is_empty() && !self.has_decls(target, &mut Vec::new()) {
             return Some((ROOT_CTX, target));
         }
@@ -302,7 +302,7 @@ impl Program {
     /// Context of the anonymous `INSTANCE` that is unit `ui` of (ctx, m).
     fn anon_instance(&mut self, ctx: CtxId, m: ModIdx, ui: usize, inst: &ast::Instance) -> Option<(CtxId, ModIdx)> {
         if let Some(&c) = self.anon_inst_ctx.get(&(ctx, m, ui)) {
-            let target = self.find_module(&inst.module)?;
+            let target = self.find_instance_module(m, &inst.module)?;
             return Some((c, target));
         }
         let (c, t) = self.instance_ctx(ctx, m, inst, None)?;

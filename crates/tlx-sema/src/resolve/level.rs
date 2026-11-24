@@ -931,7 +931,7 @@ impl Program {
                 tlx_front::ast::Unit::FnDef(fd) => nonconstant_ops(&fd.body) || fd.bounds.iter().any(|b| nonconstant_ops(&b.set)),
                 tlx_front::ast::Unit::Instance(inst) => {
                     inst.substs.iter().any(|(_, e)| nonconstant_ops(e))
-                        || self.find_module(&inst.module).is_some_and(|t| !self.is_constant_module(t, seen))
+                        || self.find_instance_module(m, &inst.module).is_some_and(|t| !self.is_constant_module(t, seen))
                 }
                 _ => false,
             };

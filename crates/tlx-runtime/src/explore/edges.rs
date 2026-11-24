@@ -490,17 +490,29 @@ impl<'m, S> EdgeRec<'m, S> {
 }
 
 /// The checkpoint codes of the error kinds (the context of an atom's error
-/// is `Other`).
+/// is `Other`). Append only: the codes are in checkpoints.
 fn kind_code(k: ErrorKind) -> u8 {
-    KINDS.iter().position(|&x| x == k).expect("an error kind") as u8
+    match k {
+        ErrorKind::General => 0,
+        ErrorKind::Unsupported => 1,
+        ErrorKind::AssertFailed => 2,
+        ErrorKind::DivisionByZero => 3,
+        ErrorKind::ArgumentError => 4,
+        ErrorKind::Overflow => 5,
+        ErrorKind::NullPowerNull => 6,
+        ErrorKind::ApplyEmptySeq => 7,
+        ErrorKind::IntegerTooBig => 8,
+        ErrorKind::LayoutMiss => 9,
+        ErrorKind::FunctionDomain => 10,
+    }
 }
 
 fn kind_of_code(c: u8) -> Option<ErrorKind> {
     KINDS.get(c as usize).copied()
 }
 
-/// Append only: the codes are in checkpoints.
-const KINDS: [ErrorKind; 10] = [
+/// Append only: the codes are in checkpoints (must match `kind_code`).
+const KINDS: [ErrorKind; 11] = [
     ErrorKind::General,
     ErrorKind::Unsupported,
     ErrorKind::AssertFailed,
@@ -511,6 +523,7 @@ const KINDS: [ErrorKind; 10] = [
     ErrorKind::ApplyEmptySeq,
     ErrorKind::IntegerTooBig,
     ErrorKind::LayoutMiss,
+    ErrorKind::FunctionDomain,
 ];
 
 /// The memory `build` allocates for the graph of the records `recs`
@@ -849,6 +862,23 @@ mod tests {
         old.truncate(old.len() - "atom failed".len() - 2);
         let mut back = EdgeRec::read_from(&Parity, 1 << 20, &old, &mut || Ok(None), &mut || Ok(None)).unwrap();
         assert!(back.failed() && back.take_error().is_none());
+    }
+
+    #[test]
+    fn function_domain_and_all_error_kinds_round_trip_checkpoint() {
+        for &kind in &KINDS {
+            let code = kind_code(kind);
+            assert_eq!(kind_of_code(code), Some(kind), "round-trip for {kind:?}");
+        }
+        let mut w = EdgeRec::new(&Parity, 1 << 20);
+        w.failed = true;
+        w.error = Some(ModelError::of_kind(ErrorKind::FunctionDomain, "not in domain"));
+        let head = w.header();
+        let mut back = EdgeRec::read_from(&Parity, 1 << 20, &head, &mut || Ok(None), &mut || Ok(None)).unwrap();
+        assert!(back.failed());
+        let err = back.take_error().expect("recovered error");
+        assert_eq!(err.kind, ErrorKind::FunctionDomain);
+        assert_eq!(err.message, "not in domain");
     }
 
     /// Action atoms 0 and 1 are `<<A>>` and `<<B>>` of actions 0 and 1

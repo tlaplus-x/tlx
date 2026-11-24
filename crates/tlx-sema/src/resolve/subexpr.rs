@@ -27,6 +27,8 @@ pub(super) enum SelKey {
     Args(usize),
     /// `!@`.
     At,
+    /// `!:`.
+    Colon,
     Label(Arc<str>, usize),
 }
 
@@ -52,18 +54,42 @@ impl Program {
         op_arg: bool,
         span: Span,
     ) -> Result<(DefId, Vec<ast::Expr>), ()> {
-        let key: Vec<SelKey> = path
-            .iter()
-            .filter_map(|s| match s {
-                ast::Selector::Index(i) => Some(SelKey::Index(*i)),
-                ast::Selector::Left => Some(SelKey::Left),
-                ast::Selector::Right => Some(SelKey::Right),
-                ast::Selector::Args(a) => Some(SelKey::Args(a.len())),
-                ast::Selector::Label(l, a) => Some(SelKey::Label(l.name.clone(), a.len())),
-                ast::Selector::At => Some(SelKey::At),
-                ast::Selector::Colon => None,
-            })
-            .collect();
+        // Keep `SelKey::Colon` only where `!:` actually changes `navigate`'s
+        // `after_opsel` state before a `Label` (trailing or redundant `!:` are
+        // no-ops and share the same synthetic definition).
+        let mut key: Vec<SelKey> = Vec::with_capacity(path.len());
+        let mut after_opsel = false;
+        let mut pending_colon = false;
+        for s in path {
+            match s {
+                ast::Selector::Colon => {
+                    if !after_opsel {
+                        pending_colon = true;
+                    }
+                    after_opsel = true;
+                }
+                ast::Selector::Label(l, a) => {
+                    if pending_colon {
+                        key.push(SelKey::Colon);
+                        pending_colon = false;
+                    }
+                    key.push(SelKey::Label(l.name.clone(), a.len()));
+                    after_opsel = false;
+                }
+                _ => {
+                    pending_colon = false;
+                    after_opsel = true;
+                    key.push(match s {
+                        ast::Selector::Index(i) => SelKey::Index(*i),
+                        ast::Selector::Left => SelKey::Left,
+                        ast::Selector::Right => SelKey::Right,
+                        ast::Selector::Args(a) => SelKey::Args(a.len()),
+                        ast::Selector::At => SelKey::At,
+                        ast::Selector::Colon | ast::Selector::Label(..) => unreachable!(),
+                    });
+                }
+            }
+        }
         // The selector arguments, in order.
         let sel_args: Vec<ast::Expr> = path
             .iter()
@@ -105,6 +131,7 @@ impl Program {
                 SelKey::Right => name.push_str("!>>"),
                 SelKey::Args(_) => name.push_str("!(..)"),
                 SelKey::At => name.push_str("!@"),
+                SelKey::Colon => name.push_str("!:"),
                 SelKey::Label(l, _) => name.push_str(&format!("!{l}")),
             }
         }

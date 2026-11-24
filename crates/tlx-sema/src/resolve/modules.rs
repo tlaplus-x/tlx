@@ -41,13 +41,33 @@ impl Program {
         // Native overrides apply by module name, wherever the module was found (as in TLC).
         let std = std || STD_MODULES.iter().any(|(n, _)| **n == *name);
         self.mods.push(ModInfo { name: name.clone(), ast: ast.clone(), std, parent });
-        self.mod_by_name.entry(name).or_insert(idx);
+        if parent.is_none() {
+            self.mod_by_name.entry(name).or_insert(idx);
+        }
         for u in &ast.units {
             if let ast::Unit::Module(nested) = u {
                 self.register_module(nested.clone(), std, Some(idx));
             }
         }
         idx
+    }
+
+    /// The nested module named `name` of `m` (or of its ancestors).
+    pub(super) fn find_nested_module(&self, m: ModIdx, name: &str) -> Option<ModIdx> {
+        let mut cur = Some(m);
+        while let Some(c) = cur {
+            if let Some(n) = (0..self.mods.len()).find(|&i| self.mods[i].parent == Some(c) && &*self.mods[i].name == name) {
+                return Some(n);
+            }
+            cur = self.mods[c].parent;
+        }
+        None
+    }
+
+    /// The module instantiated by `INSTANCE name` appearing in module `m`:
+    /// a nested module of `m` (or of its ancestors), or a top-level module.
+    pub(super) fn find_instance_module(&mut self, m: ModIdx, name: &ast::Ident) -> Option<ModIdx> {
+        self.find_nested_module(m, &name.name).or_else(|| self.find_module(name))
     }
 
     /// The module named `name`, loading it if necessary.
@@ -157,7 +177,7 @@ impl Program {
         for m in 0..self.mods.len() {
             for u in &self.mods[m].ast.units {
                 if let ast::Unit::Instance(i) = u {
-                    if let Some(&t) = self.mod_by_name.get(&i.module.name) {
+                    if let Some(t) = self.find_nested_module(m, &i.module.name).or_else(|| self.mod_by_name.get(&i.module.name).copied()) {
                         instantiated.push(t);
                     }
                 }
@@ -225,7 +245,10 @@ impl Program {
                 ast::Unit::OpDef(d) if d.params.is_empty() && (own || !d.local) => &d.name.name,
                 ast::Unit::FnDef(d) if own || !d.local => &d.name.name,
                 ast::Unit::Instance(i) if i.params.is_empty() && (own || !i.local) => {
-                    let Some(&im) = self.mod_by_name.get(&i.module.name) else { continue };
+                    let Some(im) = self.find_nested_module(m, &i.module.name).or_else(|| self.mod_by_name.get(&i.module.name).copied())
+                    else {
+                        continue;
+                    };
                     match &i.name {
                         Some(n) => {
                             let Some(&Sym::Instance(id)) = self.scopes[sc].names.get(&n.name) else { continue };
@@ -264,24 +287,26 @@ impl Program {
     fn module_deps(&mut self, m: ModIdx, is_root: bool) -> Vec<ModIdx> {
         let ast = self.mods[m].ast.clone();
         let mut names: Vec<ast::Ident> = Vec::new();
-        fn walk(md: &ast::Module, names: &mut Vec<ast::Ident>, instances: &mut Vec<ast::Ident>) {
+        fn walk(md: &ast::Module, names: &mut Vec<ast::Ident>, instances: &mut Vec<ast::Ident>, nested: &mut Vec<Arc<str>>) {
             names.extend(md.extends.iter().cloned());
             for u in &md.units {
                 match u {
                     ast::Unit::Instance(i) => instances.push(i.module.clone()),
-                    ast::Unit::Module(inner) => walk(inner, names, instances),
+                    ast::Unit::Module(inner) => {
+                        nested.push(inner.name.name.clone());
+                        walk(inner, names, instances, nested);
+                    }
                     _ => {}
                 }
             }
         }
         let mut instances = Vec::new();
-        walk(&ast, &mut names, &mut instances);
+        let mut nested = Vec::new();
+        walk(&ast, &mut names, &mut instances, &mut nested);
         if is_root {
             names.push(ast::Ident { name: "TLCExt".into(), span: ast.name.span });
         }
         names.extend(instances);
-        let nested: Vec<Arc<str>> =
-            ast.units.iter().filter_map(|u| if let ast::Unit::Module(i) = u { Some(i.name.name.clone()) } else { None }).collect();
         let mut out = Vec::new();
         for n in names {
             // Nested modules are part of this one.

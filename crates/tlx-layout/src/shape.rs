@@ -292,6 +292,13 @@ pub fn map_shape(key: Shape, range: Shape) -> Shape {
 /// same pairs. Such shapes must not become separate union arms (equal values
 /// would get different encodings, hence different fingerprints).
 fn equal_values_possible(a: &Shape, b: &Shape) -> bool {
+    match (a, b) {
+        // In TLA+, `[k \in {} |-> v]` equals `<<>>`, so any `Map` shares the
+        // empty value `<<>>` with `Seq` and empty `Tuple`.
+        (Shape::Seq { .. }, Shape::Map { .. }) | (Shape::Map { .. }, Shape::Seq { .. }) => return true,
+        (Shape::Tuple(es), Shape::Map { .. }) | (Shape::Map { .. }, Shape::Tuple(es)) if es.is_empty() => return true,
+        _ => {}
+    }
     let keys = match b {
         Shape::Fcn { dom, .. } => match dom.first() {
             None => return is_seq_like(a),
@@ -763,4 +770,36 @@ pub(crate) fn arm_for(arms: &[Shape], v: &Value) -> Option<usize> {
 #[inline]
 pub(crate) fn same_field_names<A, B>(a: &[(Sym, A)], b: &[(Sym, B)]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_fcn_union_canonicality() {
+        let atom_map =
+            Shape::Map { key: Box::new(Shape::Atom(Arc::from([Value::Str(Sym::new("a"))]))), range: Box::new(Shape::Int { lo: 1, hi: 2 }) };
+        let seq = Shape::Seq { elem: Box::new(Shape::Int { lo: 1, hi: 2 }), max_len: 2 };
+        let empty_tuple = Shape::Tuple(Arc::from([]));
+        let one_tuple = Shape::Tuple(Arc::from([Shape::Int { lo: 1, hi: 2 }]));
+
+        // `Map` and `Seq` both admit `<<>>`, so joining an Atom-keyed `Map`
+        // with `Seq` must widen to `Dyn` rather than forming a non-canonical `Union`.
+        assert_eq!(atom_map.join(&seq), Shape::Dyn);
+        assert_eq!(seq.join(&atom_map), Shape::Dyn);
+
+        // `Tuple([])` is absorbed into `Map` (its empty map represents `<<>>`).
+        assert_eq!(atom_map.join(&empty_tuple), atom_map);
+        assert_eq!(empty_tuple.join(&atom_map), atom_map);
+
+        // Through `merge_equal_arms` inside a multi-arm `Union`:
+        let bool_or_map = Shape::Bool.join(&atom_map);
+        assert_eq!(bool_or_map.join(&seq), Shape::Dyn);
+        assert_eq!(bool_or_map.join(&empty_tuple), bool_or_map);
+
+        // A non-empty `Tuple` cannot hold `<<>>` and has Int keys, so it stays
+        // a disjoint `Union` arm with an Atom-keyed `Map`.
+        assert!(matches!(atom_map.join(&one_tuple), Shape::Union(arms) if arms.len() == 2));
+    }
 }

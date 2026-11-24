@@ -223,15 +223,8 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
             }
             for_each_element(a, &mut |e| if member(&e, b)? { Ok(true) } else { f(e) })
         }
-        LazySet::Custom(c) => match c.enumerate()? {
-            Some(elems) => {
-                for e in elems {
-                    if !f(e)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
+        LazySet::Custom(c) => match c.for_each(f)? {
+            Some(done) => Ok(done),
             None => Err(c.not_enumerable(s)),
         },
     }
@@ -470,5 +463,34 @@ mod tests {
         let direct = crate::ops::enumerate(&mixed).unwrap_err().to_string();
         let e = for_each_element(&subset, &mut |_| Ok(true)).unwrap_err();
         assert_eq!(e.to_string(), direct);
+    }
+
+    #[test]
+    fn custom_set_streams_and_stops_early() {
+        #[derive(Debug)]
+        struct FailAfterFirst;
+        impl crate::lazy::CustomSet for FailAfterFirst {
+            fn contains(&self, v: &Value) -> crate::Result<bool> {
+                Ok(*v == Value::Int(1))
+            }
+            fn enumerate(&self) -> crate::Result<Option<Vec<Value>>> {
+                Err(crate::ValueError::new("enumerate should not be called"))
+            }
+            fn for_each(&self, f: &mut dyn FnMut(Value) -> crate::Result<bool>) -> crate::Result<Option<bool>> {
+                if !f(Value::Int(1))? {
+                    return Ok(Some(false));
+                }
+                Err(crate::ValueError::new("second element fails"))
+            }
+        }
+        let s = Value::LazySet(Arc::new(LazySet::Custom(Box::new(FailAfterFirst))));
+        let mut got = Vec::new();
+        let done = for_each_element(&s, &mut |v| {
+            got.push(v);
+            Ok(false)
+        })
+        .unwrap();
+        assert!(!done);
+        assert_eq!(got, vec![Value::Int(1)]);
     }
 }
