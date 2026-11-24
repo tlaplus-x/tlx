@@ -105,24 +105,41 @@ impl Gen<'_, '_, '_> {
                     };
                     r?;
                     let (t, c) = (g.b.use_var(tot), g.b.use_var(cnt));
-                    let t = g.b.ins().imul(t, c);
-                    g.b.def_var(tot, t);
-                    let cont = g.b.create_block();
-                    g.brif(t, cont, &[], done, &[]);
-                    g.switch(cont);
+                    let nonzero = g.b.create_block();
+                    let is_zero = g.b.create_block();
+                    g.brif(c, nonzero, &[], is_zero, &[]);
+                    g.switch(is_zero);
+                    let zero = g.iconst(0);
+                    g.b.def_var(tot, zero);
+                    g.b.ins().jump(done, &[]);
+                    g.switch(nonzero);
+                    let max = g.iconst(u64::MAX as i64);
+                    let lim = g.b.ins().udiv(max, c);
+                    let ovf = g.cmp(IntCC::UnsignedGreaterThan, t, lim);
+                    let prod = g.b.ins().imul(t, c);
+                    let next = g.b.ins().select(ovf, max, prod);
+                    g.b.def_var(tot, next);
                     Ok(())
                 })?;
                 self.b.ins().jump(done, &[]);
                 self.switch(done);
                 let zero = self.iconst(0);
+                let rr = self.var(zero);
                 let t = self.b.use_var(tot);
-                self.for_range(zero, t, false, &mut |g, _| {
-                    // The loop runs `rest` as unsigned `tot` times; tot >= 0.
-                    let sc = g.scope();
-                    g.stmt(rest)?;
-                    g.end_scope(sc);
-                    Ok(())
-                })?;
+                let (head, blk, exit) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.b.ins().jump(head, &[]);
+                self.switch(head);
+                let iv = self.b.use_var(rr);
+                let c = self.cmp(IntCC::UnsignedLessThan, iv, t);
+                self.brif(c, blk, &[], exit, &[]);
+                self.switch(blk);
+                let sc = self.scope();
+                self.stmt(rest)?;
+                self.end_scope(sc);
+                let next = self.b.ins().iadd_imm(iv, 1);
+                self.b.def_var(rr, next);
+                self.b.ins().jump(head, &[]);
+                self.switch(exit);
             }
         }
         Ok(())

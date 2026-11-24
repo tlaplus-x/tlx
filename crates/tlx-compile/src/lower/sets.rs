@@ -1057,6 +1057,9 @@ impl Lowerer<'_> {
             LOp::Lambda(params, body, lenv) => (params.to_vec(), body.clone(), lenv.clone()),
             _ => return None,
         };
+        if matches!(&*body.kind, H::Num(_) | H::Str(_)) {
+            return None;
+        }
         let [p] = &params[..] else { return None };
         let env2 = base.bind(*p, LBind::Ir(arg));
         Some(self.expr(&body, &env2, st))

@@ -390,36 +390,44 @@ impl Lowerer<'_> {
     /// inlined (not recursive, not action-level: those are not expressions
     /// of a compiled function).
     fn sort_comparator(&self, cmp: &hir::Expr, env: &LEnv) -> Option<(Arc<[LocalId]>, hir::Expr, LEnv)> {
-        if let H::Lambda { params, body } = &*cmp.kind {
+        let (params, body, lenv) = if let H::Lambda { params, body } = &*cmp.kind {
             let [p0, p1] = params[..] else { return None };
-            return Some((vec![p0, p1].into(), body.clone(), env.clone()));
-        }
-        let H::OpArg(r) = &*cmp.kind else { return None };
-        let r = match r {
-            OpRef::Param(l) => match env.lookup(*l, &self.ip.prog)? {
-                LBind::Op(LOp::Lambda(ps, b, lenv)) => {
-                    let [_, _] = &ps[..] else { return None };
-                    return Some((ps, b, lenv));
-                }
-                LBind::Op(LOp::Ref(r)) => r,
-                // A call-by-name argument would be evaluated in the frame of
-                // the caller's function.
-                _ => return None,
-            },
-            r => *r,
+            (vec![p0, p1].into(), body.clone(), env.clone())
+        } else {
+            let H::OpArg(r) = &*cmp.kind else { return None };
+            let r = match r {
+                OpRef::Param(l) => match env.lookup(*l, &self.ip.prog)? {
+                    LBind::Op(LOp::Lambda(ps, b, lenv)) => {
+                        let [_, _] = &ps[..] else { return None };
+                        if matches!(&*b.kind, H::Num(_) | H::Str(_)) {
+                            return None;
+                        }
+                        return Some((ps, b, lenv));
+                    }
+                    LBind::Op(LOp::Ref(r)) => r,
+                    // A call-by-name argument would be evaluated in the frame of
+                    // the caller's function.
+                    _ => return None,
+                },
+                r => *r,
+            };
+            let OpRef::Def(d) = r else { return None };
+            if self.ip.is_action_level(d) || self.is_recursive_def(d) {
+                return None;
+            }
+            let d = self.ip.redirect_def(d);
+            let def = &self.ip.prog.defs[d.idx()];
+            if def.builtin.is_some() {
+                return None;
+            }
+            let DefKind::Op(body) = &def.kind else { return None };
+            let [p0, p1] = def.params[..] else { return None };
+            (vec![p0, p1].into(), body.clone(), self.def_env(d, env))
         };
-        let OpRef::Def(d) = r else { return None };
-        if self.ip.is_action_level(d) || self.is_recursive_def(d) {
+        if matches!(&*body.kind, H::Num(_) | H::Str(_)) {
             return None;
         }
-        let d = self.ip.redirect_def(d);
-        let def = &self.ip.prog.defs[d.idx()];
-        if def.builtin.is_some() {
-            return None;
-        }
-        let DefKind::Op(body) = &def.kind else { return None };
-        let [p0, p1] = def.params[..] else { return None };
-        Some((vec![p0, p1].into(), body.clone(), self.def_env(d, env)))
+        Some((params, body, lenv))
     }
 
     /// The comparator captures nothing: its free locals are its own

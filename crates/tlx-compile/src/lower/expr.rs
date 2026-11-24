@@ -411,10 +411,29 @@ impl Lowerer<'_> {
     fn quant_loops(&mut self, kind: QuantKind, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         // (temp, set, tuple binder check) per slot, in binding order.
         let mut slots = Vec::new();
+        let mut upfront = Vec::new();
         let mut env2 = env.clone();
-        for b in bounds {
+        let multi = bounds.len() > 1;
+        for (idx, b) in bounds.iter().enumerate() {
             let set = self.expr(&b.set, env, st);
             let (set, ety) = self.typed_iter_in(set, true);
+            // When multiple bounds are nested with the first variable varying
+            // fastest (last bound outermost), an empty outer bound would skip
+            // evaluating/validating earlier bounds unless they are hoisted and
+            // statically known to be valid enumerable sets. Fall back to the
+            // interpreter when any earlier bound is not statically a valid set
+            // (or when a constant bound is known invalid).
+            let set = if multi && idx + 1 < bounds.len() {
+                if !self.bound_is_valid_set(&set) {
+                    return None;
+                }
+                self.hoist_valid_bound(set, &mut upfront)
+            } else {
+                if matches!(&*set.kind, ExprKind::Const(_)) && !self.bound_is_valid_set(&set) {
+                    return None;
+                }
+                set
+            };
             match &b.vars {
                 BoundVars::Many(ls) => {
                     for l in ls {
@@ -432,14 +451,17 @@ impl Lowerer<'_> {
             }
         }
         let body = self.bool_expr(body, &env2, st);
-        Some(slots.into_iter().rev().fold(body, |body, (bind, set, check)| {
+        // First slot fastest = innermost loop, matching TLC's ContextEnumerator
+        // and `tlx_eval::Interp::for_each_binding`.
+        let looped = slots.into_iter().fold(body, |body, (bind, set, check)| {
             let body = binders::checked(check, body);
             let k = match kind {
                 QuantKind::Exists => ExprKind::Exists { bind, set, body },
                 QuantKind::Forall => ExprKind::Forall { bind, set, body },
             };
             Expr::new(Ty::Bool, k)
-        }))
+        });
+        Some(let_in(upfront.into_iter().rev(), looped))
     }
 
     /// `\A x \in C : \A y \in S(x) : P` (or `\E`) over a small constant `C`

@@ -96,7 +96,12 @@ impl CGen<'_> {
                 let mut inner = String::new();
                 writeln!(inner, "{pad}    {{ uint64_t cnt{id} = 0;").unwrap();
                 self.loop_body(*bind, body, |g| g.stmt(body, ind + 3, &mut inner))?;
-                writeln!(inner, "{pad}    tot{id} *= cnt{id}; if (!tot{id}) goto rep{id}_done; }}").unwrap();
+                writeln!(
+                    inner,
+                    "{pad}    if (!cnt{id}) {{ tot{id} = 0; goto rep{id}_done; }} \
+                     if (tot{id} > UINT64_MAX / cnt{id}) tot{id} = UINT64_MAX; else tot{id} *= cnt{id}; }}"
+                )
+                .unwrap();
                 let lp = self.foreach(*bind, set, &inner, ind + 1, h0, Some(false), None)?;
                 writeln!(out, "{pad}{{ uint64_t tot{id} = 1;").unwrap();
                 out.push_str(&lp);

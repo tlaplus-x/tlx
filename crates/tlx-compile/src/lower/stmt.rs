@@ -538,22 +538,109 @@ impl Lowerer<'_> {
     /// Bind the variables of `\E` bounds: returns the extended environment and
     /// a function wrapping a body into the corresponding loops (first
     /// variable varies fastest, like TLC's ContextEnumerator).
-    /// All the domains of `bounds` are constant and one is empty (there
-    /// is nothing to enumerate).
+    /// All the domains of `bounds` are constant valid finite sets and at least
+    /// one is empty (there is nothing to enumerate, and no domain raises an
+    /// error).
     pub(super) fn some_bound_empty(&self, bounds: &[hir::Bound], env: &LEnv) -> bool {
-        let sets: Option<Vec<Value>> = bounds.iter().map(|b| self.const_value(&b.set, env)).collect();
-        sets.is_some_and(|ss| ss.iter().any(|s| s.is_set() && tlx_value::ops::cardinality(s).ok() == Some(0)))
+        let Some(sets): Option<Vec<Value>> = bounds.iter().map(|b| self.const_value(&b.set, env)).collect() else {
+            return false;
+        };
+        let mut empty = false;
+        for s in &sets {
+            if !s.is_set() || tlx_value::ops::materialization_error(s).is_some() {
+                return false;
+            }
+            let Ok(card) = tlx_value::ops::cardinality(s) else {
+                return false;
+            };
+            if card == 0 {
+                empty = true;
+            }
+        }
+        empty
+    }
+
+    /// `set` is statically known to be a valid finite enumerable set (cannot
+    /// fail with a non-set / non-enumerable bound error when iterated).
+    pub(super) fn bound_is_valid_set(&self, set: &Expr) -> bool {
+        match &*set.kind {
+            ExprKind::Const(v) => {
+                v.is_set() && tlx_value::ops::materialization_error(v).is_none() && tlx_value::ops::cardinality(v).is_ok()
+            }
+            ExprKind::IntRange(_, _)
+            | ExprKind::ConstElems { .. }
+            | ExprKind::Subsets(_)
+            | ExprKind::OrderedSet { .. }
+            | ExprKind::RefElems(_) => true,
+            _ => matches!(self.shape_of(set.ty), Some(Shape::Set { .. })),
+        }
+    }
+
+    /// Hoist the value sub-expressions of a statically-valid bound `set` into
+    /// `upfront` so they are evaluated before an outer loop (which may be
+    /// empty), without ever binding an iteration-source-only IR node as a
+    /// first-class `Let` value.
+    pub(super) fn hoist_valid_bound(&mut self, set: Expr, upfront: &mut Vec<(Temp, Expr)>) -> Expr {
+        match &*set.kind {
+            ExprKind::ConstElems { .. } => set,
+            ExprKind::IntRange(lo, hi) => {
+                let (lo, b1) = self.share(lo.clone());
+                let (hi, b2) = self.share(hi.clone());
+                upfront.extend(b1);
+                upfront.extend(b2);
+                Expr::new(Ty::Val, ExprKind::IntRange(lo, hi))
+            }
+            ExprKind::Subsets(x) => {
+                let (x, b) = self.share(x.clone());
+                upfront.extend(b);
+                Expr::new(set.ty, ExprKind::Subsets(x))
+            }
+            ExprKind::OrderedSet { set: inner, plan } => {
+                let (inner, b) = self.share(inner.clone());
+                upfront.extend(b);
+                Expr::new(set.ty, ExprKind::OrderedSet { set: inner, plan: plan.clone() })
+            }
+            ExprKind::RefElems(x) => {
+                let (x, b) = self.share(x.clone());
+                upfront.extend(b);
+                Expr::new(set.ty, ExprKind::RefElems(x))
+            }
+            _ => {
+                let (s, b) = self.share(set);
+                upfront.extend(b);
+                s
+            }
+        }
     }
 
     fn bind_bounds(&mut self, bounds: &[hir::Bound], env: &LEnv, st: &St) -> LResult<(LEnv, Box<dyn FnOnce(Stmt) -> Stmt>)> {
         // (temp, set, tuple binder check) per enumerated slot, in binding order.
         let mut slots: Vec<(Temp, Expr, Option<Expr>)> = Vec::new();
+        let mut upfront: Vec<(Temp, Expr)> = Vec::new();
         let mut env2 = env.clone();
         let sets: Vec<Expr> = bounds.iter().map(|b| self.expr(&b.set, env, st)).collect();
-        for (b, set) in bounds.iter().zip(sets) {
+        let multi = bounds.len() > 1;
+        for (idx, (b, set)) in bounds.iter().zip(sets).enumerate() {
+            let need_upfront = multi && idx + 1 < bounds.len();
+            let mut hoist = |this: &mut Self, set: Expr| -> Expr {
+                if !need_upfront {
+                    return set;
+                }
+                if this.bound_is_valid_set(&set) {
+                    return this.hoist_valid_bound(set, &mut upfront);
+                }
+                let (s, bnd) = this.share(set);
+                upfront.extend(bnd);
+                let dummy = this.temp(Ty::Val);
+                let chk = this.temp(Ty::Bool);
+                let probe = Expr::new(Ty::Bool, ExprKind::Exists { bind: dummy, set: s.clone(), body: bool_lit(true) });
+                upfront.push((chk, probe));
+                s
+            };
             match &b.vars {
                 BoundVars::Many(ls) => {
                     let (set, ety) = self.typed_iter(set);
+                    let set = hoist(self, set);
                     for l in ls {
                         let t = self.iter_temp(ety, &set);
                         env2 = env2.bind(*l, LBind::Ir(temp_ref(ety, t)));
@@ -564,6 +651,7 @@ impl Lowerer<'_> {
                     let (tset, ety) = self.typed_iter(set.clone());
                     let t = self.temp(ety);
                     if let Some((e3, check)) = self.bind_elem(&b.vars, &temp_ref(ety, t), &env2) {
+                        let tset = hoist(self, tset);
                         env2 = e3;
                         slots.push((t, tset, check));
                         continue;
@@ -571,7 +659,7 @@ impl Lowerer<'_> {
                     // Boxed elements: components by application (the
                     // interpreter checks that the element is a tuple of
                     // the binder's length).
-                    let set = to_val(set);
+                    let set = hoist(self, to_val(set));
                     let t = self.temp(Ty::Val);
                     for (i, l) in ls.iter().enumerate() {
                         env2 = env2.bind(*l, LBind::Ir(tuple_component(temp_ref(Ty::Val, t), i)));
@@ -581,14 +669,16 @@ impl Lowerer<'_> {
                 }
             }
         }
-        // First slot fastest = innermost loop.
+        // First slot fastest = innermost loop; upfront domain checks run
+        // outside all loops in binding order.
         let wrap = move |inner: Stmt| {
-            slots.into_iter().fold(inner, |s, (t, set, check)| Stmt::ForEach {
+            let looped = slots.into_iter().fold(inner, |s, (t, set, check)| Stmt::ForEach {
                 bind: t,
                 set,
                 sorted: false,
                 body: Box::new(binders::checked_stmt(check, s)),
-            })
+            });
+            upfront.into_iter().rev().fold(looped, |body, (temp, value)| Stmt::Let { temp, value, body: Box::new(body) })
         };
         Ok((env2, Box::new(wrap)))
     }

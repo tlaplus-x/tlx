@@ -147,6 +147,9 @@ impl Lowerer<'_> {
     pub(super) fn typed_fold_function(&mut self, args: &[hir::Expr], env: &LEnv, st: &St) -> Option<Expr> {
         let [op, base, fun] = args else { return None };
         let op = self.op_arg(op, env).ok()?;
+        if self.is_literal_op(&op, env) {
+            return None;
+        }
         let f = self.expr(fun, env, st);
         let f = self.encode_const_fn(f);
         let shape = self.shape_of(f.ty)?.clone();
@@ -235,6 +238,17 @@ impl Lowerer<'_> {
             acc = let_in(bind, next);
         }
         Some(binds(acc))
+    }
+
+    /// `op` is a lambda or user operator whose body is a bare numeric or
+    /// string literal, which TLC's native overrides reject upfront
+    /// (`Interp::native_op_val`).
+    fn is_literal_op(&self, op: &LOp, env: &LEnv) -> bool {
+        match op {
+            LOp::Lambda(_, body, _) => matches!(&*body.kind, H::Num(_) | H::Str(_)),
+            LOp::Ref(OpRef::Def(d)) => self.def_target(*d, env).is_some_and(|(_, body, _, _)| matches!(&*body.kind, H::Num(_) | H::Str(_))),
+            _ => false,
+        }
     }
 
     /// `LAMBDA s : CHOOSE x \in s : TRUE` (or an operator defined so).
