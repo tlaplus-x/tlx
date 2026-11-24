@@ -31,5 +31,3 @@ project sem s = project sem t ↔ ∃ p : GroupPerm groupSizes, rename p s.1 = t
 #print axioms specification_correct
 #print axioms counterexample_lifts
 #print axioms deadlock_preserved
-end
-end TlxOptimization.GeneratedErasedSymmetry

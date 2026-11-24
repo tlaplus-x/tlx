@@ -1,7 +1,7 @@
 //! Consolidated integration test binary for `tlx-cli`.
 //!
-//! `Cargo.toml` sets `autotests = false` so the 49 CLI test modules compile and
-//! link into one binary instead of 49 separate executables. `optimization.rs`
+//! `Cargo.toml` sets `autotests = false` so the 50 CLI test modules compile and
+//! link into one binary instead of 50 separate executables. `optimization.rs`
 //! remains its own `[[test]]` target so `cargo test -p tlx-cli --test
 //! optimization` keeps working.
 
@@ -22,6 +22,7 @@ mod choose_soundness;
 mod classpath;
 mod compile_point_bugs;
 mod config;
+mod constrained_reductions;
 mod coverage;
 mod diagnostics;
 mod dump_trace;
@@ -76,6 +77,7 @@ fn all_test_files_registered() {
         "classpath",
         "compile_point_bugs",
         "config",
+        "constrained_reductions",
         "coverage",
         "diagnostics",
         "dump_trace",

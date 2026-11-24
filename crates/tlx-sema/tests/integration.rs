@@ -4,6 +4,7 @@ mod age_projection;
 mod call_semantics;
 mod cfg_overrides;
 mod choose_symmetry;
+mod constrained_certificates;
 mod equiv_symmetry;
 mod erased_symmetry;
 mod keyed_symmetry;
@@ -25,6 +26,7 @@ fn all_test_files_registered() {
         "call_semantics",
         "cfg_overrides",
         "choose_symmetry",
+        "constrained_certificates",
         "equiv_symmetry",
         "erased_symmetry",
         "integration",

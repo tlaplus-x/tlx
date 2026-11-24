@@ -123,8 +123,11 @@ Application happens once, after the model is built and before the search, and on
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
 unchanged except for that line. A group is not applied when the specification has a declared
 `SYMMETRY`, a user `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis —
-each reason is reported under `-stats`. Connected certificate coverage further excludes constraints,
-action/initial properties, aliases and unsupported key operations. Certified unobserved-variable
+each reason is reported under `-stats`. Connected certificate coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init
+`PROPERTY`, `[][A]_sub` action `PROPERTY` conjuncts, and pure zero-arity `CONSTANT C <- Def`
+substitutions (emitting `ConstrainedCertificate` theorems when any constrained check is active),
+while excluding temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, operator or
+builtin overrides, and unsupported key operations. Certified unobserved-variable
 erasure can compose with certified automatic keyed symmetry (including disjoint products of full
 keyed groups) through `ErasedKeyedCertificate`
 ([optimization.md](optimization.md#composing-projection-with-symmetry)); other projections stay
@@ -144,9 +147,10 @@ claiming either. `-checksymmetry -suggest` runs the same bounded check on every 
 
 The connected symmetry certificates (`KeyedCertificate`, `EquivSymCertificate`,
 `ChooseSymCertificate`, and erasure-composed `ErasedKeyedCertificate`) preserve **V-safe** and
-**CEX** within their supported observation set: state invariants and deadlocks. Initialization and
-successors correspond from every orbit representative, and every reduced violation lifts to a
-concrete witness. Counts and depths describe the quotient. Temporal properties exclude automatic
+**CEX** across state invariants, implied-init properties, `[][A]_sub` action properties, state and
+action constraints, and admitted-state deadlocks. Initialization, transitions, admitted steps, and
+action observations correspond from every orbit representative, and every reduced violation lifts to
+a concrete witness. Counts and depths describe the quotient. Temporal properties exclude automatic
 application.
 
 What `"generated-lean"` proves is **per-instance quotient equivalence** (`Certificate before after

@@ -89,6 +89,37 @@ theorem deadlock_preserved (s : m.Source) :
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
 
+def constrainedConcrete : ConstrainedSystem m.Source where
+  toSystem := m.concrete
+  initSafe s := m.erased.constrainedConcrete.initSafe s.1
+  constraint s := m.erased.constrainedConcrete.constraint s.1
+  actionConstraint s t := m.erased.constrainedConcrete.actionConstraint s.1 t.1
+  actionSafe s t := m.erased.constrainedConcrete.actionSafe s.1 t.1
+
+theorem erasure_constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.erased.constrainedConcrete m.erase := by
+  refine ⟨m.erasure_certificate.initial, m.erasure_certificate.next, m.erasure_certificate.observe,
+    fun _ => Iff.rfl, fun _ => Iff.rfl, ?_, ?_⟩
+  · intro s a
+    constructor
+    · rintro ⟨⟨b, w, keys, guard, next⟩, hc, hac⟩
+      exact ⟨(a, m.hiddenUpdate b s.1 w keys s.2), ⟨b, w, keys, guard, next, rfl⟩, hc, hac, rfl⟩
+    · rintro ⟨t, ⟨b, w, keys, guard, next, _hidden⟩, hc, hac, rfl⟩
+      exact ⟨⟨b, w, keys, guard, next⟩, hc, hac⟩
+  · intro s a
+    constructor
+    · intro h ⟨b, w, keys, guard, next⟩
+      exact h (a, m.hiddenUpdate b s.1 w keys s.2) ⟨b, w, keys, guard, next, rfl⟩ rfl
+    · intro h t ⟨b, w, keys, guard, next, _hidden⟩ rfl
+      exact h ⟨b, w, keys, guard, next⟩
+
+noncomputable def constrainedReduced := m.erased.constrainedReduced
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  composeConstrained (p := m.erase) (q := KeyedRule.project)
+    m.erasure_constrained_certificate m.erased.constrained_certificate
+
 end Model
 end
 end TlxOptimization.ErasedKeyedRule

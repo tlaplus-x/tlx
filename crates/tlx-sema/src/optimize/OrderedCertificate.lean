@@ -88,6 +88,8 @@ structure Model (C W : Type) where
   delta : W → Nat
   guard : C → C → W → Test
   observe : C → Test
+  initObserve : C → Test := fun _ => .pure True
+  constraint : C → Test := fun _ => .pure True
 
 namespace Model
 variable {C W : Type} (m : Model C W)
@@ -172,5 +174,26 @@ theorem deadlock_preserved (s : State C m.seed) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (State C m.seed) where
+  toSystem := m.concrete
+  initSafe s := (m.initObserve s.2).concrete m.seed s.1.val
+  constraint s := (m.constraint s.2).concrete m.seed s.1.val
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (Bool × C) where
+  toSystem := m.reduced
+  initSafe s := (m.initObserve s.2).reduced s.1
+  constraint s := (m.constraint s.2).reduced s.1
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun _ => Test.commutes _ _ _)
+    (fun _ => Test.commutes _ _ _)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end TlxOptimization.OrderedRule

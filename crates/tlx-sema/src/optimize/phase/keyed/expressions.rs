@@ -176,7 +176,7 @@ impl Emitter<'_> {
 
     fn special_eq(&mut self, a: &Expr, b: &Expr, keys: &[(LocalId, GroupMask)]) -> Option<String> {
         // 1. Key / Slot / Fixed equality (`p = q`, `owner = p`, `owner = "none"`, `sent = rcvd`).
-        if let (Some(ka), Some(kb)) = (self.key_or_fixed_ref(a, keys), self.key_or_fixed_ref(b, keys)) {
+        if let (Some((ka, _)), Some((kb, _))) = (self.key_or_fixed_ref(a, keys), self.key_or_fixed_ref(b, keys)) {
             if !matches!((ka, kb), (KeyRef::Fixed(_), KeyRef::Fixed(_))) {
                 return Some(format!("(Test.equal {} {})", ka.lean(), kb.lean()));
             }
@@ -503,15 +503,15 @@ impl Emitter<'_> {
         }
     }
 
-    fn key_or_fixed_ref(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)]) -> Option<KeyRef> {
-        if let Some((kref, _, _)) = self.key_ref(e, keys) {
-            return Some(kref);
+    fn key_or_fixed_ref(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)]) -> Option<(KeyRef, GroupMask)> {
+        if let Some((kref, mask, _)) = self.key_ref(e, keys) {
+            return Some((kref, mask));
         }
         if let Some(atom) = self.domains.atom_value(e) {
             if !self.all_keys.contains(&atom) {
                 let id = self.fixed_atoms.len();
                 self.fixed_atoms.push(format!("{atom:?}"));
-                return Some(KeyRef::Fixed(id));
+                return Some((KeyRef::Fixed(id), 0));
             }
         }
         None
@@ -784,6 +784,362 @@ impl Emitter<'_> {
         let mut found = false;
         visit::children(e, &mut |c| found |= self.mentions_keys(c, keys));
         found
+    }
+
+    pub(super) fn action_tests(&mut self, es: &[Expr], keys: &[(LocalId, GroupMask)]) -> Option<String> {
+        let mut out = "(ActionTest.truth true)".to_owned();
+        for e in es {
+            out = bounded(format!("(ActionTest.conj {out} {})", self.action_test(e, keys, false)?))?;
+        }
+        Some(out)
+    }
+
+    fn action_test(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<String> {
+        let result = self.action_test_inner(e, keys, in_prime)?;
+        bounded(result)
+    }
+
+    fn action_test_inner(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<String> {
+        match &*e.kind {
+            ExprKind::Bool(b) => return Some(format!("(ActionTest.truth {b})")),
+            ExprKind::And(es) => {
+                let mut out = "(ActionTest.truth true)".to_owned();
+                for x in es {
+                    out = bounded(format!("(ActionTest.conj {out} {})", self.action_test(x, keys, in_prime)?))?;
+                }
+                return Some(out);
+            }
+            ExprKind::Or(es) if !es.is_empty() => {
+                let mut terms = es.iter().map(|x| self.action_test(x, keys, in_prime));
+                let mut out = terms.next()??;
+                for t in terms {
+                    out = bounded(format!("(ActionTest.disj {out} {})", t?))?;
+                }
+                return Some(out);
+            }
+            ExprKind::BoxAction { action, sub } if !in_prime => {
+                let fa = self.action_test(action, keys, false)?;
+                let fu = self.action_unchanged(sub, keys)?;
+                return Some(format!("(ActionTest.disj {fa} {fu})"));
+            }
+            ExprKind::AngleAction { action, sub } if !in_prime => {
+                let fa = self.action_test(action, keys, false)?;
+                let fu = self.action_unchanged(sub, keys)?;
+                return Some(format!("(ActionTest.conj {fa} (ActionTest.neg {fu}))"));
+            }
+            ExprKind::Builtin { op, args } => match (op, args.as_slice()) {
+                (B::Prime, [a]) if !in_prime => return self.action_test(a, keys, true),
+                (B::Unchanged, [a]) if !in_prime => return self.action_unchanged(a, keys),
+                (B::Not, [a]) => return Some(format!("(ActionTest.neg {})", self.action_test(a, keys, in_prime)?)),
+                (B::Implies, [a, b]) => {
+                    return Some(format!(
+                        "(ActionTest.disj (ActionTest.neg {}) {})",
+                        self.action_test(a, keys, in_prime)?,
+                        self.action_test(b, keys, in_prime)?
+                    ));
+                }
+                (B::Equiv, [a, b]) => {
+                    let ta = self.action_test(a, keys, in_prime)?;
+                    let tb = self.action_test(b, keys, in_prime)?;
+                    return Some(format!(
+                        "(ActionTest.disj (ActionTest.conj {ta} {tb}) (ActionTest.conj (ActionTest.neg {ta}) (ActionTest.neg {tb})))"
+                    ));
+                }
+                (B::Eq | B::Neq, [a, b]) => {
+                    if let Some(eq) = self.action_special_eq(a, b, keys, in_prime) {
+                        return Some(if *op == B::Eq { eq } else { format!("(ActionTest.neg {eq})") });
+                    }
+                }
+                (B::In | B::NotIn, [elem, set]) => {
+                    if let Some(mem) = self.action_special_mem(elem, set, keys, in_prime) {
+                        return Some(if *op == B::In { mem } else { format!("(ActionTest.neg {mem})") });
+                    }
+                }
+                _ => {}
+            },
+            ExprKind::Quant { kind, bounds, body } => {
+                if let Some(q) = self.action_quant_test(*kind, bounds, body, keys, in_prime) {
+                    return Some(q);
+                }
+            }
+            ExprKind::If { cond, then, els } => {
+                let c = self.action_test(cond, keys, in_prime)?;
+                return Some(format!(
+                    "(ActionTest.disj (ActionTest.conj {c} {}) (ActionTest.conj (ActionTest.neg {c}) {}))",
+                    self.action_test(then, keys, in_prime)?,
+                    self.action_test(els, keys, in_prime)?
+                ));
+            }
+            _ => {}
+        }
+        self.action_leaf(e, keys, in_prime)
+    }
+
+    fn action_unchanged(&mut self, sub: &Expr, keys: &[(LocalId, GroupMask)]) -> Option<String> {
+        match &*sub.kind {
+            ExprKind::Tuple(es) => {
+                let mut out = "(ActionTest.truth true)".to_owned();
+                for x in es {
+                    out = bounded(format!("(ActionTest.conj {out} {})", self.action_unchanged(x, keys)?))?;
+                }
+                Some(out)
+            }
+            ExprKind::Var(v) => {
+                if self.omitted.contains(v) {
+                    return None;
+                }
+                match self.shapes[v.idx()].clone() {
+                    VarShape::Core => {
+                        let id = self.atoms.len();
+                        self.atoms.push(format!("ActionTest UNCHANGED core var {v:?}"));
+                        Some(format!("(ActionTest.leaf {id} [] [] [])"))
+                    }
+                    VarShape::ScalarSlot { slot_id, .. } => Some(format!(
+                        "(ActionTest.equal (KeyRef2.slot true ⟨{slot_id}, by decide⟩) (KeyRef2.slot false ⟨{slot_id}, by decide⟩))"
+                    )),
+                    VarShape::FixedMap { mask, map_id } | VarShape::KeySet { mask, has_fixed: false, map_id } => {
+                        let id = self.atoms.len();
+                        self.atoms.push(format!("ActionTest UNCHANGED map {map_id} var {v:?}"));
+                        let m = self.mask_lean(mask);
+                        Some(format!(
+                            "(ActionTest.all {m} (ActionTest.leaf {id} [(true, ⟨{map_id}, by decide⟩, 0), (false, ⟨{map_id}, by decide⟩, 0)] [] []))"
+                        ))
+                    }
+                    VarShape::MixedMap { mask, map_id, .. } | VarShape::KeySet { mask, has_fixed: true, map_id } => {
+                        let id_k = self.atoms.len();
+                        self.atoms.push(format!("ActionTest UNCHANGED keyed part map {map_id} var {v:?}"));
+                        let id_f = self.atoms.len();
+                        self.atoms.push(format!("ActionTest UNCHANGED fixed part var {v:?}"));
+                        let m = self.mask_lean(mask);
+                        Some(format!(
+                            "(ActionTest.conj (ActionTest.all {m} (ActionTest.leaf {id_k} [(true, ⟨{map_id}, by decide⟩, 0), (false, ⟨{map_id}, by decide⟩, 0)] [] [])) (ActionTest.leaf {id_f} [] [] []))"
+                        ))
+                    }
+                    VarShape::RecordSet { keyed, has_free } => {
+                        let mut parts = Vec::new();
+                        for r in &keyed {
+                            let id = self.atoms.len();
+                            self.atoms.push(format!("ActionTest UNCHANGED record-set map {} var {v:?}", r.map_id));
+                            let m = self.mask_lean(r.mask);
+                            parts.push(format!(
+                                "(ActionTest.all {m} (ActionTest.leaf {id} [(true, ⟨{}, by decide⟩, 0), (false, ⟨{}, by decide⟩, 0)] [] []))",
+                                r.map_id, r.map_id
+                            ));
+                        }
+                        if has_free {
+                            let id = self.atoms.len();
+                            self.atoms.push(format!("ActionTest UNCHANGED free records var {v:?}"));
+                            parts.push(format!("(ActionTest.leaf {id} [] [] [])"));
+                        }
+                        let mut out = "(ActionTest.truth true)".to_owned();
+                        for p in parts {
+                            out = format!("(ActionTest.conj {out} {p})");
+                        }
+                        Some(out)
+                    }
+                    VarShape::FixedRecord { fields } => {
+                        let mut out = "(ActionTest.truth true)".to_owned();
+                        for (fname, fshape) in &fields {
+                            let part = match fshape {
+                                FieldShape::Core => {
+                                    let id = self.atoms.len();
+                                    self.atoms.push(format!("ActionTest UNCHANGED core field {v:?}.{fname}"));
+                                    format!("(ActionTest.leaf {id} [] [] [])")
+                                }
+                                FieldShape::ScalarSlot { slot_id, .. } => format!(
+                                    "(ActionTest.equal (KeyRef2.slot true ⟨{slot_id}, by decide⟩) (KeyRef2.slot false ⟨{slot_id}, by decide⟩))"
+                                ),
+                                FieldShape::FixedMap { mask, map_id } => {
+                                    let id = self.atoms.len();
+                                    self.atoms.push(format!("ActionTest UNCHANGED map field {v:?}.{fname} map {map_id}"));
+                                    let m = self.mask_lean(*mask);
+                                    format!(
+                                        "(ActionTest.all {m} (ActionTest.leaf {id} [(true, ⟨{map_id}, by decide⟩, 0), (false, ⟨{map_id}, by decide⟩, 0)] [] []))"
+                                    )
+                                }
+                            };
+                            out = format!("(ActionTest.conj {out} {part})");
+                        }
+                        Some(out)
+                    }
+                }
+            }
+            _ => {
+                // General subscript expression `sub`: compare `sub' = sub`.
+                let primed_sub = Expr::new(ExprKind::Builtin { op: B::Prime, args: vec![sub.clone()] }, sub.span);
+                let eq = Expr::new(ExprKind::Builtin { op: B::Eq, args: vec![primed_sub, sub.clone()] }, sub.span);
+                self.action_test(&eq, keys, false)
+            }
+        }
+    }
+
+    fn action_key_ref(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<(super::ActionKeyRef, GroupMask)> {
+        let (inner, primed) = match &*e.kind {
+            ExprKind::Builtin { op: B::Prime, args } => {
+                if in_prime || args.len() != 1 {
+                    return None;
+                }
+                (&args[0], true)
+            }
+            _ => (e, in_prime),
+        };
+        let (kref, mask) = self.key_or_fixed_ref(inner, keys)?;
+        Some((super::ActionKeyRef::from_state(kref, primed), mask))
+    }
+
+    fn action_special_eq(&mut self, a: &Expr, b: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<String> {
+        if let (Some((ra, ma)), Some((rb, mb))) = (self.action_key_ref(a, keys, in_prime), self.action_key_ref(b, keys, in_prime)) {
+            if (ma | mb) != 0 {
+                return Some(format!("(ActionTest.equal {} {})", ra.lean(), rb.lean()));
+            }
+        }
+        None
+    }
+
+    fn action_special_mem(&mut self, elem: &Expr, set: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<String> {
+        let (kref, _) = self.action_key_ref(elem, keys, in_prime)?;
+        if let Some(exact) = self.domains.exact_set(set) {
+            if let Some((mask, fixed)) = group_mask_exact(self.groups, &exact) {
+                if mask != 0 && fixed.is_empty() {
+                    return Some(format!("(ActionTest.inGroup {} {})", kref.lean(), self.mask_lean(mask)));
+                }
+            }
+        }
+        None
+    }
+
+    fn action_quant_test(
+        &mut self,
+        kind: QuantKind,
+        bounds: &[Bound],
+        body: &Expr,
+        keys: &[(LocalId, GroupMask)],
+        in_prime: bool,
+    ) -> Option<String> {
+        if bounds.is_empty() {
+            return self.action_test(body, keys, in_prime);
+        }
+        let bnd = &bounds[0];
+        let BoundVars::Many(ids) = &bnd.vars else { return None };
+        let rest_bounds = &bounds[1..];
+        let quant = match kind {
+            QuantKind::Forall => "all",
+            QuantKind::Exists => "some",
+        };
+        if let Some(exact) = self.domains.exact_set(&bnd.set) {
+            if let Some((mask, fixed)) = group_mask_exact(self.groups, &exact) {
+                if mask != 0 && fixed.is_empty() {
+                    let mut scope = keys.to_vec();
+                    for &id in ids {
+                        scope.insert(0, (id, mask));
+                    }
+                    let mut out = if rest_bounds.is_empty() {
+                        self.action_test(body, &scope, in_prime)?
+                    } else {
+                        self.action_quant_test(kind, rest_bounds, body, &scope, in_prime)?
+                    };
+                    let m = self.mask_lean(mask);
+                    for _ in ids {
+                        out = format!("(ActionTest.{quant} {m} {out})");
+                    }
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+
+    fn action_leaf(&mut self, e: &Expr, keys: &[(LocalId, GroupMask)], in_prime: bool) -> Option<String> {
+        let mut next = max_local(e).checked_add(1)?;
+        let mut map_reads = Vec::new();
+        let mut slot_map_reads = Vec::new();
+        let mut holes = Vec::new();
+        let masked = self.action_mask(e, keys, in_prime, &mut next, &mut map_reads, &mut slot_map_reads, &mut holes)?;
+        let id = self.atoms.len();
+        self.atoms.push(format!("ActionTest HIR: {masked:#?}\nPayload holes: {holes:?}"));
+        Some(format!("(ActionTest.leaf {id} [{}] [{}] [])", map_reads.join(", "), slot_map_reads.join(", ")))
+    }
+
+    #[allow(clippy::too_many_arguments)] // recursive two-state HIR masker threading fresh hole counter and map/slot read accumulators
+    fn action_mask(
+        &mut self,
+        e: &Expr,
+        keys: &[(LocalId, GroupMask)],
+        in_prime: bool,
+        next: &mut u32,
+        map_reads: &mut Vec<String>,
+        slot_map_reads: &mut Vec<String>,
+        holes: &mut Vec<LocalId>,
+    ) -> Option<Expr> {
+        if let ExprKind::Builtin { op: B::Prime, args } = &*e.kind {
+            if !in_prime && args.len() == 1 {
+                let inner = self.action_mask(&args[0], keys, true, next, map_reads, slot_map_reads, holes)?;
+                return Some(Expr::new(ExprKind::Builtin { op: B::Prime, args: vec![inner] }, e.span));
+            }
+            return None;
+        }
+        if let ExprKind::Field { record, field } = &*e.kind {
+            if let Some(v) = variable(record, false) {
+                if let VarShape::FixedRecord { fields } = &self.shapes[v.idx()] {
+                    if matches!(fields.get(field), Some(FieldShape::Core)) {
+                        return Some(e.clone());
+                    }
+                }
+            }
+        }
+        if let ExprKind::FnApp { func, args } = &*e.kind {
+            let (func_inner, func_prime) = match &*func.kind {
+                ExprKind::Builtin { op: B::Prime, args: pa } if !in_prime && pa.len() == 1 => (&pa[0], true),
+                _ => (func, in_prime),
+            };
+            if let Some((mask, map_id)) = self.fixed_map_target(func_inner) {
+                let [arg] = args.as_slice() else { return None };
+                let (kref, kmask) = self.action_key_ref(arg, keys, in_prime)?;
+                if (kmask & !mask) != 0 {
+                    return None;
+                }
+                let hole = LocalId(*next);
+                *next = next.checked_add(1)?;
+                match kref {
+                    super::ActionKeyRef::Bound(idx) => {
+                        map_reads.push(format!("({func_prime}, ⟨{map_id}, by decide⟩, {idx})"));
+                    }
+                    super::ActionKeyRef::Slot { primed, slot_id } => {
+                        slot_map_reads.push(format!("({func_prime}, ⟨{map_id}, by decide⟩, {primed}, ⟨{slot_id}, by decide⟩)"));
+                    }
+                    super::ActionKeyRef::Fixed(_) => return None,
+                }
+                holes.push(hole);
+                return Some(Expr::new(ExprKind::Local(hole), e.span));
+            }
+        }
+        match &*e.kind {
+            ExprKind::Var(v) if self.is_non_core(*v) || self.omitted.contains(v) => return None,
+            ExprKind::Local(id) if keys.iter().any(|(k, _)| k == id) => return None,
+            ExprKind::Const(_) if !independent(&self.domains.value(e, &Locals::new()), self.all_keys) => return None,
+            ExprKind::BoxAction { .. } | ExprKind::AngleAction { .. } => return None,
+            ExprKind::Builtin { op: B::Unchanged, .. } => return None,
+            ExprKind::Quant { .. }
+            | ExprKind::Choose { .. }
+            | ExprKind::FnConstruct { .. }
+            | ExprKind::SetFilter { .. }
+            | ExprKind::SetMap { .. }
+                if self.mentions_non_core(e) || self.mentions_keys(e, keys) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        let mut masked = e.clone();
+        let mut valid = true;
+        visit::children_mut(&mut masked, &mut |child| {
+            if let Some(c) = self.action_mask(child, keys, in_prime, next, map_reads, slot_map_reads, holes) {
+                *child = c;
+            } else {
+                valid = false;
+            }
+        });
+        valid.then_some(masked)
     }
 }
 

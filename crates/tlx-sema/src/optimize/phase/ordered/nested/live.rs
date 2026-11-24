@@ -73,7 +73,17 @@ impl Emitter<'_, '_> {
         out.push_str("abbrev Reads (V : Type) := Reference (Slot historyFamily) (Anchor historyFamily) → Option V\nstructure Semantics (C W V : Type) where\n  fallback : V\n  initial : Nat → C → W → Prop\n  test : Nat → C → C → W → Reads V → Prop\n  observe : Nat → C → Reads V → Prop\n  seedPayload : Nat → C → W → V\n  payload : Nat → C → C → W → Reads V → V\nvariable {C W V : Type} (sem : Semantics C W V)\n");
     }
 
-    pub(super) fn live_model(&self, out: &mut String, seeds: &[super::Seed], cases: &[super::Case], observation: &str) {
+    #[allow(clippy::too_many_arguments)] // combines live-version seed/step payloads and state-level check strings in one emitter pass
+    pub(super) fn live_model(
+        &self,
+        mut out: String,
+        seeds: &[super::Seed],
+        cases: &[super::Case],
+        observation: &str,
+        init_obs: &str,
+        constraint: &str,
+        constrained: bool,
+    ) -> super::super::super::OpenCert {
         let h = self.plan.history.as_ref().unwrap();
         out.push_str("def tick {W : Type} (choice : BranchId × W) : Bool :=\n  match choice.1.val with\n");
         for (b, c) in cases.iter().enumerate() {
@@ -96,9 +106,15 @@ impl Emitter<'_, '_> {
         }
         out.push_str("  | _ => sem.fallback\n");
         writeln!(out,"def observe {{C W V : Type}} (sem : Semantics C W V) (c : C) (reads : Reads V) : FamilyTest Family Slot Anchor := {observation}").unwrap();
+        if constrained {
+            writeln!(out, "def initObserve {{C W V : Type}} (sem : Semantics C W V) (c : C) (reads : Reads V) : FamilyTest Family Slot Anchor := {init_obs}").unwrap();
+            writeln!(out, "def constraint {{C W V : Type}} (sem : Semantics C W V) (c : C) (reads : Reads V) : FamilyTest Family Slot Anchor := {constraint}").unwrap();
+        }
         out.push_str("def model : LiveRule.Model C Family (BranchId × W) V Slot Anchor where\n  layout := layout\n  family := historyFamily\n  initial := initial sem\n  seedValues := seedValues\n  seedPayload := seedPayload sem\n  tick := tick\n  delta := delta\n  historyDelta := historyDelta\n  transfers := transfers sem\n  guard := guard sem\n  payload := payload sem\n  observe := observe sem\n");
-        out.push_str(
-            include_str!("certificate.lean").replace("rankKey", "runtimeKey").replace("GeneratedNested", "GeneratedLive").as_str(),
-        );
+        if constrained {
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        }
+        let tail = include_str!("certificate.lean").replace("rankKey", "runtimeKey");
+        super::super::super::OpenCert::new(out, &tail, "GeneratedLive", constrained, false, false)
     }
 }

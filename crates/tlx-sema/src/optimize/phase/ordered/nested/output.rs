@@ -4,7 +4,15 @@ use crate::optimize::lean::literal;
 use std::fmt::Write;
 
 impl Emitter<'_, '_> {
-    pub(super) fn output(&self, seeds: &[Seed], cases: &[Case], observation: &str) -> String {
+    pub(super) fn output(
+        &self,
+        seeds: &[Seed],
+        cases: &[Case],
+        observation: &str,
+        init_obs: &str,
+        constraint: &str,
+        constrained: bool,
+    ) -> super::super::super::OpenCert {
         let mut out = String::from(include_str!("../../../NestedRank.lean"));
         out.push_str(include_str!("../../../NestedCertificate.lean"));
         let namespace = if self.plan.history.is_some() {
@@ -47,13 +55,20 @@ impl Emitter<'_, '_> {
         self.seeds(&mut out, seeds);
         self.cases(&mut out, cases);
         if self.plan.history.is_some() {
-            self.live_model(&mut out, seeds, cases, observation);
-            return out;
+            return self.live_model(out, seeds, cases, observation, init_obs, constraint, constrained);
         }
         writeln!(out, "def observe {{C W : Type}} (sem : Semantics C W) (c : C) : FamilyTest Family Slot Anchor := {observation}").unwrap();
+        if constrained {
+            writeln!(out, "def initObserve {{C W : Type}} (sem : Semantics C W) (c : C) : FamilyTest Family Slot Anchor := {init_obs}")
+                .unwrap();
+            writeln!(out, "def constraint {{C W : Type}} (sem : Semantics C W) (c : C) : FamilyTest Family Slot Anchor := {constraint}")
+                .unwrap();
+        }
         out.push_str("def model : NestedRule.Model C Family (BranchId × W) Slot Anchor where\n  layout := layout\n  initial := initial sem\n  seedValues := seedValues\n  delta := delta\n  transfers := transfers sem\n  guard := guard sem\n  observe := observe sem\n");
-        out.push_str(include_str!("certificate.lean"));
-        out
+        if constrained {
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        }
+        super::super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedNested", constrained, false, false)
     }
     fn layout(&self, out: &mut String) {
         out.push_str("def layout (f : Family) : Layout (Anchor f) :=\n  match f with\n");

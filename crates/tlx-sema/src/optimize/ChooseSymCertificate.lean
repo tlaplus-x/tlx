@@ -1747,12 +1747,199 @@ def SlotWrite.justified {d : Nat} {M S F MS : Type} [DecidableEq F] [DecidableEq
     (inv : InvSpec d F MS) (w : SlotWrite d M S F MS) : Bool :=
   w.value.justified inv
 
+-- Two-state pure equivariant test IR for ACTION_CONSTRAINT and action PROPERTY ([][A]_sub).
+inductive KeyRef2 (S : Type) where
+  | bound (idx : Nat)
+  | slot (primed : Bool) (slot : S)
+  | fixed (id : Nat)
+
+def evalKeyRef2 {d : Nat} {sizes : Fin d → Nat} {S A : Type}
+    (fixedAtom : Nat → A) (u0 u1 : Slots S (Key sizes) A) (keys : Environment (Key sizes)) :
+    KeyRef2 S → KeyVal (Key sizes) A
+  | .bound i => .inl (keys i)
+  | .slot false s => u0 s
+  | .slot true s => u1 s
+  | .fixed id => .inr (fixedAtom id)
+
+theorem evalKeyRef2_rename {d : Nat} {sizes : Fin d → Nat} {S A : Type} (p : GroupPerm sizes)
+    (fixedAtom : Nat → A) (u0 u1 : Slots S (Key sizes) A) (keys : Environment (Key sizes))
+    (ref : KeyRef2 S) :
+    evalKeyRef2 fixedAtom (renameSlots p u0) (renameSlots p u1) (renameKeys p keys) ref =
+      renameKeyVal p (evalKeyRef2 fixedAtom u0 u1 keys ref) := by
+  cases ref with
+  | bound _ => rfl
+  | slot pr _ => cases pr <;> rfl
+  | fixed _ => rfl
+
+structure LeafSpec2 (M S F : Type) where
+  id : Nat
+  mapReads : List (Bool × M × Nat)
+  slotMapReads : List (Bool × M × Bool × S)
+  slotFixedReads : List (Bool × S)
+  flagReads : List (Bool × F × KeyRef2 S)
+
+def evalLeafSpec2 {d : Nat} {sizes : Fin d → Nat} {C M S F MS Meta V A : Type}
+    (fixedAtom : Nat → A) (st0 st1 : RawState C M S F MS (Key sizes) Meta V A)
+    (keys : Environment (Key sizes)) (aux : AuxEnv Meta V) (spec : LeafSpec2 M S F) :
+    LeafArgs Meta V A where
+  mapVals := spec.mapReads.map (fun item => (match item.1 with | false => st0.maps | true => st1.maps) item.2.1 (keys item.2.2))
+  slotMapVals := spec.slotMapReads.map (fun item =>
+    match (match item.2.2.1 with | false => st0.slots | true => st1.slots) item.2.2.2 with
+    | .inl k => some ((match item.1 with | false => st0.maps | true => st1.maps) item.2.1 k)
+    | .inr _ => none)
+  slotFixedVals := spec.slotFixedReads.map (fun item =>
+    match (match item.1 with | false => st0.slots | true => st1.slots) item.2 with
+    | .inl _ => none
+    | .inr a => some a)
+  flagVals := spec.flagReads.map (fun item =>
+    match evalKeyRef2 fixedAtom st0.slots st1.slots keys item.2.2 with
+    | .inl k => (match item.1 with | false => st0.flags | true => st1.flags) item.2.1 k
+    | .inr _ => false)
+  aux := aux
+
+theorem evalLeafSpec2_rename {d : Nat} {sizes : Fin d → Nat} {C M S F MS Meta V A : Type}
+    (p : GroupPerm sizes) (fixedAtom : Nat → A)
+    (st0 st1 : RawState C M S F MS (Key sizes) Meta V A)
+    (keys : Environment (Key sizes)) (aux : AuxEnv Meta V) (spec : LeafSpec2 M S F) :
+    evalLeafSpec2 fixedAtom (rename p st0) (rename p st1) (renameKeys p keys) aux spec =
+      evalLeafSpec2 fixedAtom st0 st1 keys aux spec := by
+  simp only [evalLeafSpec2, rename, LeafArgs.mk.injEq, and_true]
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · apply List.map_congr_left
+    rintro ⟨pr, m, idx⟩ _
+    cases pr <;> simp [renameMaps, renameKeys, p.left]
+  · apply List.map_congr_left
+    rintro ⟨prM, m, prS, s⟩ _
+    cases prM <;> cases prS <;> simp only [renameSlots]
+    · cases st0.slots s with | inl k => simp only [renameKeyVal, renameMaps, p.left] | inr _ => rfl
+    · cases st1.slots s with | inl k => simp only [renameKeyVal, renameMaps, p.left] | inr _ => rfl
+    · cases st0.slots s with | inl k => simp only [renameKeyVal, renameMaps, p.left] | inr _ => rfl
+    · cases st1.slots s with | inl k => simp only [renameKeyVal, renameMaps, p.left] | inr _ => rfl
+  · apply List.map_congr_left
+    rintro ⟨prS, s⟩ _
+    cases prS <;> simp only [renameSlots]
+    · cases st0.slots s <;> rfl
+    · cases st1.slots s <;> rfl
+  · apply List.map_congr_left
+    rintro ⟨prF, f, ref⟩ _
+    rw [evalKeyRef2_rename]
+    cases evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+    | inl k => cases prF <;> simp only [renameKeyVal, renameFlags, p.left]
+    | inr _ => rfl
+
+inductive ActionPureTest (d : Nat) (M S F MS : Type) where
+  | truth (value : Bool)
+  | leaf (spec : LeafSpec2 M S F)
+  | equal (left right : KeyRef2 S)
+  | inGroup (key : KeyRef2 S) (mask : GroupMask d)
+  | flag (primed : Bool) (f : F) (key : KeyRef2 S)
+  | msgEq (ms : MS) (key : KeyRef2 S)
+  | conj (left right : ActionPureTest d M S F MS)
+  | disj (left right : ActionPureTest d M S F MS)
+  | neg (body : ActionPureTest d M S F MS)
+  | all (mask : GroupMask d) (body : ActionPureTest d M S F MS)
+  | some (mask : GroupMask d) (body : ActionPureTest d M S F MS)
+
+def ActionPureTest.eval {d : Nat} {sizes : Fin d → Nat} {C M S F MS Meta V A : Type}
+    (testFn : Nat → LeafArgs Meta V A → Bool)
+    (fixedAtom : Nat → A) (st0 st1 : RawState C M S F MS (Key sizes) Meta V A)
+    (keys : Environment (Key sizes)) (aux : AuxEnv Meta V) : ActionPureTest d M S F MS → Bool := by
+  classical
+  exact fun t => match t with
+    | .truth b => b
+    | .leaf spec => testFn spec.id (evalLeafSpec2 fixedAtom st0 st1 keys aux spec)
+    | .equal a b => decide (evalKeyRef2 fixedAtom st0.slots st1.slots keys a = evalKeyRef2 fixedAtom st0.slots st1.slots keys b)
+    | .inGroup ref mask =>
+        match evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+        | .inl k => mask k.1
+        | .inr _ => false
+    | .flag pr f ref =>
+        match evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+        | .inl k => (match pr with | false => st0.flags | true => st1.flags) f k
+        | .inr _ => false
+    | .msgEq ms ref =>
+        match evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+        | .inl k => decide (st1.msgs ms k = st0.msgs ms k)
+        | .inr _ => true
+    | .conj a b => a.eval testFn fixedAtom st0 st1 keys aux && b.eval testFn fixedAtom st0 st1 keys aux
+    | .disj a b => a.eval testFn fixedAtom st0 st1 keys aux || b.eval testFn fixedAtom st0 st1 keys aux
+    | .neg a => !(a.eval testFn fixedAtom st0 st1 keys aux)
+    | .all mask a => (allKeys sizes).all (fun k => !mask k.1 || a.eval testFn fixedAtom st0 st1 (push keys k) aux)
+    | .some mask a => (allKeys sizes).any (fun k => mask k.1 && a.eval testFn fixedAtom st0 st1 (push keys k) aux)
+
+theorem ActionPureTest.equivariant {d : Nat} {sizes : Fin d → Nat} {C M S F MS Meta V A : Type}
+    (p : GroupPerm sizes) (testFn : Nat → LeafArgs Meta V A → Bool)
+    (fixedAtom : Nat → A) (st0 st1 : RawState C M S F MS (Key sizes) Meta V A)
+    (t : ActionPureTest d M S F MS) (keys : Environment (Key sizes)) (aux : AuxEnv Meta V) :
+    t.eval testFn fixedAtom (rename p st0) (rename p st1) (renameKeys p keys) aux =
+      t.eval testFn fixedAtom st0 st1 keys aux := by
+  classical
+  induction t generalizing keys aux with
+  | truth _ => rfl
+  | leaf spec =>
+    simp only [ActionPureTest.eval, evalLeafSpec2_rename]
+  | equal a b =>
+    simp only [ActionPureTest.eval, rename_slots, evalKeyRef2_rename]
+    exact Bool.eq_iff_iff.mpr (by simp only [decide_eq_true_eq, renameKeyVal_injective])
+  | inGroup ref mask =>
+    simp only [ActionPureTest.eval, rename_slots, evalKeyRef2_rename]
+    cases evalKeyRef2 fixedAtom st0.slots st1.slots keys ref <;> rfl
+  | flag pr f ref =>
+    simp only [ActionPureTest.eval, rename_slots, evalKeyRef2_rename]
+    cases evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+    | inl k => cases pr <;> simp only [renameKeyVal, rename_flags, renameFlags, p.left]
+    | inr _ => rfl
+  | msgEq ms ref =>
+    simp only [ActionPureTest.eval, rename_slots, evalKeyRef2_rename]
+    cases evalKeyRef2 fixedAtom st0.slots st1.slots keys ref with
+    | inl k => simp only [renameKeyVal, rename_msgs, renameMsgs, p.left]
+    | inr _ => rfl
+  | conj a b ha hb => simp only [ActionPureTest.eval, ha, hb]
+  | disj a b ha hb => simp only [ActionPureTest.eval, ha, hb]
+  | neg a ha => simp only [ActionPureTest.eval, ha]
+  | all mask a ha =>
+    simp only [ActionPureTest.eval]
+    apply Bool.eq_iff_iff.mpr
+    simp only [List.all_eq_true, Bool.or_eq_true, Bool.not_eq_true']
+    constructor
+    · intro h k _
+      have hk := h (p.toFun k) (mem_allKeys _)
+      simp only [GroupPerm.toFun_fst] at hk
+      have ha' := ha (push keys k) aux
+      rw [renameKeys_push] at ha'
+      rwa [ha'] at hk
+    · intro h k _
+      have hk := h (p.invFun k) (mem_allKeys _)
+      simp only [GroupPerm.invFun_fst] at hk
+      have ha' := ha (push keys (p.invFun k)) aux
+      rw [renameKeys_push, p.right] at ha'
+      rwa [ha']
+  | some mask a ha =>
+    simp only [ActionPureTest.eval]
+    apply Bool.eq_iff_iff.mpr
+    simp only [List.any_eq_true, Bool.and_eq_true]
+    constructor
+    · rintro ⟨k, _, hm, hb⟩
+      refine ⟨p.invFun k, mem_allKeys _, hm, ?_⟩
+      have ha' := ha (push keys (p.invFun k)) aux
+      rw [renameKeys_push, p.right] at ha'
+      rwa [ha'] at hb
+    · rintro ⟨k, _, hm, hb⟩
+      refine ⟨p.toFun k, mem_allKeys _, hm, ?_⟩
+      have ha' := ha (push keys k) aux
+      rw [renameKeys_push] at ha'
+      rwa [ha']
+
 -- Full Operations & Model bundle (Semantics has ZERO propositional premises!).
 structure Operations (d : Nat) (M S F MS IB B : Type) where
   inv : InvSpec d F MS
   initBranch : IB → InitBranch d F MS
   stepBranch : B → StepBranch d M S F MS
   observation : ChoiceTest d M S F MS
+  initObservation : ChoiceTest d M S F MS := .pure (.truth true)
+  constraintTest : ChoiceTest d M S F MS := .pure (.truth true)
+  actionConstraintTest : ActionPureTest d M S F MS := .truth true
+  actionObservation : ActionPureTest d M S F MS := .truth true
 
 def checkOperationsValid {d : Nat} {M S F MS IB B : Type}
     [DecidableEq F] [DecidableEq MS]
@@ -1776,7 +1963,9 @@ def checkOperationsValid {d : Nat} {M S F MS IB B : Type}
     sb.postGuard.justified ops.inv &&
     sb.writes.all (Write.justified ops.inv) &&
     sb.slotWrites.all (SlotWrite.justified ops.inv)) &&
-  ops.observation.justified ops.inv
+  ops.observation.justified ops.inv &&
+  ops.initObservation.justified ops.inv &&
+  ops.constraintTest.justified ops.inv
 
 structure Semantics (d : Nat) (sizes : Fin d → Nat) (C M S Meta V A IB B W : Type) where
   keyRank : Key sizes → Nat
@@ -1794,6 +1983,7 @@ structure Semantics (d : Nat) (sizes : Fin d → Nat) (C M S Meta V A IB B W : T
   obsTest : C → Nat → LeafArgs Meta V A → Bool
   obsVal : C → Nat → LeafArgs Meta V A → V
   obsInt : C → Nat → LeafArgs Meta V A → Int
+  actionTest : C → C → Nat → LeafArgs Meta V A → Bool := fun _ _ _ _ => true
 
 -- Equivariance of justified CHOOSE expressions on invariant-satisfying states.
 section Equivariance
@@ -2623,7 +2813,14 @@ private theorem opsValid_parts :
     m.ops.observation.justified m.ops.inv = true := by
   have h := m.opsValid
   simp only [checkOperationsValid, Bool.and_eq_true] at h
-  exact ⟨h.1.1.1.1, h.1.1.1.2, h.1.1.2, h.1.2, h.2⟩
+  exact ⟨h.1.1.1.1.1.1, h.1.1.1.1.1.2, h.1.1.1.1.2, h.1.1.1.2, h.1.1.2⟩
+
+private theorem opsValid_constrained_parts :
+    m.ops.initObservation.justified m.ops.inv = true ∧
+    m.ops.constraintTest.justified m.ops.inv = true := by
+  have h := m.opsValid
+  simp only [checkOperationsValid, Bool.and_eq_true] at h
+  exact ⟨h.1.2, h.2⟩
 
 theorem initial_valid (st : m.RState) (hi : m.rawConcrete.initial st) : m.valid st := by
   rcases hi with ⟨ib, w, keys, _, hflags, hmsgs⟩
@@ -3147,6 +3344,210 @@ theorem orbit_key_equivalent (s t : m.ValidState) :
   · exact Quotient.exact
   · intro h
     exact Quotient.sound (show m.orbits.r s t from h)
+
+def rawConstrained : ConstrainedSystem m.RState where
+  toSystem := m.rawConcrete
+  initSafe st := ∀ keys, m.ops.initObservation.eval m.sem.keyRank m.sem.recRank
+    (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+    m.sem.fixedAtom st keys {} = some true
+  constraint st := ∀ keys, m.ops.constraintTest.eval m.sem.keyRank m.sem.recRank
+    (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+    m.sem.fixedAtom st keys {} = some true
+  actionConstraint st t := ∀ keys, m.ops.actionConstraintTest.eval
+    (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t keys {} = true
+  actionSafe st t := ∀ keys, m.ops.actionObservation.eval
+    (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t keys {} = true
+
+theorem initSafe_rename (p : GroupPerm sizes) (st : m.RState) (hv : m.valid st) :
+    m.rawConstrained.initSafe (rename p st) ↔ m.rawConstrained.initSafe st := by
+  have hjust := m.opsValid_constrained_parts.1
+  constructor
+  · intro h keys
+    have hp := h (renameKeys p keys)
+    simp only [rename_core] at hp
+    rwa [ChoiceTest.equivariant p m.sem.constVal m.ops.inv m.sem.keyRank m.sem.recRank
+      (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+      m.sem.fixedAtom st hv m.ops.initObservation hjust keys {}] at hp
+  · intro h keys
+    have hk : renameKeys p (renameKeys p.inverse keys) = keys := by funext i; exact p.right (keys i)
+    simp only [rename_core]
+    rw [← hk, ChoiceTest.equivariant p m.sem.constVal m.ops.inv m.sem.keyRank m.sem.recRank
+      (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+      m.sem.fixedAtom st hv m.ops.initObservation hjust (renameKeys p.inverse keys) {}]
+    exact h _
+
+theorem constraint_rename (p : GroupPerm sizes) (st : m.RState) (hv : m.valid st) :
+    m.rawConstrained.constraint (rename p st) ↔ m.rawConstrained.constraint st := by
+  have hjust := m.opsValid_constrained_parts.2
+  constructor
+  · intro h keys
+    have hp := h (renameKeys p keys)
+    simp only [rename_core] at hp
+    rwa [ChoiceTest.equivariant p m.sem.constVal m.ops.inv m.sem.keyRank m.sem.recRank
+      (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+      m.sem.fixedAtom st hv m.ops.constraintTest hjust keys {}] at hp
+  · intro h keys
+    have hk : renameKeys p (renameKeys p.inverse keys) = keys := by funext i; exact p.right (keys i)
+    simp only [rename_core]
+    rw [← hk, ChoiceTest.equivariant p m.sem.constVal m.ops.inv m.sem.keyRank m.sem.recRank
+      (m.sem.obsTest st.core) (m.sem.obsVal st.core) (m.sem.obsInt st.core)
+      m.sem.fixedAtom st hv m.ops.constraintTest hjust (renameKeys p.inverse keys) {}]
+    exact h _
+
+theorem actionConstraint_rename (p : GroupPerm sizes) (st t : m.RState) :
+    m.rawConstrained.actionConstraint (rename p st) (rename p t) ↔
+      m.rawConstrained.actionConstraint st t := by
+  constructor
+  · intro h keys
+    have hp := h (renameKeys p keys)
+    simp only [rename_core] at hp
+    rwa [ActionPureTest.equivariant p (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t m.ops.actionConstraintTest keys {}] at hp
+  · intro h keys
+    have hk : renameKeys p (renameKeys p.inverse keys) = keys := by funext i; exact p.right (keys i)
+    simp only [rename_core]
+    rw [← hk, ActionPureTest.equivariant p (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t m.ops.actionConstraintTest (renameKeys p.inverse keys) {}]
+    exact h _
+
+theorem actionSafe_rename (p : GroupPerm sizes) (st t : m.RState) :
+    m.rawConstrained.actionSafe (rename p st) (rename p t) ↔
+      m.rawConstrained.actionSafe st t := by
+  constructor
+  · intro h keys
+    have hp := h (renameKeys p keys)
+    simp only [rename_core] at hp
+    rwa [ActionPureTest.equivariant p (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t m.ops.actionObservation keys {}] at hp
+  · intro h keys
+    have hk : renameKeys p (renameKeys p.inverse keys) = keys := by funext i; exact p.right (keys i)
+    simp only [rename_core]
+    rw [← hk, ActionPureTest.equivariant p (m.sem.actionTest st.core t.core) m.sem.fixedAtom st t m.ops.actionObservation (renameKeys p.inverse keys) {}]
+    exact h _
+
+def validConstrained : ConstrainedSystem m.ValidState where
+  toSystem := m.validConcrete
+  initSafe s := m.rawConstrained.initSafe s.val
+  constraint s := m.rawConstrained.constraint s.val
+  actionConstraint s t := m.rawConstrained.actionConstraint s.val t.val
+  actionSafe s t := m.rawConstrained.actionSafe s.val t.val
+
+def constrainedReduced : ConstrainedSystem (Quotient m.orbits) where
+  toSystem := m.reduced
+  initSafe a := Quotient.liftOn a m.validConstrained.initSafe (by
+    rintro s t ⟨p, hp⟩
+    have hts : t = m.renameValid p s := Subtype.ext hp.symm
+    subst hts
+    exact propext (m.initSafe_rename p s.val s.property).symm)
+  constraint a := Quotient.liftOn a m.validConstrained.constraint (by
+    rintro s t ⟨p, hp⟩
+    have hts : t = m.renameValid p s := Subtype.ext hp.symm
+    subst hts
+    exact propext (m.constraint_rename p s.val s.property).symm)
+  actionConstraint a b := ∃ s t, m.project s = a ∧ m.validConcrete.next s t ∧
+    m.validConstrained.actionConstraint s t ∧ m.project t = b
+  actionSafe a b := ∀ s t, m.project s = a → m.project t = b → m.validConcrete.next s t →
+    m.validConstrained.actionSafe s t
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.validConstrained m.constrainedReduced m.project := by
+  refine ⟨m.certificate.initial, m.certificate.next, m.certificate.observe, fun _ => Iff.rfl, fun _ => Iff.rfl, ?_, ?_⟩
+  · intro s a
+    constructor
+    · rintro ⟨_, hc, x, y, hx, hxy, hac, hy⟩
+      obtain ⟨p, hp⟩ := Quotient.exact hx
+      have hsx : s = m.renameValid p x := Subtype.ext hp.symm
+      subst hsx
+      let t := m.renameValid p y
+      have hnext : m.validConcrete.next (m.renameValid p x) t := m.next_rename p x.val y.val x.property hxy
+      have hact : m.validConstrained.actionConstraint (m.renameValid p x) t :=
+        (m.actionConstraint_rename p x.val y.val).mpr hac
+      have hpt : m.project t = a := (m.project_rename p y).trans hy
+      have hct : m.validConstrained.constraint t := by
+        change m.constrainedReduced.constraint (m.project t)
+        rw [hpt]
+        exact hc
+      exact ⟨t, hnext, hct, hact, hpt⟩
+    · rintro ⟨t, hn, hc, hac, rfl⟩
+      exact ⟨⟨s, t, rfl, hn, rfl⟩, hc, ⟨s, t, rfl, hn, hac, rfl⟩⟩
+  · intro s a
+    constructor
+    · intro h _ x y hx hy hxy
+      obtain ⟨p, hp⟩ := Quotient.exact hx
+      have hsx : s = m.renameValid p x := Subtype.ext hp.symm
+      subst hsx
+      let t := m.renameValid p y
+      have hnext : m.validConcrete.next (m.renameValid p x) t := m.next_rename p x.val y.val x.property hxy
+      have hpt : m.project t = a := (m.project_rename p y).trans hy
+      have has := h t hnext hpt
+      exact (m.actionSafe_rename p x.val y.val).mp has
+    · intro h t hst hpt
+      exact h ⟨s, t, rfl, hst, hpt⟩ s t rfl hpt hst
+
+theorem admitted_validConstrained_iff (s : m.ValidState) :
+    AdmittedReachable m.validConstrained s ↔ AdmittedReachable m.rawConstrained s.val := by
+  constructor
+  · intro hr
+    induction hr with
+    | initial hi hc => exact .initial hi hc
+    | step _ hn hc hac ih => exact .step ih hn hc hac
+  · intro hr
+    have lift : ∀ {st : m.RState}, AdmittedReachable m.rawConstrained st →
+        ∀ (hv : m.valid st), AdmittedReachable m.validConstrained ⟨st, hv⟩ := by
+      intro st hst
+      induction hst with
+      | initial hi hc => intro hv; exact .initial hi hc
+      | @step x y hx hn hc hac ih =>
+        intro hvy
+        have hvx := m.inductive_invariant x (admitted_implies_reachable m.rawConstrained hx)
+        exact .step (ih hvx) hn hc hac
+    exact lift hr s.property
+
+theorem raw_constrained_safety_iff :
+    ConstrainedSafe m.rawConstrained ↔ ConstrainedSafe m.validConstrained := by
+  constructor
+  · rintro ⟨hInit, hStep⟩
+    refine ⟨fun s hs => hInit s.val hs, fun s t hs hst => hStep s.val t.val ((m.admitted_validConstrained_iff s).mp hs) hst⟩
+  · rintro ⟨hInit, hStep⟩
+    constructor
+    · intro st hi
+      exact hInit ⟨st, m.initial_valid st hi⟩ hi
+    · intro st t hs hst
+      have hvst := m.inductive_invariant st (admitted_implies_reachable m.rawConstrained hs)
+      have hvt := m.next_valid st t hvst hst
+      exact hStep ⟨st, hvst⟩ ⟨t, hvt⟩ ((m.admitted_validConstrained_iff ⟨st, hvst⟩).mpr hs) hst
+
+theorem constrained_optimization_correct :
+    ConstrainedSafe m.rawConstrained ↔ ConstrainedSafe m.constrainedReduced :=
+  m.raw_constrained_safety_iff.trans (constrained_safety_iff m.constrained_certificate)
+
+theorem constrained_init_counterexample_lifts {a}
+    (ha : m.constrainedReduced.initial a)
+    (bad : ¬ (m.constrainedReduced.safe a ∧ m.constrainedReduced.initSafe a)) :
+    ∃ s : m.ValidState, m.rawConstrained.initial s.val ∧ m.project s = a ∧
+      ¬ (m.rawConstrained.safe s.val ∧ m.rawConstrained.initSafe s.val) :=
+  TlxOptimization.constrained_init_counterexample_lifts m.constrained_certificate ha bad
+
+theorem constrained_step_counterexample_lifts {a b}
+    (ha : AdmittedReachable m.constrainedReduced a) (hab : m.constrainedReduced.next a b)
+    (bad : ¬ (m.constrainedReduced.safe b ∧ m.constrainedReduced.actionSafe a b)) :
+    ∃ s t : m.ValidState, AdmittedReachable m.rawConstrained s.val ∧ m.rawConstrained.next s.val t.val ∧
+      m.project s = a ∧ m.project t = b ∧
+      ¬ (m.rawConstrained.safe t.val ∧ m.rawConstrained.actionSafe s.val t.val) := by
+  obtain ⟨s, t, hs, hst, hps, hpt, hbad⟩ :=
+    TlxOptimization.constrained_step_counterexample_lifts m.constrained_certificate ha hab bad
+  exact ⟨s, t, (m.admitted_validConstrained_iff s).mp hs, hst, hps, hpt, hbad⟩
+
+theorem admitted_deadlock_preserved :
+    (∃ s : m.RState, AdmittedReachable m.rawConstrained s ∧ ¬ ∃ t : m.RState, m.rawConstrained.next s t) ↔
+    (∃ a, AdmittedReachable m.constrainedReduced a ∧ ¬ ∃ b, m.constrainedReduced.next a b) := by
+  have hv := constrained_deadlock_iff m.constrained_certificate
+  constructor
+  · rintro ⟨s, hs, hno⟩
+    have hvs := m.inductive_invariant s (admitted_implies_reachable m.rawConstrained hs)
+    exact hv.mp ⟨⟨s, hvs⟩, (m.admitted_validConstrained_iff ⟨s, hvs⟩).mpr hs, fun ⟨t, ht⟩ => hno ⟨t.val, ht⟩⟩
+  · intro h
+    obtain ⟨s, hs, hno⟩ := hv.mpr h
+    refine ⟨s.val, (m.admitted_validConstrained_iff s).mp hs, fun ⟨t, ht⟩ => ?_⟩
+    have hvt := m.next_valid s.val t s.property ht
+    exact hno ⟨⟨t, hvt⟩, ht⟩
 
 end Model
 end

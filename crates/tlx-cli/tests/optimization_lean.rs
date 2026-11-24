@@ -173,7 +173,11 @@ fn unsupported_certificate_scope_disables_the_rule() {
         r#"Next == /\ h' = IF x = 0 THEN Append(h, x) ELSE <<x>>
         /\ x' = IF (h = <<>>)' THEN 0 ELSE IF x = 0 THEN 1 ELSE 0"#,
     );
-    for (spec, cfg) in [(primed, CFG.to_string()), (HISTORY.replace("====", "Limit == x <= 1\n===="), format!("{CFG}CONSTRAINT Limit\n"))] {
+    for (spec, cfg) in [
+        (primed, CFG.to_string()),
+        (HISTORY.replace("====", "ActLimit == x' <= 1\n===="), format!("{CFG}ACTION_CONSTRAINT ActLimit\n")),
+        (HISTORY.replace("====", "MyAlias == [x |-> x]\n===="), format!("{CFG}ALIAS MyAlias\n")),
+    ] {
         let dir = tlx_testkit::TempDir::with_spec("lean-history-scope", &spec, &cfg);
         let run = tlx_testkit::tlx_default!()
             .check("ProofOutput.tla")
@@ -187,6 +191,26 @@ fn unsupported_certificate_scope_disables_the_rule() {
         let text = std::fs::read_to_string(&artifacts(&dir)[0]).unwrap();
         assert!(!text.contains("namespace TlxOptimization.GeneratedHistory"));
     }
+}
+
+#[test]
+fn constrained_history_certificate_emits_constrained_theorems() {
+    let spec = HISTORY.replace("====", "Limit == x <= 1\n====");
+    let cfg = format!("{CFG}CONSTRAINT Limit\n");
+    let dir = tlx_testkit::TempDir::with_spec("lean-history-constrained", &spec, &cfg);
+    let run = tlx_testkit::tlx_default!()
+        .check("ProofOutput.tla")
+        .args(["-interp", "-optimize", "-noautosymmetry"])
+        .env("TLX_PROOF_DIR", dir.join("proofs"))
+        .dir(&dir)
+        .run();
+    assert_eq!(run.code, 0, "{}", run.text());
+    assert!(run.stdout.contains("history-summary-projection"), "{}", run.text());
+    let text = std::fs::read_to_string(&artifacts(&dir)[0]).unwrap();
+    assert!(text.contains("namespace TlxOptimization.GeneratedHistory"));
+    assert!(text.contains("theorem constrained_certificate"));
+    assert!(text.contains("theorem constrained_optimization_correct"));
+    assert!(text.contains("theorem admitted_deadlock_preserved"));
 }
 
 #[test]

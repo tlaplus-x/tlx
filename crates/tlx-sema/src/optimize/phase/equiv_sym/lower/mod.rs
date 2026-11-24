@@ -226,6 +226,11 @@ impl<'a> LowerCtx<'a> {
         self.charge(out)
     }
 
+    pub(super) fn lower_action_pred(&mut self, e: &Expr) -> Option<String> {
+        let out = self.lower_form_rec(e, true, false, false)?;
+        self.charge(out)
+    }
+
     fn lower_form_rec(&mut self, e: &Expr, allow_prime: bool, in_prime: bool, in_action_pos: bool) -> Option<String> {
         self.bump()?;
         match &*e.kind {
@@ -305,6 +310,22 @@ impl<'a> LowerCtx<'a> {
                     acc = format!("(Form.ite {c} {y} {acc})");
                 }
                 Some(acc)
+            }
+            ExprKind::BoxAction { action, sub } => {
+                if !allow_prime || in_prime {
+                    return None;
+                }
+                let fa = self.lower_form_rec(action, allow_prime, false, false)?;
+                let fu = self.lower_unchanged(sub)?;
+                self.charge(format!("(Form.disj {fa} {fu})"))
+            }
+            ExprKind::AngleAction { action, sub } => {
+                if !allow_prime || in_prime {
+                    return None;
+                }
+                let fa = self.lower_form_rec(action, allow_prime, false, false)?;
+                let fu = self.lower_unchanged(sub)?;
+                self.charge(format!("(Form.conj {fa} (Form.neg {fu}))"))
             }
             ExprKind::Quant { kind, bounds, body } => self.lower_quant(*kind, bounds, body, allow_prime, in_prime, in_action_pos),
             ExprKind::Builtin { op, args } => match (op, args.as_slice()) {

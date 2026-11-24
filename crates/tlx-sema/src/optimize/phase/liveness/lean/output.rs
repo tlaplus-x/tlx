@@ -4,7 +4,17 @@ use crate::optimize::lean::literal;
 use std::fmt::Write;
 
 impl Emitter<'_, '_> {
-    pub(super) fn output(&self, seeds: Vec<Seed>, cases: Vec<Case>, observed: Vec<bool>, observations: Vec<String>) -> String {
+    #[allow(clippy::too_many_arguments)] // combines seed/step liveness tables and state-level check vectors in one emitter pass
+    pub(super) fn output(
+        &self,
+        seeds: Vec<Seed>,
+        cases: Vec<Case>,
+        observed: Vec<bool>,
+        observations: Vec<String>,
+        init_obs: Vec<String>,
+        constraints: Vec<String>,
+        constrained: bool,
+    ) -> super::super::super::OpenCert {
         let keys = self.a.keys.map_or(1, |keys| keys.len());
         let mut out = String::from(include_str!("../../../FieldCertificate.lean"));
         out.push_str("\nnamespace TlxOptimization.GeneratedField\nopen TlxOptimization FieldRule\nnoncomputable section\nset_option linter.unusedVariables false\nset_option maxRecDepth 10000\nset_option maxHeartbeats 0\nattribute [local instance] Classical.propDecidable\n");
@@ -44,9 +54,25 @@ impl Emitter<'_, '_> {
         self.steps(&mut out, params, &cases);
         writeln!(out, "def observe {params} (c : C) (p : Key → Phase) (input : Key → Field → V) : Prop := {}", conjunction(&observations))
             .unwrap();
+        if constrained {
+            writeln!(
+                out,
+                "def initObserve {params} (c : C) (p : Key → Phase) (input : Key → Field → V) : Prop := {}",
+                conjunction(&init_obs)
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "def constraint {params} (c : C) (p : Key → Phase) (input : Key → Field → V) : Prop := {}",
+                conjunction(&constraints)
+            )
+            .unwrap();
+        }
         out.push_str("def model : FieldRule.Model C Key Phase Field V BranchId W where\n  missing := sem.missing\n  live := live\n  source := source\n  target := target\n  readsActor := readsActor\n  readsGlobal := readsGlobal\n  writes := writes\n  observed := observed\n  actorLive := by decide\n  globalLive := by decide\n  frameLive := by decide\n  observedLive := by decide\n  actor := fun b w => actor sem (b, w)\n  initial := fun c b w => initial sem c (b, w)\n  seedPhase := fun _ b _ _ => seedPhase b\n  seedValue := fun c b w k f => seedValue sem c (b, w) k f\n  guard := fun b c d w p input => guard sem c d (b, w) p input\n  value := fun b c d w p input f => value sem c d (b, w) p input f\n  observe := observe sem\n");
-        out.push_str(include_str!("certificate.lean"));
-        out
+        if constrained {
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        }
+        super::super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedField", constrained, false, false)
     }
 
     fn tables(&self, out: &mut String, cases: &[Case], observed: &[bool]) {

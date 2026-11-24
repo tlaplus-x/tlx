@@ -216,6 +216,8 @@ structure Model (C F W : Type) (I A : F → Type) where
   transfers : C → C → (w : W) → (f : F) → I f → Transfer (I f) (A f) (delta w f)
   guard : C → C → W → FamilyTest F I A
   observe : C → FamilyTest F I A
+  initObserve : C → FamilyTest F I A := fun _ => .pure True
+  constraint : C → FamilyTest F I A := fun _ => .pure True
 
 namespace Model
 variable {C F W : Type} {I A : F → Type} (m : Model C F W I A)
@@ -346,6 +348,38 @@ theorem deadlock_preserved (s : m.State) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem m.State where
+  toSystem := m.concrete
+  initSafe s := (m.initObserve s.1).eval m.layout s.2
+  constraint s := (m.constraint s.1).eval m.layout s.2
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem initSafe_related (s t : m.State) (same : m.related s t) :
+    m.constrainedConcrete.initSafe s ↔ m.constrainedConcrete.initSafe t := by
+  change (m.initObserve s.1).eval m.layout s.2 ↔ (m.initObserve t.1).eval m.layout t.2
+  rw [same.1]
+  exact FamilyTest.congr m.layout s.2 t.2 same.2 _
+
+theorem constraint_related (s t : m.State) (same : m.related s t) :
+    m.constrainedConcrete.constraint s ↔ m.constrainedConcrete.constraint t := by
+  change (m.constraint s.1).eval m.layout s.2 ↔ (m.constraint t.1).eval m.layout t.2
+  rw [same.1]
+  exact FamilyTest.congr m.layout s.2 t.2 same.2 _
+
+noncomputable def constrainedReduced : ConstrainedSystem (Quotient m.equivalence) where
+  toSystem := m.reduced
+  initSafe a := Quotient.liftOn a m.constrainedConcrete.initSafe (fun s t h => propext (m.initSafe_related s t h))
+  constraint a := Quotient.liftOn a m.constrainedConcrete.constraint (fun s t h => propext (m.constraint_related s t h))
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun _ => Iff.rfl) (fun _ => Iff.rfl)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 
 end Model
 end TlxOptimization.NestedRule

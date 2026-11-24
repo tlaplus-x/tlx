@@ -7,7 +7,12 @@ use super::{Analysis, Atom};
 use crate::{builtins::Builtin as B, hir::*};
 use std::sync::Arc;
 
-pub(super) fn emit(a: &Analysis<'_>, initial: &[Branch], steps: &[Branch], observations: &[Expr]) -> Option<String> {
+pub(super) fn emit(
+    a: &Analysis<'_>,
+    initial: &[Branch],
+    steps: &[Branch],
+    spec: super::super::CheckSpec<'_>,
+) -> Option<super::super::OpenCert> {
     let fields: Vec<_> = a.live.keys().filter(|f| f.as_ref() != a.control).cloned().collect();
     let phases: Vec<_> = a.phases.iter().cloned().collect();
     let mut e = Emitter { a, fields, phases, atoms: vec![] };
@@ -23,9 +28,11 @@ pub(super) fn emit(a: &Analysis<'_>, initial: &[Branch], steps: &[Branch], obser
         return None;
     }
     let mut observed = Reads::new(e.fields.len());
-    let observations = observations.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let observations = spec.invariants.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
     e.validate(&cases, &observed)?;
-    Some(e.output(seeds, cases, observed.global, observations))
+    Some(e.output(seeds, cases, observed.global, observations, init_obs, constraints, spec.is_constrained()))
 }
 
 struct Emitter<'a, 'd> {

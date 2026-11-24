@@ -22,5 +22,3 @@ theorem deadlock_preserved (s : C × (Key → List E)) :
 #print axioms specification_correct
 #print axioms counterexample_lifts
 #print axioms deadlock_preserved
-end
-end TlxOptimization.GeneratedLength

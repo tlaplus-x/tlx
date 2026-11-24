@@ -213,6 +213,8 @@ structure Model (C K W : Type) where
   guard : C → C → W → (K → Bool) → Test caps
   change : C → C → W → (K → Bool) → K → Decision caps Change
   observe : C → (K → Bool) → Test caps
+  initObserve : C → (K → Bool) → Test caps := fun _ _ => .pure True
+  constraint : C → (K → Bool) → Test caps := fun _ _ => .pure True
 
 namespace Model
 variable {C K W : Type} (m : Model C K W)
@@ -306,5 +308,30 @@ theorem deadlock_preserved (s : State C K) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (State C K) where
+  toSystem := m.concrete
+  initSafe s := (m.initObserve s.core (presence s.stamps)).concrete s.now s.stamps
+  constraint s := (m.constraint s.core (presence s.stamps)).concrete s.now s.stamps
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (Abstract C K) where
+  toSystem := m.reduced
+  initSafe s := (m.initObserve s.1 (presence s.2)).reduced s.2
+  constraint s := (m.constraint s.1 (presence s.2)).reduced s.2
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun s => by
+      change _ ↔ (m.initObserve s.core (presence (summarize m.caps s.now s.stamps))).reduced _
+      rw [presence_summary]; exact Test.commutes _ _ _)
+    (fun s => by
+      change _ ↔ (m.constraint s.core (presence (summarize m.caps s.now s.stamps))).reduced _
+      rw [presence_summary]; exact Test.commutes _ _ _)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end TlxOptimization.AgeRule

@@ -31,5 +31,3 @@ project sem s = project sem t ↔ (model sem).Orbit s t :=
 #print axioms specification_correct
 #print axioms counterexample_lifts
 #print axioms deadlock_preserved
-end
-end TlxOptimization.GeneratedChooseSymmetry

@@ -12,7 +12,7 @@ mod step;
 use super::{
     binding,
     domain::{self, Atom, Domain, Domains, Locals},
-    sym_groups::{comparable, group_mask_exact, independent, subst_local, validate_groups, GroupInfo, GroupMask, KeyRef},
+    sym_groups::{comparable, group_mask_exact, independent, subst_local, validate_groups, ActionKeyRef, GroupInfo, GroupMask, KeyRef},
     sym_norm::SymNormalizer,
     unchanged, variable, Branch,
 };
@@ -69,17 +69,17 @@ struct Case {
     keys: Vec<(LocalId, GroupMask)>,
 }
 
-/// Generate a connected certificate for a disjoint product of full permutation groups.
-/// Unsupported state shapes or key operations fail closed. No verifier is run.
-pub fn symmetry_certificate(
+/// Generate a connected keyed symmetry certificate covering invariants, init properties,
+/// constraints, action constraints, and action properties.
+pub fn symmetry_certificate_with_spec(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
-    observations: &[Expr],
+    spec: super::CheckSpec<'_>,
     groups: &[Vec<String>],
 ) -> Option<String> {
-    emit(program, cfg, init, next, observations, groups, vec![])
+    emit(program, cfg, init, next, spec, groups, vec![])
 }
 
 /// Certify erasure followed by symmetry for the exact installed variable tuple.
@@ -92,6 +92,20 @@ pub fn symmetry_projection_certificate(
     groups: &[Vec<String>],
     view: &Expr,
 ) -> Option<String> {
+    symmetry_projection_certificate_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations), groups, view)
+}
+
+/// Certify erasure followed by symmetry covering invariants, init properties,
+/// constraints, action constraints, and action properties.
+pub fn symmetry_projection_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+    groups: &[Vec<String>],
+    view: &Expr,
+) -> Option<String> {
     let ExprKind::Tuple(values) = &*view.kind else { return None };
     let retained = values.iter().map(|e| variable(e, false)).collect::<Option<Vec<_>>>()?;
     if retained.windows(2).any(|pair| pair[0].0 >= pair[1].0) || retained.iter().any(|v| v.idx() >= program.vars.len()) {
@@ -101,7 +115,7 @@ pub fn symmetry_projection_certificate(
     if omitted.is_empty() {
         return None;
     }
-    emit(program, cfg, init, next, observations, groups, omitted)
+    emit(program, cfg, init, next, spec, groups, omitted)
 }
 
 fn emit(
@@ -109,19 +123,20 @@ fn emit(
     cfg: &Config,
     init: &Expr,
     next: &Expr,
-    observations: &[Expr],
+    spec: super::CheckSpec<'_>,
     raw_groups: &[Vec<String>],
     omitted: Vec<VarId>,
 ) -> Option<String> {
     let (groups, all_keys) = validate_groups(raw_groups)?;
-    if !super::sym_totality::check_model_totality_with_omitted(program, cfg, init, next, observations, raw_groups, &omitted) {
+    if !super::sym_totality::check_model_totality_with_spec(program, cfg, init, next, spec, raw_groups, &omitted) {
         return None;
     }
-    let mut normalize = SymNormalizer::new(program);
+    let mut normalize = SymNormalizer::with_config(program, cfg);
     let initial = normalize.normalize(init)?;
     let init_branches = keyed_branches(&initial)?;
     let steps = keyed_branches(&normalize.normalize(next)?)?;
-    let observations = observations.iter().map(|o| normalize.normalize(o)).collect::<Option<Vec<_>>>()?;
+    let norm = spec.try_map(|o| normalize.normalize(o))?;
+    let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &init_branches, &steps)?;
 
     let mut shapes = Vec::with_capacity(domains.vars.len());
@@ -142,6 +157,7 @@ fn emit(
         return None;
     }
 
+    let max_obs_local = norm_spec.all_exprs().map(super::max_local).max().unwrap_or(0);
     let mut e = Emitter {
         domains: &domains,
         groups: &groups,
@@ -153,7 +169,7 @@ fn emit(
         omitted,
         atoms: vec![],
         fixed_atoms: vec![],
-        next_local: (program.locals.len() as u32).max(max_local_in_steps(&steps, &observations)) + 1,
+        next_local: (program.locals.len() as u32).max(max_local_in_steps(&steps, norm_spec.invariants)).max(max_obs_local) + 1,
     };
     let mut cases = Vec::new();
     for b in &steps {
@@ -165,8 +181,20 @@ fn emit(
     if cases.is_empty() {
         return None;
     }
-    let observation = e.tests(&observations, &[])?;
-    Some(e.output(&initial, &cases, &observation))
+    let observation = e.tests(norm_spec.invariants, &[])?;
+    let init_observation = e.tests(norm_spec.init_props, &[])?;
+    let constraint_test = e.tests(norm_spec.constraints, &[])?;
+    let action_constraint_test = e.action_tests(norm_spec.action_constraints, &[])?;
+    let action_observation = e.action_tests(norm_spec.action_props, &[])?;
+    let obs_bundle = super::ObsBundle {
+        observation: &observation,
+        init_observation: &init_observation,
+        constraint_test: &constraint_test,
+        action_constraint_test: &action_constraint_test,
+        action_observation: &action_observation,
+        constrained: spec.is_constrained(),
+    };
+    normalize.attach_const_subst(e.output(&initial, &cases, &obs_bundle))
 }
 
 fn classify_var(

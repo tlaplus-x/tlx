@@ -5,12 +5,12 @@
 //!   substitutes `@` eagerly in `EXCEPT`, packs multi-arg function/index tuples,
 //!   desugars `CASE ... OTHER` to right-nested `IF`, and splits provably-arity-safe
 //!   tuple binders (used by `keyed`, `domain`, and public domain queries).
-//! - [`SymNormalizer::for_equiv`] (`NormMode::Equiv`):
+//! - [`SymNormalizer::for_equiv_with_config`] (`NormMode::Equiv`):
 //!   preserves `EXCEPT` and `@` intact with lexical scope IDs for sequential
 //!   `letBind` lowering, normalizes `SelectSeq` predicate arguments to unary
 //!   `LAMBDA`s, and preserves `CASE` and tuple binders (used by `equiv_sym` and
 //!   `sym_totality`).
-//! - [`SymNormalizer::for_choose`] (`NormMode::Choose`):
+//! - [`SymNormalizer::for_choose_with_config`] (`NormMode::Choose`):
 //!   substitutes `@` eagerly in `EXCEPT` and lowers commutative-associative
 //!   recursive `CHOOSE` integer set-sum folds to explicit `fold_vars` markers
 //!   (used by `choose_sym`).
@@ -21,7 +21,7 @@
 mod folds;
 mod helpers;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tlx_front::cfg::Config;
 
@@ -60,6 +60,8 @@ pub struct SymNormalizer<'a> {
     cfg: Option<&'a Config>,
     mode: NormMode,
     pub(super) stack: Vec<DefId>,
+    const_stack: Vec<ConstId>,
+    expanded_substs: BTreeMap<ConstId, String>,
     remaining: usize,
     pub(crate) local: u32,
     at_stack: Vec<(Expr, bool)>,
@@ -83,17 +85,15 @@ impl<'a> SymNormalizer<'a> {
         Self::with_mode(program, Some(cfg), NormMode::Standard)
     }
 
-    /// Create a normalizer in `equiv_sym` / `sym_totality` mode (preserving
-    /// `EXCEPT` and `@` with lexical scope tracking and normalizing `SelectSeq`
-    /// predicates to unary `LAMBDA`s).
-    pub(in crate::optimize::phase) fn for_equiv(program: &'a Program) -> Self {
-        Self::with_mode(program, None, NormMode::Equiv)
+    /// Create a normalizer in `equiv_sym` / `sym_totality` mode with `CONSTANT C <- Def` expansion.
+    pub(in crate::optimize::phase) fn for_equiv_with_config(program: &'a Program, cfg: &'a Config) -> Self {
+        Self::with_mode(program, Some(cfg), NormMode::Equiv)
     }
 
     /// Create a normalizer in `choose_sym` mode (substituting `@` in `EXCEPT`
     /// and recognizing recursive `CHOOSE` integer set-sum folds).
-    pub(in crate::optimize::phase) fn for_choose(program: &'a Program) -> Self {
-        Self::with_mode(program, None, NormMode::Choose)
+    pub(in crate::optimize::phase) fn for_choose_with_config(program: &'a Program, cfg: &'a Config) -> Self {
+        Self::with_mode(program, Some(cfg), NormMode::Choose)
     }
 
     fn with_mode(program: &'a Program, cfg: Option<&'a Config>, mode: NormMode) -> Self {
@@ -103,6 +103,8 @@ impl<'a> SymNormalizer<'a> {
             cfg,
             mode,
             stack: Vec::new(),
+            const_stack: Vec::new(),
+            expanded_substs: BTreeMap::new(),
             remaining,
             local: program.locals.len() as u32,
             at_stack: Vec::new(),
@@ -118,6 +120,40 @@ impl<'a> SymNormalizer<'a> {
     /// budget/depth exhaustion.
     pub fn normalize(&mut self, e: &Expr) -> Option<Expr> {
         self.expand(e, &HashMap::new(), &HashMap::new(), None, None, 0)
+    }
+
+    pub(in crate::optimize::phase) fn attach_const_subst(&self, cert: super::OpenCert) -> Option<String> {
+        let cfg = self.cfg?;
+        super::attach_const_subst_obligation(self.program, cfg, &self.expanded_substs, |cid| self.expand_declared_const_subst(cid), cert)
+    }
+
+    pub(in crate::optimize::phase) fn expand_declared_const_subst(&self, c: ConstId) -> Option<String> {
+        let cfg = self.cfg?;
+        let (seen, terminal) = super::resolve_const_subst_chain(self.program, cfg, c)?;
+        let resolved = match terminal {
+            super::ConstSubstTarget::PureBuiltin(op, span) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            super::ConstSubstTarget::Const(other) => Expr::new(ExprKind::Const(other), Span::default()),
+            super::ConstSubstTarget::Def(id) => {
+                let d = &self.program.defs[id.idx()];
+                let mut fresh = Self::with_mode(self.program, self.cfg, self.mode);
+                fresh.const_stack.extend_from_slice(&seen);
+                fresh.apply_def(id, &[], &HashMap::new(), &HashMap::new(), None, None, d.span, 1).map(block_non_target)?
+            }
+        };
+        super::canonical_expr_repr(self.program, &resolved)
+    }
+
+    fn record_const_subst(&mut self, c: ConstId, res: &Expr) -> bool {
+        let Some(repr) = super::canonical_expr_repr(self.program, res) else {
+            return false;
+        };
+        match self.expanded_substs.get(&c) {
+            Some(prev) => prev == &repr,
+            None => {
+                self.expanded_substs.insert(c, repr);
+                true
+            }
+        }
     }
 
     pub(super) fn alloc_local(&mut self) -> LocalId {
@@ -208,7 +244,7 @@ impl<'a> SymNormalizer<'a> {
         let name = &*self.program.consts[c.idx()].name;
         let target = cfg.last_constant_subst(name)?;
         match self.program.lookup_resolved_root(target)? {
-            RootSymbol::Def(id) => Some(id),
+            RootSymbol::Def(id) if !self.program.def_is_let(id) => Some(id),
             _ => None,
         }
     }
@@ -284,9 +320,29 @@ impl<'a> SymNormalizer<'a> {
                 return Some(e.clone());
             }
             ExprKind::Const(c) => {
-                if let Some(def_id) = self.const_subst_def(*c) {
-                    if self.program.defs[def_id.idx()].params.is_empty() {
-                        return self.apply_def(def_id, &[], env, op_env, cur_except, lex_at, e.span, depth + 1).map(block_non_target);
+                if let Some(cfg) = self.cfg {
+                    if self.program.consts[c.idx()].arity == 0 && cfg.last_constant_subst(&self.program.consts[c.idx()].name).is_some() {
+                        if self.const_stack.contains(c) {
+                            return None;
+                        }
+                        let res = match super::resolve_const_subst_target(self.program, cfg, *c)? {
+                            super::ConstSubstTarget::PureBuiltin(op, _) => Expr::new(ExprKind::Builtin { op, args: vec![] }, e.span),
+                            super::ConstSubstTarget::Def(def_id) => {
+                                self.const_stack.push(*c);
+                                let res =
+                                    self.apply_def(def_id, &[], env, op_env, cur_except, lex_at, e.span, depth + 1).map(block_non_target);
+                                self.const_stack.pop();
+                                res?
+                            }
+                            super::ConstSubstTarget::Const(other) => {
+                                self.const_stack.push(*c);
+                                let res =
+                                    self.expand(&Expr::new(ExprKind::Const(other), e.span), env, op_env, cur_except, lex_at, depth + 1);
+                                self.const_stack.pop();
+                                res?
+                            }
+                        };
+                        return self.record_const_subst(*c, &res).then_some(res);
                     }
                 }
                 ExprKind::Const(*c)

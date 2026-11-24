@@ -9,6 +9,31 @@ use crate::{env::Env, error::EResult, eval::Ctx};
 use super::{behavior, Behavior, InterpModel};
 
 impl InterpModel {
+    fn cfg_constants_allow_certification(&self) -> bool {
+        let cfg = &self.ip.cfg;
+        tlx_sema::optimize::cfg_constants_supported(&self.ip.prog, cfg)
+            && cfg.constants.iter().all(|b| match b {
+                ConstBinding::Value { name, module: None, .. } | ConstBinding::Subst { name, module: None, .. } => {
+                    self.ip.root_def(name).is_none()
+                }
+                _ => false,
+            })
+    }
+
+    fn init_prop_exprs(&self) -> Vec<Expr> {
+        self.init_props.iter().map(|(_, e)| e.clone()).collect()
+    }
+
+    fn check_spec<'a>(&'a self, init_props: &'a [Expr]) -> tlx_sema::optimize::CheckSpec<'a> {
+        tlx_sema::optimize::CheckSpec {
+            invariants: &self.invariants,
+            init_props,
+            constraints: &self.constraints,
+            action_constraints: &self.action_constraints,
+            action_props: &self.action_props,
+        }
+    }
+
     /// Forget proved irrelevant values in fingerprints, retaining concrete
     /// values and original actions for execution and counterexample replay.
     /// Certified mathematical allocation may eliminate eventual overflow.
@@ -19,45 +44,34 @@ impl InterpModel {
             || self.has_view()
             || !self.possible.is_empty()
             || !self.postconditions.is_empty()
-            || !cfg.constants.iter().all(|b| {
-                matches!(b, ConstBinding::Value { name, module: None, .. }
-                if self.ip.root_def(name).is_none())
-            })
-        {
-            return None;
-        }
-        let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
-        // Certificates currently cover state invariants and deadlocks only.
-        // No candidate may bypass this gate, including legacy reductions.
-        if !self.constraints.is_empty()
-            || !self.action_constraints.is_empty()
-            || !self.action_props.is_empty()
-            || !self.init_props.is_empty()
+            || !self.cfg_constants_allow_certification()
             || self.alias.is_some()
             || !self.symmetry.is_empty()
             || cfg.symmetry.is_some()
         {
             return None;
         }
-        let observations = &self.invariants;
+        let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
+        let init_props = self.init_prop_exprs();
+        let spec = self.check_spec(&init_props);
         use tlx_sema::optimize as opt;
         let candidates = std::iter::once_with(|| {
-            ("unobserved-state-projection", opt::unobserved_projection(&self.ip.prog, &self.init, &next, observations))
+            ("unobserved-state-projection", opt::unobserved_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         })
         .chain(std::iter::once_with(|| {
-            ("relative-age-projection", opt::age_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+            ("relative-age-projection", opt::age_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("history-summary-projection", opt::history_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+            ("history-summary-projection", opt::history_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("phase-field-projection", opt::phase_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+            ("phase-field-projection", opt::phase_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("sequence-length-projection", opt::sequence_length_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+            ("sequence-length-projection", opt::sequence_length_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("ordered-allocation-projection", opt::ordered_projection(&self.ip.prog, cfg, &self.init, &next, observations))
+            ("ordered-allocation-projection", opt::ordered_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }));
         for (rule, candidate) in candidates {
             let Some(projection) = candidate else { continue };
@@ -80,15 +94,8 @@ impl InterpModel {
             || cfg.symmetry.is_some()
             || !self.possible.is_empty()
             || !self.postconditions.is_empty()
-            || !self.constraints.is_empty()
-            || !self.action_constraints.is_empty()
-            || !self.action_props.is_empty()
-            || !self.init_props.is_empty()
             || self.alias.is_some()
-            || !cfg.constants.iter().all(|b| {
-                matches!(b,
-                ConstBinding::Value { name, module: None, .. } if self.ip.root_def(name).is_none())
-            })
+            || !self.cfg_constants_allow_certification()
         {
             return None;
         }
@@ -100,18 +107,20 @@ impl InterpModel {
     pub fn symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
         let next = self.symmetry_cert_next()?;
         let cfg = &self.ip.cfg;
+        let init_props = self.init_prop_exprs();
+        let spec = self.check_spec(&init_props);
         if self.state_projection {
-            tlx_sema::optimize::symmetry_projection_certificate(
+            tlx_sema::optimize::symmetry_projection_certificate_with_spec(
                 &self.ip.prog,
                 cfg,
                 &self.init,
                 &next,
-                &self.invariants,
+                spec,
                 groups,
                 self.view.as_ref()?,
             )
         } else {
-            tlx_sema::optimize::symmetry_certificate(&self.ip.prog, cfg, &self.init, &next, &self.invariants, groups)
+            tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups)
         }
     }
 
@@ -123,7 +132,9 @@ impl InterpModel {
             return None;
         }
         let next = self.symmetry_cert_next()?;
-        tlx_sema::optimize::choose_symmetry_certificate(&self.ip.prog, &self.ip.cfg, &self.init, &next, &self.invariants, groups)
+        let init_props = self.init_prop_exprs();
+        let spec = self.check_spec(&init_props);
+        tlx_sema::optimize::choose_symmetry_certificate_with_spec(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, groups)
     }
 
     /// Retain the proof of the automatic group actually installed by the caller.

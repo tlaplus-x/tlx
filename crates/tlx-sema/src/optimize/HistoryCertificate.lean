@@ -186,6 +186,8 @@ structure Model (C E I W : Type) where
   step : C → C → W → Summary E I → Prop
   transfer : C → C → W → Summary E I → Transfer E
   observe : C → Summary E I → Prop
+  initObserve : C → Summary E I → Prop := fun _ _ => True
+  constraint : C → Summary E I → Prop := fun _ _ => True
 
 namespace Model
 variable {C E I W : Type} (m : Model C E I W)
@@ -257,5 +259,26 @@ theorem deadlock_preserved (s : C × History E) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (C × History E) where
+  toSystem := m.concrete
+  initSafe s := m.initObserve s.1 (indexedSummary m.predicate s.2)
+  constraint s := m.constraint s.1 (indexedSummary m.predicate s.2)
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (C × Summary E I) where
+  toSystem := m.reduced
+  initSafe s := m.initObserve s.1 s.2
+  constraint s := m.constraint s.1 s.2
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun s => by change m.initObserve s.1 (indexedSummary m.predicate s.2) ↔ _; rw [indexedSummary_eq]; rfl)
+    (fun s => by change m.constraint s.1 (indexedSummary m.predicate s.2) ↔ _; rw [indexedSummary_eq]; rfl)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end TlxOptimization.HistoryRule

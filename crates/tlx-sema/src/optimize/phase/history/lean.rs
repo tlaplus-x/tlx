@@ -10,12 +10,21 @@ use super::super::{binding, unchanged, variable, Branch};
 use super::{interval_end, one_local};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 
-pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observations: &[Expr], monitors: &[Expr]) -> Option<String> {
+pub(super) fn emit(
+    var: VarId,
+    initial: &[Branch],
+    steps: &[Branch],
+    spec: super::super::CheckSpec<'_>,
+    monitors: &[Expr],
+) -> Option<super::super::OpenCert> {
     let mut emitter = Emitter::new(var, monitors);
     let predicates = emitter.predicates()?;
     let (initial_guards, seeds) = emitter.branches(initial, false)?;
     let (step_guards, transfers) = emitter.branches(steps, true)?;
-    let observations = observations.iter().map(|e| emitter.observe(e)).collect::<Option<Vec<_>>>()?;
+    let observations = spec.invariants.iter().map(|e| emitter.observe(e)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|e| emitter.observe(e)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|e| emitter.observe(e)).collect::<Option<Vec<_>>>()?;
+    let constrained = spec.is_constrained();
     let count = monitors.len();
     let mut out = String::from(include_str!("../../HistoryCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedHistory\nopen TlxOptimization HistoryRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
@@ -47,12 +56,26 @@ pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observation
     }
     writeln!(out, "\ndef observe {params} (c : C) (s : Summary V (Fin {count})) : Prop :=\n  {}", combine(&observations, "∧", "True"))
         .unwrap();
+    if constrained {
+        writeln!(out, "\ndef initObserve {params} (c : C) (s : Summary V (Fin {count})) : Prop :=\n  {}", combine(&init_obs, "∧", "True"))
+            .unwrap();
+        writeln!(
+            out,
+            "\ndef constraint {params} (c : C) (s : Summary V (Fin {count})) : Prop :=\n  {}",
+            combine(&constraints, "∧", "True")
+        )
+        .unwrap();
+    }
     writeln!(out, "\ndef model : HistoryRule.Model C V (Fin {count}) (Nat × W) where").unwrap();
     for field in ["predicate", "initial", "seed", "step", "transfer", "observe"] {
         writeln!(out, "  {field} := @{field} C V W sem").unwrap();
     }
-    out.push_str(
-        "\ndef before := (model sem).concrete\n\
+    if constrained {
+        for field in ["initObserve", "constraint"] {
+            writeln!(out, "  {field} := @{field} C V W sem").unwrap();
+        }
+    }
+    let tail = "\ndef before := (model sem).concrete\n\
          def after := (model sem).reduced\n\
          def project := (model sem).project\n\n\
          theorem certificate : Certificate (before sem) (after sem) (project sem) :=\n\
@@ -75,10 +98,8 @@ pub(super) fn emit(var: VarId, initial: &[Branch], steps: &[Branch], observation
          #print axioms optimization_correct\n\
          #print axioms specification_correct\n\
          #print axioms counterexample_lifts\n\
-         #print axioms deadlock_preserved\n\
-         end\nend TlxOptimization.GeneratedHistory\n",
-    );
-    Some(out)
+         #print axioms deadlock_preserved\n";
+    Some(super::super::OpenCert::new(out, tail, "GeneratedHistory", constrained, false, false))
 }
 
 pub(in super::super) const SEMANTICS: &str = "\n-- These are universal semantic parameters, not correctness axioms.\n\

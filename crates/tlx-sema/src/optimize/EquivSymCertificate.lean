@@ -3315,6 +3315,10 @@ structure Model (d : Nat) (sizes : Fin d → Nat) (V A : Type) where
   initForm : Form d V
   nextForm : Form d V
   obsForm : Form d V
+  initObsForm : Form d V := .truth true
+  constraintForm : Form d V := .truth true
+  actionConstraintForm : Form d V := .truth true
+  actionObsForm : Form d V := .truth true
 
 namespace Model
 variable {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (m : Model d sizes V A)
@@ -3396,6 +3400,86 @@ theorem orbit_key_equivalent (s t : State V sizes A) :
   · exact Quotient.exact
   · intro h
     exact Quotient.sound (show (orbits V sizes A).r s t from h)
+
+def constrainedConcrete : ConstrainedSystem (State V sizes A) where
+  toSystem := m.concrete
+  initSafe s := evalForm m.ops s s emptyEnv m.initObsForm
+  constraint s := evalForm m.ops s s emptyEnv m.constraintForm
+  actionConstraint s t := evalForm m.ops s t emptyEnv m.actionConstraintForm
+  actionSafe s t := evalForm m.ops s t emptyEnv m.actionObsForm
+
+theorem initSafe_rename (p : GroupPerm sizes) (s : State V sizes A) :
+    m.constrainedConcrete.initSafe (renameState p s) ↔ m.constrainedConcrete.initSafe s := by
+  have h := evalForm_equivariant p m.ops s s emptyEnv m.initObsForm
+  rwa [renameEnv_empty] at h
+
+theorem constraint_rename (p : GroupPerm sizes) (s : State V sizes A) :
+    m.constrainedConcrete.constraint (renameState p s) ↔ m.constrainedConcrete.constraint s := by
+  have h := evalForm_equivariant p m.ops s s emptyEnv m.constraintForm
+  rwa [renameEnv_empty] at h
+
+theorem actionConstraint_rename (p : GroupPerm sizes) (s t : State V sizes A) :
+    m.constrainedConcrete.actionConstraint (renameState p s) (renameState p t) ↔
+      m.constrainedConcrete.actionConstraint s t := by
+  have h := evalForm_equivariant p m.ops s t emptyEnv m.actionConstraintForm
+  rwa [renameEnv_empty] at h
+
+theorem actionSafe_rename (p : GroupPerm sizes) (s t : State V sizes A) :
+    m.constrainedConcrete.actionSafe (renameState p s) (renameState p t) ↔
+      m.constrainedConcrete.actionSafe s t := by
+  have h := evalForm_equivariant p m.ops s t emptyEnv m.actionObsForm
+  rwa [renameEnv_empty] at h
+
+def constrainedReduced : ConstrainedSystem (Quotient (orbits V sizes A)) where
+  toSystem := m.reduced
+  initSafe a := Quotient.liftOn a m.constrainedConcrete.initSafe (by
+    rintro s t ⟨p, rfl⟩
+    exact propext (m.initSafe_rename p s).symm)
+  constraint a := Quotient.liftOn a m.constrainedConcrete.constraint (by
+    rintro s t ⟨p, rfl⟩
+    exact propext (m.constraint_rename p s).symm)
+  actionConstraint a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧
+    m.constrainedConcrete.actionConstraint s t ∧ project t = b
+  actionSafe a b := ∀ s t, project s = a → project t = b → m.concrete.next s t →
+    m.constrainedConcrete.actionSafe s t
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced project := by
+  refine ⟨m.certificate.initial, m.certificate.next, m.certificate.observe, fun _ => Iff.rfl, fun _ => Iff.rfl, ?_, ?_⟩
+  · intro s a
+    constructor
+    · rintro ⟨_, hc, x, y, hx, hxy, hac, hy⟩
+      obtain ⟨p, hp⟩ := Quotient.exact hx
+      let t := renameState p y
+      have hnext : m.concrete.next s t := by
+        have h := (m.next_rename p x y).mpr hxy
+        rwa [hp] at h
+      have hact : m.constrainedConcrete.actionConstraint s t := by
+        have h := (m.actionConstraint_rename p x y).mpr hac
+        rwa [hp] at h
+      have hpt : project t = a := (project_rename p y).trans hy
+      have hct : m.constrainedConcrete.constraint t := by
+        change m.constrainedReduced.constraint (project t)
+        rw [hpt]
+        exact hc
+      exact ⟨t, hnext, hct, hact, hpt⟩
+    · rintro ⟨t, hn, hc, hac, rfl⟩
+      exact ⟨⟨s, t, rfl, hn, rfl⟩, hc, ⟨s, t, rfl, hn, hac, rfl⟩⟩
+  · intro s a
+    constructor
+    · intro h _ x y hx hy hxy
+      obtain ⟨p, hp⟩ := Quotient.exact hx
+      let t := renameState p y
+      have hnext : m.concrete.next s t := by
+        have hn := (m.next_rename p x y).mpr hxy
+        rwa [hp] at hn
+      have hpt : project t = a := (project_rename p y).trans hy
+      have has := h t hnext hpt
+      have hrew := (m.actionSafe_rename p x y).mp
+      rw [hp] at hrew
+      exact hrew has
+    · intro h t hst hpt
+      exact h ⟨s, t, rfl, hst, hpt⟩ s t rfl hpt hst
 end Model
 end
 end TlxOptimization.EquivRule

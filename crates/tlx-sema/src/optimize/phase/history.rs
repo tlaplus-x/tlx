@@ -25,14 +25,37 @@ use super::{
 /// Prove a finite summary for one history, retaining concrete execution and
 /// the shared safety-only checking boundary. All observations are required.
 pub fn history_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
-    let mut expand = Normalizer::new(program);
+    history_projection_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations))
+}
+
+/// Prove a finite summary for one history covering invariants, state constraints,
+/// and init properties.
+pub fn history_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    let spec = spec.state_only()?;
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config(program, cfg);
     let initial = branches(&expand.root(init)?)?;
     let steps = branches(&expand.root(next)?)?;
-    let observations: Vec<_> = observations.iter().map(|e| expand.root(e)).collect::<Option<_>>()?;
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &initial, &steps)?;
     for (i, domain) in domains.vars.iter().enumerate() {
-        let Some(candidate) = candidate(program, &domains, i, domain, &initial, &steps, &observations) else { continue };
-        let certificate = lean::emit(candidate.var, &initial, &steps, &observations, &candidate.monitors);
+        let Some(candidate) = candidate(program, &domains, i, domain, &initial, &steps, norm_spec) else { continue };
+        if spec.is_constrained() && !super::sym_totality::check_projection_observations_total(program, cfg, init, next, spec) {
+            return None;
+        }
+        let certificate = match lean::emit(candidate.var, &initial, &steps, norm_spec, &candidate.monitors) {
+            Some(c) => Some(expand.attach_const_subst(c)?),
+            None => None,
+        };
         let summary = candidate.summary;
         let span = program.vars[i].span;
         let values = program
@@ -64,7 +87,7 @@ pub(super) fn candidate(
     domain: &Domain,
     initial: &[Branch],
     steps: &[Branch],
-    observations: &[Expr],
+    spec: super::CheckSpec<'_>,
 ) -> Option<Candidate> {
     let Domain::Seq(element) = domain else { return None };
     if !finite(element) {
@@ -73,7 +96,7 @@ pub(super) fn candidate(
     let mut proof = Proof { var: VarId(i as u32), domains, element, monitors: vec![], appends: false };
     if !initial.iter().all(|b| proof.branch(b, false))
         || !steps.iter().all(|b| proof.branch(b, true))
-        || !observations.iter().all(|e| proof.read(e))
+        || !spec.all_state_preds().all(|e| proof.read(e))
         || !proof.appends
     {
         return None;

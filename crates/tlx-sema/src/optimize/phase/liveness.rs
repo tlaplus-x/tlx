@@ -34,8 +34,8 @@ pub(super) fn derive(
     control: &str,
     phases: &BTreeSet<Atom>,
     branches: (&[Branch], &[Branch]),
-    observations: &[Expr],
-) -> Option<FieldProjection> {
+    spec: super::CheckSpec<'_>,
+) -> Option<(FieldProjection, Option<super::OpenCert>)> {
     let (initial, steps) = branches;
     let (keys, fields) = match &domains.vars[var.idx()] {
         Domain::Record(fs) => (None, fs),
@@ -55,7 +55,7 @@ pub(super) fn derive(
         remaining: 100_000,
     };
     a.live.get_mut(control)?.extend(phases.iter().cloned());
-    for e in observations {
+    for e in spec.all_state_preds() {
         a.read(e, phases, None)?;
     }
     let mut edges = Vec::new();
@@ -105,9 +105,9 @@ pub(super) fn derive(
             break;
         }
     }
-    let mut projection = a.view(program)?;
-    projection.certificate = lean::emit(&a, initial, steps, observations);
-    Some(projection)
+    let projection = a.view(program)?;
+    let cert = lean::emit(&a, initial, steps, spec);
+    Some((projection, cert))
 }
 
 impl Analysis<'_> {

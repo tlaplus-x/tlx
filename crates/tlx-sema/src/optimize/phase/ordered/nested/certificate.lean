@@ -27,5 +27,3 @@ theorem deadlock_preserved (s : (model sem).State) :
 #print axioms specification_correct
 #print axioms counterexample_lifts
 #print axioms deadlock_preserved
-end
-end TlxOptimization.GeneratedNested

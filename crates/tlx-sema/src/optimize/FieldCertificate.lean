@@ -27,6 +27,8 @@ structure Model (C K P F V B W : Type) where
   guard : B → C → C → W → (K → P) → (K → F → V) → Prop
   value : B → C → C → W → (K → P) → (K → F → V) → F → V
   observe : C → (K → P) → (K → F → V) → Prop
+  initObserve : C → (K → P) → (K → F → V) → Prop := fun _ _ _ => True
+  constraint : C → (K → P) → (K → F → V) → Prop := fun _ _ _ => True
 
 namespace Model
 variable {C K P F V B W : Type} (m : Model C K P F V B W)
@@ -166,6 +168,27 @@ theorem deadlock_preserved (s : State C K P F V) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (State C K P F V) where
+  toSystem := m.concrete
+  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
+  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (State C K P F V) where
+  toSystem := m.reduced
+  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
+  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun s => by change _ ↔ m.initObserve s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2)); rw [m.observations_mask]; rfl)
+    (fun s => by change _ ↔ m.constraint s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2)); rw [m.observations_mask]; rfl)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end
 end TlxOptimization.FieldRule

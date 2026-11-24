@@ -12,6 +12,8 @@ structure Model (C K E I W : Type) where
   change : C → C → W → (K → Bool) → HistoryRule.Summary E I → K → Decision age.caps Change
   guard : C → C → W → (K → Bool) → HistoryRule.Summary E I → Test age.caps
   observe : C → (K → Bool) → HistoryRule.Summary E I → Test age.caps
+  initObserve : C → (K → Bool) → HistoryRule.Summary E I → Test age.caps := fun _ _ _ => .pure True
+  constraint : C → (K → Bool) → HistoryRule.Summary E I → Test age.caps := fun _ _ _ => .pure True
 
 namespace Model
 variable {C K E I W : Type} (m : Model C K E I W)
@@ -115,5 +117,36 @@ theorem deadlock_preserved (s : State C K × History E) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (State C K × History E) where
+  toSystem := m.concrete
+  initSafe s := (m.initObserve s.1.core (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.1.now s.1.stamps
+  constraint s := (m.constraint s.1.core (presence s.1.stamps) (HistoryRule.indexedSummary m.predicate s.2)).concrete s.1.now s.1.stamps
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (Abstract C K × HistoryRule.Summary E I) where
+  toSystem := m.reduced
+  initSafe s := (m.initObserve s.1.1 (presence s.1.2) s.2).reduced s.1.2
+  constraint s := (m.constraint s.1.1 (presence s.1.2) s.2).reduced s.1.2
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun s => by
+      change _ ↔ (m.initObserve s.1.core (presence (summarize m.age.caps s.1.now s.1.stamps)) (History.summary m.predicate s.2)).reduced _
+      rw [presence_summary]
+      change (m.initObserve _ _ (HistoryRule.indexedSummary _ _)).concrete _ _ ↔ _
+      rw [HistoryRule.indexedSummary_eq]
+      exact Test.commutes _ _ _)
+    (fun s => by
+      change _ ↔ (m.constraint s.1.core (presence (summarize m.age.caps s.1.now s.1.stamps)) (History.summary m.predicate s.2)).reduced _
+      rw [presence_summary]
+      change (m.constraint _ _ (HistoryRule.indexedSummary _ _)).concrete _ _ ↔ _
+      rw [HistoryRule.indexedSummary_eq]
+      exact Test.commutes _ _ _)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end TlxOptimization.AgeHistoryRule

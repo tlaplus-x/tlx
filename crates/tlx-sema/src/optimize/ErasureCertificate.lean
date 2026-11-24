@@ -8,6 +8,10 @@ structure Model (C H W : Type) where
   step : C → C → W → Prop
   update : C → C → W → H → H
   observe : C → Prop
+  initObserve : C → Prop := fun _ => True
+  constraint : C → Prop := fun _ => True
+  actionConstraint : C → C → Prop := fun _ _ => True
+  actionObserve : C → C → Prop := fun _ _ => True
 
 namespace Model
 variable {C H W : Type} (m : Model C H W)
@@ -65,5 +69,35 @@ theorem deadlock_preserved (s : C × H) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (C × H) where
+  toSystem := m.concrete
+  initSafe s := m.initObserve s.1
+  constraint s := m.constraint s.1
+  actionConstraint s t := m.actionConstraint s.1 t.1
+  actionSafe s t := m.actionObserve s.1 t.1
+
+def constrainedReduced : ConstrainedSystem C where
+  toSystem := m.reduced
+  initSafe c := m.initObserve c
+  constraint c := m.constraint c
+  actionConstraint c d := m.actionConstraint c d
+  actionSafe c d := m.actionObserve c d
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project := by
+  refine ⟨m.certificate.initial, m.certificate.next, m.certificate.observe, fun _ => Iff.rfl, fun _ => Iff.rfl, ?_, ?_⟩
+  · intro s a
+    constructor
+    · rintro ⟨⟨w, hw⟩, hc, hac⟩
+      exact ⟨(a, m.update s.1 a w s.2), ⟨w, hw, rfl⟩, hc, hac, rfl⟩
+    · rintro ⟨t, ⟨w, hw, _⟩, hc, hac, rfl⟩
+      exact ⟨⟨w, hw⟩, hc, hac⟩
+  · intro s a
+    constructor
+    · intro h ⟨w, hw⟩
+      exact h (a, m.update s.1 a w s.2) ⟨w, hw, rfl⟩ rfl
+    · intro h t ⟨w, hw, _⟩ rfl
+      exact h ⟨w, hw⟩
 end Model
 end TlxOptimization.ErasureRule

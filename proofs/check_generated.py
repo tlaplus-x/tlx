@@ -70,14 +70,57 @@ def invoke(lean, path):
     )
 
 
+def has_decl_line(block, line):
+    return re.search(rf"(?m)^{re.escape(line)}$", block) is not None
+
+
+def has_preamble_decl(preamble, prefix):
+    return re.search(rf"(?m)^{re.escape(prefix)}\b", preamble) is not None
+
+
+def split_certificate(path, source):
+    found = [
+        name for name in SUPPORTED_NAMESPACES
+        if re.search(rf"(?m)^namespace TlxOptimization\.{re.escape(name)}$", source)
+    ]
+    if len(found) != 1:
+        raise RuntimeError(f"{path}: expected one supported generated certificate")
+    namespace = found[0]
+    open_matches = list(re.finditer(rf"(?m)^namespace TlxOptimization\.{re.escape(namespace)}\n", source))
+    if len(open_matches) != 1:
+        raise RuntimeError(f"{path}: malformed generated namespace {namespace}")
+    open_match = open_matches[0]
+    preamble = source[:open_match.start()]
+    ns_open = open_match.group(0)
+    rest = source[open_match.end():]
+    close_matches = list(re.finditer(rf"(?m)^end TlxOptimization\.{re.escape(namespace)}(?=\n|$)", rest))
+    if not close_matches:
+        raise RuntimeError(f"{path}: malformed generated namespace {namespace}")
+    close_match = close_matches[-1]
+    gen_block = rest[:close_match.start()]
+    ns_close = close_match.group(0)
+    suffix = rest[close_match.end():]
+    return namespace, preamble, ns_open, gen_block, ns_close, suffix
+
+
+def replace_once_in(text, before, after, path, label):
+    if text.count(before) != 1:
+        raise RuntimeError(f"{path}: negative test no longer targets one expression: {label}")
+    return text.replace(before, after, 1)
+
+
+def replace_gen_regex(gen_block, pattern, repl, path, label):
+    matches = list(re.finditer(pattern, gen_block, flags=re.MULTILINE))
+    if len(matches) != 1:
+        raise RuntimeError(f"{path}: negative test no longer targets one generated declaration: {label}")
+    m = matches[0]
+    return gen_block[:m.start()] + repl(m) + gen_block[m.end():]
+
+
 def verify(lean, path, negative, lean_pool=None):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in SUPPORTED_NAMESPACES
-                  if f"namespace TlxOptimization.{name}\n" in source]
-    if len(namespaces) != 1:
-        raise RuntimeError(f"{path}: expected one supported generated certificate")
-    namespace = namespaces[0]
+    namespace, preamble, ns_open, gen_block, ns_close, suffix = split_certificate(path, source)
     result = (lean_pool.submit(invoke, lean, path).result()
               if lean_pool is not None else invoke(lean, path))
     if result.returncode:
@@ -97,6 +140,17 @@ def verify(lean, path, negative, lean_pool=None):
         result.stdout,
     ):
         axioms[name] = []
+
+    has_select = has_preamble_decl(preamble, "def Test.select")
+    has_bind = has_preamble_decl(preamble, "theorem Test.bind_concrete")
+    has_commutes = has_preamble_decl(preamble, "theorem Decision.commutes")
+    is_constrained = has_decl_line(gen_block, "def constrainedAfter := (model sem).constrainedReduced")
+    has_erasure_constrained = has_decl_line(gen_block, "def constrainedIntermediate := (model sem).erased.constrainedConcrete")
+    has_const_declared = has_decl_line(gen_block, "def constSubstDeclared (i : Fin ConstSubstCount) : String :=")
+    has_const_expanded = has_decl_line(gen_block, "def constSubstExpanded (i : Fin ConstSubstCount) : String :=")
+    if has_const_declared != has_const_expanded:
+        raise RuntimeError(f"{path}: mismatched constSubstDeclared/constSubstExpanded declarations")
+
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
     if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry"}:
         theorems |= {"orbit_key_equivalent"}
@@ -104,43 +158,68 @@ def verify(lean, path, negative, lean_pool=None):
         theorems |= {"inductive_invariant", "orbit_key_equivalent"}
     if namespace == "GeneratedErasedSymmetry":
         theorems |= {"erasure_certificate"}
-    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
+    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
         theorems |= {"select_concrete", "select_reduced"}
-    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
+    if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_bind:
         theorems |= {"bind_concrete", "bind_reduced"}
-    if "theorem Decision.commutes" in source:
+    if has_commutes:
         theorems |= {"commutes", "bindValue_concrete", "bindValue_reduced"}
+    if is_constrained:
+        theorems |= {
+            "constrained_certificate",
+            "constrained_optimization_correct",
+            "constrained_init_counterexample_lifts",
+            "constrained_step_counterexample_lifts",
+            "admitted_deadlock_preserved",
+        }
+    if has_erasure_constrained:
+        theorems |= {"erasure_constrained_certificate"}
+    if has_const_declared:
+        theorems |= {"const_subst_bindings_match", "const_subst_sound"}
+        if is_constrained:
+            theorems |= {"const_subst_constrained_sound"}
     if set(axioms) != theorems:
         raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
+
     mutations = []
     if negative:
+        mutated_sources = []
+
+        def add_preamble_mutation(before, after, label):
+            new_preamble = replace_once_in(preamble, before, after, path, label)
+            mutated_sources.append((new_preamble + ns_open + gen_block + ns_close + suffix, label))
+
+        def add_gen_decl_mutation(pattern, repl, label):
+            new_gen = replace_gen_regex(gen_block, pattern, repl, path, label)
+            mutated_sources.append((preamble + ns_open + new_gen + ns_close + suffix, label))
+
         if namespace == "GeneratedPipeline":
-            final = re.search(r"def rawAfter := (M\d+)\.system", source)[1]
-            block = source.split(f"namespace {final}\n", 1)[1].split(f"end {final}\n", 1)[0]
+            final = re.search(r"(?m)^def rawAfter := (M\d+)\.system$", gen_block)[1]
+            block = gen_block.split(f"namespace {final}\n", 1)[1].split(f"end {final}\n", 1)[0]
             initial = re.search(r"def initial[^\n]*\n  \| 0 => (\d+)", block)
             prefix = f"namespace {final}\n" + block[:initial.end()]
-            changes = [
+            pipe_changes = [
                 (prefix, prefix[:-len(initial[1])] + str(int(initial[1]) + 1), "changed final initial value"),
                 (f"def rawAfter := {final}.system", f"def rawAfter := {{ {final}.system with safe := fun s => ¬ {final}.system.safe s }}", "negated exported observation"),
             ]
             saturated = re.search(r"def update\d+.*?\n(?:  \| [^\n]*\n)*?  \| \d+ => if s \d+ < (\d+) then s \d+ \+ 1 else (\d+)", block)
             if saturated:
                 prefix = f"namespace {final}\n" + block[:saturated.end()]
-                changes.append((prefix, prefix[:-len(saturated[2])] + str(int(saturated[2]) + 1), "incremented past the certified cap"))
-            for step, rule in re.findall(r'namespace Step(\d+)\ndef rule : String := "([^"\n]+)"', source):
+                pipe_changes.append((prefix, prefix[:-len(saturated[2])] + str(int(saturated[2]) + 1), "incremented past the certified cap"))
+            for step, rule in re.findall(r'namespace Step(\d+)\ndef rule : String := "([^"\n]+)"', gen_block):
                 model = f"M{int(step) + 1}"
-                target = source.split(f"namespace {model}\n", 1)[1].split(f"end {model}\n", 1)[0]
+                target = gen_block.split(f"namespace {model}\n", 1)[1].split(f"end {model}\n", 1)[0]
                 if rule == "constant-state-propagation/v1":
-                    step_block = source.split(f"namespace Step{step}\n", 1)[1].split(f"end Step{step}\n", 1)[0]
+                    step_block = gen_block.split(f"namespace Step{step}\n", 1)[1].split(f"end Step{step}\n", 1)[0]
                     constraint = re.search(r"def valid[^\n]*?s \d+ = (\d+)", step_block)
                     if constraint:
                         prefix = f"namespace Step{step}\n" + step_block[:constraint.end()]
-                        changes.append((prefix, prefix[:-len(constraint[1])] + str(int(constraint[1]) + 1), "assumed an incorrect inductive constant"))
+                        pipe_changes.append((prefix, prefix[:-len(constraint[1])] + str(int(constraint[1]) + 1), "assumed an incorrect inductive constant"))
                 elif rule == "predicate-simplification/v1":
                     guard = re.search(r"def guard0 \(s : State\) : Prop := ([^\n]+)", target)
                     if guard:
                         prefix = f"namespace {model}\n" + target[:guard.end()]
-                        changes.append((prefix, prefix[:-len(guard[1])] + f"(¬ {guard[1]})", "negated a simplified guard"))
+                        pipe_changes.append((prefix, prefix[:-len(guard[1])] + f"(¬ {guard[1]})", "negated a simplified guard"))
                 elif rule == "dead-action-elimination/v1":
                     prefix = f"namespace {model}\n" + target
                     # Alter Init as well when the result has no live action: an
@@ -151,9 +230,12 @@ def verify(lean, path, negative, lean_pool=None):
                     else:
                         start = len(f"namespace {model}\n") + initial.start(1)
                         changed = prefix[:start] + str(int(initial[1]) + 1) + prefix[start + len(initial[1]):]
-                    changes.append((prefix, changed, "changed the dead-action result"))
+                    pipe_changes.append((prefix, changed, "changed the dead-action result"))
+            for before, after, label in pipe_changes:
+                new_gen = replace_once_in(gen_block, before, after, path, label)
+                mutated_sources.append((preamble + ns_open + new_gen + ns_close + suffix, label))
         else:
-            changes = ([
+            preamble_changes = ([
                 ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
             ] if namespace == "GeneratedHistory" else [
                 ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
@@ -167,9 +249,6 @@ def verify(lean, path, negative, lean_pool=None):
                 ("if m.live (p k) f then v k f else m.missing", "if m.live (p k) f then m.missing else v k f", "erased live fields"),
                 ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
                 ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
-                ("  readsActor := readsActor", "  readsActor := fun _ _ => true", "read dead actor fields"),
-                ("  writes := writes", "  writes := fun _ _ => false", "exposed dead framed fields"),
-                ("  readsGlobal := readsGlobal", "  readsGlobal := fun _ _ => true", "read dead fields of another actor"),
             ] if namespace == "GeneratedField" else [
                 ("fun i => p.toFun (keys i)", "fun i => keys i", "failed to rename bound keys"),
                 ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
@@ -205,8 +284,6 @@ def verify(lean, path, negative, lean_pool=None):
                 ("then some v else h.values k", "then some v else none", "discarded still-live old versions"),
                 ("k = ((clock + 1 : Nat) : Int)", "k = ((clock + 2 : Nat) : Int)", "inserted at the wrong fresh key"),
                 ("(s.core, m.numericKey refs s, m.retainedTable refs s)", "(s.core, m.numericKey refs s, fun (_ : Int) (_ : V) => False)", "discarded retained payloads from the key"),
-                ("def after := (model sem).reduced", "def after := { (model sem).reduced with next := fun _ _ => False }", "discarded live-version successors"),
-                ("def after := (model sem).reduced", "def after := { (model sem).reduced with initial := fun _ => False }", "discarded live-version initialization"),
             ] if namespace == "GeneratedLive" else [
                 ("min (n + delta) cap", "min (n + delta - delta) cap", "failed to advance capped ages"),
                 ("| .reset, _ => some 0", "| .reset, _ => some cap", "reset to the wrong age"),
@@ -216,60 +293,115 @@ def verify(lean, path, negative, lean_pool=None):
                 ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
                 ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
             ])
-        if namespace == "GeneratedErasedSymmetry":
-            changes.append(("t.2 = m.hiddenUpdate b s.1 w keys s.2", "False ∧ t.2 = m.hiddenUpdate b s.1 w keys s.2", "removed concrete hidden successors"))
-        if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "def Test.select" in source:
-            changes.extend([
-                ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
-                ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
-            ])
-        if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and "theorem Test.bind_concrete" in source:
-            changes.append(("(next b).reduced h", "(next (!b)).reduced h", "passed the wrong Boolean to the consumer"))
-        if "theorem Decision.commutes" in source:
-            changes.extend([
-                ("(yes.reduced h) (no.reduced h)", "(no.reduced h) (yes.reduced h)", "swapped reduced update decision"),
-                (".branch p (yes.bindValue f) (no.bindValue f)", ".branch p (no.bindValue f) (yes.bindValue f)", "swapped value continuation branches"),
-            ])
-        if namespace == "GeneratedHistory":
-            changes.extend([
-                ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (History.summary m.predicate History.empty)", "discarded guard feedback"),
-                ("m.transfer s.1 t.1 w s.2", "m.transfer s.1 t.1 w (History.summary m.predicate History.empty)", "discarded transfer feedback"),
-            ])
-        if namespace == "GeneratedAgeHistory":
-            changes.extend([
-                ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
-                ("m.guard s.1.1 t.1.1 w (presence s.1.2) s.2", "m.guard s.1.1 t.1.1 w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded guard feedback"),
-                ("m.historyTransfer s.1.1 d w (presence s.1.2) s.2", "m.historyTransfer s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded transfer feedback"),
-                ("((m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced s.1.2).reduced m.predicate s.2" if "theorem Decision.commutes" in source else "(m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
-                ("(m.age.project s.1, History.summary m.predicate s.2)", "(m.age.project s.1, History.summary m.predicate History.empty)", "discarded observed history"),
-            ])
-        if namespace == "GeneratedAgeHistory" and "theorem Decision.commutes" in source:
-            changes.append(("m.change s.1.1 d w (presence s.1.2) s.2 k", "m.change s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty) k", "discarded timestamp history feedback"))
-        if namespace != "GeneratedPipeline":
-            changes.append(
-                ("def after := (model sem).reduced",
-                 "def after := { (model sem).reduced with safe := fun _ => True }",
-                 "changed reduced observation")
+            if namespace == "GeneratedErasedSymmetry":
+                preamble_changes.append(("t.2 = m.hiddenUpdate b s.1 w keys s.2", "False ∧ t.2 = m.hiddenUpdate b s.1 w keys s.2", "removed concrete hidden successors"))
+            if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
+                preamble_changes.extend([
+                    ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),
+                    ("consume (if b then k :: selected else selected)", "consume (if b then selected else k :: selected)", "inverted selected key membership"),
+                ])
+            if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_bind:
+                preamble_changes.append(("(next b).reduced h", "(next (!b)).reduced h", "passed the wrong Boolean to the consumer"))
+            if has_commutes:
+                preamble_changes.extend([
+                    ("(yes.reduced h) (no.reduced h)", "(no.reduced h) (yes.reduced h)", "swapped reduced update decision"),
+                    (".branch p (yes.bindValue f) (no.bindValue f)", ".branch p (no.bindValue f) (yes.bindValue f)", "swapped value continuation branches"),
+                ])
+            if namespace == "GeneratedHistory":
+                preamble_changes.extend([
+                    ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (History.summary m.predicate History.empty)", "discarded guard feedback"),
+                    ("m.transfer s.1 t.1 w s.2", "m.transfer s.1 t.1 w (History.summary m.predicate History.empty)", "discarded transfer feedback"),
+                ])
+            if namespace == "GeneratedAgeHistory":
+                preamble_changes.extend([
+                    ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
+                    ("m.guard s.1.1 t.1.1 w (presence s.1.2) s.2", "m.guard s.1.1 t.1.1 w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded guard feedback"),
+                    ("m.historyTransfer s.1.1 d w (presence s.1.2) s.2", "m.historyTransfer s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty)", "discarded transfer feedback"),
+                    ("((m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced s.1.2).reduced m.predicate s.2" if has_commutes else "(m.historyTransfer s.1.1 d w (presence s.1.2) s.2).reduced m.predicate s.2", "(HistoryRule.Transfer.keep).reduced m.predicate s.2", "dropped the shared branch history transfer"),
+                    ("(m.age.project s.1, History.summary m.predicate s.2)", "(m.age.project s.1, History.summary m.predicate History.empty)", "discarded observed history"),
+                ])
+            if namespace == "GeneratedAgeHistory" and has_commutes:
+                preamble_changes.append(("m.change s.1.1 d w (presence s.1.2) s.2 k", "m.change s.1.1 d w (presence s.1.2) (History.summary m.predicate History.empty) k", "discarded timestamp history feedback"))
+            for before, after, label in preamble_changes:
+                add_preamble_mutation(before, after, label)
+
+            if namespace == "GeneratedField":
+                add_gen_decl_mutation(
+                    r"^  readsActor := readsActor$",
+                    lambda _: "  readsActor := fun _ _ => true",
+                    "read dead actor fields",
+                )
+                add_gen_decl_mutation(
+                    r"^  writes := writes$",
+                    lambda _: "  writes := fun _ _ => false",
+                    "exposed dead framed fields",
+                )
+                add_gen_decl_mutation(
+                    r"^  readsGlobal := readsGlobal$",
+                    lambda _: "  readsGlobal := fun _ _ => true",
+                    "read dead fields of another actor",
+                )
+
+            after_pat = r"^def after := \(model sem\)\.reduced$"
+            if namespace == "GeneratedLive":
+                add_gen_decl_mutation(
+                    after_pat,
+                    lambda _: "def after := { (model sem).reduced with next := fun _ _ => False }",
+                    "discarded live-version successors",
+                )
+                add_gen_decl_mutation(
+                    after_pat,
+                    lambda _: "def after := { (model sem).reduced with initial := fun _ => False }",
+                    "discarded live-version initialization",
+                )
+            add_gen_decl_mutation(
+                after_pat,
+                lambda _: "def after := { (model sem).reduced with safe := fun _ => True }",
+                "changed reduced observation",
             )
-        def check_mutation(change):
-            before, after, label = change
-            if source.count(before) != 1:
-                raise RuntimeError(f"{path}: negative test no longer targets one expression: {label}")
+            if is_constrained:
+                constrained_pat = r"^def constrainedAfter := \(model sem\)\.constrainedReduced$"
+                for field_expr, label in (
+                    ("constraint := fun a => ¬ (model sem).constrainedReduced.constraint a", "negated reduced state constraint"),
+                    ("initSafe := fun a => ¬ (model sem).constrainedReduced.initSafe a", "negated reduced initSafe"),
+                    ("actionSafe := fun a b => ¬ (model sem).constrainedReduced.actionSafe a b", "negated reduced actionSafe"),
+                    ("actionConstraint := fun a b => ¬ (model sem).constrainedReduced.actionConstraint a b", "negated reduced actionConstraint"),
+                ):
+                    add_gen_decl_mutation(
+                        constrained_pat,
+                        lambda _, fe=field_expr: f"def constrainedAfter := {{ (model sem).constrainedReduced with {fe} }}",
+                        label,
+                    )
+            if has_const_expanded:
+                add_gen_decl_mutation(
+                    r'^(def constSubstExpanded \(i : Fin ConstSubstCount\) : String :=\n(?:  .*\n)*?  *if i\.val = 0 then )"((?:[^"\\]|\\.)*)"( else "")$',
+                    lambda m: f'{m.group(1)}"{m.group(2)}_mismatch"{m.group(3)}',
+                    "mismatched constant substitution expansion",
+                )
+                add_gen_decl_mutation(
+                    r"^  \(hModel : sys \(fun i => eval \(constSubstExpanded i\)\) = before sem\) :$",
+                    lambda _: '  (hModel : sys (fun _ => eval "") = before sem) :',
+                    "disconnected constant substitution model expansion",
+                )
+
+        def check_mutation(item):
+            mutated, label = item
             with tempfile.TemporaryDirectory(prefix="tlx-generated-proof-") as tmp:
                 bad = Path(tmp) / "Broken.lean"
-                bad.write_text(source.replace(before, after))
+                bad.write_text(mutated)
                 rejected = invoke(lean, bad)
             if rejected.returncode == 0 or not any(
                 marker in rejected.stdout for marker in
-                ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal")
+                ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal", "error: invalid `▸` notation")
             ):
                 raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
             return {"change": label, "diagnostic": rejected.stdout}
 
         if lean_pool is not None:
-            mutations = list(lean_pool.map(check_mutation, changes))
+            mutations = list(lean_pool.map(check_mutation, mutated_sources))
         else:
-            mutations = [check_mutation(change) for change in changes]
+            mutations = [check_mutation(item) for item in mutated_sources]
+
     print(f"PASS: {path} ({len(theorems)} theorem audits, {len(mutations)} rejected mutations)")
     return {
         "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -335,7 +467,7 @@ def generate_default_certificates(tlx, workdir):
             if len(certs) != 1:
                 raise RuntimeError(f"{namespace}: expected 1 generated certificate under {proof_dir}, found {len(certs)}\n{result.stdout}")
             cert = certs[0]
-        if f"namespace TlxOptimization.{namespace}\n" not in cert.read_text():
+        if not re.search(rf"(?m)^namespace TlxOptimization\.{re.escape(namespace)}$", cert.read_text()):
             raise RuntimeError(f"{namespace}: generated {cert} does not contain expected namespace TlxOptimization.{namespace}")
         covered.add(namespace)
         generated.append(cert)

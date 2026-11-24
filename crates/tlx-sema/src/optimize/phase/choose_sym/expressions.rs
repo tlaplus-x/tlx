@@ -842,7 +842,7 @@ impl Emitter<'_> {
                         None
                     };
                     if let Some(texpr) = target_opt {
-                        if let Some(tkref) = self.key_or_fixed_ref(texpr, keys, aux) {
+                        if let Some((tkref, _)) = self.key_or_fixed_ref(texpr, keys, aux) {
                             let mut scope = keys.to_vec();
                             scope.insert(0, (v, mask));
                             let mut rest: Vec<Expr> =

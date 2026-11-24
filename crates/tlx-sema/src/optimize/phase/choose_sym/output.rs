@@ -1,23 +1,58 @@
 //! Instantiate `ChooseSymCertificate.lean` with this model's exact operations and invariants.
 
-use super::{Emitter, InitCase, InvPlan, StepCase};
+use super::super::{CheckSpec, ObsBundle, OpenCert};
+use super::{AuxScope, Branch, Emitter, InitCase, InvPlan, StepCase};
 use crate::{hir::Expr, optimize::lean::literal};
 use std::fmt::Write;
 
 impl Emitter<'_> {
-    pub(super) fn output(
-        &self,
+    pub(super) fn finish(
+        &mut self,
         initial: &Expr,
-        init_cases: &[InitCase],
-        step_cases: &[StepCase],
-        observation: &str,
-        inv: &InvPlan,
-    ) -> String {
+        init_branches: &[Branch],
+        steps: &[Branch],
+        norm_spec: CheckSpec<'_>,
+    ) -> Option<OpenCert> {
+        let mut init_cases = Vec::with_capacity(init_branches.len());
+        for ib in init_branches {
+            init_cases.push(self.lower_init_branch(ib)?);
+            if init_cases.len() > 128 {
+                return None;
+            }
+        }
+        let mut step_cases = Vec::new();
+        for sb in steps {
+            step_cases.push(self.lower_step_branch(sb)?);
+            if step_cases.len() > 512 {
+                return None;
+            }
+        }
+        let aux = AuxScope::default();
+        let observation = self.choice_tests(norm_spec.invariants, &[], &aux)?;
+        let init_observation = self.choice_tests(norm_spec.init_props, &[], &aux)?;
+        let constraint_test = self.choice_tests(norm_spec.constraints, &[], &aux)?;
+        let action_constraint_test = self.action_pure_tests(norm_spec.action_constraints, &[])?;
+        let action_observation = self.action_pure_tests(norm_spec.action_props, &[])?;
+        if !self.used_choose {
+            return None;
+        }
+        let inv_plan = self.synthesize_inv_plan(&init_cases, &step_cases)?;
+        let obs = ObsBundle {
+            observation: &observation,
+            init_observation: &init_observation,
+            constraint_test: &constraint_test,
+            action_constraint_test: &action_constraint_test,
+            action_observation: &action_observation,
+            constrained: norm_spec.is_constrained(),
+        };
+        Some(self.output(initial, &init_cases, &step_cases, &obs, &inv_plan))
+    }
+
+    fn output(&self, initial: &Expr, init_cases: &[InitCase], step_cases: &[StepCase], obs: &ObsBundle<'_>, inv: &InvPlan) -> OpenCert {
         let mut out = String::from(include_str!("../../ChooseSymCertificate.lean"));
         self.write_header_and_metadata(&mut out, initial, init_cases.len(), step_cases, inv);
-        self.write_branches_and_model(&mut out, init_cases, step_cases, observation);
-        out.push_str(include_str!("certificate.lean"));
-        out
+        self.write_branches_and_model(&mut out, init_cases, step_cases, obs);
+        OpenCert::new(out, include_str!("certificate.lean"), "GeneratedChooseSymmetry", obs.constrained, false, true)
     }
 
     fn write_header_and_metadata(&self, out: &mut String, initial: &Expr, init_len: usize, step_cases: &[StepCase], inv: &InvPlan) {
@@ -102,7 +137,7 @@ impl Emitter<'_> {
         .unwrap();
     }
 
-    fn write_branches_and_model(&self, out: &mut String, init_cases: &[InitCase], step_cases: &[StepCase], observation: &str) {
+    fn write_branches_and_model(&self, out: &mut String, init_cases: &[InitCase], step_cases: &[StepCase], obs: &ObsBundle<'_>) {
         out.push_str("def initBranch (ib : InitBranchId) : InitBranch GroupCount FlagId MsgSetId :=\n  match ib.val with\n");
         for (i, ic) in init_cases.iter().enumerate() {
             let mut fl_arms = String::new();
@@ -157,7 +192,24 @@ impl Emitter<'_> {
              \x20          flagSteps := fun _ => FlagStep.keep, msgSteps := fun _ => MsgStep.keep }\n",
         );
 
-        writeln!(out, "def observation : ChoiceTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {observation}").unwrap();
+        writeln!(out, "def observation : ChoiceTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {}", obs.observation).unwrap();
+        if obs.constrained {
+            writeln!(out, "def initObservation : ChoiceTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {}", obs.init_observation)
+                .unwrap();
+            writeln!(out, "def constraintTest : ChoiceTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {}", obs.constraint_test).unwrap();
+            writeln!(
+                out,
+                "def actionConstraintTest : ActionPureTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {}",
+                obs.action_constraint_test
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "def actionObservation : ActionPureTest GroupCount MapId SlotId FlagId MsgSetId :=\n  {}",
+                obs.action_observation
+            )
+            .unwrap();
+        }
         out.push_str(
             "-- C, Meta, V, A and W contain no renamed keys; keyRank and recRank are arbitrary\n\
              -- un-permuted total-order rankings with zero symmetry premises.\n\
@@ -166,8 +218,18 @@ impl Emitter<'_> {
              \x20 inv := invSpec\n\
              \x20 initBranch := initBranch\n\
              \x20 stepBranch := stepBranch\n\
-             \x20 observation := observation\n\
-             variable {C Meta V A W : Type} (sem : Semantics GroupCount groupSizes C MapId SlotId Meta V A InitBranchId BranchId W)\n",
+             \x20 observation := observation\n",
+        );
+        if obs.constrained {
+            out.push_str(
+                "  initObservation := initObservation\n\
+                 \x20 constraintTest := constraintTest\n\
+                 \x20 actionConstraintTest := actionConstraintTest\n\
+                 \x20 actionObservation := actionObservation\n",
+            );
+        }
+        out.push_str(
+            "variable {C Meta V A W : Type} (sem : Semantics GroupCount groupSizes C MapId SlotId Meta V A InitBranchId BranchId W)\n",
         );
         writeln!(
             out,

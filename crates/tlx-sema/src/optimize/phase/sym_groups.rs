@@ -30,6 +30,31 @@ impl KeyRef {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActionKeyRef {
+    Bound(usize),
+    Slot { primed: bool, slot_id: usize },
+    Fixed(usize),
+}
+
+impl ActionKeyRef {
+    pub(super) fn from_state(kref: KeyRef, primed: bool) -> Self {
+        match kref {
+            KeyRef::Bound(i) => Self::Bound(i),
+            KeyRef::Slot(slot_id) => Self::Slot { primed, slot_id },
+            KeyRef::Fixed(id) => Self::Fixed(id),
+        }
+    }
+
+    pub(super) fn lean(self) -> String {
+        match self {
+            Self::Bound(i) => format!("(KeyRef2.bound {i})"),
+            Self::Slot { primed, slot_id } => format!("(KeyRef2.slot {primed} ⟨{slot_id}, by decide⟩)"),
+            Self::Fixed(id) => format!("(KeyRef2.fixed {id})"),
+        }
+    }
+}
+
 pub(super) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, BTreeSet<Atom>)> {
     if raw.is_empty() || raw.len() > 16 {
         return None;
