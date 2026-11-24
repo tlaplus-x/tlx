@@ -73,6 +73,7 @@ pub(crate) fn run_identity(
         ("deadlock".into(), if check_deadlock { "checked" } else { "not checked" }.into()),
         ("seed".into(), (seed as i64).to_string()),
         ("symmetry".into(), symmetry.map_or_else(|| "none".to_string(), |s| s.group.clone())),
+        ("projection".into(), if model.has_automatic_projection() { "applied" } else { "none" }.into()),
     ]
 }
 

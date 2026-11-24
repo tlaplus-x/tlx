@@ -259,6 +259,28 @@ fn observations_and_temporal_checks_keep_the_full_graph() {
 }
 
 #[test]
+fn optimize_disables_default_checkpointer_and_rejects_checkpoint_abort_env() {
+    let dir = tlx_testkit::TempDir::with_spec("optimize-no-checkpoint", PROJECTION_SPEC, CFG);
+    let refused =
+        tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp"]).env("TLX_CHECKPOINT_ABORT", "1").dir(&dir).run();
+    assert_eq!(refused.code, 2, "{}", refused.text());
+    assert!(refused.stderr.contains("without simulation, symmetry diagnostics, coverage or checkpoints"), "{}", refused.text());
+
+    // Without `-checkpoint`, `-optimize` must not arm the default 30-minute
+    // checkpointer (so `TLX_VALUE_STORE=1` sees `opts.checkpoint.is_none()`
+    // rather than logging that it suppressed a default checkpoint timer).
+    let run = tlx_testkit::tlx_default!()
+        .check("Counter.tla")
+        .args(["-optimize", "-compile", "-noautosymmetry"])
+        .env("TLX_VALUE_STORE", "1")
+        .env("TLX_PRERUN_REUSE", "0")
+        .dir(&dir)
+        .run();
+    assert_eq!(run.code, 0, "{}", run.text());
+    assert!(!run.text().contains("this run takes no checkpoints"), "{}", run.text());
+}
+
+#[test]
 fn projection_removes_an_unobserved_copy_cycle() {
     let spec = r#"---- MODULE Counter ----
 EXTENDS Integers

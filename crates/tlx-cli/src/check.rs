@@ -86,7 +86,8 @@ fn prepare(started: Instant) -> Result<Prepared, ExitCode> {
             || a.recover.is_some()
             || a.checkpoint.is_some_and(|n| n > 0)
             || ck_env.0.is_some()
-            || ck_env.1.is_some())
+            || ck_env.1.is_some()
+            || ck_env.2.is_some())
     {
         eprintln!("tlx: -optimize supports exhaustive checking without simulation, symmetry diagnostics, coverage or checkpoints");
         return Err(ExitCode::from(2));
@@ -135,7 +136,7 @@ fn prepare(started: Instant) -> Result<Prepared, ExitCode> {
             return Err(ExitCode::from(EXIT_GENERAL_ERROR));
         }
     }
-    if !a.checksymmetry && a.simulate.is_none() && a.dump.is_none() {
+    if !a.checksymmetry && a.simulate.is_none() && a.dump.is_none() && (!a.optimize || a.tlc) {
         a.checkpointer = checkpointer(a.checkpoint.is_some(), ck_interval, ck_env, identity, recovery.is_some());
     }
     if !a.checksymmetry {
