@@ -150,3 +150,9 @@ jobs:
         run: |
           test "$QUALITY_RESULT" = success
           test "$TEST_RESULT" = success
+      - name: Notify Multica on failure
+        if: failure() && github.ref == 'refs/heads/main'
+        run: |
+          curl -sS -X POST "${{ secrets.MULTICA_CI_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","run_id":"${{ github.run_id }}","ref":"${{ github.ref_name }}","sha":"${{ github.sha }}"}'
