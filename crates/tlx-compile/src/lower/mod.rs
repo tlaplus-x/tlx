@@ -550,7 +550,12 @@ impl<'a> Lowerer<'a> {
     /// packed, else `Concat`.
     fn pack_shape(&self, sid: ShapeId, parts: Vec<Expr>) -> Expr {
         let fl = FieldLayout::of_shape(self.typing.shape(sid)).expect("product/fcn shape");
-        self.pack_locs(sid, fl.locs.into_vec(), parts)
+        let mut locs = fl.locs.into_vec();
+        for i in 0..parts.len().saturating_sub(locs.len()) {
+            locs.push(FieldLoc::Words(fl.words + i));
+        }
+        debug_assert_eq!(locs.len(), parts.len());
+        self.pack_locs(sid, locs, parts)
     }
 
     /// Build a composite of shape `sid` placing `parts[i]` at `locs[i]`: emits

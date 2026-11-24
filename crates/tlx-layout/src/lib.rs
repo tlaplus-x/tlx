@@ -30,4 +30,4 @@ pub mod store;
 
 pub use layout::{Layout, Miss};
 pub use layout_tree::LayoutNode;
-pub use shape::Shape;
+pub use shape::{FcnWitness, Shape};

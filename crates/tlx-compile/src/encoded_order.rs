@@ -60,10 +60,13 @@ pub(crate) fn order_safe(s: &Shape) -> bool {
         _ if s.cardinality() == Some(1) => true,
         Shape::Record(fs) => fs.iter().all(|(_, f)| order_safe(f)),
         Shape::Tuple(es) => es.iter().all(order_safe),
-        // A function of a fixed domain: every value of the shape has that
-        // domain, so TLC's comparison (domains first, then the values in
-        // domain order) is the one of its range's slots in that order.
-        Shape::Fcn { range, .. } => order_safe(range),
+        // A function of a fixed domain (without a trailing dynamic witness
+        // word): every value of the shape has that domain, so TLC's comparison
+        // (domains first, then the values in domain order) is the one of its
+        // range's slots in that order.
+        Shape::Fcn { range, witness, key_variants, .. } if *witness != tlx_layout::FcnWitness::Dynamic && key_variants.is_empty() => {
+            order_safe(range)
+        }
         // A sequence is a function on `1..n`: TLC compares the lengths first
         // and then the elements in order (`tlx_value::order::cmp_tuples`,
         // reached through `fcn_cmp`'s `length_order`), which is the word order
@@ -117,7 +120,9 @@ fn node_parts(s: &Shape) -> Option<(u64, Vec<Part<'_>>)> {
         Shape::Record(fs) => (PRODUCT, product_parts(fs.iter().map(|(_, s)| s))),
         Shape::Tuple(es) => (PRODUCT, product_parts(es.iter())),
         // One slot per domain element, in the shape's domain order.
-        Shape::Fcn { dom, range } => (PRODUCT, product_parts(std::iter::repeat_n(&**range, dom.len()))),
+        Shape::Fcn { dom, range, witness, key_variants } if *witness != tlx_layout::FcnWitness::Dynamic && key_variants.is_empty() => {
+            (PRODUCT, product_parts(std::iter::repeat_n(&**range, dom.len())))
+        }
         Shape::Union(arms) if homogeneous(arms) || model_union(arms) => (UNION, arms.iter().map(Part::Shape).collect()),
         _ => return None,
     })

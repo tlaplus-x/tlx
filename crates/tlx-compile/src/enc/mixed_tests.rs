@@ -29,11 +29,12 @@ fn pairs() -> Vec<(&'static str, Expr, Expr)> {
     let rank_flat = |r: u64| int(K::RankFlat { x: var(0), radices: Arc::from([3, r]) });
     let index = |map: IndexMap| int(K::Index { base: var(0), arg: var(0), map, slot: SlotLayout::Words(1) });
     let sorted_op = |max_card: u32| int(K::SortedOp { op: SetOp::Union, a: var(0), b: var(0), elem_words: 1, max_card });
-    let map_put = |insert: bool| {
+    let map_put = |insert: bool, insert_witness: Option<u64>| {
         let absent = if insert { tlx_value::plan::Absent::Insert } else { tlx_value::plan::Absent::Unchanged };
-        let plan = crate::ir::MapPutPlan { absent, reject_when_empty: Arc::from([]) };
+        let plan = crate::ir::MapPutPlan { absent, insert_witness, reject_when_empty: Arc::from([]), reject_when_canonical: Arc::from([]) };
         int(K::MapPut { base: var(0), rank: var(0), value: var(0), plan })
     };
+    let map_build = |witness: Option<u64>| int(K::MapBuild { bind: 0, set: var(0), rank: var(0), value: var(0), witness });
     let seq_sub = |elem_words: usize| int(K::SeqSub { base: var(0), lo: var(0), hi: var(0), slot: SlotLayout::Words(elem_words) });
     let map_set = |cond: Option<Expr>| int(K::MapSet { bind: 0, set: var(0), elem: var(0), cond });
     let enabled = |v: u32| Expr::new(Ty::Bool, K::Enabled(Box::new(Stmt::Assign { var: v, value: var(0), body: Box::new(Stmt::Emit) })));
@@ -46,7 +47,9 @@ fn pairs() -> Vec<(&'static str, Expr, Expr)> {
         ("IndexMap table", index(IndexMap::Table(Arc::from([0, 1]))), index(IndexMap::Table(Arc::from([1, 0])))),
         ("IndexMap range", index(IndexMap::IntRange { lo: 0, n: 2 }), index(IndexMap::IntRange { lo: 1, n: 2 })),
         ("SortedOp max_card", sorted_op(4), sorted_op(5)),
-        ("MapPut insert", map_put(false), map_put(true)),
+        ("MapPut insert", map_put(false, None), map_put(true, None)),
+        ("MapPut insert_witness", map_put(true, Some(0)), map_put(true, Some(1))),
+        ("MapBuild witness", map_build(Some(0)), map_build(Some(1))),
         ("SeqSub elem_words", seq_sub(1), seq_sub(2)),
         ("MapSet cond", map_set(Some(var(0))), int(K::MapSet { bind: 0, set: var(0), elem: var(0), cond: None })),
         ("ENABLED statement payload", enabled(0), enabled(1)),

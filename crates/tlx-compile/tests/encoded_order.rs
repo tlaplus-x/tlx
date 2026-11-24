@@ -213,7 +213,15 @@ fn function_and_nested_record_orders_follow_tlc() {
     let dom: std::sync::Arc<[Value]> = dom.into();
     let record = Shape::Record(
         vec![
-            (Sym::new("fn"), Shape::Fcn { dom: dom.clone(), range: Box::new(Shape::Int { lo: 0, hi: 2 }) }),
+            (
+                Sym::new("fn"),
+                Shape::Fcn {
+                    dom: dom.clone(),
+                    range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+                    witness: tlx_layout::FcnWitness::Enumerated,
+                    key_variants: std::sync::Arc::from([]),
+                },
+            ),
             (Sym::new("set"), Shape::Set { elem: Box::new(Shape::Int { lo: 1, hi: 3 }), max_card: 3 }),
         ]
         .into(),
@@ -223,7 +231,12 @@ fn function_and_nested_record_orders_follow_tlc() {
             (Sym::new("inner"), record.clone()),
             (
                 Sym::new("dom"),
-                Shape::Fcn { dom: dom.clone(), range: Box::new(Shape::Set { elem: Box::new(Shape::Int { lo: 1, hi: 2 }), max_card: 2 }) },
+                Shape::Fcn {
+                    dom: dom.clone(),
+                    range: Box::new(Shape::Set { elem: Box::new(Shape::Int { lo: 1, hi: 2 }), max_card: 2 }),
+                    witness: tlx_layout::FcnWitness::Enumerated,
+                    key_variants: std::sync::Arc::from([]),
+                },
             ),
         ]
         .into(),

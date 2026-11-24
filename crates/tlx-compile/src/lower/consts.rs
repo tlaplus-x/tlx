@@ -31,12 +31,32 @@ fn fits_parts<'v>(n: usize, mut vs: impl Iterator<Item = &'v Value>) -> bool {
 }
 
 impl Lowerer<'_> {
-    /// Encode a constant into shape `sid` at compile time.
+    /// Encode a constant into shape `sid` at compile time (preserving witness).
     pub(super) fn const_words(&self, v: &Value, sid: ShapeId) -> Option<Expr> {
         let t = &self.typing;
         let mut out = vec![0u64; t.words(sid) as usize];
         tlx_layout::layout::encode(t.shape(sid), &v.normalize().ok()?, &mut out).ok()?;
         Some(Expr::new(Ty::Enc(sid), ExprKind::ConstWords(out.into())))
+    }
+
+    /// Encode a constant into shape `sid` at compile time ignoring
+    /// function-domain construction witnesses (for semantic equality/membership).
+    pub(super) fn const_words_semantic(&self, v: &Value, sid: ShapeId) -> Option<Expr> {
+        let t = &self.typing;
+        let mut out = vec![0u64; t.words(sid) as usize];
+        tlx_layout::layout::encode_semantic(t.shape(sid), &v.normalize().ok()?, &mut out).ok()?;
+        Some(Expr::new(Ty::Enc(sid), ExprKind::ConstWords(out.into())))
+    }
+
+    /// Encode a constant set or interval into `Shape::Set` `sid`, preserving
+    /// exact element witnesses (for `Value::Interval`, every element is a plain
+    /// integer with no alternative witness, so only the outer interval tag is
+    /// dropped).
+    pub(super) fn const_set_words_exact_elems(&self, v: &Value, sid: ShapeId) -> Option<Expr> {
+        match v {
+            Value::Interval(..) => self.const_words_semantic(v, sid),
+            _ => self.const_words(v, sid),
+        }
     }
 
     /// The elements of constant set `v` (TLC enumeration order, as the
@@ -93,7 +113,7 @@ impl Lowerer<'_> {
         let elem = self.const_elem_shape(v)?;
         let n = cardinality(v).unwrap_or(0) as usize;
         let ssid = self.sid(&Shape::Set { elem: Box::new(elem.clone()), max_card: n.max(1) });
-        let c = self.const_words(v, ssid)?;
+        let c = self.const_set_words_exact_elems(v, ssid)?;
         let esid = self.sid(&elem);
         Some((c, Ty::Enc(esid)))
     }
@@ -152,7 +172,7 @@ impl Lowerer<'_> {
         if !self.is_bitset(Ty::Enc(ssid)) {
             return None;
         }
-        self.const_words(v, ssid)
+        self.const_set_words_exact_elems(v, ssid)
     }
 
     /// A shape describing all of `vals`, reusing the layout's atom universes
@@ -160,7 +180,7 @@ impl Lowerer<'_> {
     /// directly with state values): ints, atoms, sets (bitsets over a reused
     /// universe), records and tuples of those.
     pub(super) fn fit_shape(&self, vals: &[Value]) -> Option<Shape> {
-        if vals.is_empty() {
+        if vals.is_empty() || vals.iter().any(typed::has_non_reducible_lazy_set) {
             return None;
         }
         if let Some((lo, hi)) = int_bounds(vals) {
@@ -178,7 +198,7 @@ impl Lowerer<'_> {
             let s = Value::set_from(vals.to_vec()).ok()?;
             return self.const_elem_shape(&s);
         }
-        if vals.iter().all(|v| v.is_set()) {
+        if vals.iter().all(|v| matches!(v, Value::Set(_))) {
             let mut inner = Vec::new();
             let mut max_card = 0;
             for v in vals {
@@ -246,22 +266,24 @@ impl Lowerer<'_> {
             unify_empty_sets(&mut parts);
             return Some(Shape::Tuple(parts.into()));
         }
-        if let Some(Value::Fcn(first, _)) = vals.first() {
+        if let Some(Value::Fcn(first, dom_kind)) = vals.first() {
             // Functions with one (fixed) domain.
             if !fits_parts(first.len(), first.iter().map(|(_, x)| x)) {
                 return None;
             }
             let dom: Vec<Value> = first.iter().map(|(k, _)| k.clone()).collect();
+            let mut witness = tlx_layout::FcnWitness::from_dom(*dom_kind);
             let mut range = Vec::new();
             for v in vals {
-                let Value::Fcn(ps, _) = v else { return None };
-                if ps.len() != dom.len() || ps.iter().zip(&dom).any(|((k, _), d)| k != d) {
+                let Value::Fcn(ps, dk) = v else { return None };
+                if ps.len() != dom.len() || ps.iter().zip(&dom).any(|((k, _), d)| !k.exact_eq(d)) {
                     return None;
                 }
+                witness = witness.join(tlx_layout::FcnWitness::from_dom(*dk));
                 range.extend(ps.iter().map(|(_, x)| x.clone()));
             }
             let range = self.fit_shape(&range)?;
-            return Some(Shape::Fcn { dom: dom.into(), range: Box::new(range) });
+            return Some(Shape::Fcn { dom: dom.into(), range: Box::new(range), witness, key_variants: Arc::from([]) });
         }
         None
     }

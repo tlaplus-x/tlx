@@ -83,7 +83,7 @@ fn loop_parts(e: &Expr) -> Option<(Temp, &Expr, Vec<&Expr>)> {
         K::SeqFilter { bind, seq, pred, .. } => (*bind, seq, vec![pred]),
         K::Collect { bind, set, elem } => (*bind, set, vec![elem]),
         K::MapSet { bind, set, elem, cond } => (*bind, set, cond.iter().chain([elem]).collect()),
-        K::MapBuild { bind, set, rank, value } => (*bind, set, vec![rank, value]),
+        K::MapBuild { bind, set, rank, value, .. } => (*bind, set, vec![rank, value]),
         _ => return None,
     })
 }
@@ -105,7 +105,7 @@ fn loop_parts_mut(e: &mut Expr) -> Option<(Temp, &mut Expr, Vec<&mut Expr>)> {
             Some(c) => (*bind, set, vec![c]),
             None => (*bind, set, vec![elem]),
         },
-        K::MapBuild { bind, set, rank, value } => (*bind, set, vec![rank, value]),
+        K::MapBuild { bind, set, rank, value, .. } => (*bind, set, vec![rank, value]),
         _ => return None,
     })
 }

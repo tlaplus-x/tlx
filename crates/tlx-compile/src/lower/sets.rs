@@ -16,21 +16,49 @@ use super::*;
 
 /// The largest sorted-array union shape `typed_union` widens to.
 const MAX_UNION_CARD: usize = 256;
+/// Traversal budget for syntactic eager-set / lazy-preservation checks.
+pub(super) const EAGER_DEPTH: usize = 8;
+
+fn is_eager_set_depth(v: &Value, levels: usize) -> bool {
+    levels == 0 || v.enum_elements().is_some_and(|es| es.iter().all(|x| is_eager_set_depth(x, levels - 1)))
+}
+
+fn shape_may_hold_set(s: &Shape) -> bool {
+    let mut found = matches!(s, Shape::Set { .. } | Shape::Dyn | Shape::Ref(_));
+    if !found {
+        s.for_each_child(|c| found |= shape_may_hold_set(c));
+    }
+    found
+}
 
 impl Lowerer<'_> {
     /// `s \subseteq t`, also membership in an already lowered powerset.
     /// Only total comparable element universes may bypass boxed membership.
     pub(super) fn native_bit_subset(&mut self, s: &Expr, t: &Expr) -> Option<Expr> {
-        let shape = |x: &Expr| self.shape_of(x.ty).cloned().or_else(|| typed::const_of(x).map(|v| Shape::of(&v)));
-        let (Some(Shape::Set { elem: a, .. }), Some(Shape::Set { elem: b, .. })) = (shape(s), shape(t)) else {
+        let (Some(a), Some(b)) = (self.set_elem_shape(s), self.set_elem_shape(t)) else {
             return None;
         };
         if !typed::shapes_comparable(&a, &b) {
             return None;
         }
-        let (s, t, sid) = self.same_bitsets(s, t).or_else(|| self.converted_bitsets(s, t, false))?;
+        let (s, t, sid) = self.same_bitsets(s, t, true, true).or_else(|| self.converted_bitsets(s, t, false))?;
         let outside = Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(SetOp::Diff, s, t));
         Some(eq(outside, self.zero_enc(sid)))
+    }
+
+    /// Element shape of an encoded set or constant set/interval expression.
+    pub(super) fn set_elem_shape(&self, x: &Expr) -> Option<Shape> {
+        if let Some(Shape::Set { elem, .. }) = self.shape_of(x.ty) {
+            return Some((**elem).clone());
+        }
+        match &*x.kind {
+            ExprKind::Const(v @ Value::Set(_)) => match Shape::of(v) {
+                Shape::Set { elem, .. } => Some(*elem),
+                _ => None,
+            },
+            ExprKind::Const(Value::Interval(lo, hi)) => Some(if hi < lo { Shape::Never } else { Shape::Int { lo: *lo, hi: *hi } }),
+            _ => None,
+        }
     }
 
     pub(super) fn is_bitset(&self, t: Ty) -> bool {
@@ -40,7 +68,7 @@ impl Lowerer<'_> {
     /// Element shape id, element words and max cardinality of a sorted-array set.
     pub(super) fn sorted_elem(&mut self, t: Ty) -> Option<(ShapeId, u32, u32)> {
         let Some(Shape::Set { elem, max_card }) = self.shape_of(t).cloned() else { return None };
-        if bitset_universe(&elem).is_some() {
+        if bitset_universe(&elem).is_some() || elem.has_dynamic_witness() {
             return None;
         }
         let esid = self.sid(&elem);
@@ -107,26 +135,38 @@ impl Lowerer<'_> {
     }
 
     /// Both operands as bitsets of the same shape (encoding a constant one).
-    fn same_bitsets(&self, a: &Expr, b: &Expr) -> Option<(Expr, Expr, ShapeId)> {
+    /// `left_semantic` / `right_semantic` allow semantic encoding only when the
+    /// corresponding constant operand's elements cannot appear in the result
+    /// (e.g. `s \subseteq t` for both sides, or the right operand of `\cap`/`\`).
+    fn same_bitsets(&self, a: &Expr, b: &Expr, left_semantic: bool, right_semantic: bool) -> Option<(Expr, Expr, ShapeId)> {
+        let enc_const = |v: &Value, sid: ShapeId, semantic: bool| {
+            if semantic {
+                self.const_words_semantic(v, sid)
+            } else {
+                self.const_set_words_exact_elems(v, sid)
+            }
+        };
         match (a.ty, b.ty) {
             (Ty::Enc(x), Ty::Enc(y)) if x == y && self.is_bitset(a.ty) => Some((a.clone(), b.clone(), x)),
             (Ty::Enc(x), Ty::Enc(_)) if self.is_bitset(a.ty) => Some((a.clone(), self.bitset_retype(b, x)?, x)),
             (Ty::Enc(x), _) if self.is_bitset(a.ty) => {
                 let ExprKind::Const(v) = &*b.kind else { return None };
-                let c = self.const_words(v, x)?;
-                Some((a.clone(), c, x))
+                Some((a.clone(), enc_const(v, x, right_semantic)?, x))
             }
             (_, Ty::Enc(y)) if self.is_bitset(b.ty) => {
                 let ExprKind::Const(v) = &*a.kind else { return None };
-                let c = self.const_words(v, y)?;
-                Some((c, b.clone(), y))
+                Some((enc_const(v, y, left_semantic)?, b.clone(), y))
             }
             _ => None,
         }
     }
 
     /// Rank of element `x` in bitset `set` (scalar or flat product elements).
-    pub(super) fn bit_rank(&mut self, set: &Expr, x: &Expr) -> Option<Expr> {
+    /// When `semantic` is true (lookups / membership), constant elements rank
+    /// semantically ignoring construction witnesses; when false (constructing a
+    /// set element or map key), exact witnesses are required so a mismatch
+    /// ranks as `-1` and triggers a runtime layout miss.
+    pub(super) fn bit_rank(&mut self, set: &Expr, x: &Expr, semantic: bool) -> Option<Expr> {
         let Some(Shape::Set { elem, .. }) = self.shape_of(set.ty).cloned() else { return None };
         bitset_universe(&elem)?;
         if elem.cardinality() == Some(0) {
@@ -143,17 +183,19 @@ impl Lowerer<'_> {
             return Some(Expr::new(Ty::Int, ExprKind::IntBin(IntOp::Sub, xi, int_lit(lo))));
         }
         if let ExprKind::Const(v) = &*x.kind {
-            // Constant element: rank at compile time (absent => never a member).
-            let r = tlx_layout::layout::rank(&elem, v).map_or(-1, |r| r as i64);
-            return Some(int_lit(r));
+            // Constant element: rank at compile time (absent => -1).
+            let res = if semantic { tlx_layout::layout::rank_semantic(&elem, v) } else { tlx_layout::layout::rank(&elem, v) };
+            return Some(int_lit(res.map_or(-1, |r| r as i64)));
         }
-        if let ExprKind::Convert(c) = &*x.kind {
-            // A constant outside the element shape (converted at run time,
-            // which fails): never a member, if comparable with all the
-            // elements without a TLC error.
-            if let ExprKind::Const(v) = &*c.kind {
-                if tlx_layout::layout::rank(&elem, v).is_err() && v.normalize().is_ok_and(|v| typed::comparable(&elem, &v)) {
-                    return Some(int_lit(-1));
+        if semantic {
+            if let ExprKind::Convert(c) = &*x.kind {
+                // A constant outside the element shape (converted at run time,
+                // which fails): never a member, if comparable with all the
+                // elements without a TLC error.
+                if let ExprKind::Const(v) = &*c.kind {
+                    if tlx_layout::layout::rank_semantic(&elem, v).is_err() && v.normalize().is_ok_and(|v| typed::comparable(&elem, &v)) {
+                        return Some(int_lit(-1));
+                    }
                 }
             }
         }
@@ -193,11 +235,6 @@ impl Lowerer<'_> {
                 None => Expr::new(Ty::Int, ExprKind::Rank(x.clone())),
                 Some(radices) => Expr::new(Ty::Int, ExprKind::RankFlat { x: x.clone(), radices: radices.into() }),
             });
-        }
-        if let ExprKind::Const(v) = &*x.kind {
-            // Constant element: rank at compile time (absent => never a member).
-            let r = tlx_layout::layout::rank(&elem, v).map_or(-1, |r| r as i64);
-            return Some(int_lit(r));
         }
         None
     }
@@ -363,6 +400,7 @@ impl Lowerer<'_> {
                 self.total_filter_predicate(x)
             }
             ExprKind::IntCmp(_, a, b) => self.total_filter_predicate(a) && self.total_filter_predicate(b),
+            ExprKind::Eq(a, b) if a.ty != Ty::Val && b.ty != Ty::Val => self.total_filter_predicate(a) && self.total_filter_predicate(b),
             ExprKind::IntBin(IntOp::Add | IntOp::Sub | IntOp::Mul, a, b) => {
                 self.int_range(e).is_some() && self.total_filter_predicate(a) && self.total_filter_predicate(b)
             }
@@ -372,34 +410,48 @@ impl Lowerer<'_> {
     }
 
     /// `{x \in S : P}` over an encoded `S` (not a bitset of composites).
-    pub(super) fn typed_filter(&mut self, bound: &hir::Bound, pred: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    pub(super) fn typed_filter(&mut self, bound: &hir::Bound, pred: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
+        let extensional = mode.is_extensional();
         let set = self.expr(&bound.set, env, st);
         // Quorum filters over a small powerset: retain the subset's bitset
         // type, so later quantification does not box every voter. The
         // element encoding admits the full base universe (its rank is the
         // bitmask), even if the observed set cardinality was smaller.
-        if let Some((_, ety)) = self.subsets_source(&set, true) {
-            let Shape::Set { elem, .. } = self.shape_of(ety)?.clone() else { return None };
-            let universe = bitset_universe(&elem)?;
-            let subset = Shape::Set { elem, max_card: usize::try_from(universe).ok()? };
-            let count = subset.cardinality()?;
-            // Same inferred-universe budget as computed interval filters.
-            if count > 4096 {
-                return None;
+        if extensional {
+            if let Some((_, ety)) = self.subsets_source(&set, true) {
+                let Shape::Set { elem, .. } = self.shape_of(ety)?.clone() else { return None };
+                let universe = bitset_universe(&elem)?;
+                let subset = Shape::Set { elem, max_card: usize::try_from(universe).ok()? };
+                let count = subset.cardinality()?;
+                // Same inferred-universe budget as computed interval filters.
+                if count > 4096 {
+                    return None;
+                }
+                let sid = self.sid(&Shape::Set { elem: Box::new(subset.clone()), max_card: count as usize });
+                let mapped = self.set_filter_into(bound, pred, &subset, env, st, sid)?;
+                let ExprKind::MapSet { cond: Some(cond), .. } = &*mapped.kind else { return None };
+                // SUBSET filters are lazy. Materialize only a total predicate:
+                // no errors or effects may appear beyond an early quantifier hit.
+                return self.total_filter_predicate(cond).then_some(mapped);
             }
-            let sid = self.sid(&Shape::Set { elem: Box::new(subset.clone()), max_card: count as usize });
-            let mapped = self.set_filter_into(bound, pred, &subset, env, st, sid)?;
-            let ExprKind::MapSet { cond: Some(cond), .. } = &*mapped.kind else { return None };
-            // SUBSET filters are lazy. Materialize only a total predicate:
-            // no errors or effects may appear beyond an early quantifier hit.
-            return self.total_filter_predicate(cond).then_some(mapped);
         }
         if let ExprKind::Const(v) = &*set.kind {
+            let reducible = tlx_value::ops::is_reducible(v);
+            if !typed::const_preserves_lazy(v, extensional) || (!extensional && !reducible) {
+                return None;
+            }
             // A filter over a constant set: a bitset over its universe.
             let enc = self.const_bitset(v)?;
             let Ty::Enc(sid) = enc.ty else { return None };
             let Some(Shape::Set { elem, .. }) = self.shape_of(enc.ty).cloned() else { return None };
-            return self.set_filter_into(bound, pred, &elem, env, st, sid);
+            let mapped = self.set_filter_into(bound, pred, &elem, env, st, sid)?;
+            if !reducible {
+                let ExprKind::MapSet { cond: Some(cond), .. } = &*mapped.kind else { return None };
+                if !self.total_filter_predicate(cond) {
+                    return None;
+                }
+            }
+            return Some(mapped);
         }
         if let ExprKind::ValOp { op: B::DotDot, args } = &*set.kind {
             // A filter over a computed interval: a bitset over the integers
@@ -416,6 +468,11 @@ impl Lowerer<'_> {
             let sid = self.sid(&Shape::Set { elem: Box::new(elem.clone()), max_card: (hi - lo + 1) as usize });
             return self.set_filter_into(bound, pred, &elem, env, st, sid);
         }
+        let (set, lazy_domain) = match set.ty {
+            Ty::Enc(_) => (set, false),
+            _ if extensional => (self.expr_with_mode(&bound.set, env, st, mode), true),
+            _ => return None,
+        };
         let Ty::Enc(sid) = set.ty else { return None };
         let Some(Shape::Set { elem, .. }) = self.shape_of(set.ty).cloned() else { return None };
         if is_composite_bitset_elem(&elem) {
@@ -424,23 +481,30 @@ impl Lowerer<'_> {
         let esid = self.sid(&elem);
         let t = self.temp(Ty::Enc(esid));
         let (env2, check) = self.bind_elem(&bound.vars, &temp_ref(Ty::Enc(esid), t), env)?;
-        let p = self.bool_expr(pred, &env2, st);
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Filter { bind: t, set, pred: binders::checked(check, p) }))
+        let p = binders::checked(check, self.bool_expr(pred, &env2, st));
+        if lazy_domain && !self.total_filter_predicate(&p) {
+            return None;
+        }
+        Some(Expr::new(Ty::Enc(sid), ExprKind::Filter { bind: t, set, pred: p }))
     }
 
     /// `A \X B` of two encoded sets whose element universes multiply to a
     /// small one: the pairs as a bitset of the product universe, the element
     /// of the product whose components are in `A` and `B`. Both operands are
-    /// evaluated, and neither can fail once it is an encoded set.
-    pub(super) fn typed_times(&mut self, a: &hir::Expr, b: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
-        let x = self.expr(a, env, st);
-        let y = self.expr(b, env, st);
+    /// evaluated under `mode` (preserving factor enumeration multiplicity
+    /// under `ActionIter`), and neither can fail once it is an encoded set.
+    /// Wider n-ary products (`A \X B \X C`) return `None` to take the general
+    /// path with every factor intact.
+    pub(super) fn typed_times(&mut self, args: &[hir::Expr], env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
+        let [a, b] = args else { return None };
+        let x = self.expr_with_mode(a, env, st, mode);
+        let y = self.expr_with_mode(b, env, st, mode);
         let (Some(Shape::Set { elem: ea, .. }), Some(Shape::Set { elem: eb, .. })) =
             (self.shape_of(x.ty).cloned(), self.shape_of(y.ty).cloned())
         else {
             return None;
         };
-        if !self.is_bitset(x.ty) || !self.is_bitset(y.ty) {
+        if !self.is_bitset(x.ty) || !self.is_bitset(y.ty) || ea.has_dynamic_witness() || eb.has_dynamic_witness() {
             return None;
         }
         let pair = Shape::Tuple(vec![(*ea).clone(), (*eb).clone()].into());
@@ -455,8 +519,8 @@ impl Lowerer<'_> {
         let (ys, by) = self.share(y);
         let t = self.temp(Ty::Enc(psid));
         let slot = |loc: FieldLoc, sid| Expr::new(Ty::Enc(sid), ExprKind::Slice { base: temp_ref(Ty::Enc(psid), t), loc });
-        let r0 = self.bit_rank(&xs, &slot(fl.locs[0], esid))?;
-        let r1 = self.bit_rank(&ys, &slot(fl.locs[1], fsid))?;
+        let r0 = self.bit_rank(&xs, &slot(fl.locs[0], esid), true)?;
+        let r1 = self.bit_rank(&ys, &slot(fl.locs[1], fsid), true)?;
         let m0 = Expr::new(Ty::Bool, ExprKind::BitMember { set: xs, rank: r0 });
         let m1 = Expr::new(Ty::Bool, ExprKind::BitMember { set: ys, rank: r1 });
         let mut full = vec![0u64; nw as usize];
@@ -471,11 +535,11 @@ impl Lowerer<'_> {
 
     /// `S \subseteq T` for an encoded S: `\A x \in S : x \in T`.
     pub(super) fn typed_subseteq(&mut self, s: &hir::Expr, t: &hir::Expr, env: &LEnv, st: &St) -> Expr {
-        let s = self.expr(s, env, st);
+        let s = self.extensional_set_expr(s, env, st);
         match self.subseteq_lowered(s.clone(), t, env, st) {
             Some(x) => x,
             None => {
-                let t = self.expr(t, env, st);
+                let t = self.extensional_set_expr(t, env, st);
                 self.val_op(B::SubsetEq, vec![s, t])
             }
         }
@@ -485,7 +549,7 @@ impl Lowerer<'_> {
     /// iterable encoded set.
     pub(super) fn subseteq_lowered(&mut self, s: Expr, t: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         let s = self.set_operand(s);
-        let tset = self.expr(t, env, st);
+        let tset = self.extensional_set_expr(t, env, st);
         let tset = self.set_operand(tset);
         // A small integer set against a constant interval already has native
         // short-circuit range tests. Keep that established path: replacing it
@@ -548,35 +612,302 @@ impl Lowerer<'_> {
         Some(Expr::new(Ty::Enc(sid), ExprKind::SortedOp { op: SetOp::Union, a: la, b: lb, elem_words: ew, max_card }))
     }
 
+    /// Whether `e` syntactically evaluates to an eager `Value::Set` on every
+    /// path within `depth` steps (returning `false` when the budget expires,
+    /// e.g. on recursive operators).
+    pub(super) fn constructs_eager_set(&self, e: &hir::Expr, env: &LEnv, depth: usize) -> bool {
+        self.constructs_eager_levels(e, env, 1, depth)
+    }
+
+    /// Whether `e` evaluates to `levels` nested sets with `enum_elements()`
+    /// (for `levels == 1`, a top-level `Value::Set`; each unary `UNION` adds a
+    /// required eager-set level, matching `tlx_value::ops::big_union`).
+    fn constructs_eager_levels(&self, e: &hir::Expr, env: &LEnv, levels: usize, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if let Some(v) = self.const_value(e, env) {
+            return (levels > 1 || matches!(v, Value::Set(_))) && is_eager_set_depth(&v, levels) && !typed::has_non_reducible_lazy_set(&v);
+        }
+        let (p, penv) = self.peel(e, env).unwrap_or_else(|| (e.clone(), env.clone()));
+        match &*p.kind {
+            H::SetEnum(es) => levels == 1 || es.iter().all(|x| self.constructs_eager_levels(x, &penv, levels - 1, depth - 1)),
+            H::SetMap { expr: f, .. } => levels == 1 || self.constructs_eager_levels(f, &penv, levels - 1, depth - 1),
+            H::Builtin { op: B::Union, args } if !self.ip.is_builtin_overridden(B::Union) => {
+                self.constructs_eager_levels(&args[0], &penv, levels + 1, depth - 1)
+            }
+            H::SetFilter { bound, .. } => {
+                (levels == 1
+                    && (self
+                        .const_value(&bound.set, &penv)
+                        .is_some_and(|v| tlx_value::ops::is_reducible(&v) && !typed::has_non_reducible_lazy_set(&v))
+                        || (matches!(&*bound.set.kind, H::Builtin { op: B::DotDot, .. }) && !self.ip.is_builtin_overridden(B::DotDot))))
+                    || self.constructs_eager_levels(&bound.set, &penv, levels, depth - 1)
+            }
+            H::If { then, els, .. } => {
+                self.constructs_eager_levels(then, &penv, levels, depth - 1) && self.constructs_eager_levels(els, &penv, levels, depth - 1)
+            }
+            H::Case { arms, other } => {
+                arms.iter().all(|(_, v)| self.constructs_eager_levels(v, &penv, levels, depth - 1))
+                    && other.as_ref().is_none_or(|o| self.constructs_eager_levels(o, &penv, levels, depth - 1))
+            }
+            H::Let { body, .. } => self.constructs_eager_levels(body, &penv, levels, depth - 1),
+            H::Apply { op: hir::OpRef::Def(d), args } if !args.is_empty() => {
+                self.def_target(*d, &penv).is_some_and(|(_, body, base, _)| self.constructs_eager_levels(&body, &base, levels, depth - 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether building `e` into `shape` via `expr_into` / `ref_expr` is
+    /// guaranteed not to normalize any nested or top-level non-reducible
+    /// `LazySet` into `Value::Set`.
+    pub(super) fn preserves_lazy_into(&self, e: &hir::Expr, env: &LEnv, shape: &Shape, depth: usize) -> bool {
+        self.preserves_lazy_into_mode(e, env, shape, depth, expr::SetMode::Exact)
+    }
+
+    /// Like `preserves_lazy_into`, parameterized by `mode`:
+    /// - `SetMode::SetExt` relaxes only the outermost `Shape::Set` container
+    ///   (including multiplicity), while every nested element still requires
+    ///   `SetMode::Exact` and lazy-domain `SetFilter`s stay out of `expr_into`
+    ///   so `typed_filter` enforces predicate totality.
+    /// - `SetMode::ActionIter` allows duplicate-free outer `Times` while
+    ///   rejecting lazy `UNION`/`\cup` deduplication, lazy-domain `SetFilter`
+    ///   materialization, and requiring `SetMode::Exact` for elements.
+    pub(super) fn preserves_lazy_into_mode(&self, e: &hir::Expr, env: &LEnv, shape: &Shape, depth: usize, mode: expr::SetMode) -> bool {
+        let mut seen = Vec::new();
+        self.preserves_lazy_into_in(e, env, shape, depth, mode, &mut seen)
+    }
+
+    fn preserves_lazy_into_in(
+        &self,
+        e: &hir::Expr,
+        env: &LEnv,
+        shape: &Shape,
+        depth: usize,
+        mode: expr::SetMode,
+        seen: &mut Vec<hir::DefId>,
+    ) -> bool {
+        let extensional = mode.is_extensional();
+        if !shape_may_hold_set(shape) {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        if let Some(v) = self.const_value(e, env) {
+            let ext_set = extensional && matches!(shape, Shape::Set { .. });
+            return typed::const_preserves_lazy(&v, ext_set)
+                && (!matches!(shape, Shape::Set { .. }) || ext_set || matches!(v, Value::Set(_)));
+        }
+        let (p, penv) = self.peel(e, env).unwrap_or_else(|| (e.clone(), env.clone()));
+        match &*p.kind {
+            H::Var(v) => {
+                return !self.primed
+                    && (matches!(shape, Shape::Ref(_))
+                        || matches!(
+                            self.shape_of(self.var_ty(v.idx())),
+                            Some(vs) if !vs.has_dynamic_witness() && (!matches!(shape, Shape::Set { .. }) || matches!(vs, Shape::Set { .. }))
+                        ));
+            }
+            H::If { then, els, .. } => {
+                return self.preserves_lazy_into_in(then, &penv, shape, depth - 1, mode, seen)
+                    && self.preserves_lazy_into_in(els, &penv, shape, depth - 1, mode, seen);
+            }
+            H::Case { arms, other } => {
+                return arms.iter().all(|(_, v)| self.preserves_lazy_into_in(v, &penv, shape, depth - 1, mode, seen))
+                    && other.as_ref().is_none_or(|o| self.preserves_lazy_into_in(o, &penv, shape, depth - 1, mode, seen));
+            }
+            H::Let { body, .. } => return self.preserves_lazy_into_in(body, &penv, shape, depth - 1, mode, seen),
+            H::Apply { op: hir::OpRef::Def(d), args } if !args.is_empty() => {
+                let def = self.ip.redirect_def(*d);
+                if seen.contains(&def) {
+                    return mode == expr::SetMode::SetExt && matches!(shape, Shape::Set { elem, .. } if !shape_may_hold_set(elem));
+                }
+                return self.def_target(*d, &penv).is_some_and(|(_, body, base, _)| {
+                    seen.push(def);
+                    let ok = self.preserves_lazy_into_in(&body, &base, shape, depth - 1, mode, seen);
+                    seen.pop();
+                    ok
+                });
+            }
+            _ => {}
+        }
+        match (&*p.kind, shape) {
+            (H::SetEnum(es), Shape::Set { elem, .. }) => {
+                es.iter().all(|x| self.preserves_lazy_into_in(x, &penv, elem, depth - 1, expr::SetMode::Exact, seen))
+            }
+            (H::SetMap { expr: f, .. }, Shape::Set { elem, .. }) => {
+                self.preserves_lazy_into_in(f, &penv, elem, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::SetFilter { bound, .. }, Shape::Set { .. }) => {
+                // Only filters over provably reducible domains are eager in TLC;
+                // lazy-domain filters (`SUBSET`, `\X`, non-reducible constants)
+                // fall through to `typed_filter`, which gates materialization on
+                // `total_filter_predicate` and otherwise keeps the branch boxed.
+                self.const_value(&bound.set, &penv)
+                    .is_some_and(|v| tlx_value::ops::is_reducible(&v) && !typed::has_non_reducible_lazy_set(&v))
+                    || (matches!(&*bound.set.kind, H::Builtin { op: B::DotDot, .. }) && !self.ip.is_builtin_overridden(B::DotDot))
+                    || self.preserves_lazy_into_in(&bound.set, &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Builtin { op: B::Times, args }, Shape::Set { elem, .. }) if extensional && !self.ip.is_builtin_overridden(B::Times) => {
+                let [a, b] = args.as_slice() else { return false };
+                matches!(&**elem, Shape::Tuple(parts) if parts.len() == 2
+                    && self.preserves_lazy_into_in(a, &penv, &Shape::Set { elem: Box::new(parts[0].clone()), max_card: usize::MAX }, depth - 1, mode, seen)
+                    && self.preserves_lazy_into_in(b, &penv, &Shape::Set { elem: Box::new(parts[1].clone()), max_card: usize::MAX }, depth - 1, mode, seen))
+            }
+            (H::Builtin { op: B::Union, args }, Shape::Set { .. }) if !self.ip.is_builtin_overridden(B::Union) => {
+                // Lazy `UNION` preserves enumeration multiplicity (e.g.
+                // `UNION {a \X a, a \X b}` in assignment bounds), so only relax
+                // inner members under `SetExt` while keeping element witness
+                // checks intact.
+                if mode == expr::SetMode::SetExt {
+                    let (ap, apenv) = self.peel(&args[0], &penv).unwrap_or_else(|| (args[0].clone(), penv.clone()));
+                    match &*ap.kind {
+                        H::SetEnum(es) => es.iter().all(|x| self.preserves_lazy_into_in(x, &apenv, shape, depth - 1, mode, seen)),
+                        H::SetMap { expr: f, .. } => self.preserves_lazy_into_in(f, &apenv, shape, depth - 1, mode, seen),
+                        _ => {
+                            let outer = Shape::Set { elem: Box::new(shape.clone()), max_card: usize::MAX };
+                            self.preserves_lazy_into_in(&args[0], &penv, &outer, depth - 1, expr::SetMode::Exact, seen)
+                        }
+                    }
+                } else {
+                    let outer = Shape::Set { elem: Box::new(shape.clone()), max_card: usize::MAX };
+                    self.preserves_lazy_into_in(&args[0], &penv, &outer, depth - 1, expr::SetMode::Exact, seen)
+                }
+            }
+            (H::Builtin { op: B::Cup, args }, Shape::Set { .. }) if !self.ip.is_builtin_overridden(B::Cup) => {
+                self.preserves_lazy_into_in(&args[0], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+                    && self.preserves_lazy_into_in(&args[1], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Record(fields), Shape::Record(fs)) if fields.len() == fs.len() => fs.iter().all(|(name, fshape)| {
+                fields
+                    .iter()
+                    .find(|(n, _)| tlx_value::Sym::new(n) == *name)
+                    .is_some_and(|(_, fe)| self.preserves_lazy_into(fe, &penv, fshape, depth - 1))
+            }),
+            (H::Record(fields), Shape::Union(arms)) => {
+                let mut names: Vec<tlx_value::Sym> = fields.iter().map(|(n, _)| tlx_value::Sym::new(n)).collect();
+                names.sort();
+                arms.iter()
+                    .find(|a| matches!(a, Shape::Record(fs) if fs.len() == names.len() && fs.iter().map(|f| f.0).eq(names.iter().copied())))
+                    .is_some_and(|arm| self.preserves_lazy_into(&p, &penv, arm, depth - 1))
+            }
+            (H::Tuple(es), Shape::Tuple(shapes)) if es.len() == shapes.len() => {
+                es.iter().zip(shapes.iter()).all(|(x, xs)| self.preserves_lazy_into(x, &penv, xs, depth - 1))
+            }
+            (H::Tuple(es), Shape::Seq { elem, .. }) => es.iter().all(|x| self.preserves_lazy_into(x, &penv, elem, depth - 1)),
+            (H::FnConstruct { body, .. }, Shape::Tuple(shapes)) => {
+                shapes.iter().all(|xs| self.preserves_lazy_into(body, &penv, xs, depth - 1))
+            }
+            (H::FnConstruct { body, .. }, Shape::Seq { elem, .. }) => self.preserves_lazy_into(body, &penv, elem, depth - 1),
+            (H::FnConstruct { body, .. }, Shape::Fcn { range, .. }) => self.preserves_lazy_into(body, &penv, range, depth - 1),
+            (H::FnConstruct { bounds, body }, Shape::Map { key, range, .. }) => {
+                let dom_ok = !shape_may_hold_set(key)
+                    || matches!(bounds.as_slice(), [b] if self.preserves_lazy_into(&b.set, &penv, &Shape::Set { elem: key.clone(), max_card: usize::MAX }, depth - 1));
+                dom_ok && self.preserves_lazy_into(body, &penv, range, depth - 1)
+            }
+            (H::Builtin { op: B::ColonGt, args }, Shape::Map { key, range, .. }) if !self.ip.is_builtin_overridden(B::ColonGt) => {
+                self.preserves_lazy_into(&args[0], &penv, key, depth - 1) && self.preserves_lazy_into(&args[1], &penv, range, depth - 1)
+            }
+            (H::Builtin { op: B::AtAt, args }, Shape::Map { .. } | Shape::Fcn { .. }) if !self.ip.is_builtin_overridden(B::AtAt) => {
+                self.preserves_lazy_into(&args[0], &penv, shape, depth - 1) && self.preserves_lazy_into(&args[1], &penv, shape, depth - 1)
+            }
+            (H::Record(fs), Shape::Ref(_)) => fs.iter().all(|(_, fe)| self.preserves_lazy_into(fe, &penv, shape, depth - 1)),
+            (H::Tuple(es) | H::SetEnum(es), Shape::Ref(_)) => es.iter().all(|x| self.preserves_lazy_into(x, &penv, shape, depth - 1)),
+            (H::Builtin { op: B::ColonGt | B::AtAt, args }, Shape::Ref(_)) => {
+                args.iter().all(|x| self.preserves_lazy_into(x, &penv, shape, depth - 1))
+            }
+            (
+                H::At
+                | H::Num(_)
+                | H::Str(_)
+                | H::And(_)
+                | H::Or(_)
+                | H::Builtin {
+                    op:
+                        B::Plus
+                        | B::Minus
+                        | B::Mul
+                        | B::Div
+                        | B::Mod
+                        | B::Pow
+                        | B::Gcd
+                        | B::Neg
+                        | B::Cardinality
+                        | B::Len
+                        | B::Not
+                        | B::Implies
+                        | B::Equiv
+                        | B::Eq
+                        | B::Neq
+                        | B::Lt
+                        | B::Le
+                        | B::Gt
+                        | B::Ge
+                        | B::In
+                        | B::NotIn
+                        | B::SubsetEq
+                        | B::IsFiniteSet,
+                    ..
+                },
+                Shape::Ref(_),
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether lowered `x` (from `src` in `env`) is guaranteed to evaluate at
+    /// run time to a reducible set (`Value::Set`, `Value::Interval`, or
+    /// `LazySet::Enum`).
+    fn is_reducible_operand(&self, x: &Expr, src: &hir::Expr, env: &LEnv) -> bool {
+        matches!(self.shape_of(x.ty), Some(Shape::Set { .. }))
+            || matches!(&*x.kind, ExprKind::ValOp { op: B::DotDot, .. } if !self.ip.is_builtin_overridden(B::DotDot))
+            || matches!(&*x.kind, ExprKind::Const(v) if tlx_value::ops::is_reducible(v))
+            || self.constructs_eager_set(src, env, EAGER_DEPTH)
+    }
+
+    /// Lower both operands of `\cup`, `\cap`, or `\` (`op`), returning `Err`
+    /// with the boxed `val_op` fallback whenever either operand cannot be
+    /// proven reducible (or, for `\cup`, when the right operand is not
+    /// guaranteed to be an enumerated `Value::Set`, since `{} \cup (a..b)`
+    /// yields `Value::Interval`).
+    fn reducible_set_operands(&mut self, op: B, a: &hir::Expr, b: &hir::Expr, env: &LEnv, st: &St) -> Result<(Expr, Expr), Expr> {
+        let la = self.expr(a, env, st);
+        let la = self.set_operand(la);
+        if !self.is_reducible_operand(&la, a, env) {
+            let lb = self.expr(b, env, st);
+            return Err(self.val_op(op, vec![la, lb]));
+        }
+        let lb = self.expr(b, env, st);
+        let lb = self.set_operand(lb);
+        let b_ok = if op == B::Cup {
+            matches!(self.shape_of(lb.ty), Some(Shape::Set { .. }))
+                || matches!(&*lb.kind, ExprKind::Const(Value::Set(_)))
+                || self.constructs_eager_set(b, env, EAGER_DEPTH)
+        } else {
+            self.is_reducible_operand(&lb, b, env)
+        };
+        if !b_ok {
+            return Err(self.val_op(op, vec![la, lb]));
+        }
+        Ok((la, lb))
+    }
+
     /// `A \cup B`: inserting enumerated elements into a sorted-array set,
     /// or a bitset union.
     pub(super) fn typed_union(&mut self, a: &hir::Expr, b: &hir::Expr, env: &LEnv, st: &St) -> Expr {
         let ha = a;
-        let a = self.expr(a, env, st);
-        // TLC's SetCupValue enumerates both operands, including duplicates,
-        // when either is a lazy set. Encoding a constant lazy operand here
-        // would instead turn the union into a deduplicated SetEnumValue.
-        let lb = self.expr(b, env, st);
-        let reducible = |x: &Expr| {
-            matches!(&*x.kind, ExprKind::Const(Value::Set(_) | Value::Interval(..)))
-                || matches!(self.shape_of(x.ty), Some(Shape::Set { .. }))
+        let (a, lb) = match self.reducible_set_operands(B::Cup, a, b, env, st) {
+            Ok(p) => p,
+            Err(e) => return e,
         };
-        if !reducible(&a) || !reducible(&lb) {
-            return self.val_op(B::Cup, vec![a, lb]);
-        }
         // A union universe can encode values whose TLC comparisons fail
         // (e.g. an integer and a string). Word-wise union would omit
         // the merge's required comparisons, even for a subset RHS.
-        if [&a, &lb].into_iter().any(|x| {
-            let shape = self.shape_of(x.ty).cloned().or_else(|| match &*x.kind {
-                ExprKind::Const(v) => Some(Shape::of(v)),
-                _ => None,
-            });
-            matches!(shape, Some(Shape::Set { elem, .. }) if !typed::shapes_comparable(&elem, &elem))
-        }) {
+        if [&a, &lb].into_iter().any(|x| self.set_elem_shape(x).is_some_and(|elem| !typed::shapes_comparable(&elem, &elem))) {
             return self.val_op(B::Cup, vec![a, lb]);
         }
-        let a = self.set_operand(a);
         // A constructed sorted-array operand (e.g. `{x} \cup S`) has room
         // for its own elements only: the union is built into a shape with
         // room for both operands (otherwise it fails at run time as soon
@@ -584,50 +915,67 @@ impl Lowerer<'_> {
         if let (Some((_, _, ma)), true) = (self.sorted_elem(a.ty), builds_set(ha)) {
             let mb = match &*b.kind {
                 H::SetEnum(es) => Some(es.len()),
-                _ => {
-                    let lb = self.expr(b, env, st);
-                    let lb = self.set_operand(lb);
-                    match (self.shape_of(lb.ty), self.shape_of(a.ty)) {
-                        (Some(Shape::Set { elem: eb, .. }), Some(Shape::Set { elem: ea, .. })) if eb == ea => self.iter_bound(&lb),
-                        _ => None,
-                    }
-                }
+                _ => match (self.shape_of(lb.ty), self.shape_of(a.ty)) {
+                    (Some(Shape::Set { elem: eb, .. }), Some(Shape::Set { elem: ea, .. })) if eb == ea => self.iter_bound(&lb),
+                    _ => None,
+                },
             };
             if let Some(mb) = mb {
                 let total = ma as usize + mb;
                 if total > ma as usize && total <= MAX_UNION_CARD {
                     let Some(Shape::Set { elem, .. }) = self.shape_of(a.ty).cloned() else { unreachable!() };
-                    let wsid = self.sid(&Shape::Set { elem, max_card: total });
-                    if let Some(x) = self.sorted_union_into(ha, b, env, st, wsid) {
-                        return x;
+                    let wshape = Shape::Set { elem, max_card: total };
+                    if self.preserves_lazy_into(ha, env, &wshape, EAGER_DEPTH) && self.preserves_lazy_into(b, env, &wshape, EAGER_DEPTH) {
+                        let wsid = self.sid(&wshape);
+                        if let Some(x) = self.sorted_union_into(ha, b, env, st, wsid) {
+                            return x;
+                        }
                     }
                 }
             }
         }
         if let (Some((esid, ew, max_card)), H::SetEnum(es)) = (self.sorted_elem(a.ty), &*b.kind) {
-            let ty = a.ty;
-            let mut out = a;
-            for x in es {
-                let elem = self.expr_into(x, env, st, esid);
-                out = Expr::new(ty, ExprKind::SortedInsert { set: out, elem, elem_words: ew, max_card });
+            if es.iter().all(|x| self.preserves_lazy_into(x, env, self.typing.shape(esid), EAGER_DEPTH)) {
+                let ty = a.ty;
+                let mut out = a;
+                for x in es {
+                    let elem = self.expr_into(x, env, st, esid);
+                    out = Expr::new(ty, ExprKind::SortedInsert { set: out, elem, elem_words: ew, max_card });
+                }
+                return out;
             }
-            return out;
+            return self.val_op(B::Cup, vec![a, lb]);
         }
+        let b_eager_ctor = self.constructs_eager_set(b, env, EAGER_DEPTH);
         if let Some((_, ew, max_card)) = self.sorted_elem(a.ty) {
             let Ty::Enc(sid) = a.ty else { unreachable!() };
-            let b = if self.constructs(b, env) { self.expr_into(b, env, st, sid) } else { self.expr(b, env, st) };
-            let b = if b.ty == a.ty { b } else { self.coerce_enc(b, sid) };
+            let b = if b_eager_ctor && self.preserves_lazy_into(b, env, self.typing.shape(sid), EAGER_DEPTH) {
+                self.expr_into(b, env, st, sid)
+            } else {
+                lb
+            };
+            let b = if b.ty == a.ty {
+                b
+            } else {
+                let cb = self.coerce_enc(b.clone(), sid);
+                if matches!(&*cb.kind, ExprKind::Convert(_)) {
+                    return self.val_op(B::Cup, vec![a, b]);
+                }
+                cb
+            };
             let ty = a.ty;
             return Expr::new(ty, ExprKind::SortedOp { op: SetOp::Union, a, b, elem_words: ew, max_card });
         }
-        let b = self.bitset_operand(b, a.ty, env, st);
+        let b = if b_eager_ctor { self.bitset_operand(b, lb, a.ty, env, st) } else { lb };
         // Bitsets of different element shapes: one converted into the
         // other's universe, where every element fits; else a computed set
         // into a variable's universe, where its elements are expected to
         // fit (an element that does not is a runtime failure, as when the
         // union is stored in that variable).
-        let same =
-            self.same_bitsets(&a, &b).or_else(|| self.converted_bitsets(&a, &b, false)).or_else(|| self.converted_bitsets(&a, &b, true));
+        let same = self
+            .same_bitsets(&a, &b, false, false)
+            .or_else(|| self.converted_bitsets(&a, &b, false))
+            .or_else(|| self.converted_bitsets(&a, &b, true));
         match same {
             Some((a, b, sid)) => {
                 let bound = self.bitset_bound(a.ty).zip(self.bitset_bound(b.ty)).map(|(x, y)| x + y);
@@ -669,70 +1017,91 @@ impl Lowerer<'_> {
         None
     }
 
-    /// `A \cap B` / `A \ B` (`op`) as a bitset operation where possible.
+    /// `A \cap B` / `A \ B` (`op`) as a bitset or sorted-set operation where
+    /// both operands are provably reducible.
     pub(super) fn typed_set_op(&mut self, op: B, a: &hir::Expr, b: &hir::Expr, env: &LEnv, st: &St) -> Expr {
-        let a = self.expr(a, env, st);
-        let a = self.set_operand(a);
-        if let Some((_, ew, max_card)) = self.sorted_elem(a.ty) {
+        let (a, lb) = match self.reducible_set_operands(op, a, b, env, st) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let b_eager_ctor = self.constructs_eager_set(b, env, EAGER_DEPTH);
+        let b_enum =
+            b_eager_ctor || matches!(self.shape_of(lb.ty), Some(Shape::Set { .. })) || matches!(&*lb.kind, ExprKind::Const(Value::Set(_)));
+        if let (Some((_, ew, max_card)), true) = (self.sorted_elem(a.ty), b_enum) {
             let Ty::Enc(sid) = a.ty else { unreachable!() };
-            let b = if self.constructs(b, env) { self.expr_into(b, env, st, sid) } else { self.expr(b, env, st) };
+            let b = if b_eager_ctor && self.preserves_lazy_into(b, env, self.typing.shape(sid), EAGER_DEPTH) {
+                self.expr_into(b, env, st, sid)
+            } else {
+                lb
+            };
             let b = if b.ty == a.ty { b } else { self.coerce_enc(b, sid) };
             let sop = if op == B::Cap { SetOp::Inter } else { SetOp::Diff };
             let ty = a.ty;
             return Expr::new(ty, ExprKind::SortedOp { op: sop, a, b, elem_words: ew, max_card });
         }
-        // A constant left operand: encode it like the right operand when that
-        // is a bitset, else as a bitset over a universe shared with the state.
+        let orig_a = a.clone();
+        // A reducible constant left operand: encode it like the right operand
+        // when that is a bitset, else as a bitset over a universe shared with
+        // the state. Keep `orig_a` untouched if bitset lowering falls back.
         let (a, b) = match &*a.kind {
-            ExprKind::Const(v) if a.ty == Ty::Val && self.constructs(b, env) => {
+            ExprKind::Const(v) if a.ty == Ty::Val && b_eager_ctor => {
                 let ac = self.const_bitset(v).unwrap_or(a.clone());
-                let bl = self.bitset_operand(b, ac.ty, env, st);
+                let bl = self.bitset_operand(b, lb, ac.ty, env, st);
                 (ac, bl)
             }
-            ExprKind::Const(v) if a.ty == Ty::Val => {
-                let bl = self.expr(b, env, st);
-                match bl.ty {
-                    Ty::Enc(bsid) if self.is_bitset(bl.ty) => match self.const_words(v, bsid) {
-                        Some(ac) => (ac, bl),
-                        None => (self.const_bitset(v).unwrap_or(a), bl),
-                    },
-                    _ => (self.const_bitset(v).unwrap_or(a), bl),
-                }
-            }
+            ExprKind::Const(v) if a.ty == Ty::Val => match lb.ty {
+                Ty::Enc(bsid) if self.is_bitset(lb.ty) => match self.const_set_words_exact_elems(v, bsid) {
+                    Some(ac) => (ac, lb),
+                    None => (self.const_bitset(v).unwrap_or(a), lb),
+                },
+                _ => (self.const_bitset(v).unwrap_or(a), lb),
+            },
             _ => {
-                let bl = self.bitset_operand(b, a.ty, env, st);
+                let bl = if b_eager_ctor { self.bitset_operand(b, lb, a.ty, env, st) } else { lb };
                 (a, bl)
             }
         };
         // (Converted only where every element fits: an element outside the
         // other universe would be dropped, not fail.)
-        match self.same_bitsets(&a, &b).or_else(|| self.converted_bitsets(&a, &b, false)) {
+        match self.same_bitsets(&a, &b, false, true).or_else(|| self.converted_bitsets(&a, &b, false)) {
             Some((a, b, sid)) => {
                 let sop = if op == B::Cap { SetOp::Inter } else { SetOp::Diff };
                 Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(sop, a, b))
             }
-            None => self.val_op(op, vec![a, b]),
+            None => self.val_op(op, vec![orig_a, b]),
         }
     }
 
     /// The right operand of a set operator whose left operand has type
-    /// `aty`: a constructor is built directly into a bitset encoding.
-    fn bitset_operand(&mut self, e: &hir::Expr, aty: Ty, env: &LEnv, st: &St) -> Expr {
+    /// `aty`: a constructor is built directly into a bitset encoding,
+    /// reusing the already lowered `lb` when direct construction does not
+    /// apply.
+    fn bitset_operand(&mut self, e: &hir::Expr, lb: Expr, aty: Ty, env: &LEnv, st: &St) -> Expr {
         match aty {
-            Ty::Enc(sid) if self.is_bitset(aty) && self.constructs(e, env) => self.expr_into(e, env, st, sid),
-            _ => {
-                let x = self.expr(e, env, st);
-                self.set_operand(x)
+            Ty::Enc(sid)
+                if self.is_bitset(aty)
+                    && self.constructs(e, env)
+                    && self.preserves_lazy_into(e, env, self.typing.shape(sid), EAGER_DEPTH) =>
+            {
+                self.expr_into(e, env, st, sid)
             }
+            _ => lb,
         }
     }
 
     /// `UNION S` as a bitset (see the three cases below). The listed form is
     /// tried first: it unrolls a constant domain at compile time.
-    pub(super) fn typed_big_union(&mut self, arg: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
-        self.big_union_listed(arg, env, st)
-            .or_else(|| self.big_union_mapped(arg, env, st))
-            .or_else(|| self.big_union_of_bitsets(arg, env, st))
+    ///
+    /// Members are lowered with `SetMode::SetExt` only when the union's own
+    /// consumer ignores multiplicity (`SetMode::SetExt`), and with
+    /// `SetMode::Exact` otherwise (e.g. `ActionIter` in `x' \in UNION {a \X a, a \X b}`),
+    /// because TLC only eagerly deduplicates `UNION` when every member is an
+    /// enumerated set.
+    pub(super) fn typed_big_union(&mut self, arg: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
+        let inner_mode = if mode == expr::SetMode::SetExt { expr::SetMode::SetExt } else { expr::SetMode::Exact };
+        self.big_union_listed(arg, env, st, inner_mode)
+            .or_else(|| self.big_union_mapped(arg, env, st, inner_mode))
+            .or_else(|| self.big_union_of_bitsets(arg, env, st, inner_mode))
     }
 
     /// `UNION {f(x) : x \in S}` for a non-constant `S` whose members are
@@ -741,21 +1110,21 @@ impl Lowerer<'_> {
     /// set of sets before taking its union — so an error in any member is
     /// reported, and the result is a subset of the members' element
     /// universe whatever their own capacity was.
-    fn big_union_mapped(&mut self, arg: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    fn big_union_mapped(&mut self, arg: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
         let (p, penv) = self.peel(arg, env)?;
         let H::SetMap { expr: f, bounds } = &*p.kind else { return None };
         let [b] = &bounds[..] else { return None };
         if !binders::single_binder(b) {
             return None;
         }
-        let s = self.expr(&b.set, &penv, st);
+        let s = self.extensional_set_expr(&b.set, &penv, st);
         let (src, ety) = self.typed_iter_in(s, true);
         if !src.is_typed_source() {
             return None;
         }
         let t = self.temp(ety);
         let (env2, check) = self.bind_elem(&b.vars, &temp_ref(ety, t), &penv)?;
-        let x = binders::checked(check, self.expr(f, &env2, st));
+        let x = binders::checked(check, self.expr_with_mode(f, &env2, st, mode));
         // The union of subsets of one universe: the members' own bitset
         // shape holds it whatever capacity it was inferred with (a bitset
         // represents every subset of its universe; only the shapes of the
@@ -781,7 +1150,7 @@ impl Lowerer<'_> {
         if !binders::single_binder(b) {
             return None;
         }
-        let s = self.expr(&b.set, &penv, st);
+        let s = self.extensional_set_expr(&b.set, &penv, st);
         let (src, ety) = self.typed_iter_in(s, true);
         if !src.is_typed_source() {
             return None;
@@ -806,9 +1175,9 @@ impl Lowerer<'_> {
     /// `UNION S` of an encoded set `S` of bitsets with a small element
     /// universe: the elements of the universe in some member of `S` (a
     /// bitset of the universe).
-    fn big_union_of_bitsets(&mut self, arg: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    fn big_union_of_bitsets(&mut self, arg: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
         const MAX_UNIVERSE: u64 = 256;
-        let s = self.expr(arg, env, st);
+        let s = self.expr_with_mode(arg, env, st, mode);
         let s = self.set_operand(s);
         let Some(Shape::Set { elem: inner, .. }) = self.shape_of(s.ty).cloned() else { return None };
         let Shape::Set { elem, .. } = &*inner else { return None };
@@ -825,7 +1194,7 @@ impl Lowerer<'_> {
         }
         let (src, bind) = self.share(src);
         let (u, x) = (self.temp(Ty::Enc(esid)), self.temp(ity));
-        let rank = self.bit_rank(&temp_ref(ity, x), &temp_ref(Ty::Enc(esid), u))?;
+        let rank = self.bit_rank(&temp_ref(ity, x), &temp_ref(Ty::Enc(esid), u), true)?;
         let member = Expr::new(Ty::Bool, ExprKind::BitMember { set: temp_ref(ity, x), rank });
         let some = Expr::new(Ty::Bool, ExprKind::Exists { bind: x, set: src, body: member });
         let full = Expr::new(Ty::Enc(rsid), ExprKind::ConstWords(full.into()));
@@ -835,7 +1204,8 @@ impl Lowerer<'_> {
     /// `UNION {f(x) : x \in S}` / `UNION {a, b, ...}` for a constant `S`
     /// whose members are bitsets of one shape: their union, unrolled (every
     /// member is evaluated, as TLC builds the set of sets first).
-    fn big_union_listed(&mut self, arg: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    fn big_union_listed(&mut self, arg: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
+        let extensional = mode.is_extensional();
         let (p, penv) = self.peel(arg, env)?;
         let mut members = Vec::new();
         match &*p.kind {
@@ -851,7 +1221,7 @@ impl Lowerer<'_> {
                 }
                 for x in elems {
                     let env2 = binders::bind_const(&b.vars, &x, &penv)?;
-                    let m = self.expr(f, &env2, st);
+                    let m = self.expr_with_mode(f, &env2, st, mode);
                     if m.ty == Ty::Val && !matches!(&*m.kind, ExprKind::Const(_)) {
                         return None;
                     }
@@ -860,7 +1230,7 @@ impl Lowerer<'_> {
             }
             H::SetEnum(es) if !es.is_empty() && es.len() <= 64 => {
                 for e in es {
-                    members.push(self.expr(e, &penv, st));
+                    members.push(self.expr_with_mode(e, &penv, st, mode));
                 }
             }
             _ => return None,
@@ -873,7 +1243,13 @@ impl Lowerer<'_> {
         for m in members {
             let m = match m.ty {
                 Ty::Enc(s) if s == sid => m,
-                _ => self.const_words(&typed::const_of(&m)?, sid)?,
+                _ => {
+                    let v = typed::const_of(&m)?;
+                    if !typed::const_preserves_lazy(&v, extensional) || (!extensional && v.enum_elements().is_none()) {
+                        return None;
+                    }
+                    self.const_words(&v, sid)?
+                }
             };
             acc = Some(match acc {
                 None => m,
@@ -899,9 +1275,9 @@ impl Lowerer<'_> {
             xs.push(x);
         }
         let elem = self.common_shape(&mut xs)?;
-        // Encoded insertion compares words; it cannot preserve a deferred
-        // comparison error or membership in an unnormalized mixed set.
-        if !typed::shapes_comparable(&elem, &elem) {
+        // Encoded insertion compares raw words; it cannot preserve a deferred
+        // comparison error or semantically deduplicate dynamic-witness elements.
+        if !typed::shapes_comparable(&elem, &elem) || elem.has_dynamic_witness() {
             return None;
         }
         let esid = self.sid(&elem);
@@ -917,7 +1293,7 @@ impl Lowerer<'_> {
                 return None;
             }
             let probe = self.zero_enc(sid);
-            let ranks = xs.iter().map(|x| self.bit_rank(&probe, x)).collect::<Option<Vec<_>>>()?;
+            let ranks = xs.iter().map(|x| self.bit_rank(&probe, x, false)).collect::<Option<Vec<_>>>()?;
             return Some(Expr::new(Ty::Enc(sid), ExprKind::BitSet(ranks)));
         }
         let ew = self.words(esid);
@@ -930,7 +1306,7 @@ impl Lowerer<'_> {
 
     /// `Cardinality(s)`.
     pub(super) fn typed_cardinality(&mut self, s: &hir::Expr, env: &LEnv, st: &St) -> Expr {
-        let s = self.expr(s, env, st);
+        let s = self.extensional_set_expr(s, env, st);
         if self.is_ref(s.ty) {
             return self.ref_op(crate::ir::RefOp::Cardinality, vec![s]);
         }
@@ -952,7 +1328,7 @@ impl Lowerer<'_> {
         if !binders::single_binder(b) {
             return None;
         }
-        let s = self.expr(&b.set, env, st);
+        let s = self.extensional_set_expr(&b.set, env, st);
         let (src, ety) = self.typed_iter_in(s, true);
         if !src.is_typed_source() {
             return None;
@@ -970,14 +1346,14 @@ impl Lowerer<'_> {
         }
         let Ty::Enc(esid) = x.ty else { return None };
         let elem = self.shape_of(x.ty)?.clone();
-        if !typed::shapes_comparable(&elem, &elem) {
+        if !typed::shapes_comparable(&elem, &elem) || elem.has_dynamic_witness() {
             return None;
         }
         let max_card = elem.cardinality().map_or(bound, |c| (c.min(usize::MAX as u64) as usize).min(bound)).max(1);
         let sid = self.sid(&Shape::Set { elem: Box::new(elem.clone()), max_card });
         let x = if self.is_bitset(Ty::Enc(sid)) {
             let probe = self.zero_enc(sid);
-            self.bit_rank(&probe, &x)?
+            self.bit_rank(&probe, &x, false)?
         } else {
             let _ = esid;
             x

@@ -216,3 +216,76 @@ Sym == Permutations(Actors)
         }
     }
 }
+
+#[test]
+fn witness_only_view_miss_matches_canonical_view_in_escape_mode() {
+    let src = r#"---- MODULE EscapeViewWitness ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == UNCHANGED x
+V == IF x = 0 THEN <<1>> ELSE [i \in {1} |-> 1]
+===="#;
+    let settings = Settings::from_lookup(|k| match k {
+        "TLX_ESCAPE" | "TLX_NO_NATIVE" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
+    let base = Arc::new(load(src, "INIT Init\nNEXT Next\nVIEW V\n"));
+    let view_shape = Shape::Tuple(Arc::from([Shape::Int { lo: 1, hi: 1 }]));
+    let defs = vec![(super::super::speculate::view_def(&base).unwrap(), view_shape)];
+    let model = EncModel::new(base, Arc::new(Layout::new(vec![Shape::Int { lo: 0, hi: 1 }])), defs, &settings);
+    let codec = &model.escape.as_ref().unwrap().codec;
+
+    // `x = 0` produces `<<1>>` (fits Tuple VIEW); `x = 1` produces `[i \in {1} |-> 1]`
+    // (witness-only VIEW miss on both inline and escaped states). All must match.
+    let s0_inline = codec.encode(&[Value::Int(0)]).unwrap();
+    let s0_escaped = codec.force_escape(&[Value::Int(0)]).unwrap();
+    let s1_inline = codec.encode(&[Value::Int(1)]).unwrap();
+    let s1_escaped = codec.force_escape(&[Value::Int(1)]).unwrap();
+    let fp0 = model.words_fp(&s0_inline, 1).unwrap();
+    assert_eq!(fp0, model.words_fp(&s0_escaped, 1).unwrap());
+    assert_eq!(fp0, model.words_fp(&s1_inline, 1).unwrap());
+    assert_eq!(fp0, model.words_fp(&s1_escaped, 1).unwrap());
+}
+
+#[test]
+fn out_of_layout_view_on_dynamic_witness_shape_does_not_panic() {
+    let src = r#"---- MODULE EscapeViewDynOutlier ----
+EXTENDS Integers
+VARIABLE x
+Init == x = 0
+Next == UNCHANGED x
+V == IF x = 0 THEN <<0, 1>> ELSE IF x = 1 THEN [i \in {1, 2} |-> i - 1] ELSE "outlier"
+===="#;
+    let settings = Settings::from_lookup(|k| match k {
+        "TLX_ESCAPE" | "TLX_NO_NATIVE" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
+    let base = Arc::new(load(src, "INIT Init\nNEXT Next\nVIEW V\n"));
+    // 3-word VIEW shape (2 slots + 1 dynamic witness word): an out-of-layout
+    // VIEW produces a digest that must not be walked as a 3-word buffer.
+    let view_shape = Shape::Fcn {
+        dom: Arc::from([Value::Int(1), Value::Int(2)]),
+        range: Box::new(Shape::Int { lo: 0, hi: 1 }),
+        witness: tlx_layout::FcnWitness::Dynamic,
+        key_variants: Arc::from([]),
+    };
+    let defs = vec![(super::super::speculate::view_def(&base).unwrap(), view_shape)];
+    let model = EncModel::new(base, Arc::new(Layout::new(vec![Shape::Int { lo: 0, hi: 2 }])), defs, &settings);
+    let codec = &model.escape.as_ref().unwrap().codec;
+
+    // `x = 0` (`<<0, 1>>`) and `x = 1` (`[i \in {1, 2} |-> i - 1]`) share one VIEW fp.
+    let fp0 = model.words_fp(&codec.encode(&[Value::Int(0)]).unwrap(), 1).unwrap();
+    let fp1 = model.words_fp(&codec.encode(&[Value::Int(1)]).unwrap(), 1).unwrap();
+    assert_eq!(fp0, fp1);
+
+    // `x = 2` (`"outlier"`) is out-of-layout on an inline state and on an escaped state.
+    let s2_inline = codec.encode(&[Value::Int(2)]).unwrap();
+    let s2_escaped = codec.force_escape(&[Value::Int(2)]).unwrap();
+    let fp2_inline = model.words_fp(&s2_inline, 1).unwrap();
+    let fp2_escaped = model.words_fp(&s2_escaped, 1).unwrap();
+    assert_eq!(fp2_inline, fp2_escaped);
+    assert_ne!(fp0, fp2_inline);
+}

@@ -13,6 +13,30 @@ use tlx_sema::hir::{self, BoundVars, DefKind, ExprKind as H, LocalId, OpRef, Qua
 
 use super::*;
 
+/// How much of a set expression's representation the consumer observes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SetMode {
+    /// Full value semantics: representation (`LazySet` vs `Value::Set`),
+    /// multiplicity, and lazy filter behavior are all observable.
+    Exact,
+    /// Action/statement iteration (`x' \in S`, `\E x \in S : Next`, `\A`
+    /// action bounds): duplicate-free lazy sets (`A \X B`, total `SUBSET`
+    /// filters) may be encoded, while element representations and
+    /// `UNION`/`\cup` enumeration multiplicity must be preserved.
+    ActionIter,
+    /// Pure extensional expression consumer (`=`, `\in`, `\subseteq`,
+    /// `Cardinality`, `CHOOSE`, expression quantifiers): top-level set
+    /// representation and multiplicity are unobserved, while element
+    /// representations and lazy filter side effects/errors are preserved.
+    SetExt,
+}
+
+impl SetMode {
+    pub(super) fn is_extensional(self) -> bool {
+        self != SetMode::Exact
+    }
+}
+
 impl Lowerer<'_> {
     pub(super) fn bool_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
         let x = self.expr(e, env, st);
@@ -43,15 +67,32 @@ impl Lowerer<'_> {
 
     /// Lower an expression (value semantics).
     pub(super) fn expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
-        let x = self.expr_lowered(e, env, st);
+        self.expr_with_mode(e, env, st, SetMode::Exact)
+    }
+
+    /// Lower `e` for an action/statement iteration bound where enumeration
+    /// multiplicity is observable (`x' \in S`, `\E x \in S : Next`).
+    pub(super) fn action_iter_set_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
+        self.expr_with_mode(e, env, st, SetMode::ActionIter)
+    }
+
+    /// Lower `e` where only its extensional set elements/membership are
+    /// observed (`LazySet` vs `Value::Set` and multiplicity cannot affect the
+    /// result).
+    pub(super) fn extensional_set_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
+        self.expr_with_mode(e, env, st, SetMode::SetExt)
+    }
+
+    pub(super) fn expr_with_mode(&mut self, e: &hir::Expr, env: &LEnv, st: &St, mode: SetMode) -> Expr {
+        let x = self.expr_lowered(e, env, st, mode);
         self.regions_post(e, env, x)
     }
 
-    fn expr_lowered(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Expr {
+    fn expr_lowered(&mut self, e: &hir::Expr, env: &LEnv, st: &St, mode: SetMode) -> Expr {
         if let Some(v) = self.const_value(e, env) {
             return const_expr(v);
         }
-        if let Some(x) = self.typed_expr(e, env, st) {
+        if let Some(x) = self.typed_expr(e, env, st, mode) {
             return x;
         }
         match &*e.kind {
@@ -68,7 +109,7 @@ impl Lowerer<'_> {
             H::Builtin { op: B::Prime, args } if !st.init && !self.primed => self.prime_expr(e, &args[0], env, st),
             H::Local(l) => match env.lookup(*l, &self.ip.prog) {
                 Some(LBind::Ir(x)) => x,
-                Some(LBind::Thunk(te, tenv)) => self.expr(&te, &tenv, st),
+                Some(LBind::Thunk(te, tenv)) => self.expr_with_mode(&te, &tenv, st, mode),
                 _ => self.interp(e, env),
             },
             H::And(es) => and(es.iter().map(|c| self.bool_expr(c, env, st)).collect()),
@@ -78,15 +119,6 @@ impl Lowerer<'_> {
                 let a = self.bool_expr(&args[0], env, st);
                 let b = self.bool_expr(&args[1], env, st);
                 or(vec![not(a), b])
-            }
-            H::If { cond, then, els } => {
-                if let Some(b) = self.const_bool(cond, env) {
-                    return self.expr(if b { then } else { els }, env, st);
-                }
-                let c = self.bool_expr(cond, env, st);
-                let t = self.val_expr(then, env, st);
-                let f = self.val_expr(els, env, st);
-                Expr::new(Ty::Val, ExprKind::If(c, t, f))
             }
             H::Builtin { op: B::Eq, args } => {
                 let a = self.val_expr(&args[0], env, st);
@@ -107,7 +139,7 @@ impl Lowerer<'_> {
                     return x;
                 }
                 let unique = self.unique_choice(vars, set, body);
-                let set = self.expr(set, env, st);
+                let set = self.extensional_set_expr(set, env, st);
                 if !unique {
                     if let Some(x) = self.verified_choose(vars, &set, body, env, st) {
                         return x;
@@ -132,13 +164,13 @@ impl Lowerer<'_> {
                 let args = args.iter().map(|a| self.val_expr(a, env, st)).collect();
                 self.val_op(*op, args)
             }
-            H::Apply { op, args } => match self.inline_apply(*op, args, env, st) {
+            H::Apply { op, args } => match self.inline_apply_mode(*op, args, env, st, mode) {
                 Some(x) => x,
                 None => self.interp(e, env),
             },
             H::Let { defs, body } => {
                 let (env2, lets) = self.let_temps(defs, body, env, st);
-                let out = self.expr(body, &env2, st);
+                let out = self.expr_with_mode(body, &env2, st, mode);
                 let_in(lets.into_iter().rev(), out)
             }
             _ => self.interp(e, env),
@@ -415,7 +447,7 @@ impl Lowerer<'_> {
         let mut env2 = env.clone();
         let multi = bounds.len() > 1;
         for (idx, b) in bounds.iter().enumerate() {
-            let set = self.expr(&b.set, env, st);
+            let set = self.extensional_set_expr(&b.set, env, st);
             let (set, ety) = self.typed_iter_in(set, true);
             // When multiple bounds are nested with the first variable varying
             // fastest (last bound outermost), an empty outer bound would skip
@@ -528,13 +560,25 @@ impl Lowerer<'_> {
     /// Inline a user-defined operator application in expression position.
     /// Arguments are passed by name in action-level contexts (as TLC
     /// does), by value (bound to temps) otherwise.
-    fn inline_apply(&mut self, op: OpRef, args: &[hir::Expr], env: &LEnv, st: &St) -> Option<Expr> {
-        self.inline_with(op, args, env, st, None)
+    fn inline_apply_mode(&mut self, op: OpRef, args: &[hir::Expr], env: &LEnv, st: &St, mode: SetMode) -> Option<Expr> {
+        self.inline_with_mode(op, args, env, st, None, mode)
     }
 
     /// Inline an operator application; with `into`, its body is built
     /// directly in that encoding (destination-driven construction).
     pub(super) fn inline_with(&mut self, op: OpRef, args: &[hir::Expr], env: &LEnv, st: &St, into: Option<ShapeId>) -> Option<Expr> {
+        self.inline_with_mode(op, args, env, st, into, SetMode::Exact)
+    }
+
+    fn inline_with_mode(
+        &mut self,
+        op: OpRef,
+        args: &[hir::Expr],
+        env: &LEnv,
+        st: &St,
+        into: Option<ShapeId>,
+        mode: SetMode,
+    ) -> Option<Expr> {
         // A LET definition computed once at its LET (see `let_temps`).
         if let (OpRef::Def(d), true, false) = (op, args.is_empty(), self.primed) {
             if let Some(LBind::Ir(x)) = env.lookup(tlx_eval::env::let_cache_key(d), &self.ip.prog) {
@@ -618,7 +662,7 @@ impl Lowerer<'_> {
         }
         let out = match into {
             Some(sid) => self.expr_into(&body, &env2, st, sid),
-            None => self.expr(&body, &env2, st),
+            None => self.expr_with_mode(&body, &env2, st, mode),
         };
         if def.is_some() {
             self.inline_stack.pop();

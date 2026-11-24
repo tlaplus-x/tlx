@@ -49,19 +49,19 @@ impl EncModel {
     /// (`Value` equality, which `compare_states` checks, ignores it).
     pub(super) fn check_store_slots(&self, what: &dyn Fn() -> String, want: &[Vec<Value>], compiled: &[Box<[u64]>]) {
         let Some(sem) = &self.sem else { return };
+        let Some(store) = &sem.store else { return };
         let refs: Vec<usize> = (0..self.layout.vars.len()).filter(|&i| sem.ref_vars[i]).collect();
         if refs.is_empty() || want.len() != compiled.len() {
             return;
         }
         let mut got: Vec<Vec<u64>> = compiled.iter().map(|w| refs.iter().map(|&i| w[self.layout.offsets[i]]).collect()).collect();
-        let mut exp: Vec<Vec<u64>> =
-            want.iter().map(|s| refs.iter().map(|&i| sem.store.freeze(&s[i]).unwrap_or(u64::MAX)).collect()).collect();
+        let mut exp: Vec<Vec<u64>> = want.iter().map(|s| refs.iter().map(|&i| store.freeze(&s[i]).unwrap_or(u64::MAX)).collect()).collect();
         got.sort_unstable();
         exp.sort_unstable();
         if got != exp {
             let show = |hs: &[Vec<u64>]| {
                 hs.iter()
-                    .map(|h| h.iter().map(|x| format!("{:?}", sem.store.try_thaw(*x))).collect::<Vec<_>>().join(", "))
+                    .map(|h| h.iter().map(|x| format!("{:?}", store.try_thaw(*x))).collect::<Vec<_>>().join(", "))
                     .collect::<Vec<_>>()
                     .join("\n  ")
             };

@@ -17,7 +17,7 @@ the landing page (what tlx is, quick start, performance). This directory holds e
 | [compat.md](compat.md) | The compatibility contract with TLC (three tiers), the documented differences (D-n) and the known limitations. |
 | [tlc-semantics.md](tlc-semantics.md) | Reference for TLC's exact behavior (values, comparison, enumeration order, counting, fingerprints, standard modules), derived from TLC's source. |
 | [features.md](features.md) | Support matrix: TLC command-line options, `.cfg` keywords, standard modules, CommunityModules and Apalache modules, operator by operator. |
-| [issues.md](issues.md) | Active engineering follow-ups, resource limits, benchmark input migration and pending validation (documented TLC differences and D-13 live in [compat.md](compat.md)). |
+| [issues.md](issues.md) | Active engineering follow-ups, resource limits, benchmark input migration and pending validation (documented TLC differences live in [compat.md](compat.md)). |
 
 ## Internals
 

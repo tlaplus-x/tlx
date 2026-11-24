@@ -77,7 +77,11 @@ fn safe_state_codec_rejects_corrupted_packed_scalars_and_padding() {
     }
 
     // 3. Packed Map with non-zero bits in an absent slot.
-    let map_shape = Shape::Map { key: Box::new(Shape::Int { lo: 1, hi: 4 }), range: Box::new(Shape::Int { lo: 0, hi: 2 }) };
+    let map_shape = Shape::Map {
+        key: Box::new(Shape::Int { lo: 1, hi: 4 }),
+        range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+        witness: tlx_layout::FcnWitness::Interval,
+    };
     let map_m = model(map_shape.clone());
     let mut map_good = [0u64; 2];
     tlx_layout::layout::encode(&map_shape, &Value::fcn_from_pairs(vec![(Value::Int(1), Value::Int(2))]).unwrap(), &mut map_good).unwrap();
@@ -106,7 +110,8 @@ fn safe_state_codec_rejects_corrupted_packed_scalars_and_padding() {
     assert!(pair_seq.validate(&[0, 1]).is_err());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| StateCodec::decode(&pair_seq, &[0, 1], 1, 0))).is_err());
 
-    let pair_map = model(Shape::Map { key: Box::new(Shape::Bool), range: Box::new(pair_bool) });
+    let pair_map =
+        model(Shape::Map { key: Box::new(Shape::Bool), range: Box::new(pair_bool), witness: tlx_layout::FcnWitness::Enumerated });
     assert!(pair_map.validate(&[0, 0, 0]).is_ok());
     assert!(pair_map.validate(&[0, 1, 0]).is_err());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| StateCodec::decode(&pair_map, &[0, 1, 0], 1, 0))).is_err());

@@ -135,23 +135,36 @@ impl Value {
         }
     }
 
-    /// A function from its pairs (sorted by key, distinct) of an encoding
-    /// that does not record how TLC built it (the compiled tier's layouts:
-    /// `FcnDom` is not part of a value's encoding): over an interval if the
-    /// keys are the integers `lo..hi` with `lo # 1` (functions over such
-    /// intervals are much more common than over enumerated sets of
-    /// consecutive integers), otherwise over the enumerated domain.
-    pub fn fcn_decoded(pairs: Vec<(Value, Value)>) -> Value {
-        let dom = if is_int_interval(&pairs) { FcnDom::Interval } else { FcnDom::Enumerated };
+    /// Build a function from sorted, distinct pairs with an explicit domain witness.
+    pub fn fcn_with_dom(pairs: Vec<(Value, Value)>, dom: FcnDom) -> Value {
         Value::Fcn(Arc::from(pairs), dom)
     }
 
-    /// `fcn_decoded` for a function built from decoded pairs by
-    /// `fcn_from_pairs` (a `Tuple` / `Record` stays as it is).
-    pub fn with_decoded_dom(self) -> Value {
-        match self {
-            Value::Fcn(ps, FcnDom::Enumerated) if is_int_interval(&ps) => Value::Fcn(ps, FcnDom::Interval),
-            v => v,
+    /// Build a function over an integer interval from sorted, distinct pairs:
+    /// `Tuple` for empty / `1..n`, else `Fcn(_, FcnDom::Interval)`.
+    pub fn fcn_over_interval_sorted(pairs: Vec<(Value, Value)>) -> Value {
+        fcn_over_interval(pairs)
+    }
+
+    /// Build the structured/canonical function value from sorted, distinct
+    /// pairs: `Tuple` for empty / `1..n`, `Record` for non-empty all-string
+    /// domains, `Fcn(_, FcnDom::Interval)` for contiguous `lo..hi` (`lo # 1`),
+    /// otherwise `Fcn(_, FcnDom::Enumerated)`.
+    pub fn fcn_canonical_sorted(pairs: Vec<(Value, Value)>) -> Value {
+        use crate::plan::Witness;
+        match Witness::canonical_of_sorted_keys(pairs.iter().map(|(k, _)| k)) {
+            Witness::Tuple => Value::Tuple(pairs.into_iter().map(|(_, v)| v).collect()),
+            Witness::Record => Value::Record(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| match k {
+                        Value::Str(s) => (s, v),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            ),
+            Witness::Interval => Value::Fcn(Arc::from(pairs), FcnDom::Interval),
+            Witness::Enumerated => Value::Fcn(Arc::from(pairs), FcnDom::Enumerated),
         }
     }
 
@@ -276,6 +289,152 @@ impl Value {
             Value::LazySet(_) | Value::LazyFcn(_) => false,
         }
     }
+
+    /// Representation-exact equality: agrees with `PartialEq` on scalars, and
+    /// additionally distinguishes construction representations (`Interval` vs
+    /// `Set`, `Tuple` vs `Record` vs `Fcn(_, Enumerated)` vs `Fcn(_, Interval)`)
+    /// recursively.
+    pub fn exact_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::ModelValue(a), Value::ModelValue(b)) => a == b,
+            (Value::Interval(a, b), Value::Interval(c, d)) => (b < a && d < c) || (a == c && b == d),
+            (Value::Set(a), Value::Set(b)) | (Value::Tuple(a), Value::Tuple(b)) => {
+                Arc::ptr_eq(a, b) || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.exact_eq(y)))
+            }
+            (Value::Record(a), Value::Record(b)) => {
+                Arc::ptr_eq(a, b) || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.0 == y.0 && x.1.exact_eq(&y.1)))
+            }
+            (Value::Fcn(a, da), Value::Fcn(b, db)) => {
+                da == db
+                    && (Arc::ptr_eq(a, b)
+                        || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.0.exact_eq(&y.0) && x.1.exact_eq(&y.1))))
+            }
+            (Value::LazySet(_), Value::LazySet(_)) | (Value::LazyFcn(_), Value::LazyFcn(_)) => self == other,
+            _ => false,
+        }
+    }
+
+    /// Representation-exact hash consistent with `exact_eq`.
+    pub fn exact_hash<H: Hasher>(&self, state: &mut H) {
+        self.exact_tag().hash(state);
+        match self {
+            Value::Bool(b) => b.hash(state),
+            Value::Int(n) => n.hash(state),
+            Value::Str(s) | Value::ModelValue(s) => s.hash(state),
+            Value::Interval(lo, hi) => {
+                if hi < lo {
+                    (1i64, 0i64).hash(state);
+                } else {
+                    (lo, hi).hash(state);
+                }
+            }
+            Value::Set(es) | Value::Tuple(es) => {
+                es.len().hash(state);
+                for e in es.iter() {
+                    e.exact_hash(state);
+                }
+            }
+            Value::Record(fs) => {
+                fs.len().hash(state);
+                for (k, v) in fs.iter() {
+                    k.hash(state);
+                    v.exact_hash(state);
+                }
+            }
+            Value::Fcn(ps, _) => {
+                ps.len().hash(state);
+                for (k, v) in ps.iter() {
+                    k.exact_hash(state);
+                    v.exact_hash(state);
+                }
+            }
+            Value::LazySet(_) | Value::LazyFcn(_) => self.hash(state),
+        }
+    }
+
+    /// Deterministic total order consistent with `exact_eq` (used to sort and
+    /// deduplicate exact domain-key variants in `tlx-layout`).
+    pub fn exact_cmp(&self, other: &Value) -> Ordering {
+        let ord = self.exact_tag().cmp(&other.exact_tag());
+        if ord != Ordering::Equal {
+            return ord;
+        }
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Str(a), Value::Str(b)) | (Value::ModelValue(a), Value::ModelValue(b)) => a.cmp(b),
+            (Value::Interval(a, b), Value::Interval(c, d)) => {
+                let lhs = if b < a { (1i64, 0i64) } else { (*a, *b) };
+                let rhs = if d < c { (1i64, 0i64) } else { (*c, *d) };
+                lhs.cmp(&rhs)
+            }
+            (Value::Set(a), Value::Set(b)) | (Value::Tuple(a), Value::Tuple(b)) => {
+                if Arc::ptr_eq(a, b) {
+                    return Ordering::Equal;
+                }
+                a.len().cmp(&b.len()).then_with(|| {
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        let o = x.exact_cmp(y);
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    Ordering::Equal
+                })
+            }
+            (Value::Record(a), Value::Record(b)) => {
+                if Arc::ptr_eq(a, b) {
+                    return Ordering::Equal;
+                }
+                a.len().cmp(&b.len()).then_with(|| {
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        let o = x.0.cmp(&y.0).then_with(|| x.1.exact_cmp(&y.1));
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    Ordering::Equal
+                })
+            }
+            (Value::Fcn(a, _), Value::Fcn(b, _)) => {
+                if Arc::ptr_eq(a, b) {
+                    return Ordering::Equal;
+                }
+                a.len().cmp(&b.len()).then_with(|| {
+                    for (x, y) in a.iter().zip(b.iter()) {
+                        let o = x.0.exact_cmp(&y.0).then_with(|| x.1.exact_cmp(&y.1));
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    Ordering::Equal
+                })
+            }
+            (Value::LazySet(_), Value::LazySet(_)) | (Value::LazyFcn(_), Value::LazyFcn(_)) => self.cmp(other),
+            _ => unreachable!("same exact_tag implies matching variants"),
+        }
+    }
+
+    #[inline]
+    fn exact_tag(&self) -> u8 {
+        match self {
+            Value::Bool(_) => 0,
+            Value::Int(_) => 1,
+            Value::Str(_) => 2,
+            Value::ModelValue(_) => 3,
+            Value::Set(_) => 4,
+            Value::Interval(..) => 5,
+            Value::Tuple(_) => 6,
+            Value::Record(_) => 7,
+            Value::Fcn(_, FcnDom::Enumerated) => 8,
+            Value::Fcn(_, FcnDom::Interval) => 9,
+            Value::LazySet(_) => 10,
+            Value::LazyFcn(_) => 11,
+        }
+    }
 }
 
 /// A conservative, transitive family in which sorting cannot fail. In
@@ -353,16 +512,6 @@ pub(crate) fn fcn_from_sorted_pairs(pairs: Vec<(Value, Value)>) -> Value {
         );
     }
     Value::Fcn(Arc::from(pairs), FcnDom::Enumerated)
-}
-
-/// Whether sorted keys are the integers `lo..hi`, `lo # 1`.
-fn is_int_interval(pairs: &[(Value, Value)]) -> bool {
-    match pairs.first() {
-        Some((Value::Int(lo), _)) if *lo != 1 => {
-            pairs.iter().enumerate().all(|(i, (k, _))| matches!(k, Value::Int(n) if *n == lo + i as i64))
-        }
-        _ => false,
-    }
 }
 
 /// The function TLC builds as an `FcnRcdValue` over an integer interval,

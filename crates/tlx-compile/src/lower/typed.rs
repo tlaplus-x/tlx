@@ -14,7 +14,7 @@ use super::*;
 
 impl Lowerer<'_> {
     /// Typed lowering of `e`, if specialized.
-    pub(super) fn typed_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    pub(super) fn typed_expr(&mut self, e: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Option<Expr> {
         use B::*;
         let ip = self.ip;
         let overridden = |op: B| ip.is_builtin_overridden(op);
@@ -57,11 +57,11 @@ impl Lowerer<'_> {
                 // A constructor is built in the other side's encoding (errors
                 // do not depend on the order: the interpreter reports them).
                 let (a, b) = if self.constructs(&args[0], env) && !self.constructs(&args[1], env) {
-                    let b = self.expr(&args[1], env, st);
-                    (self.expr_as(&args[0], b.ty, env, st), b)
+                    let b = self.extensional_set_expr(&args[1], env, st);
+                    (self.expr_as_mode(&args[0], b.ty, env, st, expr::SetMode::SetExt), b)
                 } else {
-                    let a = self.expr(&args[0], env, st);
-                    let b = self.expr_as(&args[1], a.ty, env, st);
+                    let a = self.extensional_set_expr(&args[0], env, st);
+                    let b = self.expr_as_mode(&args[1], a.ty, env, st, expr::SetMode::SetExt);
                     (a, b)
                 };
                 let eq = self.typed_eq(a, b);
@@ -75,6 +75,8 @@ impl Lowerer<'_> {
             }
             // Encoded sets are finite (the operand is still evaluated: TLC
             // reports its errors, e.g. an out-of-domain application inside).
+            // Lower non-extensionally so lazy filters over lazy domains (such
+            // as `{q \in a \X a : P(q)}`) remain lazy and do not execute `P`.
             H::Builtin { op: IsFiniteSet, args } if !overridden(IsFiniteSet) => {
                 let x = self.expr(&args[0], env, st);
                 match self.shape_of(x.ty) {
@@ -147,19 +149,19 @@ impl Lowerer<'_> {
                 let u = self.unchanged_typed(sub, env, st);
                 Some(and(vec![a, not(u)]))
             }
-            H::If { cond, then, els } => Some(self.typed_if(cond, then, els, env, st)),
-            H::Case { arms, other } => Some(self.typed_case(arms, other.as_ref(), env, st)),
-            H::SetFilter { bound, pred } if binders::single_binder(bound) => self.typed_filter(bound, pred, env, st),
+            H::If { cond, then, els } => Some(self.typed_if(cond, then, els, env, st, mode)),
+            H::Case { arms, other } => Some(self.typed_case(arms, other.as_ref(), env, st, mode)),
+            H::SetFilter { bound, pred } if binders::single_binder(bound) => self.typed_filter(bound, pred, env, st, mode),
             H::Builtin { op: op @ (In | NotIn), args } => {
                 let m = self.typed_in(&args[0], &args[1], env, st);
                 Some(if *op == NotIn { not(to_bool(m)) } else { m })
             }
             H::Builtin { op: SubsetEq, args } if !overridden(SubsetEq) => Some(self.typed_subseteq(&args[0], &args[1], env, st)),
             H::Builtin { op: Cup, args } => Some(self.typed_union(&args[0], &args[1], env, st)),
-            H::Builtin { op: Times, args } if !overridden(Times) => self.typed_times(&args[0], &args[1], env, st),
+            H::Builtin { op: Times, args } if mode.is_extensional() && !overridden(Times) => self.typed_times(args, env, st, mode),
             H::Builtin { op: op @ (Cap | SetMinus), args } => Some(self.typed_set_op(*op, &args[0], &args[1], env, st)),
             H::Builtin { op: Cardinality, args } if !overridden(Cardinality) => Some(self.typed_cardinality(&args[0], env, st)),
-            H::Builtin { op: Union, args } if !overridden(Union) => self.typed_big_union(&args[0], env, st),
+            H::Builtin { op: Union, args } if !overridden(Union) => self.typed_big_union(&args[0], env, st, mode),
             _ => None,
         }
     }
@@ -178,6 +180,10 @@ impl Lowerer<'_> {
     /// Lower `e` to be combined with a value of type `ty`: a constructor is
     /// built directly in `ty`'s encoding.
     pub(super) fn expr_as(&mut self, e: &hir::Expr, ty: Ty, env: &LEnv, st: &St) -> Expr {
+        self.expr_as_mode(e, ty, env, st, expr::SetMode::Exact)
+    }
+
+    fn expr_as_mode(&mut self, e: &hir::Expr, ty: Ty, env: &LEnv, st: &St, mode: expr::SetMode) -> Expr {
         match ty {
             // (Not a constant outside that encoding: its runtime conversion
             // could be dropped by a consumer that only needs the shape, e.g.
@@ -187,18 +193,22 @@ impl Lowerer<'_> {
             // layout, which the values of state variables fit.)
             Ty::Enc(sid)
                 if (self.constructs(e, env) || (self.typing.in_layout(sid) && self.builds(e, env, 4)))
-                    && self.const_value(e, env).is_none_or(|v| self.const_words(&v, sid).is_some()) =>
+                    && self.preserves_lazy_into_mode(e, env, self.typing.shape(sid), sets::EAGER_DEPTH, mode)
+                    && self.const_value(e, env).is_none_or(|v| {
+                        const_preserves_lazy(&v, mode.is_extensional() && matches!(self.typing.shape(sid), Shape::Set { .. }))
+                            && self.const_words(&v, sid).is_some()
+                    }) =>
             {
                 self.expr_into(e, env, st, sid)
             }
-            _ => self.expr(e, env, st),
+            _ => self.expr_with_mode(e, env, st, mode),
         }
     }
 
     /// `IF c THEN t ELSE f` with both branches in a common representation.
-    fn typed_if(&mut self, cond: &hir::Expr, then: &hir::Expr, els: &hir::Expr, env: &LEnv, st: &St) -> Expr {
+    fn typed_if(&mut self, cond: &hir::Expr, then: &hir::Expr, els: &hir::Expr, env: &LEnv, st: &St, mode: expr::SetMode) -> Expr {
         if let Some(b) = self.const_bool(cond, env) {
-            return self.expr(if b { then } else { els }, env, st);
+            return self.expr_with_mode(if b { then } else { els }, env, st, mode);
         }
         let c = self.bool_expr(cond, env, st);
         // A constructor in the THEN branch and an encoded value in the ELSE
@@ -206,33 +216,34 @@ impl Lowerer<'_> {
         // constructor in the other branch's encoding, which a constructor of
         // its own choosing would not match. (Only a shape of the layout:
         // values of a state variable's shape fit it.)
-        if self.builds(then, env, 4) && !self.constructs(els, env) {
-            let f = self.expr(els, env, st);
+        let (t, f) = if self.builds(then, env, 4) && !self.constructs(els, env) {
+            let f = self.expr_with_mode(els, env, st, mode);
             let t = match f.ty {
-                Ty::Enc(sid) if self.typing.in_layout(sid) => self.expr_into(then, env, st, sid),
-                _ => self.expr(then, env, st),
+                Ty::Enc(sid) if self.typing.in_layout(sid) => self.expr_as_mode(then, f.ty, env, st, mode),
+                _ => self.expr_with_mode(then, env, st, mode),
             };
-            let (t, f) = self.unify_branches(t, f);
-            return Expr::new(t.ty, ExprKind::If(c, t, f));
-        }
-        let t = self.expr(then, env, st);
-        let f = self.expr_as(els, t.ty, env, st);
-        let (t, f) = self.unify_branches(t, f);
+            (t, f)
+        } else {
+            let t = self.expr_with_mode(then, env, st, mode);
+            let f = self.expr_as_mode(els, t.ty, env, st, mode);
+            (t, f)
+        };
+        let (t, f) = self.unify_branches(t, f, mode);
         Expr::new(t.ty, ExprKind::If(c, t, f))
     }
 
     /// `CASE g1 -> e1 [] ... [] OTHER -> e`: guards in order, the first true
     /// one selects its value; no true guard and no OTHER is an error.
-    fn typed_case(&mut self, arms: &[(hir::Expr, hir::Expr)], other: Option<&hir::Expr>, env: &LEnv, st: &St) -> Expr {
+    fn typed_case(&mut self, arms: &[(hir::Expr, hir::Expr)], other: Option<&hir::Expr>, env: &LEnv, st: &St, mode: expr::SetMode) -> Expr {
         let (arms, other) = self.live_case_arms(arms, other, env);
         let mut acc = match other {
-            Some(o) => self.expr(o, env, st),
+            Some(o) => self.expr_with_mode(o, env, st, mode),
             None => Expr::new(Ty::Val, ExprKind::Fail("No CASE arm is true.".into())),
         };
         for (g, v) in arms.iter().rev() {
             let c = self.bool_expr(g, env, st);
-            let t = self.expr(v, env, st);
-            let (t, f) = self.unify_branches(t, acc);
+            let t = self.expr_with_mode(v, env, st, mode);
+            let (t, f) = self.unify_branches(t, acc, mode);
             acc = Expr::new(t.ty, ExprKind::If(c, t, f));
         }
         acc
@@ -348,7 +359,8 @@ impl Lowerer<'_> {
     }
 
     /// Bring two conditional branches to one representation.
-    pub(super) fn unify_branches(&mut self, t: Expr, f: Expr) -> (Expr, Expr) {
+    fn unify_branches(&mut self, t: Expr, f: Expr, mode: expr::SetMode) -> (Expr, Expr) {
+        let extensional = mode.is_extensional();
         // A failing branch (e.g. recursion beyond the unrolling) takes the
         // other branch's representation.
         let retype = |x: Expr, ty: Ty| match &*x.kind {
@@ -357,7 +369,9 @@ impl Lowerer<'_> {
         };
         let (tt, ft) = (t.ty, f.ty);
         let (t, f) = (retype(t, ft), retype(f, tt));
-        if matches!((t.ty, f.ty), (Ty::Val, Ty::Enc(_)) | (Ty::Enc(_), Ty::Val)) {
+        if matches!((t.ty, f.ty), (Ty::Val, Ty::Enc(_)) | (Ty::Enc(_), Ty::Val))
+            && [&t, &f].into_iter().all(|x| !matches!(&*x.kind, ExprKind::Const(v) if has_non_reducible_lazy_set(v)))
+        {
             if let Some(x) = self.union_branches(&t, &f) {
                 return x;
             }
@@ -391,7 +405,11 @@ impl Lowerer<'_> {
             // otherwise: a runtime conversion could be dropped by a consumer
             // that only needs the shape, e.g. DOMAIN of a fixed-length tuple,
             // instead of failing with a layout miss.)
-            (Ty::Enc(a), _) if matches!(&*f.kind, ExprKind::Const(v) if self.const_words(v, a).is_some()) => {
+            (Ty::Enc(a), _)
+                if matches!(&*f.kind, ExprKind::Const(v)
+                    if const_preserves_lazy(v, extensional && matches!(self.typing.shape(a), Shape::Set { .. }))
+                        && self.const_words(v, a).is_some()) =>
+            {
                 let f = self.coerce_enc(f, a);
                 (t, f)
             }
@@ -417,6 +435,9 @@ impl Lowerer<'_> {
                 // A constant and a scalar(-ish) value: meet at their join.
                 let (c, other_is_t) = if t.ty == Ty::Val { (t.clone(), false) } else { (f.clone(), true) };
                 let ExprKind::Const(v) = &*c.kind else { unreachable!() };
+                if !const_preserves_lazy(v, extensional && matches!(self.typing.shape(b), Shape::Set { .. })) {
+                    return (to_val(t), to_val(f));
+                }
                 // The constant fits the other branch's encoding.
                 if let Some(k) = self.const_words(v, b) {
                     return if other_is_t { (t, k) } else { (k, f) };
@@ -941,6 +962,39 @@ impl Lowerer<'_> {
                 }
             }
             if x == y {
+                let shape = self.typing.shape(x).clone();
+                if shape.has_dynamic_witness() {
+                    if ok {
+                        let payload = match &shape {
+                            Shape::Fcn { dom, range, witness, key_variants }
+                                if !range.has_dynamic_witness() && (witness.extra_words() > 0 || !key_variants.is_empty()) =>
+                            {
+                                Some(Shape::Fcn {
+                                    dom: dom.clone(),
+                                    range: range.clone(),
+                                    witness: tlx_layout::FcnWitness::Enumerated,
+                                    key_variants: std::sync::Arc::from([]),
+                                })
+                            }
+                            Shape::Map { key, range, witness: tlx_layout::FcnWitness::Dynamic } if !range.has_dynamic_witness() => {
+                                Some(Shape::Map { key: key.clone(), range: range.clone(), witness: tlx_layout::FcnWitness::Enumerated })
+                            }
+                            _ => None,
+                        };
+                        if let Some(payload) = payload {
+                            let psid = self.sid(&payload);
+                            if self.words(psid) == 0 {
+                                let (_, bind_a) = self.share(a);
+                                let (_, bind_b) = self.share(b);
+                                return let_in(bind_b.into_iter().chain(bind_a), bool_lit(true));
+                            }
+                            let pa = Expr::new(Ty::Enc(psid), ExprKind::Slice { base: a, loc: FieldLoc::Words(0) });
+                            let pb = Expr::new(Ty::Enc(psid), ExprKind::Slice { base: b, loc: FieldLoc::Words(0) });
+                            return eq(pa, pb);
+                        }
+                    }
+                    return eq(to_val(a), to_val(b));
+                }
                 if ok {
                     return eq(a, b);
                 }
@@ -951,7 +1005,7 @@ impl Lowerer<'_> {
             }
             if ok {
                 if let Some((a2, b2)) = self.common_encoding(&a, &b) {
-                    return eq(a2, b2);
+                    return self.typed_eq(a2, b2);
                 }
                 // Kinds that hold no common value: every comparison is
                 // `false` (so the encodings need not be brought together).
@@ -980,7 +1034,7 @@ impl Lowerer<'_> {
                         return self.truth_error_table(enc.clone(), table);
                     }
                 }
-                if let Some(c) = self.const_words(v, sid) {
+                if let Some(c) = self.const_words_semantic(v, sid) {
                     // A Dyn (also nested) accepts any constant, but unequal
                     // handles still need TLC's incomparable-value check.
                     return self.typed_eq(enc.clone(), c);
@@ -1018,6 +1072,48 @@ impl Lowerer<'_> {
             diag::emit(Topic::Eq, format_args!("boxed: {:?} {:?} / {:?} {:?}", a.ty, self.shape_of(a.ty), b.ty, self.shape_of(b.ty)));
         }
         eq(to_val(a), to_val(b))
+    }
+}
+
+/// Whether `v` contains a non-reducible `LazySet` whose normalization into a
+/// `Shape::Set` would lose its lazy-set operand semantics under `\cap`/`\cup`/`\`.
+pub(super) fn has_non_reducible_lazy_set(v: &Value) -> bool {
+    match v {
+        Value::LazySet(ls) => match ls.as_ref() {
+            tlx_value::LazySet::Enum(es) => es.iter().any(has_non_reducible_lazy_set),
+            _ => !tlx_value::ops::is_reducible(v),
+        },
+        Value::Set(es) | Value::Tuple(es) => es.iter().any(has_non_reducible_lazy_set),
+        Value::Record(fs) => fs.iter().any(|(_, x)| has_non_reducible_lazy_set(x)),
+        Value::Fcn(ps, _) => ps.iter().any(|(k, x)| has_non_reducible_lazy_set(k) || has_non_reducible_lazy_set(x)),
+        _ => false,
+    }
+}
+
+/// Whether encoding constant `v` preserves all observable non-reducible
+/// `LazySet` values. When `extensional` is `true`, only the outermost set
+/// container may be a non-reducible `LazySet`; its elements must still contain
+/// no non-reducible `LazySet`.
+pub(super) fn const_preserves_lazy(v: &Value, extensional: bool) -> bool {
+    if !extensional {
+        return !has_non_reducible_lazy_set(v);
+    }
+    match v {
+        Value::Set(es) => !es.iter().any(has_non_reducible_lazy_set),
+        Value::Interval(..) => true,
+        Value::LazySet(ls) => match ls.as_ref() {
+            tlx_value::LazySet::Enum(es) => !es.iter().any(has_non_reducible_lazy_set),
+            tlx_value::LazySet::Subset(s) | tlx_value::LazySet::KSubset(_, s) | tlx_value::LazySet::Seq(s) => const_preserves_lazy(s, true),
+            tlx_value::LazySet::Product(ss) => ss.iter().all(|s| const_preserves_lazy(s, true)),
+            tlx_value::LazySet::RecordSet(fs) => fs.iter().all(|(_, s)| const_preserves_lazy(s, true)),
+            tlx_value::LazySet::FcnSet(dom, cod) => const_preserves_lazy(dom, true) && const_preserves_lazy(cod, true),
+            tlx_value::LazySet::Cap(a, b) | tlx_value::LazySet::Diff(a, b) => {
+                const_preserves_lazy(a, true) && const_preserves_lazy(b, true)
+            }
+            tlx_value::LazySet::Nat | tlx_value::LazySet::Int | tlx_value::LazySet::StringSet => true,
+            tlx_value::LazySet::Cup(_, _) | tlx_value::LazySet::Union(_) | tlx_value::LazySet::Any | tlx_value::LazySet::Custom(_) => false,
+        },
+        _ => !has_non_reducible_lazy_set(v),
     }
 }
 
@@ -1109,8 +1205,10 @@ fn pair_comparable(a: &Shape, b: &Shape, unequal: bool) -> bool {
         }
         (S::Tuple(xs), S::Tuple(ys)) => xs.len() != ys.len() || xs.iter().zip(ys.iter()).all(|(x, y)| pair_comparable(x, y, unequal)),
         (S::Tuple(xs), S::Seq { elem, .. }) | (S::Seq { elem, .. }, S::Tuple(xs)) => xs.iter().all(|x| pair_comparable(x, elem, unequal)),
-        (S::Fcn { dom: d, range: r }, S::Fcn { dom: e, range: s }) if d == e => pair_comparable(r, s, unequal),
-        (S::Map { key: k, range: r }, S::Map { key: l, range: s }) if pair_comparable(k, l, unequal) => pair_comparable(r, s, unequal),
+        (S::Fcn { dom: d, range: r, .. }, S::Fcn { dom: e, range: s, .. }) if d == e => pair_comparable(r, s, unequal),
+        (S::Map { key: k, range: r, .. }, S::Map { key: l, range: s, .. }) if pair_comparable(k, l, unequal) => {
+            pair_comparable(r, s, unequal)
+        }
         _ if unequal && no_common_value(a, b) => true,
         _ => match (shape_fcn_like(a), shape_fcn_like(b)) {
             (Some(x), Some(y)) => x.comparable_with(&y, |r, s| pair_comparable(r, s, unequal)),
@@ -1196,8 +1294,10 @@ fn shape_fcn_like(s: &Shape) -> Option<FcnLike<&Shape>> {
     Some(match s {
         Shape::Tuple(es) => FcnLike { min: es.len(), max: es.len(), keys: FcnKeys::Int, ranges: es.iter().collect() },
         Shape::Seq { elem, max_len } => FcnLike { min: 0, max: *max_len, keys: FcnKeys::Int, ranges: vec![&**elem] },
-        Shape::Fcn { dom, range } => FcnLike { min: dom.len(), max: dom.len(), keys: keys_of_values(dom.iter()), ranges: vec![&**range] },
-        Shape::Map { key, range } => {
+        Shape::Fcn { dom, range, .. } => {
+            FcnLike { min: dom.len(), max: dom.len(), keys: keys_of_values(dom.iter()), ranges: vec![&**range] }
+        }
+        Shape::Map { key, range, .. } => {
             let keys = match &**key {
                 Shape::Int { .. } => FcnKeys::Int,
                 Shape::Atom(u) => keys_of_values(u.iter()),

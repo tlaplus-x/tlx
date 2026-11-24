@@ -59,7 +59,7 @@ impl Lowerer<'_> {
                 let mut slots = Vec::new();
                 let mut env2 = env.clone();
                 for b in bounds {
-                    let set = self.expr(&b.set, env, st);
+                    let set = self.extensional_set_expr(&b.set, env, st);
                     let (set, ety) = self.typed_iter(set);
                     match &b.vars {
                         BoundVars::Many(ls) => {

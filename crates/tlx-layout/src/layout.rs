@@ -26,8 +26,11 @@ use crate::layout_tree::LayoutNode;
 pub use crate::pack::{
     bit_mask, bits_for_max, extract_bits, insert_bits, scalar_bits, BitPos, FieldGroup, FieldLayout, FieldLoc, SlotLayout,
 };
-use crate::shape::{arm_for, binom, fit_shape, force, same_field_names, set_elems, set_len, Shape, MAX_BITSET_UNIVERSE};
-use tlx_value::Value;
+use crate::shape::{
+    arm_for, arm_for_semantic, binom, fcn_dom_matches_record, fcn_dom_matches_tuple, fcn_key_at, fit_shape, force, match_fcn_keys_exact,
+    same_field_names, set_elems, set_len, FcnWitness, Shape, MAX_BITSET_UNIVERSE,
+};
+use tlx_value::{FcnDom, Value};
 
 /// A value does not fit the layout (speculation failed); the host widens the
 /// shape and recompiles.
@@ -67,6 +70,8 @@ pub struct Layout {
     /// Word offset of each variable.
     pub offsets: Vec<usize>,
     pub words: usize,
+    /// Whether any variable's shape carries a dynamic function-domain witness.
+    pub has_dynamic_witness: bool,
     /// The precomputed layout tree of each variable's shape.
     nodes: Vec<LayoutNode>,
 }
@@ -74,13 +79,27 @@ pub struct Layout {
 impl Layout {
     pub fn new(vars: Vec<Shape>) -> Layout {
         let nodes: Vec<LayoutNode> = vars.iter().map(LayoutNode::new).collect();
+        let has_dynamic_witness = nodes.iter().any(LayoutNode::has_dynamic_witness);
         let mut offsets = Vec::with_capacity(vars.len());
         let mut total = 0;
         for n in &nodes {
             offsets.push(total);
             total += n.words();
         }
-        Layout { vars, offsets, words: total, nodes }
+        Layout { vars, offsets, words: total, has_dynamic_witness, nodes }
+    }
+
+    /// Zero every trailing dynamic function-domain witness word in an encoded
+    /// state so semantically equal states have identical canonical words.
+    pub fn canonicalize_state(&self, words: &mut [u64]) {
+        if !self.has_dynamic_witness {
+            return;
+        }
+        for (n, &o) in self.nodes.iter().zip(&self.offsets) {
+            if n.has_dynamic_witness() {
+                n.canonicalize_words(&mut words[o..]);
+            }
+        }
     }
 
     /// The layout tree of variable `i`.
@@ -169,7 +188,7 @@ impl MapDims {
     /// The dimensions of map shape `s` (None: not a map shape, or keys
     /// without a bitset universe).
     pub fn of(s: &Shape) -> Option<MapDims> {
-        let Shape::Map { key, range } = s else { return None };
+        let Shape::Map { key, range, .. } = s else { return None };
         Some(MapDims::new(bitset_universe(key)? as usize, SlotLayout::of(range)))
     }
 
@@ -178,7 +197,7 @@ impl MapDims {
         MapDims::new(bitset_universe(key).expect("map key universe") as usize, SlotLayout::of(range))
     }
 
-    /// Words of the whole encoding.
+    /// Words of the bitset and slots (excluding any trailing dynamic witness word).
     #[inline]
     pub fn words(&self) -> usize {
         self.bitset_words.saturating_add(self.slot.array_words(self.universe))
@@ -200,8 +219,10 @@ pub fn words(s: &Shape) -> usize {
             Some(n) => n.div_ceil(64) as usize,
             None => 1usize.saturating_add(max_card.saturating_mul(words(elem))),
         },
-        Shape::Fcn { dom, range } => SlotLayout::of(range).array_words(dom.len()),
-        Shape::Map { key, range } => MapDims::of_parts(key, range).words(),
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            SlotLayout::of(range).array_words(dom.len()) + witness.extra_words() + key_variants.len()
+        }
+        Shape::Map { key, range, witness } => MapDims::of_parts(key, range).words() + witness.extra_words(),
         Shape::Record(fs) => FieldLayout::of_shapes(fs.iter().map(|(_, f)| f)).words,
         Shape::Tuple(es) => FieldLayout::of_shapes(es.iter()).words,
         Shape::Seq { elem, max_len } => 1usize.saturating_add(SlotLayout::of(elem).array_words(*max_len)),
@@ -233,7 +254,7 @@ pub fn ref_offsets(s: &Shape, base: usize, out: &mut Vec<usize>) -> Option<()> {
                 }
             }
         }
-        Shape::Fcn { dom, range } => {
+        Shape::Fcn { dom, range, .. } => {
             if let SlotLayout::Words(w) = SlotLayout::of(range) {
                 for i in 0..dom.len() {
                     ref_offsets(range, base + i * w, out)?;
@@ -274,16 +295,34 @@ pub fn store_of<'a>(shapes: impl IntoIterator<Item = &'a Shape>) -> Option<crate
     found
 }
 
-/// Encode `v` into `out[..words(s)]` (later words of `out` are untouched).
+/// Sort fixed-width `ew`-word chunks from `src` into `dst`.
+pub(crate) fn sort_word_chunks(src: &[u64], ew: usize, dst: &mut [u64]) {
+    let mut chunks: Vec<&[u64]> = src.chunks_exact(ew).collect();
+    chunks.sort_unstable();
+    for (i, c) in chunks.into_iter().enumerate() {
+        dst[i * ew..(i + 1) * ew].copy_from_slice(c);
+    }
+}
+
+/// Encode `v` into `out[..words(s)]` (later words of `out` are untouched),
+/// preserving function-domain construction witnesses.
 pub fn encode(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
     out[..words(s)].fill(0);
-    enc(s, v, out)
+    enc::<false>(s, v, out)
+}
+
+/// Encode `v` into `out[..words(s)]` ignoring function-domain construction
+/// witnesses (for semantic equality/membership probes; trailing dynamic witness
+/// words are written as 0).
+pub fn encode_semantic(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
+    out[..words(s)].fill(0);
+    enc::<true>(s, v, out)
 }
 
 /// `encode` into an already zeroed `out`.
-fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
+fn enc<const SEMANTIC: bool>(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
     if let Shape::Dyn = s {
-        out[0] = dynval::intern(v);
+        out[0] = if SEMANTIC { dynval::intern(v) } else { dynval::intern_exact(v) };
         return Ok(());
     }
     if let Shape::Ref(store) = s {
@@ -293,7 +332,7 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
         return Ok(());
     }
     let Some(v) = force(v) else { return Err(Miss::new(v)) };
-    let v = fit_shape(s, v);
+    let v = if SEMANTIC { fit_shape(s, v) } else { v };
     let v = &*v;
     match (s, v) {
         (Shape::Bool, Value::Bool(b)) => out[0] = *b as u64,
@@ -303,13 +342,16 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             Err(_) => return Err(Miss::new(v)),
         },
         (Shape::Set { elem, max_card }, Value::Set(_) | Value::Interval(..)) => {
+            if !SEMANTIC && matches!(v, Value::Interval(..)) {
+                return Err(Miss::new(v));
+            }
             if set_len(v).unwrap() > *max_card as u64 {
                 return Err(Miss::new(v));
             }
             let es = set_elems(v).unwrap();
             if bitset_universe(elem).is_some() {
                 for e in es.iter() {
-                    let r = rank_finite(elem, e).map_err(|m| m.under("{}"))?;
+                    let r = rank_finite::<SEMANTIC>(elem, e).map_err(|m| m.under("{}"))?;
                     out[(r / 64) as usize] |= 1u64 << (r % 64);
                 }
             } else {
@@ -324,30 +366,69 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
                 }
                 let mut buf = vec![0u64; es.len() * ew];
                 for (i, e) in es.iter().enumerate() {
-                    enc(elem, e, &mut buf[i * ew..]).map_err(|m| m.under("{}"))?;
+                    enc::<SEMANTIC>(elem, e, &mut buf[i * ew..]).map_err(|m| m.under("{}"))?;
                 }
-                let mut chunks: Vec<&[u64]> = buf.chunks(ew).collect();
-                chunks.sort_unstable();
-                for (i, c) in chunks.iter().enumerate() {
-                    out[1 + i * ew..1 + (i + 1) * ew].copy_from_slice(c);
-                }
+                sort_word_chunks(&buf, ew, &mut out[1..]);
             }
         }
-        (Shape::Fcn { dom, range }, Value::Fcn(ps, _)) => {
-            if !same_domain(ps, dom) {
+        (Shape::Fcn { dom, range, witness, key_variants }, Value::Fcn(ps, d)) => {
+            if !(SEMANTIC || witness.accepts_dom(*d)) {
                 return Err(Miss::new(v));
             }
             let slot = SlotLayout::of(range);
+            let payload_words = slot.array_words(dom.len());
+            let kv_base = payload_words + witness.extra_words();
+            let dom_ok = if SEMANTIC {
+                same_domain(ps, dom)
+            } else {
+                match_fcn_keys_exact(ps.iter().map(|(k, _)| k), dom, key_variants, |slot, idx| {
+                    out[kv_base + slot] = idx as u64;
+                })
+            };
+            if !dom_ok {
+                return Err(Miss::new(v));
+            }
             for (i, (k, x)) in ps.iter().enumerate() {
-                enc_loc(range, x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
+                enc_loc::<SEMANTIC>(range, x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
+            }
+            if *witness == FcnWitness::Dynamic {
+                out[payload_words] = u64::from(!SEMANTIC && *d == FcnDom::Enumerated);
             }
         }
-        (Shape::Map { key, range }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
+        (Shape::Fcn { dom, range, witness: FcnWitness::Dynamic, key_variants }, Value::Tuple(vs)) => {
+            if (!SEMANTIC && !key_variants.is_empty()) || !fcn_dom_matches_tuple(dom, vs.len()) {
+                return Err(Miss::new(v));
+            }
+            let slot = SlotLayout::of(range);
+            let payload_words = slot.array_words(dom.len());
+            for (i, x) in vs.iter().enumerate() {
+                enc_loc::<SEMANTIC>(range, x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+            }
+            out[payload_words] = 0;
+        }
+        (Shape::Fcn { dom, range, witness: FcnWitness::Dynamic, key_variants }, Value::Record(fs)) => {
+            if (!SEMANTIC && !key_variants.is_empty()) || !fcn_dom_matches_record(dom, fs) {
+                return Err(Miss::new(v));
+            }
+            let slot = SlotLayout::of(range);
+            let payload_words = slot.array_words(dom.len());
+            for (i, (k, x)) in fs.iter().enumerate() {
+                enc_loc::<SEMANTIC>(range, x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!(".{}", k.as_str())))?;
+            }
+            out[payload_words] = 0;
+        }
+        (Shape::Map { key, range, witness }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
+            if !(SEMANTIC || witness.accepts_map_value(v)) {
+                return Err(Miss::new(v));
+            }
             let d = MapDims::of_parts(key, range);
             for (k, x) in crate::shape::fcn_pairs(v).expect("function value") {
-                let r = rank_finite(key, &k).map_err(|m| m.under("DOMAIN"))?;
+                let r = rank_finite::<SEMANTIC>(key, &k).map_err(|m| m.under("DOMAIN"))?;
                 out[(r / 64) as usize] |= 1u64 << (r % 64);
-                enc_loc(range, &x, out, d.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))?;
+                enc_loc::<SEMANTIC>(range, &x, out, d.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))?;
+            }
+            if *witness == FcnWitness::Dynamic {
+                out[d.words()] = u64::from(!SEMANTIC && matches!(v, Value::Fcn(_, FcnDom::Enumerated)));
             }
         }
         (Shape::Record(fs), Value::Record(vs)) => {
@@ -356,7 +437,7 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             }
             let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
             for ((f, x), &loc) in fs.iter().zip(vs.iter()).zip(fl.locs.iter()) {
-                enc_loc(&f.1, &x.1, out, loc).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
+                enc_loc::<SEMANTIC>(&f.1, &x.1, out, loc).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
             }
         }
         (Shape::Tuple(ss), Value::Tuple(vs)) => {
@@ -365,7 +446,7 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             }
             let fl = FieldLayout::of_shapes(ss.iter());
             for (i, ((s, x), &loc)) in ss.iter().zip(vs.iter()).zip(fl.locs.iter()).enumerate() {
-                enc_loc(s, x, out, loc).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                enc_loc::<SEMANTIC>(s, x, out, loc).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
             }
         }
         (Shape::Seq { elem, max_len }, Value::Tuple(vs)) => {
@@ -375,13 +456,13 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             out[0] = vs.len() as u64;
             let slot = SlotLayout::of(elem);
             for (i, x) in vs.iter().enumerate() {
-                enc_loc(elem, x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                enc_loc::<SEMANTIC>(elem, x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
             }
         }
-        (Shape::Union(arms), _) => match arm_for(arms, v) {
+        (Shape::Union(arms), _) => match if SEMANTIC { arm_for_semantic(arms, v) } else { arm_for(arms, v) } {
             Some(i) => {
                 out[0] = i as u64;
-                enc(&arms[i], v, &mut out[1..])?;
+                enc::<SEMANTIC>(&arms[i], v, &mut out[1..])?;
             }
             None => return Err(Miss::new(v)),
         },
@@ -428,13 +509,20 @@ pub unsafe fn decode_unchecked(s: &Shape, words: &[u64]) -> Value {
                 }
                 sorted_set(es)
             }
-            Shape::Fcn { dom, range } => {
+            Shape::Fcn { dom, range, witness, key_variants } => {
                 let slot = SlotLayout::of(range);
-                Value::fcn_decoded(
-                    dom.iter().enumerate().map(|(i, d)| (d.clone(), decode_loc_unchecked(range, words, slot.loc(0, i)))).collect(),
-                )
+                let payload_words = slot.array_words(dom.len());
+                let kv_base = payload_words + witness.extra_words();
+                let mut kv_slot = 0usize;
+                let pairs: Vec<(Value, Value)> = (0..dom.len())
+                    .map(|i| {
+                        let key = fcn_key_at(dom, key_variants, &mut kv_slot, i, |slot, _| words[kv_base + slot] as usize).clone();
+                        (key, decode_loc_unchecked(range, words, slot.loc(0, i)))
+                    })
+                    .collect();
+                witness.decode_fcn(pairs, || words[payload_words])
             }
-            Shape::Map { key, range } => {
+            Shape::Map { key, range, witness } => {
                 let d = MapDims::of_parts(key, range);
                 let mut pairs = Vec::new();
                 for r in 0..d.universe as u64 {
@@ -442,9 +530,7 @@ pub unsafe fn decode_unchecked(s: &Shape, words: &[u64]) -> Value {
                         pairs.push((unrank_finite(key, r), decode_loc_unchecked(range, words, d.slot_loc(r as usize))));
                     }
                 }
-                // Keys come in TLC order; the constructor picks the canonical
-                // representation (`<<>>`, a tuple for `1..n`, ...).
-                Value::fcn_from_pairs(pairs).expect("distinct keys").with_decoded_dom()
+                witness.decode_map(pairs, || words[d.words()])
             }
             Shape::Record(fs) => {
                 let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
@@ -466,12 +552,12 @@ pub unsafe fn decode_unchecked(s: &Shape, words: &[u64]) -> Value {
     }
 }
 
-fn enc_loc(s: &Shape, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
+fn enc_loc<const SEMANTIC: bool>(s: &Shape, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
     match loc {
-        FieldLoc::Words(w) => enc(s, v, &mut out[w..]),
+        FieldLoc::Words(w) => enc::<SEMANTIC>(s, v, &mut out[w..]),
         FieldLoc::Bits(pos) => {
             let mut tmp = [0u64];
-            enc(s, v, &mut tmp)?;
+            enc::<SEMANTIC>(s, v, &mut tmp)?;
             pos.set_zeroed(out, tmp[0]);
             Ok(())
         }
@@ -523,19 +609,33 @@ pub fn rank(s: &Shape, v: &Value) -> Result<u64, Miss> {
         m.path.push_str("<shape has no finite universe>");
         return Err(m);
     }
-    rank_finite(s, v)
+    rank_finite::<false>(s, v)
+}
+
+/// Rank of `v` within `s` ignoring function-domain construction witnesses
+/// (for membership/lookup probes against sets and map domains).
+pub fn rank_semantic(s: &Shape, v: &Value) -> Result<u64, Miss> {
+    if s.cardinality().is_none() {
+        let mut m = Miss::new(v);
+        m.path.push_str("<shape has no finite universe>");
+        return Err(m);
+    }
+    rank_finite::<true>(s, v)
 }
 
 /// `rank` for a shape whose cardinality is known to fit in u64.
-fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
+fn rank_finite<const SEMANTIC: bool>(s: &Shape, v: &Value) -> Result<u64, Miss> {
     let Some(v) = force(v) else { return Err(Miss::new(v)) };
-    let v = fit_shape(s, v);
+    let v = if SEMANTIC { fit_shape(s, v) } else { v };
     let v = &*v;
     Ok(match (s, v) {
         (Shape::Bool, Value::Bool(b)) => *b as u64,
         (Shape::Int { lo, hi }, Value::Int(n)) if lo <= n && n <= hi => n.wrapping_sub(*lo) as u64,
         (Shape::Atom(u), Value::Str(_) | Value::ModelValue(_)) => u.binary_search(v).map_err(|_| Miss::new(v))? as u64,
         (Shape::Set { elem, max_card }, Value::Set(_) | Value::Interval(..)) => {
+            if !SEMANTIC && matches!(v, Value::Interval(..)) {
+                return Err(Miss::new(v));
+            }
             if set_len(v).unwrap() > *max_card as u64 {
                 return Err(Miss::new(v));
             }
@@ -543,7 +643,7 @@ fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
             let es = set_elems(v).unwrap();
             let mut ranks = Vec::with_capacity(es.len());
             for e in es.iter() {
-                ranks.push(rank_finite(elem, e).map_err(|m| m.under("{}"))?);
+                ranks.push(rank_finite::<SEMANTIC>(elem, e).map_err(|m| m.under("{}"))?);
             }
             if *max_card as u64 >= n {
                 ranks.iter().fold(0u64, |acc, r| acc | (1u64 << r))
@@ -557,25 +657,32 @@ fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
                 r
             }
         }
-        (Shape::Fcn { dom, range }, Value::Fcn(ps, _)) => {
-            if !same_domain(ps, dom) {
+        (Shape::Fcn { dom, range, witness, key_variants }, Value::Fcn(ps, d)) => {
+            debug_assert!(*witness != FcnWitness::Dynamic && key_variants.is_empty(), "dynamic witness has no finite cardinality");
+            let dom_ok =
+                if SEMANTIC { same_domain(ps, dom) } else { match_fcn_keys_exact(ps.iter().map(|(k, _)| k), dom, key_variants, |_, _| {}) };
+            if !(SEMANTIC || witness.accepts_dom(*d)) || !dom_ok {
                 return Err(Miss::new(v));
             }
             let c = range.cardinality().unwrap();
             let mut r = 0u64;
             for (k, x) in ps.iter() {
-                r = r * c + rank_finite(range, x).map_err(|m| m.under(format_args!("[{k}]")))?;
+                r = r * c + rank_finite::<SEMANTIC>(range, x).map_err(|m| m.under(format_args!("[{k}]")))?;
             }
             r
         }
-        (Shape::Map { key, range }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
+        (Shape::Map { key, range, witness }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
+            debug_assert!(*witness != FcnWitness::Dynamic, "dynamic witness has no finite cardinality");
+            if !(SEMANTIC || witness.accepts_map_value(v)) {
+                return Err(Miss::new(v));
+            }
             // Mixed radix over the universe: digit 0 = absent, 1 + rank otherwise.
             let u = key.cardinality().unwrap();
             let c = range.cardinality().unwrap() + 1;
             let mut digits = vec![0u64; u as usize];
             for (k, x) in crate::shape::fcn_pairs(v).expect("function value") {
-                let r = rank_finite(key, &k).map_err(|m| m.under("DOMAIN"))?;
-                digits[r as usize] = 1 + rank_finite(range, &x).map_err(|m| m.under(format_args!("[{k}]")))?;
+                let r = rank_finite::<SEMANTIC>(key, &k).map_err(|m| m.under("DOMAIN"))?;
+                digits[r as usize] = 1 + rank_finite::<SEMANTIC>(range, &x).map_err(|m| m.under(format_args!("[{k}]")))?;
             }
             digits.iter().fold(0u64, |acc, d| acc * c + d)
         }
@@ -586,7 +693,7 @@ fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
             let mut r = 0u64;
             for (f, x) in fs.iter().zip(vs.iter()) {
                 let c = f.1.cardinality().unwrap();
-                r = r * c + rank_finite(&f.1, &x.1).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
+                r = r * c + rank_finite::<SEMANTIC>(&f.1, &x.1).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
             }
             r
         }
@@ -597,7 +704,7 @@ fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
             let mut r = 0u64;
             for (i, (s, x)) in ss.iter().zip(vs.iter()).enumerate() {
                 let c = s.cardinality().unwrap();
-                r = r * c + rank_finite(s, x).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                r = r * c + rank_finite::<SEMANTIC>(s, x).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
             }
             r
         }
@@ -609,14 +716,14 @@ fn rank_finite(s: &Shape, v: &Value) -> Result<u64, Miss> {
             let shorter: u64 = (0..vs.len()).map(|l| c.pow(l as u32)).sum();
             let mut m = 0u64;
             for (i, x) in vs.iter().enumerate() {
-                m = m * c + rank_finite(elem, x).map_err(|e| e.under(format_args!("[{}]", i + 1)))?;
+                m = m * c + rank_finite::<SEMANTIC>(elem, x).map_err(|e| e.under(format_args!("[{}]", i + 1)))?;
             }
             shorter + m
         }
         (Shape::Union(arms), _) => {
-            let i = arm_for(arms, v).ok_or_else(|| Miss::new(v))?;
+            let i = if SEMANTIC { arm_for_semantic(arms, v) } else { arm_for(arms, v) }.ok_or_else(|| Miss::new(v))?;
             let off: u64 = arms[..i].iter().map(|a| a.cardinality().unwrap()).sum();
-            off + rank_finite(&arms[i], v)?
+            off + rank_finite::<SEMANTIC>(&arms[i], v)?
         }
         _ => return Err(Miss::new(v)),
     })
@@ -671,10 +778,16 @@ fn unrank_finite(s: &Shape, mut r: u64) -> Value {
             }
             sorted_set(ranks.into_iter().map(|e| unrank_finite(elem, e)).collect())
         }
-        Shape::Fcn { dom, range } => {
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            debug_assert!(key_variants.is_empty(), "unrank: dynamic key variants have no finite universe");
             let c = range.cardinality().unwrap();
             let vals = mixed_radix(r, dom.iter().map(|_| (range.as_ref(), c)));
-            Value::fcn_decoded(dom.iter().cloned().zip(vals).collect())
+            let pairs = dom.iter().cloned().zip(vals).collect();
+            match witness {
+                FcnWitness::Enumerated => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+                FcnWitness::Interval => Value::fcn_with_dom(pairs, FcnDom::Interval),
+                FcnWitness::Dynamic => unreachable!("unrank: dynamic witness has no finite universe"),
+            }
         }
         Shape::Record(fs) => {
             let vals = mixed_radix(r, fs.iter().map(|f| (&f.1, f.1.cardinality().unwrap())));
@@ -704,7 +817,7 @@ fn unrank_finite(s: &Shape, mut r: u64) -> Value {
             }
             unreachable!("unrank: rank out of range")
         }
-        Shape::Map { key, range } => {
+        Shape::Map { key, range, witness } => {
             let u = key.cardinality().unwrap();
             let c = range.cardinality().unwrap() + 1;
             let mut digits = vec![0u64; u as usize];
@@ -718,7 +831,11 @@ fn unrank_finite(s: &Shape, mut r: u64) -> Value {
                 .filter(|(_, d)| **d > 0)
                 .map(|(k, d)| (unrank_finite(key, k as u64), unrank_finite(range, d - 1)))
                 .collect();
-            Value::fcn_from_pairs(pairs).expect("distinct keys").with_decoded_dom()
+            match witness {
+                FcnWitness::Enumerated => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+                FcnWitness::Interval => Value::fcn_over_interval_sorted(pairs),
+                FcnWitness::Dynamic => unreachable!("unrank: dynamic witness has no finite universe"),
+            }
         }
         Shape::Never | Shape::Dyn | Shape::Ref(_) => unreachable!("unrank: shape without finite universe"),
     }

@@ -1,7 +1,6 @@
 //! Random values of layout shapes (for property tests on encoded states).
 
-use tlx_layout::layout;
-use tlx_layout::Shape;
+use tlx_layout::{layout, Shape};
 use tlx_value::Value;
 
 use crate::Rng;
@@ -55,10 +54,19 @@ fn gen(s: &Shape, rng: &mut Rng) -> Value {
             }
             Value::set_from(es).expect("comparable elements")
         }
-        Shape::Fcn { dom, range } => {
-            Value::fcn_from_pairs(dom.iter().map(|k| (k.clone(), random_value(range, rng))).collect()).expect("distinct keys")
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            let mut kv_slot = 0usize;
+            let pairs: Vec<(Value, Value)> = (0..dom.len())
+                .map(|pos| {
+                    let key =
+                        tlx_layout::shape::fcn_key_at(dom, key_variants, &mut kv_slot, pos, |_, vs| rng.below(vs.len() as u64) as usize)
+                            .clone();
+                    (key, random_value(range, rng))
+                })
+                .collect();
+            witness.decode_fcn(pairs, || u64::from(!rng.chance(1, 2)))
         }
-        Shape::Map { key, range } => {
+        Shape::Map { key, range, witness } => {
             let u = key.cardinality().expect("map keys have a finite universe");
             let dense = rng.below(4);
             let mut pairs: Vec<(Value, Value)> = Vec::new();
@@ -72,7 +80,7 @@ fn gen(s: &Shape, rng: &mut Rng) -> Value {
                     pairs.push((layout::unrank(key, r), random_value(range, rng)));
                 }
             }
-            Value::fcn_from_pairs(pairs).expect("distinct keys")
+            witness.decode_map(pairs, || u64::from(!rng.chance(1, 2)))
         }
         Shape::Record(fs) => Value::record(fs.iter().map(|(k, f)| (*k, random_value(f, rng))).collect()),
         Shape::Tuple(es) => Value::tuple(es.iter().map(|e| random_value(e, rng)).collect()),

@@ -22,7 +22,7 @@ reports XPASS: remove both entries.
 | `FzWorkersAPropFirst` | workers-action-property-first | w4 | under VIEW with several workers tlx reports the action property violated by a step before the invariant violated by its new successor; TLC reports the invariant |
 | `FzViewAPropTrace` | view-trace | interp, compile, paranoid | under VIEW tlx's counterexample of an action property ends in a stuttering step (the first state of the successor's view class); TLC rejects it |
 | `FzCupDupGenerated` | fixed | none | `x' \in (S \X T) \cup {x}` with x in `S \X T`: TLC and the interpreter enumerate the duplicate twice (3 generated), the compiled tier once (2) |
-| `FzEmptyFcnExcept` | d13-empty-function | paranoid | EXCEPT with a string key on the empty function `[x \in {} \|-> ""]`: the compiled (C) tier decodes it as `<<>>` and fails; TLC leaves it unchanged (docs/compat.md D-13 family) |
+| `FzEmptyFcnExcept` | fixed | none | EXCEPT with a string key on the empty function `[x \in {} \|-> ""]`: fixed by `FcnWitness` in `Shape::Fcn` / `Shape::Map` (docs/compat.md D-13) |
 | `FzConstInvErrorCounts` | init-eval-error | all but w4 | a constant-level INVARIANT fails to evaluate on the initial states: TLC's error counts 2 generated states, tlx's 1 |
 | `FzLivePredErrorCounts` | init-eval-error | all but w4 | a liveness property's state predicate fails to evaluate: TLC reports it while computing the initial states, tlx after the search (counts differ) |
 | `FzLivePredErrorStats` | init-eval-error | all but w4 | a liveness predicate fails on an initial state that violates an invariant: TLC reports the violation with statistics, tlx without |

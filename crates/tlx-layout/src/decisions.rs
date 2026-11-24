@@ -97,9 +97,15 @@ pub fn summary(s: &Shape) -> String {
             None => format!("Set sorted(max {max_card}) of {}", summary(elem)),
         },
         Shape::Seq { elem, max_len } => format!("Seq(max {max_len}) of {}", summary(elem)),
-        Shape::Fcn { dom, range } => format!("Fcn({} keys) to {}", dom.len(), summary(range)),
-        Shape::Map { key, range } => {
-            format!("Map(universe {}) of {} to {}", key.cardinality().unwrap_or(0), summary(key), summary(range))
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            if key_variants.is_empty() {
+                format!("Fcn({} keys, {witness:?}) to {}", dom.len(), summary(range))
+            } else {
+                format!("Fcn({} keys, {witness:?}, {} key variants) to {}", dom.len(), key_variants.len(), summary(range))
+            }
+        }
+        Shape::Map { key, range, witness } => {
+            format!("Map(universe {}, {witness:?}) of {} to {}", key.cardinality().unwrap_or(0), summary(key), summary(range))
         }
         Shape::Record(fs) => format!("Record({} fields)", fs.len()),
         Shape::Tuple(es) => format!("Tuple({})", es.len()),

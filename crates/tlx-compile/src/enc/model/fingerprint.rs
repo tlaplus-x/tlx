@@ -16,12 +16,13 @@ use super::symmetry::orbit_fp;
 use super::{EState, EncModel, View};
 use crate::paranoid::{mismatch, state_list};
 
-/// Fingerprints of encodings holding value store handles (`Shape::Ref`):
-/// a handle's number depends on the representation and on the order of
-/// interning, so each is hashed as its semantic digest instead (equal
-/// values, equal fingerprints; `tlx_layout::store`).
+/// Canonical fingerprints of encodings holding value store handles
+/// (`Shape::Ref`) or dynamic function-domain witnesses (`FcnWitness::Dynamic`):
+/// a handle is replaced by its semantic digest, and every trailing dynamic
+/// witness word is zeroed before hashing or symmetry comparison so semantically
+/// equal values always share one fingerprint.
 pub(in crate::enc) struct SemFp {
-    pub(in crate::enc) store: tlx_layout::store::StoreRef,
+    pub(in crate::enc) store: Option<tlx_layout::store::StoreRef>,
     /// The word offsets of the handles in a state.
     pub(in crate::enc) state: Box<[usize]>,
     /// The word offsets of the handles in the VIEW's encoding.
@@ -36,38 +37,80 @@ thread_local! {
 
 impl SemFp {
     /// For a layout (and the VIEW's shape, if fingerprinted by its
-    /// encoding); None without handles.
+    /// encoding); None when neither holds handles nor dynamic witnesses.
     pub(super) fn of(layout: &Layout, view: Option<&Shape>) -> Option<SemFp> {
-        let store = tlx_layout::layout::store_of(layout.vars.iter().chain(view))?;
-        let mut state = Vec::new();
-        for (s, off) in layout.vars.iter().zip(&layout.offsets) {
-            tlx_layout::layout::ref_offsets(s, *off, &mut state).expect("value store handles at fixed positions");
+        let store = tlx_layout::layout::store_of(layout.vars.iter().chain(view));
+        if store.is_none() && !layout.has_dynamic_witness && !view.is_some_and(Shape::has_dynamic_witness) {
+            return None;
         }
+        let mut state = Vec::new();
         let mut v = Vec::new();
-        if let Some(s) = view {
-            tlx_layout::layout::ref_offsets(s, 0, &mut v).expect("value store handles at fixed positions");
+        if store.is_some() {
+            for (s, off) in layout.vars.iter().zip(&layout.offsets) {
+                tlx_layout::layout::ref_offsets(s, *off, &mut state).expect("value store handles at fixed positions");
+            }
+            if let Some(s) = view {
+                tlx_layout::layout::ref_offsets(s, 0, &mut v).expect("value store handles at fixed positions");
+            }
         }
         let ref_vars = layout.vars.iter().map(|s| matches!(s, Shape::Ref(_))).collect();
         Some(SemFp { store, state: state.into(), view: v.into(), ref_vars })
     }
 
-    /// `words` with the handles at `refs` replaced by their digests.
-    pub(in crate::enc) fn semantic(&self, words: &[u64], refs: &[usize], out: &mut Vec<u64>) {
+    pub(in crate::enc) fn state_needs_canonical(&self, layout: &Layout) -> bool {
+        !self.state.is_empty() || layout.has_dynamic_witness
+    }
+
+    /// `words` of a state with handles replaced by digests and dynamic
+    /// witness words zeroed.
+    pub(in crate::enc) fn semantic_state(&self, layout: &Layout, words: &[u64], out: &mut Vec<u64>) {
         out.clear();
         out.extend_from_slice(words);
-        for &i in refs {
-            out[i] = self.store.digest(out[i]);
+        if let Some(store) = &self.store {
+            for &i in &self.state {
+                out[i] = store.digest(out[i]);
+            }
+        }
+        if layout.has_dynamic_witness {
+            layout.canonicalize_state(out);
         }
     }
 
-    /// The fingerprint of `words` (handles at `refs`).
-    pub(in crate::enc) fn fp(&self, words: &[u64], refs: &[usize]) -> u64 {
-        if refs.is_empty() {
+    /// `words` of a VIEW with handles replaced by digests and dynamic
+    /// witness words zeroed.
+    pub(in crate::enc) fn semantic_view(&self, node: &tlx_layout::LayoutNode, words: &[u64], out: &mut Vec<u64>) {
+        out.clear();
+        out.extend_from_slice(words);
+        if let Some(store) = &self.store {
+            for &i in &self.view {
+                out[i] = store.digest(out[i]);
+            }
+        }
+        if node.has_dynamic_witness() {
+            node.canonicalize_words(out);
+        }
+    }
+
+    /// The canonical fingerprint of encoded state `words`.
+    pub(in crate::enc) fn fp_state(&self, layout: &Layout, words: &[u64]) -> u64 {
+        if !self.state_needs_canonical(layout) {
             return fp_words(words);
         }
         SEM_BUF.with(|b| {
             let mut b = b.borrow_mut();
-            self.semantic(words, refs, &mut b);
+            self.semantic_state(layout, words, &mut b);
+            fp_words(&b)
+        })
+    }
+
+    /// The canonical fingerprint of encoded VIEW `words`.
+    pub(in crate::enc) fn fp_view(&self, node: &tlx_layout::LayoutNode, words: &[u64]) -> u64 {
+        if self.view.is_empty() && !node.has_dynamic_witness() {
+            return fp_words(words);
+        }
+        SEM_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            self.semantic_view(node, words, &mut b);
             fp_words(&b)
         })
     }
@@ -137,11 +180,11 @@ impl EncModel {
                 if self.paranoid {
                     self.check_permutations(group, words);
                 }
-                Ok(orbit_fp(group, order, &self.layout.offsets, words, self.sem.as_ref()))
+                Ok(orbit_fp(group, order, &self.layout, words, self.sem.as_ref()))
             }
             Fingerprint::SymView { group, view } => self.sym_view_fp(group, view, words, level),
             Fingerprint::Words | Fingerprint::Values => Ok(match &self.sem {
-                Some(sem) => sem.fp(words, &sem.state),
+                Some(sem) => sem.fp_state(&self.layout, words),
                 None => fp_words(words),
             }),
         }
@@ -199,14 +242,24 @@ impl EncModel {
             self.base.count_generated();
             self.base.error(x)
         })?;
-        let node = v.typing.layout.node(v.typing.layout.vars.len() - 1);
+        let node = v.result_node();
         let mut out = vec![0; node.words()];
-        if node.encode(&val, &mut out).is_err() {
+        if node.encode_semantic(&val, &mut out).is_err() {
             return tlx_layout::store::digest_of_value(&val)
                 .map(|d| fp_words(&[u64::MAX, d]))
                 .map_err(|x| ModelError::new(format!("escape VIEW: {x:?}")));
         }
-        Ok(fp_words(&out))
+        Ok(self.hash_view_words(v, &out))
+    }
+
+    fn hash_view_words(&self, v: &View, words: &[u64]) -> u64 {
+        if let Some(orbit) = &v.orbit {
+            return orbit.fingerprint(words);
+        }
+        match &self.sem {
+            Some(sem) => sem.fp_view(v.result_node(), words),
+            None => fp_words(words),
+        }
     }
 
     /// Fingerprint of the VIEW of the least state of the SYMMETRY orbit of
@@ -279,34 +332,34 @@ impl EncModel {
             out.clear();
             if v.compiled(&self.base, ext, level, out) {
                 if self.paranoid {
-                    let want = self.view_interpreted(v, words, level)?;
-                    if *out != want {
-                        let st = self.base.render(&self.decode(&EState {
-                            words: words.into(),
-                            level,
-                            fp: 0,
-                            #[cfg(debug_assertions)]
-                            model: self.id,
-                        }));
-                        mismatch(format_args!("VIEW on state\n{st}\ninterpreter: {want:?}\ncompiled:    {out:?}"));
+                    match self.view_interpreted(v, words, level)? {
+                        ViewEncoded::Words(want) if *out == want => {}
+                        want => {
+                            let st = self.base.render(&self.decode(&EState {
+                                words: words.into(),
+                                level,
+                                fp: 0,
+                                #[cfg(debug_assertions)]
+                                model: self.id,
+                            }));
+                            mismatch(format_args!("VIEW on state\n{st}\ninterpreter: {want:?}\ncompiled:    {out:?}"));
+                        }
                     }
                 }
             } else {
-                *out = self.view_interpreted(v, words, level)?;
+                match self.view_interpreted(v, words, level)? {
+                    ViewEncoded::Words(w) => *out = w,
+                    ViewEncoded::Digest(d) => return Ok(fp_words(&[u64::MAX, d])),
+                }
             }
-            if let Some(orbit) = &v.orbit {
-                return Ok(orbit.fingerprint(out));
-            }
-            Ok(match &self.sem {
-                Some(sem) => sem.fp(out, &sem.view),
-                None => fp_words(out),
-            })
+            Ok(self.hash_view_words(v, out))
         })
     }
 
     /// The VIEW's encoding computed by the interpreter; a value that does
-    /// not fit its shape is a layout miss of the VIEW definition.
-    fn view_interpreted(&self, v: &View, words: &[u64], level: u32) -> Result<Vec<u64>, ModelError> {
+    /// not fit its shape is a layout miss of the VIEW definition (or, in
+    /// escape mode, a semantic encoding or outlier digest).
+    fn view_interpreted(&self, v: &View, words: &[u64], level: u32) -> Result<ViewEncoded, ModelError> {
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
         let vals = unsafe { self.layout.decode_state_unchecked(words) };
@@ -316,17 +369,33 @@ impl EncModel {
             self.base.count_generated();
             self.base.error(e)
         })?;
-        let node = v.typing.layout.node(v.typing.layout.vars.len() - 1);
+        let node = v.result_node();
         let mut out = vec![0u64; node.words()];
         match node.encode(&val, &mut out) {
-            Ok(()) => Ok(out),
-            Err(_) if self.escape.is_some() => tlx_layout::store::digest_of_value(&val)
-                .map(|d| vec![u64::MAX, d])
-                .map_err(|x| ModelError::new(format!("escape VIEW: {x:?}"))),
+            Ok(()) => Ok(ViewEncoded::Words(out)),
+            Err(_) if self.escape.is_some() => {
+                if node.encode_semantic(&val, &mut out).is_ok() {
+                    Ok(ViewEncoded::Words(out))
+                } else {
+                    tlx_layout::store::digest_of_value(&val)
+                        .map(ViewEncoded::Digest)
+                        .map_err(|x| ModelError::new(format!("escape VIEW: {x:?}")))
+                }
+            }
             Err(_) => match v.def {
                 Some(def) => Err(Self::record_miss(&self.def_miss, def, val)),
                 None => Err(ModelError::new("internal error: anonymous VIEW value does not fit its inferred shape")),
             },
         }
     }
+}
+
+/// Result of interpreting a `VIEW` expression for fingerprinting.
+#[derive(Debug)]
+enum ViewEncoded {
+    /// Encoded in the VIEW shape's layout (`len == node.words()`).
+    Words(Vec<u64>),
+    /// Out-of-layout VIEW in escape mode: hash `[u64::MAX, digest]` directly
+    /// without walking the VIEW shape's `SemFp` or `ProjectionOrbit`.
+    Digest(u64),
 }

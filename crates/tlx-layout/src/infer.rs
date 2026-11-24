@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use tlx_value::{Sym, Value};
 
-use crate::shape::Shape;
+use crate::shape::{fcn_dom_matches_record, fcn_dom_matches_tuple, set_shape, Shape};
 
 /// Static information that widens observed shapes.
 #[derive(Clone, Debug, Default)]
@@ -129,15 +129,17 @@ fn cap_strings(s: &Shape, hints: &Hints) -> Option<Shape> {
             Shape::Dyn
         }),
         Shape::Never | Shape::Bool | Shape::Int { .. } | Shape::Dyn | Shape::Ref(_) => None,
-        Shape::Set { elem, max_card } => Some(Shape::Set { elem: Box::new(cap(elem)?), max_card: *max_card }),
+        Shape::Set { elem, max_card } => Some(set_shape(cap(elem)?, *max_card)),
         Shape::Seq { elem, max_len } => Some(Shape::Seq { elem: Box::new(cap(elem)?), max_len: *max_len }),
-        Shape::Fcn { dom, range } => Some(Shape::Fcn { dom: dom.clone(), range: Box::new(cap(range)?) }),
-        Shape::Map { key, range } => {
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            Some(Shape::Fcn { dom: dom.clone(), range: Box::new(cap(range)?), witness: *witness, key_variants: key_variants.clone() })
+        }
+        Shape::Map { key, range, witness } => {
             let (k, r) = (cap(key), cap(range));
             if k.is_none() && r.is_none() {
                 return None;
             }
-            Some(crate::shape::map_shape(k.unwrap_or_else(|| (**key).clone()), r.unwrap_or_else(|| (**range).clone())))
+            Some(crate::shape::map_shape(k.unwrap_or_else(|| (**key).clone()), r.unwrap_or_else(|| (**range).clone()), *witness))
         }
         Shape::Record(fs) => {
             let capped: Vec<Option<Shape>> = fs.iter().map(|(_, f)| cap(f)).collect();
@@ -229,17 +231,18 @@ fn escalate(old: &Shape, new: &Shape, hints: &Hints, prior: u32, value: bool) ->
         }
         (Shape::Atom(u0), Shape::Atom(u)) if open_ended(u0, u, hints, prior) => open_dyn(),
         (Shape::Never, Shape::Atom(u)) if open_ended(&[], u, hints, prior) => open_dyn(),
-        (Shape::Set { elem: e1, .. }, Shape::Set { elem: e2, max_card }) => {
-            Shape::Set { elem: Box::new(escalate(e1, e2, hints, prior, false)), max_card: *max_card }
-        }
+        (Shape::Set { elem: e1, .. }, Shape::Set { elem: e2, max_card }) => set_shape(escalate(e1, e2, hints, prior, false), *max_card),
         (Shape::Seq { elem: e1, .. }, Shape::Seq { elem: e2, max_len }) => {
             Shape::Seq { elem: Box::new(escalate(e1, e2, hints, prior, true)), max_len: *max_len }
         }
-        (Shape::Fcn { range: r1, .. }, Shape::Fcn { dom, range: r2 }) => {
-            Shape::Fcn { dom: dom.clone(), range: Box::new(escalate(r1, r2, hints, prior, true)) }
-        }
-        (Shape::Map { key: k1, range: r1 }, Shape::Map { key: k2, range: r2 }) => {
-            crate::shape::map_shape(escalate(k1, k2, hints, prior, false), escalate(r1, r2, hints, prior, true))
+        (Shape::Fcn { range: r1, .. }, Shape::Fcn { dom, range: r2, witness, key_variants }) => Shape::Fcn {
+            dom: dom.clone(),
+            range: Box::new(escalate(r1, r2, hints, prior, true)),
+            witness: *witness,
+            key_variants: key_variants.clone(),
+        },
+        (Shape::Map { key: k1, range: r1, .. }, Shape::Map { key: k2, range: r2, witness }) => {
+            crate::shape::map_shape(escalate(k1, k2, hints, prior, false), escalate(r1, r2, hints, prior, true), *witness)
         }
         (Shape::Record(f1), Shape::Record(f2)) if f1.len() == f2.len() => {
             Shape::Record(f1.iter().zip(f2.iter()).map(|(a, b)| (b.0, escalate(&a.1, &b.1, hints, prior, value))).collect())
@@ -316,7 +319,7 @@ fn set_headroom(elem: Shape, max_card: usize, in_elem: bool) -> Shape {
             m = n.max(max_card);
         }
     }
-    Shape::Set { elem: Box::new(elem), max_card: m }
+    set_shape(elem, m)
 }
 
 /// The hint atoms that extend an observed atom universe: the strings when the
@@ -379,8 +382,10 @@ fn headroom_at(s: &Shape, hints: &Hints, in_elem: bool) -> Shape {
         }
         Shape::Atom(u) => Shape::Atom(extend_atoms(u, hints)),
         Shape::Set { elem, max_card } => set_headroom(headroom_at(elem, hints, true), *max_card, in_elem),
-        Shape::Fcn { dom, range } => Shape::Fcn { dom: dom.clone(), range: Box::new(headroom(range, hints)) },
-        Shape::Map { key, range } => {
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            Shape::Fcn { dom: dom.clone(), range: Box::new(headroom(range, hints)), witness: *witness, key_variants: key_variants.clone() }
+        }
+        Shape::Map { key, range, witness } => {
             // Widen the key universe only while the map stays compact, and
             // keys that are strings not by the spec's strings: a map over
             // strings is usually a record built with `:>` and `@@` (its
@@ -396,7 +401,7 @@ fn headroom_at(s: &Shape, hints: &Hints, in_elem: bool) -> Shape {
             };
             [headroom_at(key, &key_hints, true), (**key).clone()]
                 .into_iter()
-                .map(|k| crate::shape::map_shape(k, range.clone()))
+                .map(|k| crate::shape::map_shape(k, range.clone(), *witness))
                 .find(|m| *m != Shape::Dyn)
                 .unwrap_or_else(|| s.clone())
         }
@@ -442,7 +447,7 @@ fn grow_at(old: &Shape, new: &Shape, obs: Option<&Shape>, hints: &Hints, in_elem
                 };
                 set_headroom(elem, n, in_elem)
             } else if m1 == m2 && (in_elem || !bitset) {
-                Shape::Set { elem: Box::new(elem), max_card: *m2 }
+                set_shape(elem, *m2)
             } else {
                 set_headroom(elem, *m2, in_elem)
             }
@@ -451,11 +456,11 @@ fn grow_at(old: &Shape, new: &Shape, obs: Option<&Shape>, hints: &Hints, in_elem
             elem: Box::new(grow(e1, e2, obs_part(obs, |o| if let Shape::Seq { elem, .. } = o { Some(&**elem) } else { None }), hints)),
             max_len: if l1 == l2 { *l2 } else { grow_len(*l2) },
         },
-        (Shape::Fcn { range: r1, .. }, Shape::Fcn { dom, range: r2 }) => {
+        (Shape::Fcn { range: r1, .. }, Shape::Fcn { dom, range: r2, witness, key_variants }) => {
             let o = obs_part(obs, |o| if let Shape::Fcn { range, .. } = o { Some(&**range) } else { None });
-            Shape::Fcn { dom: dom.clone(), range: Box::new(grow(r1, r2, o, hints)) }
+            Shape::Fcn { dom: dom.clone(), range: Box::new(grow(r1, r2, o, hints)), witness: *witness, key_variants: key_variants.clone() }
         }
-        (Shape::Map { key: k1, range: r1 }, Shape::Map { key: k2, range: r2 }) => {
+        (Shape::Map { key: k1, range: r1, .. }, Shape::Map { key: k2, range: r2, witness }) => {
             // Keys get headroom only while the map stays compact.
             let range = grow(r1, r2, obs_part(obs, |o| if let Shape::Map { range, .. } = o { Some(&**range) } else { None }), hints);
             [
@@ -463,7 +468,7 @@ fn grow_at(old: &Shape, new: &Shape, obs: Option<&Shape>, hints: &Hints, in_elem
                 (**k2).clone(),
             ]
             .into_iter()
-            .map(|k| crate::shape::map_shape(k, range.clone()))
+            .map(|k| crate::shape::map_shape(k, range.clone(), *witness))
             .find(|m| *m != Shape::Dyn)
             .unwrap_or_else(|| new.clone())
         }
@@ -566,13 +571,18 @@ fn replace_records(s: &Shape, joined: &[(Vec<Sym>, Shape)]) -> Shape {
             if e == **elem {
                 s.clone()
             } else {
-                Shape::Set { elem: Box::new(e), max_card: *max_card }
+                set_shape(e, *max_card)
             }
         }
         Shape::Seq { elem, max_len } => Shape::Seq { elem: Box::new(replace_records(elem, joined)), max_len: *max_len },
-        Shape::Fcn { dom, range } => Shape::Fcn { dom: dom.clone(), range: Box::new(replace_records(range, joined)) },
-        Shape::Map { key, range } => {
-            let m = crate::shape::map_shape(replace_records(key, joined), replace_records(range, joined));
+        Shape::Fcn { dom, range, witness, key_variants } => Shape::Fcn {
+            dom: dom.clone(),
+            range: Box::new(replace_records(range, joined)),
+            witness: *witness,
+            key_variants: key_variants.clone(),
+        },
+        Shape::Map { key, range, witness } => {
+            let m = crate::shape::map_shape(replace_records(key, joined), replace_records(range, joined), *witness);
             if m == Shape::Dyn {
                 s.clone()
             } else {
@@ -596,9 +606,14 @@ pub fn map_value_ints(s: &Shape, f: &mut dyn FnMut(i64, i64) -> Option<(i64, i64
             None => s.clone(),
         },
         Shape::Seq { elem, max_len } => Shape::Seq { elem: Box::new(map_value_ints(elem, f)), max_len: *max_len },
-        Shape::Fcn { dom, range } => Shape::Fcn { dom: dom.clone(), range: Box::new(map_value_ints(range, f)) },
-        Shape::Map { key, range } => {
-            let m = crate::shape::map_shape((**key).clone(), map_value_ints(range, f));
+        Shape::Fcn { dom, range, witness, key_variants } => Shape::Fcn {
+            dom: dom.clone(),
+            range: Box::new(map_value_ints(range, f)),
+            witness: *witness,
+            key_variants: key_variants.clone(),
+        },
+        Shape::Map { key, range, witness } => {
+            let m = crate::shape::map_shape((**key).clone(), map_value_ints(range, f), *witness);
             if m == Shape::Dyn {
                 s.clone()
             } else {
@@ -624,7 +639,7 @@ pub fn grown_ints(old: &Shape, new: &Shape, out: &mut Vec<((i64, i64), (i64, i64
         (Shape::Set { elem: a, .. }, Shape::Set { elem: b, .. })
         | (Shape::Seq { elem: a, .. }, Shape::Seq { elem: b, .. })
         | (Shape::Fcn { range: a, .. }, Shape::Fcn { range: b, .. }) => grown_ints(a, b, out),
-        (Shape::Map { key: k1, range: a }, Shape::Map { key: k2, range: b }) => {
+        (Shape::Map { key: k1, range: a, .. }, Shape::Map { key: k2, range: b, .. }) => {
             grown_ints(k1, k2, out);
             grown_ints(a, b, out);
         }
@@ -669,7 +684,7 @@ pub fn set_elem_bound(set: &Value) -> Shape {
                 Shape::Dyn => Shape::Dyn,
                 elem => {
                     let max_card = tlx_value::ops::cardinality(s).ok().and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX);
-                    Shape::Set { elem: Box::new(elem), max_card }
+                    set_shape(elem, max_card)
                 }
             },
             // (Sets of at most |S| elements, as `SUBSET S`.)
@@ -677,7 +692,7 @@ pub fn set_elem_bound(set: &Value) -> Shape {
                 Shape::Dyn => Shape::Dyn,
                 elem => {
                     let max_card = tlx_value::ops::cardinality(s).ok().and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX);
-                    Shape::Set { elem: Box::new(elem), max_card }
+                    set_shape(elem, max_card)
                 }
             },
             L::FcnSet(d, r) => fcn_bound(d, set_elem_bound(r)),
@@ -710,11 +725,11 @@ fn fcn_bound(dom: &Value, range: Shape) -> Shape {
     let small = tlx_value::ops::cardinality(dom).is_ok_and(|n| (0..=crate::shape::MAX_BITSET_UNIVERSE as i64).contains(&n));
     let Some(keys) = small.then(|| tlx_value::ops::enumerate_normalized(dom).ok()).flatten() else { return Shape::Dyn };
     // The shape of a function with these keys, with the range filled in.
-    let Ok(sample) = Value::fcn_from_pairs(keys.into_iter().map(|k| (k, Value::Bool(false))).collect()) else { return Shape::Dyn };
+    let Ok(sample) = Value::fcn_over(dom, keys.into_iter().map(|k| (k, Value::Bool(false))).collect()) else { return Shape::Dyn };
     match Shape::of(&sample) {
         Shape::Tuple(es) => Shape::Tuple(vec![range; es.len()].into()),
         Shape::Record(fs) => Shape::Record(fs.iter().map(|(k, _)| (*k, range.clone())).collect()),
-        Shape::Fcn { dom, .. } => Shape::Fcn { dom, range: Box::new(range) },
+        Shape::Fcn { dom, witness, key_variants, .. } => Shape::Fcn { dom, range: Box::new(range), witness, key_variants },
         _ => Shape::Dyn,
     }
 }
@@ -740,8 +755,20 @@ pub fn bound_covers(b: &Shape, o: &Shape) -> bool {
         (Shape::Int { lo: bl, hi: bh }, Shape::Int { lo: ol, hi: oh }) => bl <= ol && oh <= bh,
         (Shape::Atom(bu), Shape::Atom(ou)) => ou.iter().all(|a| bu.binary_search(a).is_ok()),
         (Shape::Set { elem: be, max_card: bm }, Shape::Set { elem: oe, max_card: om }) => om <= bm && bound_covers(be, oe),
-        (Shape::Fcn { dom: bd, range: br }, Shape::Fcn { dom: od, range: or }) => bd == od && bound_covers(br, or),
-        (Shape::Map { key: bk, range: br }, Shape::Map { key: ok, range: or }) => bound_covers(bk, ok) && bound_covers(br, or),
+        (Shape::Fcn { dom: bd, range: br, .. }, Shape::Fcn { dom: od, range: or, .. }) => bd == od && bound_covers(br, or),
+        (Shape::Fcn { dom: bd, range: br, .. }, Shape::Tuple(ot)) => {
+            fcn_dom_matches_tuple(bd, ot.len()) && ot.iter().all(|y| bound_covers(br, y))
+        }
+        (Shape::Fcn { dom: bd, range: br, .. }, Shape::Record(of)) => {
+            fcn_dom_matches_record(bd, of) && of.iter().all(|(_, y)| bound_covers(br, y))
+        }
+        (Shape::Tuple(bt), Shape::Fcn { dom: od, range: or, .. }) => {
+            fcn_dom_matches_tuple(od, bt.len()) && bt.iter().all(|x| bound_covers(x, or))
+        }
+        (Shape::Record(bf), Shape::Fcn { dom: od, range: or, .. }) => {
+            fcn_dom_matches_record(od, bf) && bf.iter().all(|(_, x)| bound_covers(x, or))
+        }
+        (Shape::Map { key: bk, range: br, .. }, Shape::Map { key: ok, range: or, .. }) => bound_covers(bk, ok) && bound_covers(br, or),
         (Shape::Record(bf), Shape::Record(of)) => {
             crate::shape::same_field_names(bf, of) && bf.iter().zip(of.iter()).all(|(x, y)| bound_covers(&x.1, &y.1))
         }
@@ -803,13 +830,21 @@ pub fn refine(s: &Shape, b: &Shape) -> Shape {
                 Some(_) => s.clone(),
             }
         }
-        (Shape::Fcn { dom: sd, range: sr }, Shape::Fcn { dom: bd, range: br }) if sd == bd => {
-            Shape::Fcn { dom: sd.clone(), range: Box::new(refine(sr, br)) }
+        (Shape::Fcn { dom: sd, range: sr, witness, key_variants }, Shape::Fcn { dom: bd, range: br, .. }) if sd == bd => {
+            Shape::Fcn { dom: sd.clone(), range: Box::new(refine(sr, br)), witness: *witness, key_variants: key_variants.clone() }
         }
-        (Shape::Map { key, range: sr }, Shape::Map { range: br, .. }) => match crate::shape::map_shape((**key).clone(), refine(sr, br)) {
-            Shape::Dyn => s.clone(),
-            m => m,
-        },
+        (Shape::Record(sf), Shape::Fcn { dom: bd, range: br, .. }) if fcn_dom_matches_record(bd, sf) => {
+            Shape::Record(sf.iter().map(|(k, x)| (*k, refine(x, br))).collect())
+        }
+        (Shape::Tuple(st), Shape::Fcn { dom: bd, range: br, .. }) if fcn_dom_matches_tuple(bd, st.len()) => {
+            Shape::Tuple(st.iter().map(|x| refine(x, br)).collect())
+        }
+        (Shape::Map { key, range: sr, witness }, Shape::Map { range: br, .. }) => {
+            match crate::shape::map_shape((**key).clone(), refine(sr, br), *witness) {
+                Shape::Dyn => s.clone(),
+                m => m,
+            }
+        }
         (Shape::Record(sf), Shape::Record(bf)) if crate::shape::same_field_names(sf, bf) => {
             Shape::Record(sf.iter().zip(bf.iter()).map(|(x, y)| (x.0, refine(&x.1, &y.1))).collect())
         }
@@ -872,13 +907,22 @@ fn refine_elem(s: &Shape, b: &Shape, exact: Exact) -> Shape {
                 Some(n) => (*bm).min(usize::try_from(n).unwrap_or(usize::MAX)),
                 None => (*sm).min(*bm),
             };
-            Shape::Set { elem: Box::new(elem), max_card }
+            set_shape(elem, max_card)
         }
-        (Shape::Fcn { dom: sd, range: sr }, Shape::Fcn { dom: bd, range: br }) if sd == bd => {
-            Shape::Fcn { dom: sd.clone(), range: Box::new(refine_elem(sr, br, exact)) }
+        (Shape::Fcn { dom: sd, range: sr, witness, key_variants }, Shape::Fcn { dom: bd, range: br, .. }) if sd == bd => Shape::Fcn {
+            dom: sd.clone(),
+            range: Box::new(refine_elem(sr, br, exact)),
+            witness: *witness,
+            key_variants: key_variants.clone(),
+        },
+        (Shape::Record(sf), Shape::Fcn { dom: bd, range: br, .. }) if fcn_dom_matches_record(bd, sf) => {
+            Shape::Record(sf.iter().map(|(k, x)| (*k, refine_elem(x, br, exact))).collect())
         }
-        (Shape::Map { key: sk, range: sr }, Shape::Map { key: bk, range: br }) => {
-            match crate::shape::map_shape(refine_elem(sk, bk, exact), refine_elem(sr, br, exact)) {
+        (Shape::Tuple(st), Shape::Fcn { dom: bd, range: br, .. }) if fcn_dom_matches_tuple(bd, st.len()) => {
+            Shape::Tuple(st.iter().map(|x| refine_elem(x, br, exact)).collect())
+        }
+        (Shape::Map { key: sk, range: sr, witness }, Shape::Map { key: bk, range: br, .. }) => {
+            match crate::shape::map_shape(refine_elem(sk, bk, exact), refine_elem(sr, br, exact), *witness) {
                 Shape::Dyn => s.clone(),
                 m => m,
             }

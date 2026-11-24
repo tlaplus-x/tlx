@@ -54,6 +54,60 @@ impl Witness {
         }
     }
 
+    /// Witness assigned by `Value::fcn_canonical_sorted` to sorted, distinct
+    /// domain keys `dom`.
+    pub fn canonical_of_sorted_keys<'a>(mut dom: impl Iterator<Item = &'a Value>) -> Witness {
+        let Some(first) = dom.next() else {
+            return Witness::Tuple;
+        };
+        match first {
+            Value::Int(lo) => {
+                let mut expected = *lo;
+                for k in dom {
+                    expected = match expected.checked_add(1) {
+                        Some(n) if *k == Value::Int(n) => n,
+                        _ => return Witness::Enumerated,
+                    };
+                }
+                if *lo == 1 {
+                    Witness::Tuple
+                } else {
+                    Witness::Interval
+                }
+            }
+            Value::Str(_) => {
+                if dom.all(|k| matches!(k, Value::Str(_))) {
+                    Witness::Record
+                } else {
+                    Witness::Enumerated
+                }
+            }
+            _ => Witness::Enumerated,
+        }
+    }
+
+    /// Whether `DOMAIN f` for a function with this witness produces an integer
+    /// interval (`Value::Interval`) rather than an enumerated `Value::Set`:
+    /// `Tuple` (`1..n`) and `Interval` (`lo..hi`) yield an interval, while
+    /// `Record` and `Enumerated` yield a `Value::Set`.
+    pub fn domain_is_interval(self) -> bool {
+        matches!(self, Witness::Tuple | Witness::Interval)
+    }
+
+    /// Build the `DOMAIN f` value for a finite function with this witness and
+    /// sorted, distinct keys `keys`.
+    pub fn domain_value<'a>(self, mut keys: impl ExactSizeIterator<Item = &'a Value> + DoubleEndedIterator) -> Value {
+        if self.domain_is_interval() {
+            match (keys.next(), keys.next_back()) {
+                (Some(Value::Int(lo)), Some(Value::Int(hi))) => Value::Interval(*lo, *hi),
+                (Some(Value::Int(lo)), None) => Value::Interval(*lo, *lo),
+                _ => Value::Interval(1, 0),
+            }
+        } else {
+            Value::Set(keys.cloned().collect())
+        }
+    }
+
     /// The keys a function of this witness accepts as arguments at all:
     /// any other key is a type error, also when it is absent and the
     /// operation (EXCEPT) would leave an absent key unchanged.

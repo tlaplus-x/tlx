@@ -728,6 +728,12 @@ fn fcn_over_enumerated_domain() {
     assert_eq!(ops::len(&f).unwrap(), 2);
     assert_eq!(ops::apply(&f, &int(2)).unwrap(), int(8));
     assert_eq!(ops::domain(&f).unwrap().to_string(), "{1, 2}");
+    // Interval-backed non-1-based functions yield an Interval domain (matching
+    // TLC's FcnRcdValue.getDomainAsSet), while enumerated domains yield a Set.
+    let fi = Value::fcn_over(&ops::interval(0, 1), vec![(int(0), int(7)), (int(1), int(8))]).unwrap();
+    let fe = Value::fcn_over(&ints(&[0, 1]), vec![(int(0), int(7)), (int(1), int(8))]).unwrap();
+    assert!(matches!(ops::domain(&fi).unwrap(), Value::Interval(0, 1)));
+    assert!(matches!(ops::domain(&fe).unwrap(), Value::Set(_)));
     // The interval domain gives the tuple (TLC: an interval FcnRcdValue).
     assert!(matches!(Value::fcn_over(&ops::interval(1, 2), vec![(int(1), int(7)), (int(2), int(8))]).unwrap(), Value::Tuple(_)));
     // EXCEPT with a model value: unchanged (FcnRcdValue) vs an error (tuple).

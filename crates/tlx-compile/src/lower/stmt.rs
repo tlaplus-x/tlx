@@ -289,7 +289,7 @@ impl Lowerer<'_> {
         } else {
             hir::Expr::new(H::Quant { kind: QuantKind::Forall, bounds: inner_bounds, body: body.clone() }, body.span)
         };
-        let set = self.expr(&b.set, env, st);
+        let set = self.action_iter_set_expr(&b.set, env, st);
         let (set, ety) = self.typed_iter(set);
         let t = self.iter_temp(ety, &set);
         let id = self.repeats;
@@ -325,7 +325,7 @@ impl Lowerer<'_> {
 
     /// `x' \in S` for an unassigned `x`: a branch per element.
     fn go_assign_in(&mut self, v: usize, set: &hir::Expr, env: &LEnv, k: &Cont, st: &St) -> LResult<Stmt> {
-        let set = self.expr(set, env, st);
+        let set = self.action_iter_set_expr(set, env, st);
         // A constant domain: list its elements directly in the variable's
         // encoding.
         let direct = match (&*set.kind, self.var_ty(v)) {
@@ -470,7 +470,9 @@ impl Lowerer<'_> {
                 return self.assign(v, cur, k, st);
             }
             // Assigned: must equal the current value (else the branch is pruned).
-            let same = eq(self.next_var_expr(v), self.var_expr(v));
+            let next = self.next_var_expr(v);
+            let cur = self.var_expr(v);
+            let same = to_bool(self.typed_eq(next, cur));
             return self.guarded(same, k, st);
         }
         match &*e.kind {
@@ -618,7 +620,7 @@ impl Lowerer<'_> {
         let mut slots: Vec<(Temp, Expr, Option<Expr>)> = Vec::new();
         let mut upfront: Vec<(Temp, Expr)> = Vec::new();
         let mut env2 = env.clone();
-        let sets: Vec<Expr> = bounds.iter().map(|b| self.expr(&b.set, env, st)).collect();
+        let sets: Vec<Expr> = bounds.iter().map(|b| self.action_iter_set_expr(&b.set, env, st)).collect();
         let multi = bounds.len() > 1;
         for (idx, (b, set)) in bounds.iter().zip(sets).enumerate() {
             let need_upfront = multi && idx + 1 < bounds.len();

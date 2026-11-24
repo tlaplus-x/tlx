@@ -182,11 +182,11 @@ fn prerun_shapes_inner(
     if budget.walk_depth > 0 || search_is_volatile(base) {
         threads = 1;
     }
-    let (states, rest) = generation_bfs(base, threads, constrain, &chooser, &mut obs, (seen, queue.into()), &within)?;
-    if budget.walk_depth > 0 {
+    let (states, rest, errored) = generation_bfs(base, threads, constrain, &chooser, &mut obs, (seen, queue.into()), &within)?;
+    if !errored && budget.walk_depth > 0 {
         random_walks(base, &inits, budget.walk_depth, start + budget.time, constrain, &mut |v| obs.state(&chooser, v));
     }
-    let settled = chooser.settled() && rest;
+    let settled = !errored && chooser.settled() && rest;
     Ok(result(&obs.watch, hints, &chooser.bounds, states, settled))
 }
 
@@ -235,7 +235,11 @@ fn faithful_prerun<'a>(
         }
     }
     if let Some(e) = generation_error(&r) {
-        return Err(e);
+        if r.stats.distinct == 0 {
+            return Err(e);
+        }
+        let obs = watcher.obs.into_inner().unwrap();
+        return Ok(result(&obs.watch, hints, &chooser.bounds, r.stats.distinct as usize, false));
     }
     let obs = watcher.obs.into_inner().unwrap();
     // Settled: the layout settled and the search stopped with states left
@@ -581,7 +585,8 @@ fn volatile(base: &InterpModel, mut stack: Vec<hir::Expr>) -> bool {
 /// anew at each state that did not fit: the observations that decide when
 /// it settles are those of a sequential pre-run.
 ///
-/// The distinct states seen, and whether states were left unexpanded.
+/// The distinct states seen, whether states were left unexpanded, and whether
+/// generation stopped on a runtime error (after observing at least one state).
 fn generation_bfs<'a>(
     base: &InterpModel,
     threads: usize,
@@ -590,7 +595,7 @@ fn generation_bfs<'a>(
     obs: &mut Observed<'a>,
     (seen, mut frontier): (HashSet<u64>, Vec<State>),
     within: &(dyn Fn(usize) -> bool + Sync),
-) -> Result<(usize, bool), ModelError> {
+) -> Result<(usize, bool, bool), ModelError> {
     const SHARDS: usize = 64;
     let eager = threads <= 1;
     let mut shards: Vec<Mutex<HashSet<u64>>> = (0..SHARDS).map(|_| Mutex::new(HashSet::new())).collect();
@@ -688,9 +693,6 @@ fn generation_bfs<'a>(
             })
             .unwrap()
         };
-        if let Some(e) = err.lock().unwrap().take() {
-            return Err(e);
-        }
         let unexpanded = next_index.load(Ordering::Relaxed) < frontier.len();
         let mut next = Vec::new();
         let mut miss = false;
@@ -703,16 +705,23 @@ fn generation_bfs<'a>(
             miss |= m;
             halted |= h;
         }
+        if let Some(e) = err.lock().unwrap().take() {
+            let n = count.load(Ordering::Relaxed);
+            if n == 0 {
+                return Err(e);
+            }
+            return Ok((n, false, true));
+        }
         if miss && !eager && chooser.settle > 0 {
             obs.chosen = Some(chooser.choose(&obs.watch));
         }
         // (A sequential queue also holds the states found before it stopped.)
         if unexpanded || (eager && halted && !next.is_empty()) {
-            return Ok((count.load(Ordering::Relaxed), true));
+            return Ok((count.load(Ordering::Relaxed), true, false));
         }
         frontier = next;
     }
-    Ok((count.load(Ordering::Relaxed), !frontier.is_empty()))
+    Ok((count.load(Ordering::Relaxed), !frontier.is_empty(), false))
 }
 
 /// The pre-run's result from what `w` observed in `states` distinct states

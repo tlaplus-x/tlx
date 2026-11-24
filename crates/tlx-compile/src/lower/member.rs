@@ -21,7 +21,7 @@ impl Lowerer<'_> {
         match self.member_hir(x, env, set, env, st, 0) {
             Some(m) => m,
             None => {
-                let set = self.expr(set, env, st);
+                let set = self.extensional_set_expr(set, env, st);
                 self.member(x, env, set, st)
             }
         }
@@ -73,7 +73,7 @@ impl Lowerer<'_> {
         // element (otherwise the boxed membership reports the error).
         if let (ExprKind::Const(v), Some(Shape::Set { elem, .. })) = (&*x.kind, self.shape_of(set.ty)) {
             if let Ok(n) = v.normalize() {
-                if !elem.contains(&n) && typed::shapes_comparable(&Shape::of(&n), elem) {
+                if !elem.contains_semantic(&n) && typed::shapes_comparable(&Shape::of(&n), elem) {
                     let (_, bind) = self.share(set);
                     return let_in(bind, bool_lit(false));
                 }
@@ -143,7 +143,7 @@ impl Lowerer<'_> {
             }
             _ => x,
         };
-        if let Some(rank) = self.bit_rank(&set, &x) {
+        if let Some(rank) = self.bit_rank(&set, &x, true) {
             return Expr::new(Ty::Bool, ExprKind::BitMember { set, rank });
         }
         match self.sorted_elem(set.ty) {
@@ -385,18 +385,7 @@ impl Lowerer<'_> {
         let (tx, bind) = self.share(x);
         let la = self.expr(a, senv, st);
         let lb = self.expr(b, senv, st);
-        let elem_shape = |e: &Expr| -> Option<Shape> {
-            if let Some(Shape::Set { elem, .. }) = self.shape_of(e.ty) {
-                return Some((**elem).clone());
-            }
-            if let ExprKind::Const(v @ (Value::Set(_) | Value::Interval(..))) = &*e.kind {
-                if let Shape::Set { elem, .. } = Shape::of(v) {
-                    return Some(*elem);
-                }
-            }
-            None
-        };
-        let Some((ea, eb)) = elem_shape(&la).zip(elem_shape(&lb)) else {
+        let Some((ea, eb)) = self.set_elem_shape(&la).zip(self.set_elem_shape(&lb)) else {
             self.frame.restore(mark);
             return None;
         };
@@ -697,7 +686,7 @@ impl Lowerer<'_> {
         let fl = FieldLayout::of_shape(shape)?;
         let mut out = Vec::with_capacity(fl.locs.len());
         match shape {
-            Shape::Fcn { dom, range } => {
+            Shape::Fcn { dom, range, .. } => {
                 self.sid(range);
                 for (d, &loc) in dom.iter().zip(fl.locs.iter()) {
                     out.push((d.clone(), loc, (**range).clone()));
@@ -780,8 +769,12 @@ impl Lowerer<'_> {
             return Some(Expr::new(Ty::Bool, ExprKind::BitMember { set: m, rank: Expr::new(Ty::Int, ExprKind::Rank(x.clone())) }));
         }
         if elems.len() <= 16 {
-            let parts = elems.iter().filter_map(|e| self.const_words(e, sid)).map(|c| eq(x.clone(), c)).collect();
+            let consts: Vec<Expr> = elems.iter().filter_map(|e| self.const_words_semantic(e, sid)).collect();
+            let parts = consts.into_iter().map(|c| self.typed_eq(x.clone(), c)).collect();
             return Some(or_any(parts));
+        }
+        if shape.has_dynamic_witness() {
+            return None;
         }
         // Many composite elements: binary search in a constant sorted array
         // of their encodings (elements that do not fit `shape` are never
@@ -791,7 +784,7 @@ impl Lowerer<'_> {
             .iter()
             .filter_map(|e| {
                 let mut w = vec![0u64; ew];
-                tlx_layout::layout::encode(shape, &e.normalize().ok()?, &mut w).ok().map(|_| w)
+                tlx_layout::layout::encode_semantic(shape, &e.normalize().ok()?, &mut w).ok().map(|_| w)
             })
             .collect();
         encs.sort();

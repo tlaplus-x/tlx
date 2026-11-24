@@ -13,17 +13,21 @@ impl<'c> Compiler<'c> {
         Ok(match &*e.kind {
             ExprKind::MapGet { base, rank } => self.map_get(base, rank)?,
             ExprKind::MapPut { base, rank, value, plan } => self.map_put(ty, base, rank, value, plan)?,
-            ExprKind::MapBuild { bind, set, rank, value } => {
+            ExprKind::MapBuild { bind, set, rank, value, witness } => {
                 let MapDims { universe: u, bitset_words: bw, slot } = self.map_dims(ty)?;
                 let n = self.words(ty)?;
                 let src = self.src(set, false)?;
                 let bind = self.slots[*bind as usize];
                 let r = self.int_(rank)?;
                 let (v, _) = self.enc(value)?;
+                let witness = *witness;
                 let out = self.alloc(n);
                 self.fresh(
                     Box::new(move |fx| {
                         fx.fr.w[out..out + n].fill(0);
+                        if let Some(wv) = witness {
+                            fx.fr.w[out + n - 1] = wv;
+                        }
                         src.run(fx, bind, &mut |fx| {
                             let r = r(fx)?;
                             if r < 0 || r as usize >= u {
@@ -49,8 +53,9 @@ impl<'c> Compiler<'c> {
                 )
             }
             ExprKind::MapMerge(a, b) => {
-                let MapDims { bitset_words: bw, slot, .. } = self.map_dims(ty)?;
+                let d @ MapDims { bitset_words: bw, slot, .. } = self.map_dims(ty)?;
                 let n = self.words(ty)?;
+                let dyn_witness = n > d.words();
                 let (a, _) = self.enc(a)?;
                 let (b, _) = self.enc(b)?;
                 let fstage = self.alloc(n);
@@ -76,6 +81,9 @@ impl<'c> Compiler<'c> {
                                     SlotLayout::insert(bits, &mut m[bw..], r, val);
                                 }
                             }
+                        }
+                        if dyn_witness {
+                            m[n - 1] = 1;
                         }
                         Ok(Loc::frame(out))
                     }),
@@ -124,14 +132,17 @@ impl<'c> Compiler<'c> {
     }
 
     fn map_put(&mut self, ty: Ty, base: &Expr, rank: &Expr, value: &Expr, plan: &MapPutPlan) -> C<Code> {
-        let MapDims { universe: u, bitset_words: bw, slot } = self.map_dims(ty)?;
+        let d @ MapDims { universe: u, bitset_words: bw, slot } = self.map_dims(ty)?;
         let n = self.words(ty)?;
+        let dyn_witness = n > d.words();
         let r = self.int_(rank)?;
         let (b, _) = self.enc(base)?;
         let place = self.last;
         let (v, _) = self.enc(value)?;
         let insert = plan.inserts();
-        let non_integer = plan.reject_when_empty.clone();
+        let insert_witness = plan.insert_witness;
+        let reject_empty = plan.reject_when_empty.clone();
+        let reject_canon = plan.reject_when_canonical.clone();
         let out = self.out_slot(place, n);
         Ok(self.fresh(
             Box::new(move |fx| {
@@ -154,11 +165,17 @@ impl<'c> Compiler<'c> {
                             SlotLayout::insert(bits, &mut fx.fr.w[out + bw..out + n], r as usize, val);
                         }
                     }
-                } else if !insert
-                    && non_integer.iter().any(|range| range.contains(&(r as u64)))
-                    && fx.fr.w[out..out + bw].iter().all(|w| *w == 0)
-                {
-                    return err("Attempted to access tuple at a non integral index");
+                    if let Some(wv) = insert_witness {
+                        fx.fr.w[out + n - 1] = wv;
+                    }
+                } else if !insert && (!dyn_witness || fx.fr.w[out + n - 1] == 0) {
+                    let ru = r as u64;
+                    if r >= 0
+                        && (reject_canon.iter().any(|range| range.contains(&ru))
+                            || (reject_empty.iter().any(|range| range.contains(&ru)) && fx.fr.w[out..out + bw].iter().all(|w| *w == 0)))
+                    {
+                        return err("Attempted to access tuple at a non integral index");
+                    }
                 }
                 Ok(Loc::frame(out))
             }),

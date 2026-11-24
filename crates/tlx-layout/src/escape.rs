@@ -77,18 +77,25 @@ impl EscapeLayout {
     /// never handle numbers; aliases in the overflow store have equal keys.
     pub fn key(&self, words: &[u64]) -> Box<[u64]> {
         if !self.is_escaped(words) {
-            return words[..self.layout.words].into();
+            let mut out: Box<[u64]> = words[..self.layout.words].into();
+            if self.layout.has_dynamic_witness {
+                self.layout.canonicalize_state(&mut out);
+            }
+            return out;
         }
         let mut out = words.to_vec();
         let mut outlier = false;
         for i in 0..self.layout.vars.len() {
             let h = out[self.layout.words + i];
+            let range = self.layout.var_range(i);
             if h == 0 {
+                if self.layout.has_dynamic_witness {
+                    self.layout.node(i).canonicalize_words(&mut out[range]);
+                }
                 continue;
             }
-            let range = self.layout.var_range(i);
             let v = self.store().thaw(h);
-            if self.layout.node(i).encode(&v, &mut out[range.clone()]).is_ok() {
+            if self.layout.node(i).encode_semantic(&v, &mut out[range.clone()]).is_ok() {
                 out[self.layout.words + i] = 0;
             } else {
                 out[range].fill(0);

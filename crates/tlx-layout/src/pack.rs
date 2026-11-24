@@ -267,7 +267,7 @@ impl FieldLayout {
         match s {
             Shape::Record(fs) => Some(Self::of_shapes(fs.iter().map(|(_, f)| f))),
             Shape::Tuple(es) => Some(Self::of_shapes(es.iter())),
-            Shape::Fcn { dom, range } => Some(Self::of_shapes(std::iter::repeat_n(range.as_ref(), dom.len()))),
+            Shape::Fcn { dom, range, .. } => Some(Self::of_shapes(std::iter::repeat_n(range.as_ref(), dom.len()))),
             _ => None,
         }
     }
