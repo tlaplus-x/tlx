@@ -77,10 +77,18 @@ pub enum IndexMap {
 pub struct MapPutPlan {
     /// `Absent::Unchanged` (EXCEPT) or `Absent::Insert` (`:>`, `@@`).
     pub absent: Absent,
-    /// Key ranks that an EXCEPT on an empty map rejects although they are
-    /// absent: an empty map decodes as `<<>>`, whose witness admits only
-    /// integer keys (`Witness::Tuple.key_type()`). Empty for inserts.
+    /// For `Absent::Insert` on a map with `FcnWitness::Dynamic`, the trailing
+    /// witness word to write (`0` = canonical, `1` = enumerated). `None` for
+    /// static witnesses or `Absent::Unchanged`.
+    pub insert_witness: Option<u64>,
+    /// Key ranks that an EXCEPT on a canonical empty map rejects although they
+    /// are absent (`<<>>` admits only integer keys). Empty for inserts and for
+    /// maps with a static `Enumerated` witness.
     pub reject_when_empty: Arc<[std::ops::Range<u64>]>,
+    /// Key ranks that an EXCEPT on a canonical map rejects although they are
+    /// absent (`Tuple` / `Interval` admit only integer keys; `Record` admits
+    /// only string keys). Empty for inserts and for `Enumerated` maps.
+    pub reject_when_canonical: Arc<[std::ops::Range<u64>]>,
 }
 
 impl MapPutPlan {
@@ -479,6 +487,9 @@ pub enum ExprKind {
         set: Expr,
         rank: Expr,
         value: Expr,
+        /// Trailing witness word for `FcnWitness::Dynamic` maps (`Some(0)` =
+        /// canonical, `Some(1)` = enumerated), `None` for static witnesses.
+        witness: Option<u64>,
     },
     /// `f @@ g` on two maps of `ty`'s shape (`f`'s entries take precedence).
     MapMerge(Expr, Expr),

@@ -50,7 +50,7 @@ impl Lowerer<'_> {
             }
             // A record built as a function over an enumerated set of strings
             // (`[k \in {"a", "b"} |-> e]`): the slot of the key.
-            Some(Shape::Fcn { dom, range }) => {
+            Some(Shape::Fcn { dom, range, .. }) => {
                 if let Some(i) = dom.iter().position(|k| matches!(k, Value::Str(s) if *s == sym)) {
                     let loc = SlotLayout::of(&range).loc(0, i);
                     let fsid = self.sid(&range);
@@ -65,7 +65,7 @@ impl Lowerer<'_> {
             // A record built with `:>` and `@@` (a map over strings): the
             // slot of the key (absent: a runtime error, which the
             // interpreter reports).
-            Some(Shape::Map { key, range }) => {
+            Some(Shape::Map { key, range, .. }) => {
                 if let Ok(rank) = tlx_layout::layout::rank(&key, &Value::Str(sym)) {
                     return self.map_get(r, int_lit(rank as i64), &range);
                 }
@@ -174,7 +174,7 @@ impl Lowerer<'_> {
             return self.ref_op(crate::ir::RefOp::Apply, vec![f, k]);
         }
         if let Some((key, range)) = self.map_parts(f.ty) {
-            if let Some(r) = self.map_key_rank_hir(&key, arg, env, st) {
+            if let Some(r) = self.map_key_rank_hir(&key, arg, env, st, true) {
                 return self.map_get(f, r, &range);
             }
         }
@@ -236,7 +236,7 @@ impl Lowerer<'_> {
             _ => a,
         };
         if let Some((key, range)) = self.map_parts(f.ty) {
-            if let Some(r) = self.map_key_rank(&key, a.clone()) {
+            if let Some(r) = self.map_key_rank(&key, a.clone(), true) {
                 return self.map_get(f, r, &range);
             }
         }
@@ -385,7 +385,7 @@ impl Lowerer<'_> {
                 let slot = SlotLayout::of(&first);
                 Some((Sel::Index(IndexMap::IntRange { lo: 1, n: elems.len() as u32 }, slot), self.sid(&first)))
             }
-            Shape::Fcn { dom, range } => {
+            Shape::Fcn { dom, range, .. } => {
                 let slot = SlotLayout::of(&range);
                 let rsid = self.sid(&range);
                 if let Some(k) = konst {
@@ -420,7 +420,7 @@ impl Lowerer<'_> {
                 // Positions encoded in full-width Int{-1..i64::MAX} (word = position + 1).
                 let mut table = vec![0u64; u as usize];
                 for (i, d) in dom.iter().enumerate() {
-                    if let Ok(r) = tlx_layout::layout::rank(&ashape, d) {
+                    if let Ok(r) = tlx_layout::layout::rank_semantic(&ashape, d) {
                         table[r as usize] = i as u64 + 1;
                     }
                 }
@@ -472,6 +472,10 @@ impl Lowerer<'_> {
     ) -> Option<Expr> {
         let mut cur = self.expr(base, env, st);
         if self.is_ref(cur.ty) {
+            let Ty::Enc(rsid) = cur.ty else { unreachable!() };
+            if !updates.iter().all(|(_, val)| self.preserves_lazy_into(val, env, self.typing.shape(rsid), sets::EAGER_DEPTH)) {
+                return None;
+            }
             return Some(self.ref_except(cur, updates, env, st));
         }
         if !matches!(cur.ty, Ty::Enc(_)) {
@@ -487,7 +491,7 @@ impl Lowerer<'_> {
     /// integer ranges / atom sets: the slot at the mixed-radix position
     /// (a key outside the domain is a runtime error, as in TLC).
     pub(super) fn apply_product(&mut self, f: Expr, comps: Vec<Expr>) -> Option<Expr> {
-        let Some(Shape::Fcn { dom, range }) = self.shape_of(f.ty).cloned() else { return None };
+        let Some(Shape::Fcn { dom, range, .. }) = self.shape_of(f.ty).cloned() else { return None };
         let (pos, valid, binds) = self.product_key(&dom, comps)?;
         let rsid = self.sid(&range);
         let slot_layout = SlotLayout::of(&range);
@@ -581,6 +585,16 @@ impl Lowerer<'_> {
     /// encoding). `@` in `val` is the old value at the full path.
     pub(super) fn except_path(&mut self, b: Expr, keys: &[hir::ExceptKey], val: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         let Ty::Enc(bsid) = b.ty else { return None };
+        if keys.is_empty() {
+            if !self.preserves_lazy_into(val, env, self.typing.shape(bsid), sets::EAGER_DEPTH) {
+                return None;
+            }
+            // `@` is the old value of the selected slot.
+            let saved = self.at.replace(b);
+            let v = self.expr_into(val, env, st, bsid);
+            self.at = saved;
+            return Some(self.coerce_enc(v, bsid));
+        }
         // Bind the base (and a computed key) once: both are used twice.
         let (b, bind_b) = self.share(b);
         let key = match &keys[0] {
@@ -614,9 +628,10 @@ impl Lowerer<'_> {
             return Some(let_in(bind_b, x));
         }
         if let (ExprKind::Const(k), Some(shape)) = (&*key.kind, self.shape_of(b.ty).cloned()) {
-            // Tuples and records as the interpreter treats them: a key of
-            // the wrong kind is an error, one outside the domain leaves the
-            // value unchanged.
+            use tlx_layout::FcnWitness as W;
+            // Tuples, records, and fixed-domain functions as the interpreter
+            // treats them: a key rejected by the witness is an error; a
+            // comparable key outside the domain leaves the value unchanged.
             match (&shape, k) {
                 (Shape::Tuple(es), Value::Int(i)) if *i < 1 || *i as usize > es.len() => return Some(let_in(bind_b, b)),
                 (Shape::Tuple(_), Value::Int(_)) => {}
@@ -625,16 +640,31 @@ impl Lowerer<'_> {
                 (Shape::Tuple(_) | Shape::Record(_), _) => {
                     return Some(Expr::new(Ty::Enc(bsid), ExprKind::Fail("EXCEPT with a key of the wrong kind".into())))
                 }
+                (Shape::Fcn { dom, range, witness, .. }, _) if !dom.iter().any(|d| d == k) => {
+                    let fail = || Expr::new(Ty::Enc(bsid), ExprKind::Fail("EXCEPT with a key of the wrong kind".into()));
+                    let enum_ok = dom.is_empty() || dom.iter().all(|d| tlx_value::order::eq_tlc(d, k).is_ok());
+                    return match witness {
+                        W::Interval => Some(if matches!(k, Value::Int(_)) { let_in(bind_b, b) } else { fail() }),
+                        W::Enumerated => Some(if enum_ok { let_in(bind_b, b) } else { fail() }),
+                        W::Dynamic => {
+                            let canon_w = tlx_value::plan::Witness::canonical_of_sorted_keys(dom.iter());
+                            let canon_ok =
+                                if canon_w == tlx_value::plan::Witness::Enumerated { enum_ok } else { canon_w.key_type().admits(k) };
+                            if enum_ok && canon_ok {
+                                Some(let_in(bind_b, b))
+                            } else if !enum_ok && !canon_ok {
+                                Some(fail())
+                            } else if enum_ok {
+                                let w_off = SlotLayout::of(range).array_words(dom.len());
+                                let w_word = self.int_word(b.clone(), w_off, 1);
+                                Some(let_in(bind_b, Expr::new(Ty::Enc(bsid), ExprKind::If(eq(w_word, int_lit(1)), b, fail()))))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                }
                 _ => {}
-            }
-            // A key outside the domain (comparable with its elements, else
-            // TLC reports an error) leaves the function unchanged.
-            let same_kind = |d: &Value| std::mem::discriminant(d) == std::mem::discriminant(k);
-            if self
-                .slots(&shape)
-                .is_some_and(|ss| !ss.is_empty() && !ss.iter().any(|(d, _, _)| d == k) && ss.iter().all(|(d, _, _)| same_kind(d)))
-            {
-                return Some(let_in(bind_b, b));
             }
         }
         // A union of function-like arms (e.g. a snapshot that is a function or
@@ -654,16 +684,29 @@ impl Lowerer<'_> {
         let Ty::Enc(bsid) = b.ty else { return None };
         let (key, bind_k) = self.share(key);
         let (sel, elem_sid) = self.select(&b, &key)?;
+        // `ExceptIndex` with `IndexMap::Table` leaves `b` unchanged on `-1`:
+        // only valid when every absent atom in `key`'s universe is admitted by
+        // `b`'s witness without raising a TLC type/comparison error.
+        if let Sel::Index(IndexMap::Table(ref table), _) = sel {
+            if table.contains(&-1) {
+                let Some(Shape::Atom(univ)) = self.shape_of(key.ty) else { return None };
+                match self.shape_of(b.ty)? {
+                    Shape::Record(_) => {
+                        if !univ.iter().all(|u| matches!(u, Value::Str(_))) {
+                            return None;
+                        }
+                    }
+                    Shape::Fcn { dom, witness: tlx_layout::FcnWitness::Enumerated, .. } => {
+                        if !univ.iter().all(|u| dom.iter().all(|d| tlx_value::order::eq_tlc(d, u).is_ok())) {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
         let old = self.apply_sel(b.clone(), key.clone(), sel.clone(), elem_sid);
-        let v = if keys.len() == 1 {
-            // `@` is the old value of the selected slot.
-            let saved = self.at.replace(old);
-            let v = self.expr_into(val, env, st, elem_sid);
-            self.at = saved;
-            self.coerce_enc(v, elem_sid)
-        } else {
-            self.except_path(old, &keys[1..], val, env, st)?
-        };
+        let v = self.except_path(old, &keys[1..], val, env, st)?;
         let k = match sel {
             Sel::Loc(loc) => ExprKind::ExceptAt { base: b, loc, value: v },
             Sel::Index(map, slot) => {
@@ -721,6 +764,12 @@ impl Lowerer<'_> {
     /// when `k` is statically in the domain: `g` with the slot of `k` set
     /// to `v` (the domain stays that of `g`). None otherwise.
     pub(super) fn fcn_merge_into(&mut self, f: &hir::Expr, g: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
+        let Some(Shape::Fcn { dom, range, witness, key_variants }) = self.shape_of(Ty::Enc(sid)).cloned() else { return None };
+        // `(k :> v) @@ g` always builds an enumerated-domain function in TLC,
+        // and replaces the domain key at `k` with `k`'s own construction witness.
+        if witness == tlx_layout::FcnWitness::Interval || !key_variants.is_empty() {
+            return None;
+        }
         let (p, penv) = self.peel(f, env)?;
         let H::Builtin { op: B::ColonGt, args } = &*p.kind else { return None };
         if self.ip.is_builtin_overridden(B::ColonGt) {
@@ -728,6 +777,15 @@ impl Lowerer<'_> {
         }
         let key = self.expr(&args[0], &penv, st);
         if !is_trivial(&key) {
+            return None;
+        }
+        // Only keep `g`'s fixed domain representation when `key` cannot carry a
+        // different construction witness from `dom`.
+        let key_exact = match &*key.kind {
+            ExprKind::Const(kv) => dom.iter().any(|d| d.exact_eq(kv)),
+            _ => dom.iter().all(|d| matches!(d, Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::ModelValue(_))),
+        };
+        if !key_exact {
             return None;
         }
         let base = self.expr_into(g, env, st, sid);
@@ -752,7 +810,14 @@ impl Lowerer<'_> {
             }
             Sel::Pos(..) => return None,
         };
-        Some(let_in(bind_b, Expr::new(Ty::Enc(sid), k)))
+        let mut out = Expr::new(Ty::Enc(sid), k);
+        if witness == tlx_layout::FcnWitness::Dynamic {
+            let wsid = self.sid(&Shape::Int { lo: 0, hi: 1 });
+            let one = Expr::new(Ty::Enc(wsid), ExprKind::ConstWords(vec![1u64].into()));
+            let w_off = SlotLayout::of(&range).array_words(dom.len());
+            out = Expr::new(Ty::Enc(sid), ExprKind::ExceptAt { base: out, loc: FieldLoc::Words(w_off), value: one });
+        }
+        Some(let_in(bind_b, out))
     }
 
     /// `[s EXCEPT ![i]... = v]` on an encoded sequence: the slots after the
@@ -776,14 +841,7 @@ impl Lowerer<'_> {
         let esid = self.sid(elem);
         let slot = SlotLayout::of(elem);
         let old = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: b.clone(), arg: i.clone(), slot });
-        let v = if keys.len() == 1 {
-            let saved = self.at.replace(old);
-            let v = self.expr_into(val, env, st, esid);
-            self.at = saved;
-            self.coerce_enc(v, esid)
-        } else {
-            self.except_path(old, &keys[1..], val, env, st)?
-        };
+        let v = self.except_path(old, &keys[1..], val, env, st)?;
         let lsid = self.sid(&Shape::Int { lo: 0, hi: max_len as i64 });
         let ssid = self.sid(&Shape::Tuple(vec![elem.clone(); max_len].into()));
         let len_word = Expr::new(Ty::Enc(lsid), ExprKind::Slice { base: b.clone(), loc: FieldLoc::Words(0) });
@@ -814,21 +872,14 @@ impl Lowerer<'_> {
         st: &St,
     ) -> Option<Expr> {
         let Ty::Enc(bsid) = b.ty else { return None };
-        let Some(Shape::Fcn { dom, range }) = self.shape_of(b.ty).cloned() else { return None };
+        let Some(Shape::Fcn { dom, range, .. }) = self.shape_of(b.ty).cloned() else { return None };
         let (pos, valid, binds) = self.product_key(&dom, comps)?;
         let (pos, bind_p) = self.share(pos);
         let rsid = self.sid(&range);
         let slot = SlotLayout::of(&range);
         let map = IndexMap::IntRange { lo: 0, n: dom.len() as u32 };
         let old = Expr::new(Ty::Enc(rsid), ExprKind::Index { base: b.clone(), arg: pos.clone(), map: map.clone(), slot });
-        let v = if keys.len() == 1 {
-            let saved = self.at.replace(old);
-            let v = self.expr_into(val, env, st, rsid);
-            self.at = saved;
-            self.coerce_enc(v, rsid)
-        } else {
-            self.except_path(old, &keys[1..], val, env, st)?
-        };
+        let v = self.except_path(old, &keys[1..], val, env, st)?;
         let upd = Expr::new(Ty::Enc(bsid), ExprKind::ExceptIndex { base: b.clone(), arg: pos, map, slot, value: v });
         // TLC: EXCEPT on a key outside the domain leaves the function unchanged.
         let x = Expr::new(Ty::Enc(bsid), ExprKind::If(valid, upd, b));
@@ -931,10 +982,29 @@ impl Lowerer<'_> {
         }
         match self.shape_of(x.ty)?.clone() {
             Shape::Tuple(es) => Some(fixed(self, x, Value::Interval(1, es.len() as i64))),
-            Shape::Map { key, .. } => Some(self.map_domain(x, &key)),
-            Shape::Fcn { dom, .. } => {
-                let d = Value::set_from(dom.to_vec()).ok()?;
-                Some(fixed(self, x, d))
+            // Only an enumerated-witness map is guaranteed to have a `Value::Set`
+            // domain; an interval or dynamic map can hold a `Value::Tuple`
+            // (including `<<>>`) whose `DOMAIN` is `Value::Interval(1, n)`.
+            Shape::Map { key, witness: tlx_layout::FcnWitness::Enumerated, .. } => Some(self.map_domain(x, &key)),
+            Shape::Fcn { dom, witness, key_variants, .. } => {
+                use tlx_value::plan::Witness as PW;
+                // Defer to runtime when any key's construction witness is
+                // dynamic, or when a mixed-witness slot can yield either an
+                // interval or an enumerated set depending on its runtime tag.
+                if !key_variants.is_empty() {
+                    return None;
+                }
+                let w = match witness {
+                    tlx_layout::FcnWitness::Interval => PW::Interval,
+                    tlx_layout::FcnWitness::Enumerated => PW::Enumerated,
+                    tlx_layout::FcnWitness::Dynamic => {
+                        if PW::canonical_of_sorted_keys(dom.iter()).domain_is_interval() {
+                            return None;
+                        }
+                        PW::Enumerated
+                    }
+                };
+                Some(fixed(self, x, w.domain_value(dom.iter())))
             }
             Shape::Record(fs) => {
                 let d = Value::set_from(fs.iter().map(|(n, _)| Value::Str(*n)).collect()).ok()?;
@@ -980,13 +1050,18 @@ impl Lowerer<'_> {
         let (la, lb) = if self.constructs(a, env) {
             let lb = self.expr(b, env, st);
             match lb.ty {
-                Ty::Enc(sid) => (self.expr_into(a, env, st, sid), lb),
+                Ty::Enc(sid) if self.preserves_lazy_into(a, env, self.typing.shape(sid), sets::EAGER_DEPTH) => {
+                    (self.expr_into(a, env, st, sid), lb)
+                }
                 _ => {
                     // `b` untyped on its own (e.g. a recursive operator whose
                     // result representation is not inferred): into `a`'s.
                     let la = self.expr(a, env, st);
                     match la.ty {
-                        Ty::Enc(sid) if !matches!(&*lb.kind, ExprKind::Const(_)) => {
+                        Ty::Enc(sid)
+                            if !matches!(&*lb.kind, ExprKind::Const(_))
+                                && self.preserves_lazy_into(b, env, self.typing.shape(sid), sets::EAGER_DEPTH) =>
+                        {
                             let lb = self.expr_into(b, env, st, sid);
                             (la, lb)
                         }
@@ -997,7 +1072,7 @@ impl Lowerer<'_> {
         } else {
             let la = self.expr(a, env, st);
             match la.ty {
-                Ty::Enc(sid) => {
+                Ty::Enc(sid) if self.preserves_lazy_into(b, env, self.typing.shape(sid), sets::EAGER_DEPTH) => {
                     let lb = self.expr_into(b, env, st, sid);
                     (la, lb)
                 }
@@ -1010,11 +1085,17 @@ impl Lowerer<'_> {
         // A constant operand: in the other operand's encoding if it fits.
         let (la, lb) = match (la.ty, lb.ty) {
             (Ty::Enc(sid), Ty::Val) => {
-                let lb = typed::const_of(&lb).and_then(|v| self.const_words(&v, sid)).unwrap_or(lb);
+                let lb = typed::const_of(&lb)
+                    .filter(|v| !typed::has_non_reducible_lazy_set(v))
+                    .and_then(|v| self.const_words(&v, sid))
+                    .unwrap_or(lb);
                 (la, lb)
             }
             (Ty::Val, Ty::Enc(sid)) => {
-                let la = typed::const_of(&la).and_then(|v| self.const_words(&v, sid)).unwrap_or(la);
+                let la = typed::const_of(&la)
+                    .filter(|v| !typed::has_non_reducible_lazy_set(v))
+                    .and_then(|v| self.const_words(&v, sid))
+                    .unwrap_or(la);
                 (la, lb)
             }
             _ => (la, lb),
@@ -1043,14 +1124,18 @@ impl Lowerer<'_> {
     pub(super) fn typed_append(&mut self, s: &hir::Expr, x: &hir::Expr, env: &LEnv, st: &St) -> Expr {
         let s = self.expr(s, env, st);
         if self.is_ref(s.ty) {
-            let x = self.ref_expr(x, env, st);
-            return self.ref_op(crate::ir::RefOp::Append, vec![s, x]);
-        }
-        if let Some(Shape::Seq { elem, max_len }) = self.shape_of(s.ty).cloned() {
-            let esid = self.sid(&elem);
-            let slot = SlotLayout::of(&elem);
-            let x = self.expr_into(x, env, st, esid);
-            return Expr::new(s.ty, ExprKind::SeqAppend { base: s, value: x, slot, max_len: max_len as u32 });
+            let Ty::Enc(rsid) = s.ty else { unreachable!() };
+            if self.preserves_lazy_into(x, env, self.typing.shape(rsid), sets::EAGER_DEPTH) {
+                let x = self.ref_expr(x, env, st);
+                return self.ref_op(crate::ir::RefOp::Append, vec![s, x]);
+            }
+        } else if let Some(Shape::Seq { elem, max_len }) = self.shape_of(s.ty).cloned() {
+            if self.preserves_lazy_into(x, env, &elem, sets::EAGER_DEPTH) {
+                let esid = self.sid(&elem);
+                let slot = SlotLayout::of(&elem);
+                let x = self.expr_into(x, env, st, esid);
+                return Expr::new(s.ty, ExprKind::SeqAppend { base: s, value: x, slot, max_len: max_len as u32 });
+            }
         }
         let x = self.expr(x, env, st);
         self.val_op(B::Append, vec![s, x])

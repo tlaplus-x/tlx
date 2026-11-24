@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tlx_layout::layout::{bitset_universe, decode, encode, rank, unrank, words};
 use tlx_layout::layout_tree::transcode;
-use tlx_layout::shape::map_shape;
+use tlx_layout::shape::{map_shape, set_shape, FcnWitness};
 use tlx_layout::{Layout, LayoutNode, Shape};
 use tlx_value::{Sym, Value};
 
@@ -86,23 +86,44 @@ fn shape(rng: &mut Rng, depth: u32) -> Shape {
     match rng.below_or_zero(9) {
         0 => {
             let elem = shape(rng, depth + 1);
-            Shape::Set { elem: Box::new(elem), max_card: rng.below_or_zero(5) as usize }
+            set_shape(elem, rng.below_or_zero(5) as usize)
         }
         1 => {
-            // A domain that is neither `1..n` nor all strings.
             let n = 1 + rng.below_or_zero(3);
-            let pairs: Vec<(Value, Value)> = if rng.chance_inclusive(0.5) {
-                (0..n).map(|i| (Value::Int(i as i64), Value::TRUE)).collect()
+            let (pairs, witness): (Vec<(Value, Value)>, FcnWitness) = if rng.chance_inclusive(0.4) {
+                let w = match rng.below_or_zero(3) {
+                    0 => FcnWitness::Enumerated,
+                    1 => FcnWitness::Interval,
+                    _ => FcnWitness::Dynamic,
+                };
+                ((0..n).map(|i| (Value::Int(i as i64), Value::TRUE)).collect(), w)
+            } else if rng.chance_inclusive(0.5) {
+                let w = if rng.chance_inclusive(0.5) { FcnWitness::Enumerated } else { FcnWitness::Dynamic };
+                ((1..=n).map(|i| (Value::Int(i as i64), Value::TRUE)).collect(), w)
             } else {
                 let mut a: Vec<Value> = (0..n).map(|i| Value::model_value(ATOMS[i as usize])).collect();
                 a.push(Value::Int(7));
-                a.into_iter().map(|k| (k, Value::TRUE)).collect()
+                (a.into_iter().map(|k| (k, Value::TRUE)).collect(), FcnWitness::Enumerated)
             };
-            let Value::Fcn(ps, _) = Value::fcn_from_pairs(pairs).unwrap() else { unreachable!() };
+            let Value::Fcn(ps, _) = Value::fcn_rcd_from_pairs(pairs).unwrap() else { unreachable!() };
             let dom: Arc<[Value]> = ps.iter().map(|p| p.0.clone()).collect();
-            Shape::Fcn { dom, range: Box::new(shape(rng, depth + 1)) }
+            Shape::Fcn { dom, range: Box::new(shape(rng, depth + 1)), witness, key_variants: Arc::from([]) }
         }
-        2 => map_shape(key_shape(rng), shape(rng, depth + 1)),
+        2 => {
+            let key = key_shape(rng);
+            let witness = if matches!(key, Shape::Int { .. }) {
+                match rng.below_or_zero(3) {
+                    0 => FcnWitness::Enumerated,
+                    1 => FcnWitness::Interval,
+                    _ => FcnWitness::Dynamic,
+                }
+            } else if rng.chance_inclusive(0.5) {
+                FcnWitness::Enumerated
+            } else {
+                FcnWitness::Dynamic
+            };
+            map_shape(key, shape(rng, depth + 1), witness)
+        }
         3 => record_shape(rng, depth, false),
         4 => Shape::Tuple((0..rng.below_or_zero(4)).map(|_| shape(rng, depth + 1)).collect()),
         5 => Shape::Seq { elem: Box::new(shape(rng, depth + 1)), max_len: rng.below_or_zero(4) as usize },
@@ -146,13 +167,28 @@ fn value(rng: &mut Rng, s: &Shape, depth: u32) -> Value {
             }
             Value::Set(Arc::from(es))
         }
-        Shape::Fcn { dom, range } => Value::fcn_decoded(dom.iter().map(|d| (d.clone(), value(rng, range, depth + 1))).collect()),
-        Shape::Map { key, range } => {
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            let mut kv_slot = 0usize;
+            let pairs: Vec<(Value, Value)> = (0..dom.len())
+                .map(|pos| {
+                    let key = tlx_layout::shape::fcn_key_at(dom, key_variants, &mut kv_slot, pos, |_, vs| {
+                        rng.below_or_zero(vs.len() as u64) as usize
+                    })
+                    .clone();
+                    (key, value(rng, range, depth + 1))
+                })
+                .collect();
+            witness.decode_fcn(pairs, || u64::from(!rng.chance_inclusive(0.5)))
+        }
+        Shape::Map { key, range, witness } => {
             let n = rng.below_or_zero(4);
             let mut pairs: Vec<(Value, Value)> = (0..n).map(|_| (value(rng, key, depth + 1), value(rng, range, depth + 1))).collect();
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             pairs.dedup_by(|a, b| a.0 == b.0);
-            Value::fcn_from_pairs(pairs).unwrap_or(Value::TRUE)
+            let Ok(Value::Fcn(sorted, _)) = Value::fcn_rcd_from_pairs(pairs) else {
+                return Value::TRUE;
+            };
+            witness.decode_map(sorted.to_vec(), || u64::from(!rng.chance_inclusive(0.5)))
         }
         Shape::Record(fs) => Value::Record(fs.iter().map(|(k, f)| (*k, value(rng, f, depth + 1))).collect()),
         Shape::Tuple(es) => Value::tuple(es.iter().map(|e| value(rng, e, depth + 1)).collect()),
@@ -321,11 +357,19 @@ fn transcode_matches_reencoding() {
             }
             let mut got = vec![0u64; nn.words()];
             let ok = transcode(&no, &nn, &src, &mut got);
+            let decoded = no.decode(&src);
             let mut want = vec![0u64; nn.words()];
-            let fits = nn.encode(&v, &mut want).is_ok();
+            let fits = nn.encode(&decoded, &mut want).is_ok();
             assert_eq!(ok, fits, "transcode of {v} from {old:?} to {new:?}");
             if ok {
                 assert_eq!(got, want, "transcode of {v} from {old:?} to {new:?}");
+                let mut orig = vec![0u64; nn.words()];
+                if nn.encode(&v, &mut orig).is_ok() {
+                    let mut got_can = got.clone();
+                    nn.canonicalize_words(&mut got_can);
+                    nn.canonicalize_words(&mut orig);
+                    assert_eq!(got_can, orig, "canonical transcode of {v} from {old:?} to {new:?}");
+                }
                 copied += 1;
             }
         }

@@ -52,8 +52,11 @@ fn shape(e: &Expr, layout: &Layout, remaining: &mut usize, depth: usize) -> Opti
             if args.len() != 1 {
                 return None;
             }
-            let Shape::Fcn { dom, .. } = sub(&args[0])? else { return None };
-            Some(Shape::Fcn { dom, range: Box::new(sub(body)?) })
+            let Shape::Fcn { dom, witness, key_variants, .. } = sub(&args[0])? else { return None };
+            if witness == tlx_layout::FcnWitness::Dynamic || !key_variants.is_empty() {
+                return None;
+            }
+            Some(Shape::Fcn { dom, range: Box::new(sub(body)?), witness, key_variants: std::sync::Arc::from([]) })
         }
         _ => None,
     }

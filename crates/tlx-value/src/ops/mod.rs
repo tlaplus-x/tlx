@@ -60,7 +60,9 @@ pub fn is_enumerable(s: &Value) -> bool {
     }
 }
 
-pub(super) fn is_reducible(s: &Value) -> bool {
+/// TLC's `instanceof Reducible`: eager sets/intervals whose elements TLC
+/// filters directly on `\cap` and `\` (retaining their element witnesses).
+pub fn is_reducible(s: &Value) -> bool {
     matches!(s, Value::Set(_) | Value::Interval(..)) || matches!(s, Value::LazySet(l) if matches!(**l, LazySet::Enum(_)))
 }
 

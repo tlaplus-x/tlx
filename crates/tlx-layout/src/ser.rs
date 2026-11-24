@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tlx_value::ser::{decode_arc, DecodeResult, Reader, Writer};
 
 use crate::layout::Layout;
-use crate::shape::Shape;
+use crate::shape::{FcnWitness, Shape};
 
 const S_NEVER: u8 = 0;
 const S_BOOL: u8 = 1;
@@ -47,6 +47,27 @@ const S_TUPLE: u8 = 8;
 const S_SEQ: u8 = 9;
 const S_UNION: u8 = 10;
 const S_DYN: u8 = 11;
+
+const W_ENUM: u8 = 0;
+const W_INTV: u8 = 1;
+const W_DYN: u8 = 2;
+
+fn write_witness(w: &mut Writer, witness: FcnWitness) {
+    w.u8(match witness {
+        FcnWitness::Enumerated => W_ENUM,
+        FcnWitness::Interval => W_INTV,
+        FcnWitness::Dynamic => W_DYN,
+    });
+}
+
+fn read_witness(r: &mut Reader<'_>) -> DecodeResult<FcnWitness> {
+    Ok(match r.u8()? {
+        W_ENUM => FcnWitness::Enumerated,
+        W_INTV => FcnWitness::Interval,
+        W_DYN => FcnWitness::Dynamic,
+        t => return r.error(format!("unknown function witness tag {t}")),
+    })
+}
 
 const MAX_DEPTH: u32 = 1000;
 
@@ -68,15 +89,22 @@ pub fn write_shape(w: &mut Writer, s: &Shape) {
             write_shape(w, elem);
             w.usize(*max_card);
         }
-        Shape::Fcn { dom, range } => {
+        Shape::Fcn { dom, range, witness, key_variants } => {
             w.u8(S_FCN);
             write_values(w, dom);
             write_shape(w, range);
+            write_witness(w, *witness);
+            w.usize(key_variants.len());
+            for (pos, vs) in key_variants.iter() {
+                w.usize(*pos);
+                write_values(w, vs);
+            }
         }
-        Shape::Map { key, range } => {
+        Shape::Map { key, range, witness } => {
             w.u8(S_MAP);
             write_shape(w, key);
             write_shape(w, range);
+            write_witness(w, *witness);
         }
         Shape::Record(fs) => {
             w.u8(S_RECORD);
@@ -138,9 +166,44 @@ fn read_shape_at(r: &mut Reader<'_>, depth: u32) -> DecodeResult<Shape> {
         S_SET => Shape::Set { elem: Box::new(read_shape_at(r, d)?), max_card: r.usize()? },
         S_FCN => {
             let dom = read_values(r)?;
-            Shape::Fcn { dom, range: Box::new(read_shape_at(r, d)?) }
+            let range = Box::new(read_shape_at(r, d)?);
+            let witness = read_witness(r)?;
+            let kv_n = r.count(2)?;
+            let mut key_variants = Vec::with_capacity(kv_n);
+            let mut prev_pos: Option<usize> = None;
+            for _ in 0..kv_n {
+                let pos = r.usize()?;
+                if pos >= dom.len() || prev_pos.is_some_and(|p| pos <= p) {
+                    return r.error(format!("invalid function key variant position {pos}"));
+                }
+                prev_pos = Some(pos);
+                let vs = read_values(r)?;
+                if vs.len() < 2 {
+                    return r.error("function key variant must hold at least two keys");
+                }
+                if !vs[0].exact_eq(&dom[pos]) {
+                    return r.error("function key variant first key must match domain representative");
+                }
+                for w in vs.windows(2) {
+                    if w[0].exact_cmp(&w[1]) != std::cmp::Ordering::Less {
+                        return r.error("function key variants must be strictly increasing in exact order");
+                    }
+                }
+                for v in &vs[1..] {
+                    if tlx_value::order::eq_tlc(&vs[0], v) != Ok(true) {
+                        return r.error("function key variants must be TLA+-equal to domain representative");
+                    }
+                }
+                key_variants.push((pos, vs));
+            }
+            Shape::Fcn { dom, range, witness, key_variants: Arc::from(key_variants) }
         }
-        S_MAP => Shape::Map { key: Box::new(read_shape_at(r, d)?), range: Box::new(read_shape_at(r, d)?) },
+        S_MAP => {
+            let key = Box::new(read_shape_at(r, d)?);
+            let range = Box::new(read_shape_at(r, d)?);
+            let witness = read_witness(r)?;
+            Shape::Map { key, range, witness }
+        }
         S_RECORD => {
             let n = r.count(2)?;
             let mut fs = Vec::with_capacity(n);

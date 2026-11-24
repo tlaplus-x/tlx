@@ -259,7 +259,7 @@ impl<'a> Check<'a> {
         let slots: Vec<&Shape> = match self.shape(base.ty)? {
             Shape::Tuple(parts) => parts.iter().collect(),
             Shape::Record(fields) => fields.iter().map(|(_, s)| s).collect(),
-            Shape::Fcn { dom, range } => vec![range; dom.len()],
+            Shape::Fcn { dom, range, .. } => vec![range; dom.len()],
             _ => return Err("indexed base has no fixed slots".into()),
         };
         require(slots.iter().all(|s| **s == *val_shape), "index slot shape mismatch")?;
@@ -626,20 +626,29 @@ impl<'a> Check<'a> {
             MapGet { base, rank } | MapPut { base, rank, .. } => {
                 self.expr(base)?;
                 self.expect(rank, Ty::Int)?;
-                let Shape::Map { range, .. } = self.shape(base.ty)? else {
+                let Shape::Map { range, witness, .. } = self.shape(base.ty)? else {
                     return Err("map operation on non-map".into());
                 };
-                if let MapPut { value, .. } = &*e.kind {
+                if let MapPut { value, plan, .. } = &*e.kind {
                     same(e.ty, base.ty)?;
+                    if plan.inserts() {
+                        let want_dyn = *witness == tlx_layout::FcnWitness::Dynamic;
+                        require(plan.insert_witness.is_some() == want_dyn, "map put dynamic witness mismatch")?;
+                        require(plan.insert_witness.is_none_or(|w| w <= 1), "invalid map put witness value")?;
+                    } else {
+                        require(plan.insert_witness.is_none(), "map put unchanged carries insert witness")?;
+                    }
                     self.expect(value, self.shape_ty(range)?)
                 } else {
                     same(e.ty, self.shape_ty(range)?)
                 }
             }
-            MapBuild { bind, set, rank, value } => {
-                let Shape::Map { range, .. } = self.shape(e.ty)? else {
+            MapBuild { bind, set, rank, value, witness: w } => {
+                let Shape::Map { range, witness, .. } = self.shape(e.ty)? else {
                     return Err("map construction result is not a map".into());
                 };
+                require(w.is_some() == (*witness == tlx_layout::FcnWitness::Dynamic), "map build dynamic witness mismatch")?;
+                require(w.is_none_or(|v| v <= 1), "invalid map build witness value")?;
                 let result = self.shape_ty(range)?;
                 let ty = self.source(set)?;
                 self.bind(*bind, ty, |c| {
@@ -648,7 +657,10 @@ impl<'a> Check<'a> {
                 })
             }
             MapMerge(a, b) => {
-                require(matches!(self.shape(e.ty)?, Shape::Map { .. }), "map merge result is not a map")?;
+                let Shape::Map { witness, .. } = self.shape(e.ty)? else {
+                    return Err("map merge result is not a map".into());
+                };
+                require(*witness != tlx_layout::FcnWitness::Interval, "map merge into interval map")?;
                 self.expect(a, e.ty)?;
                 self.expect(b, e.ty)
             }

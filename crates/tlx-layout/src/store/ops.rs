@@ -56,15 +56,34 @@ pub fn witness(s: &Store, f: u64) -> Option<Witness> {
 }
 
 impl Store {
-    /// `DOMAIN f` (`ops::domain`): `1..n` of a tuple, the set of a
-    /// record's fields or of a function's keys.
+    /// `DOMAIN f` (`ops::domain`): `1..n` of a tuple, `lo..hi` of an
+    /// interval-backed function, or the enumerated set of a record's fields or
+    /// an enumerated function's keys.
     pub fn domain(&self, f: u64) -> R<u64> {
         let Some(node) = self.node(f) else { return eval() };
+        if let Body::Fcn(kv, FcnDom::Interval) = &node.body {
+            let keys = &kv[..kv.len() / 2];
+            if !keys.is_empty() && (as_int(keys[0]).is_none() || as_int(keys[keys.len() - 1]).is_none()) {
+                return eval();
+            }
+        }
         let make = || -> Result<u64, StoreError> {
             match &node.body {
                 Body::Tuple(t) => self.intern(Body::Interval(1, t.len() as i64)),
                 Body::Record(r) => self.intern(Body::Set(r.iter().map(|(k, _)| str_handle(*k)).collect())),
-                Body::Fcn(kv, _) => self.intern(Body::Set(kv[..kv.len() / 2].into())),
+                Body::Fcn(kv, dom) => {
+                    let keys = &kv[..kv.len() / 2];
+                    let w = if *dom == FcnDom::Interval { Witness::Interval } else { Witness::Enumerated };
+                    if w.domain_is_interval() {
+                        let (lo, hi) = match (keys.first(), keys.last()) {
+                            (Some(&a), Some(&b)) => (as_int(a).unwrap(), as_int(b).unwrap()),
+                            _ => (1, 0),
+                        };
+                        self.intern(Body::Interval(lo, hi))
+                    } else {
+                        self.intern(Body::Set(keys.into()))
+                    }
+                }
                 _ => unreachable!(),
             }
         };

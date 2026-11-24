@@ -543,8 +543,11 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
         | K::Choose { bind, .. }
         | K::Filter { bind, .. }
         | K::Collect { bind, .. }
-        | K::UnionFold { bind, .. }
-        | K::MapBuild { bind, .. } => h.u64(*bind as u64),
+        | K::UnionFold { bind, .. } => h.u64(*bind as u64),
+        K::MapBuild { bind, witness, .. } => {
+            h.u64(*bind as u64);
+            h.u64(witness.map_or(u64::MAX, |w| w));
+        }
         K::MapSet { bind, cond, .. } => h.u64((*bind as u64) << 1 | cond.is_some() as u64),
         K::Fold { product, bind, .. } => h.u64((*bind as u64) << 1 | *product as u64),
         K::Let { temp, .. } => h.u64(*temp as u64),
@@ -621,8 +624,11 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
             arms.iter().for_each(|a| words(h, a));
         }
         K::Lookup { table: t, .. } => table(h, t),
-        // (The plan's rejected ranks follow from the node's type.)
-        K::MapPut { plan, .. } => h.u64(plan.inserts() as u64),
+        // (The plan's rejected ranks follow from the node's type; insert_witness varies per site.)
+        K::MapPut { plan, .. } => {
+            h.u64(plan.inserts() as u64);
+            h.u64(plan.insert_witness.map_or(u64::MAX, |w| w));
+        }
         // Its statement tree, instead of the expressions in it.
         K::Enabled(s) => return hash_stmt(h, s),
         K::Call { func, args } => {

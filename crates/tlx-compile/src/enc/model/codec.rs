@@ -18,7 +18,7 @@ impl EncModel {
     /// The run's value store (`TLX_VALUE_STORE`), if the layout has
     /// handles.
     pub fn value_store(&self) -> Option<&tlx_layout::store::StoreRef> {
-        self.sem.as_ref().map(|s| &s.store)
+        self.sem.as_ref().and_then(|s| s.store.as_ref())
     }
 
     /// The variable values of an encoded state.

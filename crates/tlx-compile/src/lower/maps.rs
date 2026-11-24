@@ -38,7 +38,15 @@ impl Lowerer<'_> {
     /// Key and range shapes of an encoded map.
     pub(super) fn map_parts(&self, t: Ty) -> Option<(Shape, Shape)> {
         match self.shape_of(t)? {
-            Shape::Map { key, range } => Some(((**key).clone(), (**range).clone())),
+            Shape::Map { key, range, .. } => Some(((**key).clone(), (**range).clone())),
+            _ => None,
+        }
+    }
+
+    /// Key, range, and witness of an encoded map.
+    pub(super) fn map_info(&self, t: Ty) -> Option<(Shape, Shape, tlx_layout::FcnWitness)> {
+        match self.shape_of(t)? {
+            Shape::Map { key, range, witness } => Some(((**key).clone(), (**range).clone(), *witness)),
             _ => None,
         }
     }
@@ -53,7 +61,7 @@ impl Lowerer<'_> {
     /// Rank of `x` in the universe of `key` (an integer expression; values
     /// outside the universe rank outside `0..|universe|` or fail at run
     /// time). `x` is brought into the key encoding first if necessary.
-    pub(super) fn map_key_rank(&mut self, key: &Shape, x: Expr) -> Option<Expr> {
+    pub(super) fn map_key_rank(&mut self, key: &Shape, x: Expr, semantic: bool) -> Option<Expr> {
         let ksid = self.sid(key);
         let dsid = self.sid(&map_domain_shape(key));
         let probe = self.zero_enc(dsid);
@@ -64,23 +72,23 @@ impl Lowerer<'_> {
             Ty::Val if !matches!(&*x.kind, ExprKind::Const(_)) => self.coerce_enc(x, ksid),
             _ => x,
         };
-        if let Some(r) = self.bit_rank(&probe, &x) {
+        if let Some(r) = self.bit_rank(&probe, &x, semantic) {
             return Some(r);
         }
         let x = self.coerce_enc(x, ksid);
-        self.bit_rank(&probe, &x)
+        self.bit_rank(&probe, &x, semantic)
     }
 
     /// `map_key_rank` of the key expression `e` (a constructor is built
     /// directly in the key encoding).
-    pub(super) fn map_key_rank_hir(&mut self, key: &Shape, e: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
+    pub(super) fn map_key_rank_hir(&mut self, key: &Shape, e: &hir::Expr, env: &LEnv, st: &St, semantic: bool) -> Option<Expr> {
         let x = if self.constructs(e, env) {
             let ksid = self.sid(key);
             self.expr_into(e, env, st, ksid)
         } else {
             self.expr(e, env, st)
         };
-        self.map_key_rank(key, x)
+        self.map_key_rank(key, x, semantic)
     }
 
     /// `m[k]` for the key of rank `rank` (absent: runtime error).
@@ -95,32 +103,81 @@ impl Lowerer<'_> {
     /// (they decode as tuples).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn map_except(&mut self, m: Expr, k: Expr, keys: &[hir::ExceptKey], val: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
-        let (key, range) = self.map_parts(m.ty)?;
-        let rank = self.map_key_rank(&key, k)?;
+        use tlx_layout::FcnWitness as W;
+        let Ty::Enc(msid) = m.ty else { return None };
+        let (key, range, witness) = self.map_info(m.ty)?;
+        if !typed::shapes_comparable(&key, &key) {
+            return None;
+        }
+        if let ExprKind::Const(v) = &*k.kind {
+            if tlx_layout::layout::rank_semantic(&key, v).is_err() {
+                if !v.normalize().is_ok_and(|n| typed::comparable(&key, &n)) {
+                    return None;
+                }
+                // Key is comparable with the key universe and statically absent:
+                // value expression is never evaluated.
+                let mty = m.ty;
+                let fail = || Expr::new(mty, ExprKind::Fail("Attempted to access tuple at a non integral index".into()));
+                return Some(match witness {
+                    W::Enumerated => m,
+                    W::Interval => {
+                        if matches!(v, Value::Int(_)) {
+                            m
+                        } else {
+                            fail()
+                        }
+                    }
+                    W::Dynamic => {
+                        let admit_empty = tlx_value::plan::Witness::Tuple.key_type().admits(v);
+                        let admit_nonempty = crate::types::map_canonical_witness(&key).key_type().admits(v);
+                        if admit_empty && admit_nonempty {
+                            m
+                        } else {
+                            let w_off = self.words(msid) as usize - 1;
+                            let w_word = self.int_word(m.clone(), w_off, 1);
+                            let is_enum = eq(w_word, int_lit(1));
+                            let ok = if !admit_empty && !admit_nonempty {
+                                is_enum
+                            } else {
+                                let dom = self.map_domain(m.clone(), &key);
+                                let dsid = self.sid(&map_domain_shape(&key));
+                                let non_empty = not(eq(dom, self.zero_enc(dsid)));
+                                or(vec![is_enum, non_empty])
+                            };
+                            Expr::new(mty, ExprKind::If(ok, m, fail()))
+                        }
+                    }
+                });
+            }
+        } else if let Some(ks) = self.shape_of(k.ty) {
+            if !typed::shapes_comparable(&key, ks) {
+                return None;
+            }
+        }
+        let rank = self.map_key_rank(&key, k, true)?;
         let (rank, bind) = self.share(rank);
         let old = self.map_get(m.clone(), rank.clone(), &range);
-        let v = if keys.len() == 1 {
-            let rsid = self.sid(&range);
-            let saved = self.at.replace(old);
-            let v = self.expr_into(val, env, st, rsid);
-            self.at = saved;
-            self.coerce_enc(v, rsid)
-        } else {
-            self.except_path(old, &keys[1..], val, env, st)?
-        };
+        let v = self.except_path(old, &keys[1..], val, env, st)?;
         let ty = m.ty;
-        let plan = self.typing.map_put_plan(ty, Absent::Unchanged);
+        let plan = self.typing.map_put_plan(ty, Absent::Unchanged, None);
         Some(let_in(bind, Expr::new(ty, ExprKind::MapPut { base: m, rank, value: v, plan })))
     }
 
     /// `[x \in S |-> body]` into map shape `sid`: `S` is any set that can
     /// be iterated with typed elements (typically built from `DOMAIN`s).
     pub(super) fn map_build_into(&mut self, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
-        let (key, range) = self.map_parts(Ty::Enc(sid))?;
+        use tlx_layout::FcnWitness as W;
+        let (key, range, map_w) = self.map_info(Ty::Enc(sid))?;
         let [b] = bounds else { return None };
         if !binders::single_binder(b) {
             return None;
         }
+        let dw = self.domain_witness(&b.set, env, st)?;
+        let witness = match (map_w, dw) {
+            (W::Enumerated, W::Enumerated) | (W::Interval, W::Interval) => None,
+            (W::Dynamic, _) => Some(u64::from(dw == W::Enumerated)),
+            _ => return None,
+        };
         let s = if self.constructs(&b.set, env) {
             let dsid = self.sid(&map_domain_shape(&key));
             self.expr_into(&b.set, env, st, dsid)
@@ -134,12 +191,12 @@ impl Lowerer<'_> {
         }
         let t = self.temp(ety);
         let x = temp_ref(ety, t);
-        let rank = self.map_key_rank(&key, x.clone())?;
+        let rank = self.map_key_rank(&key, x.clone(), false)?;
         let (env2, check) = self.bind_elem(&b.vars, &x, env)?;
         let rsid = self.sid(&range);
         let v = self.expr_into(body, &env2, st, rsid);
         let value = binders::checked(check, self.coerce_enc(v, rsid));
-        Some(Expr::new(Ty::Enc(sid), ExprKind::MapBuild { bind: t, set: src, rank, value }))
+        Some(Expr::new(Ty::Enc(sid), ExprKind::MapBuild { bind: t, set: src, rank, value, witness }))
     }
 
     /// `DOMAIN s` of an expression `s` of sequence shape: the domain is the
@@ -171,25 +228,37 @@ impl Lowerer<'_> {
     }
 
     /// `base` with key `k` mapped to `v` (inserted if absent), for map
-    /// shape `sid`.
+    /// shape `sid` (from `:>` / `@@`, so the result always has an enumerated witness).
     fn map_insert(&mut self, base: Expr, k: &hir::Expr, v: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
-        let (key, range) = self.map_parts(Ty::Enc(sid))?;
-        let rank = self.map_key_rank_hir(&key, k, env, st)?;
+        let (key, range, witness) = self.map_info(Ty::Enc(sid))?;
+        if witness == tlx_layout::FcnWitness::Interval {
+            return None;
+        }
+        let rank = self.map_key_rank_hir(&key, k, env, st, false)?;
         let rsid = self.sid(&range);
         let value = self.expr_into(v, env, st, rsid);
         let value = self.coerce_enc(value, rsid);
-        let plan = self.typing.map_put_plan(Ty::Enc(sid), Absent::Insert);
+        let insert_witness = (witness == tlx_layout::FcnWitness::Dynamic).then_some(1);
+        let plan = self.typing.map_put_plan(Ty::Enc(sid), Absent::Insert, insert_witness);
         Some(Expr::new(Ty::Enc(sid), ExprKind::MapPut { base, rank, value, plan }))
     }
 
     /// `k :> v` into map shape `sid`.
     pub(super) fn map_single_into(&mut self, k: &hir::Expr, v: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
+        let (_, _, witness) = self.map_info(Ty::Enc(sid))?;
+        if witness == tlx_layout::FcnWitness::Interval {
+            return None;
+        }
         let empty = self.zero_enc(sid);
         self.map_insert(empty, k, v, env, st, sid)
     }
 
     /// `f @@ g` into map shape `sid` (`(k :> v) @@ g` inserts into `g`).
     pub(super) fn map_merge_into(&mut self, f: &hir::Expr, g: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
+        let (_, _, witness) = self.map_info(Ty::Enc(sid))?;
+        if witness == tlx_layout::FcnWitness::Interval {
+            return None;
+        }
         if let Some((p, penv)) = self.peel(f, env) {
             if let H::Builtin { op: B::ColonGt, args } = &*p.kind {
                 if !self.ip.is_builtin_overridden(B::ColonGt) {
@@ -207,14 +276,21 @@ impl Lowerer<'_> {
     /// universe, or a fixed-domain function, tuple or record) converted to
     /// map shape `sid`; `None` if not possible statically.
     pub(super) fn map_coerce(&mut self, x: &Expr, sid: ShapeId) -> Option<Expr> {
-        let (key, range) = self.map_parts(Ty::Enc(sid))?;
+        use tlx_layout::FcnWitness as W;
+        let (key, range, dst_w) = self.map_info(Ty::Enc(sid))?;
         let src = self.shape_of(x.ty)?.clone();
         if !matches!(src, Shape::Map { .. } | Shape::Fcn { .. } | Shape::Tuple(_) | Shape::Record(_)) {
             return None;
         }
         let rsid = self.sid(&range);
         let (xs, bind) = self.share(x.clone());
-        let out = if let Shape::Map { key: k2, range: r2 } = &src {
+        let out = if let Shape::Map { key: k2, range: r2, witness: src_w } = &src {
+            let build_w = match (dst_w, src_w) {
+                (W::Enumerated, W::Enumerated) | (W::Interval, W::Interval) => None,
+                (W::Dynamic, W::Enumerated) => Some(1),
+                (W::Dynamic, W::Interval) => Some(0),
+                _ => return None,
+            };
             // Entry by entry over the source's domain.
             let dom = self.map_domain(xs.clone(), k2);
             let (it, ety) = self.typed_iter_in(dom, true);
@@ -223,24 +299,39 @@ impl Lowerer<'_> {
             }
             let t = self.temp(ety);
             let e = temp_ref(ety, t);
-            let from = self.map_key_rank(k2, e.clone())?;
-            let to = self.map_key_rank(&key, e)?;
+            let from = self.map_key_rank(k2, e.clone(), false)?;
+            let to = self.map_key_rank(&key, e, false)?;
             let v = self.map_get(xs, from, r2);
             let value = self.coerce_enc(v, rsid);
-            Expr::new(Ty::Enc(sid), ExprKind::MapBuild { bind: t, set: it, rank: to, value })
+            Expr::new(Ty::Enc(sid), ExprKind::MapBuild { bind: t, set: it, rank: to, value, witness: build_w })
         } else {
+            let insert_w: Option<u64> = match (&src, dst_w) {
+                (Shape::Tuple(_), W::Interval) => None,
+                (Shape::Tuple(_) | Shape::Record(_), W::Dynamic) => Some(0),
+                (Shape::Fcn { witness: W::Enumerated, key_variants, .. }, W::Enumerated) if key_variants.is_empty() => None,
+                (Shape::Fcn { witness: W::Interval, key_variants, .. }, W::Interval) if key_variants.is_empty() => None,
+                (Shape::Fcn { witness: W::Enumerated, key_variants, .. }, W::Dynamic) if key_variants.is_empty() => Some(1),
+                (Shape::Fcn { witness: W::Interval, key_variants, .. }, W::Dynamic) if key_variants.is_empty() => Some(0),
+                _ => return None,
+            };
             let slots = self.slots(&src)?;
             if slots.len() > MAX_COERCED_ENTRIES {
                 return None;
             }
-            let mut acc = self.zero_enc(sid);
+            let mut acc = if insert_w == Some(1) {
+                let mut words = vec![0u64; self.words(sid) as usize];
+                *words.last_mut().unwrap() = 1;
+                Expr::new(Ty::Enc(sid), ExprKind::ConstWords(words.into()))
+            } else {
+                self.zero_enc(sid)
+            };
             for (k, loc, sh) in slots {
                 // A key outside the universe: the value never fits.
                 let r = tlx_layout::layout::rank(&key, &k).ok()?;
                 let ssid = self.sid(&sh);
                 let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: xs.clone(), loc });
                 let value = self.coerce_enc(slot, rsid);
-                let plan = self.typing.map_put_plan(Ty::Enc(sid), Absent::Insert);
+                let plan = self.typing.map_put_plan(Ty::Enc(sid), Absent::Insert, insert_w);
                 acc = Expr::new(Ty::Enc(sid), ExprKind::MapPut { base: acc, rank: int_lit(r as i64), value, plan });
             }
             acc
@@ -252,7 +343,7 @@ impl Lowerer<'_> {
     /// map `x` (shape `shape`): the presence bitset is `dom`'s, and every
     /// slot is in `range`.
     pub(super) fn map_in_fcn_set(&mut self, x: &Expr, shape: &Shape, dom: &Value, range: &Value, depth: usize) -> Option<Expr> {
-        let Shape::Map { key, range: rs } = shape else { return None };
+        let Shape::Map { key, range: rs, .. } = shape else { return None };
         let dims = map_dims(shape)?;
         let bw = dims.bitset_words;
         let ds = tlx_value::ops::enumerate_normalized(dom).ok()?;
@@ -266,7 +357,7 @@ impl Lowerer<'_> {
         let mut ranks = Vec::new();
         for d in &ds {
             // A domain element outside the universe is never in DOMAIN x.
-            let Ok(r) = tlx_layout::layout::rank(key, d) else { return Some(bool_lit(false)) };
+            let Ok(r) = tlx_layout::layout::rank_semantic(key, d) else { return Some(bool_lit(false)) };
             mask[(r / 64) as usize] |= 1 << (r % 64);
             ranks.push(r as usize);
         }
@@ -295,7 +386,7 @@ impl Lowerer<'_> {
             return None;
         }
         let t = self.temp(ety);
-        let rank = self.map_key_rank(&key, temp_ref(ety, t))?;
+        let rank = self.map_key_rank(&key, temp_ref(ety, t), true)?;
         let slot = self.map_get(xs, rank, &range);
         // The range is evaluated for every key (it may not depend on it).
         let m = to_bool(self.member_of(slot, r, env, st));

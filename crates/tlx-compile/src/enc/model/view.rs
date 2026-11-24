@@ -70,11 +70,14 @@ impl ProjectionOrbit {
 
     pub(super) fn fingerprint(&self, words: &[u64]) -> u64 {
         assert_eq!(words.len(), self.layout.words);
-        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout.offsets, words, None)
+        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout, words, None)
     }
 }
 
 impl View {
+    pub(super) fn result_node(&self) -> &tlx_layout::LayoutNode {
+        self.typing.layout.node(self.typing.layout.vars.len() - 1)
+    }
     pub(super) fn compile(
         base: &InterpModel,
         layout: &Layout,

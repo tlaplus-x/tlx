@@ -185,12 +185,12 @@ cannot be resumed, and a stored run takes none of TLC's default interval checkpo
   values. `Merge` rebuilds the merged node, which costs O(n log n) in the size of the function.
 - **No spill.** Store nodes are never written to disk, so the budget is a resident-memory limit and
   the store takes part in no part of the memory and disk protocol of [scale.md](scale.md).
-- **D-13 remains for the fixed encodings.** Because the store keeps a function's construction, D-13
-  does not apply to `Ref` slots; it still applies to every slot with a fixed encoding. In particular
-  an empty function over an enumerated domain (`[i \in {} |-> e]`) must keep its witness in state and
-  VIEW slots, where decoding it as the tuple `<<>>` currently makes a string-key EXCEPT fail. That is
-  the open tlx bug pinned by `tests/fuzz/specs/FzEmptyFcnExcept` (TLC and the interpreter end at
-  3 generated / 2 distinct / depth 2), and it is a deviation of the fixed encodings, not of the store.
+- **Function witnesses (`D-13`, resolved).** Both `Ref` slots and the compiled tier's fixed
+  encodings (`Shape::Fcn` / `Shape::Map` via `FcnWitness`) now preserve how a function's domain was
+  built in state and `VIEW` slots — including empty enumerated functions (`[i \in {} |-> e]`,
+  `tests/fuzz/specs/FzEmptyFcnExcept`) and mixed-witness slots (`[i \in {1, 2} |-> i]` alongside
+  `<<1, 2>>`) — while canonicalizing dynamic witness words for equality and fingerprints
+  ([compat.md](compat.md) `D-13`).
 
 ## 9. Tests
 

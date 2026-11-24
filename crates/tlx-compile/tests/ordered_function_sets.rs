@@ -51,7 +51,15 @@ fn harness() -> Harness {
         vec![
             (tlx_value::Sym::new("idx"), Shape::Int { lo: 0, hi: 1000 }),
             (tlx_value::Sym::new("tag"), Shape::Int { lo: 1, hi: 2 }),
-            (tlx_value::Sym::new("fn"), Shape::Fcn { dom, range: Box::new(Shape::Int { lo: 1, hi: 2 }) }),
+            (
+                tlx_value::Sym::new("fn"),
+                Shape::Fcn {
+                    dom,
+                    range: Box::new(Shape::Int { lo: 1, hi: 2 }),
+                    witness: tlx_layout::FcnWitness::Enumerated,
+                    key_variants: Arc::from([]),
+                },
+            ),
             (
                 tlx_value::Sym::new("inner"),
                 Shape::Record(

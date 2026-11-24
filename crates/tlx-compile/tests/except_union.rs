@@ -33,7 +33,16 @@ const PLACEHOLDERS: &[&str] = &["Empty", "v1", "v2"];
 /// placeholder: the union of the two arms.
 fn snapshot_shape() -> Shape {
     Shape::Union(
-        vec![Shape::Atom(atoms(&["Empty"])), Shape::Fcn { dom: atoms(KEYS), range: Box::new(Shape::Atom(atoms(PLACEHOLDERS))) }].into(),
+        vec![
+            Shape::Atom(atoms(&["Empty"])),
+            Shape::Fcn {
+                dom: atoms(KEYS),
+                range: Box::new(Shape::Atom(atoms(PLACEHOLDERS))),
+                witness: tlx_layout::FcnWitness::Enumerated,
+                key_variants: std::sync::Arc::from([]),
+            },
+        ]
+        .into(),
     )
 }
 
@@ -93,7 +102,14 @@ Next == Start \/ Put \/ Keep
     let cfg = "CONSTANTS k1 = k1 k2 = k2 v1 = v1 v2 = v2 Empty = Empty\nINIT Init\nNEXT Next\n";
     let inner = Shape::Fcn {
         dom: atoms(KEYS),
-        range: Box::new(Shape::Fcn { dom: atoms(KEYS), range: Box::new(Shape::Atom(atoms(PLACEHOLDERS))) }),
+        range: Box::new(Shape::Fcn {
+            dom: atoms(KEYS),
+            range: Box::new(Shape::Atom(atoms(PLACEHOLDERS))),
+            witness: tlx_layout::FcnWitness::Enumerated,
+            key_variants: std::sync::Arc::from([]),
+        }),
+        witness: tlx_layout::FcnWitness::Enumerated,
+        key_variants: std::sync::Arc::from([]),
     };
     let snap = Shape::Union(vec![Shape::Atom(atoms(&["Empty"])), inner].into());
     let h = Harness::with_shapes(&module("ExceptUnionNested", nested), cfg, vec![snap, int(0, 3)]);
@@ -151,7 +167,18 @@ Put == snap' = [snap EXCEPT ![key] = 1 \div (n - n)] /\ UNCHANGED <<key, n>>
 Next == Start \/ Pick \/ Put
 "#;
     let cfg = "CONSTANTS k1 = k1 k2 = k2 elsewhere = elsewhere Empty = Empty\nINIT Init\nNEXT Next\n";
-    let snap = Shape::Union(vec![Shape::Atom(atoms(&["Empty"])), Shape::Fcn { dom: atoms(KEYS), range: Box::new(int(0, 2)) }].into());
+    let snap = Shape::Union(
+        vec![
+            Shape::Atom(atoms(&["Empty"])),
+            Shape::Fcn {
+                dom: atoms(KEYS),
+                range: Box::new(int(0, 2)),
+                witness: tlx_layout::FcnWitness::Enumerated,
+                key_variants: std::sync::Arc::from([]),
+            },
+        ]
+        .into(),
+    );
     let key = Shape::Atom(atoms(&["k1", "k2", "elsewhere"]));
     let h = Harness::with_shapes(&module("ExceptUnionLazy", spec), cfg, vec![snap, key, int(0, 8)]);
     let dump = h.dump("Put");

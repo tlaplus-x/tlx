@@ -72,7 +72,12 @@ fn harness(narrow_first_arm: bool) -> Harness {
     let (ukind, ufield, uextra) = (field("ukind"), field("ufield"), field("uextra"));
     let first = if narrow_first_arm { &vs[..1] } else { &vs[..] };
     let m = Shape::Union(vec![arm(1, first, false, ukind, ufield, uextra), arm(2, &vs, true, ukind, ufield, uextra)].into());
-    let f = Shape::Fcn { dom: Arc::from(&vs[..2]), range: Box::new(Shape::Int { lo: 0, hi: 1 }) };
+    let f = Shape::Fcn {
+        dom: Arc::from(&vs[..2]),
+        range: Box::new(Shape::Int { lo: 0, hi: 1 }),
+        witness: tlx_layout::FcnWitness::Enumerated,
+        key_variants: Arc::from([]),
+    };
     Harness::with_shapes(&module("UnionScalarField", SRC), CFG, vec![m, f])
 }
 

@@ -47,19 +47,24 @@ enum Ids {
 struct Shard {
     ids: HashMap<u64, Ids, BuildHasherDefault<IdHasher>>,
     vals: Vec<Value>,
+    /// Index in `vals` of the first TLA+-equal value in this shard
+    /// (`canon[i] <= i` and `vals[canon[i]] == vals[i]`).
+    canon: Vec<u32>,
 }
 
 impl Shard {
-    fn find(&self, hash: u64, v: &Value) -> Option<u32> {
+    fn find_by(&self, hash: u64, v: &Value, eq: fn(&Value, &Value) -> bool) -> Option<u32> {
         match self.ids.get(&hash)? {
-            Ids::One(i) => (self.vals[*i as usize] == *v).then_some(*i),
-            Ids::Many(is) => is.iter().copied().find(|i| self.vals[*i as usize] == *v),
+            Ids::One(i) => eq(&self.vals[*i as usize], v).then_some(*i),
+            Ids::Many(is) => is.iter().copied().find(|i| eq(&self.vals[*i as usize], v)),
         }
     }
 
     fn insert(&mut self, hash: u64, v: &Value) -> u32 {
         let i = u32::try_from(self.vals.len()).expect("dynval: too many values");
+        let canon = self.find_by(hash, v, PartialEq::eq).unwrap_or(i);
         self.vals.push(v.clone());
+        self.canon.push(canon);
         match self.ids.get_mut(&hash) {
             None => {
                 self.ids.insert(hash, Ids::One(i));
@@ -112,22 +117,50 @@ fn shard_of(hash: u64) -> usize {
     (hash >> 32) as usize & (SHARDS - 1)
 }
 
-pub fn intern(v: &Value) -> u64 {
+fn intern_by(v: &Value, eq: fn(&Value, &Value) -> bool) -> u64 {
     if let Some(h) = scalar::immediate(v) {
         return h;
     }
     let hash = hash(v);
     let si = shard_of(hash);
     let shard = &shards()[si];
-    if let Some(i) = shard.read().find(hash, v) {
+    if let Some(i) = shard.read().find_by(hash, v, eq) {
         return handle(si, i);
     }
     let mut t = shard.write();
-    let i = match t.find(hash, v) {
+    let i = match t.find_by(hash, v, eq) {
         Some(i) => i,
         None => t.insert(hash, v),
     };
     handle(si, i)
+}
+
+pub fn intern(v: &Value) -> u64 {
+    intern_by(v, PartialEq::eq)
+}
+
+/// Intern `v` by exact representation (`Value::exact_eq`), preserving
+/// construction witnesses (`Tuple` vs `Record` vs `Fcn(_, Enumerated)` vs
+/// `Fcn(_, Interval)`, `Interval` vs `Set`) while `canonical(h)` maps all
+/// TLA+-equal handles to one canonical handle.
+pub fn intern_exact(v: &Value) -> u64 {
+    intern_by(v, Value::exact_eq)
+}
+
+/// Canonical handle of the TLA+-equality class of `h`: equal values have
+/// identical canonical handles (`canonical(intern_exact(a)) == intern(b)`
+/// whenever `a == b`).
+pub fn canonical(h: u64) -> u64 {
+    if scalar::tag(h) != TAG_TABLE {
+        return h;
+    }
+    let t = scalar::payload(h);
+    let si = (t & (SHARDS as u64 - 1)) as usize;
+    let shard = shards()[si].read();
+    match (t >> SHARD_BITS).checked_sub(1).and_then(|i| shard.canon.get(i as usize).copied()) {
+        Some(c) => handle(si, c),
+        None => panic!("dynval::canonical: invalid handle {h}"),
+    }
 }
 
 /// The number of interned values and the bytes of the tables holding them
@@ -138,7 +171,9 @@ pub fn footprint() -> (usize, usize) {
     for s in shards() {
         let t = s.read();
         n += t.vals.len();
-        bytes += t.vals.capacity() * std::mem::size_of::<Value>() + t.ids.capacity() * (8 + std::mem::size_of::<Ids>() + 1);
+        bytes += t.vals.capacity() * std::mem::size_of::<Value>()
+            + t.canon.capacity() * std::mem::size_of::<u32>()
+            + t.ids.capacity() * (8 + std::mem::size_of::<Ids>() + 1);
     }
     (n, bytes)
 }
@@ -246,12 +281,12 @@ pub fn restore(snap: &[Vec<Value>]) -> Result<(), String> {
                 return Err(format!("Dyn interner snapshot: value {v} is in shard {si}, but hashes to another shard"));
             }
             if let Some(old) = t.vals.get(i) {
-                if old != v {
+                if !old.exact_eq(v) {
                     return Err(format!("Dyn interner: handle {} is {old}, snapshot has {v}", handle(si, i as u32)));
                 }
                 continue;
             }
-            if let Some(j) = t.find(hash, v) {
+            if let Some(j) = t.find_by(hash, v, Value::exact_eq) {
                 return Err(format!("Dyn interner snapshot: {v} occurs twice in shard {si} (indices {j} and {i})"));
             }
             t.insert(hash, v);

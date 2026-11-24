@@ -886,7 +886,11 @@ Next == Bad \/ Missing
 "#,
     );
     let key = atoms(&["m", "missing"]);
-    let h = Harness::with_shapes(&src, CFG, vec![Shape::Map { key: Box::new(key), range: Box::new(Shape::Int { lo: 0, hi: 2 }) }]);
+    let h = Harness::with_shapes(
+        &src,
+        CFG,
+        vec![Shape::Map { key: Box::new(key), range: Box::new(Shape::Int { lo: 0, hi: 2 }), witness: tlx_layout::FcnWitness::Dynamic }],
+    );
     assert!(h.not_native().is_empty(), "{:?}", h.not_native());
     assert!(h.node_kinds().contains("MapPut"));
     let mut rep = h.run_reachable(10);
@@ -907,7 +911,11 @@ Next == rec' = [rec EXCEPT ![1] = 1 \div 0]
     let h = Harness::with_shapes(
         &src,
         CFG,
-        vec![Shape::Map { key: Box::new(Shape::Int { lo: 1, hi: 2 }), range: Box::new(Shape::Int { lo: 0, hi: 2 }) }],
+        vec![Shape::Map {
+            key: Box::new(Shape::Int { lo: 1, hi: 2 }),
+            range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+            witness: tlx_layout::FcnWitness::Interval,
+        }],
     );
     assert!(h.not_native().is_empty(), "{:?}", h.not_native());
     h.run_reachable(10).assert_ok("integer EXCEPT key on an empty map");

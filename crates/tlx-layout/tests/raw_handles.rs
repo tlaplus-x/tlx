@@ -111,16 +111,24 @@ fn checked_raw_handles_round_trip() {
 
 #[test]
 fn checked_layouts_reject_nested_invalid_handles() {
-    use tlx_layout::{Layout, LayoutNode, Shape};
+    use tlx_layout::{FcnWitness, Layout, LayoutNode, Shape};
     let bad = (u32::MAX as u64) << 3 | 1;
     let cases = [
         (Shape::Dyn, vec![bad]),
         (Shape::Tuple(vec![Shape::Dyn].into()), vec![bad]),
         (Shape::Record(vec![(Sym::new("field"), Shape::Dyn)].into()), vec![bad]),
-        (Shape::Fcn { dom: vec![Value::Bool(false)].into(), range: Box::new(Shape::Dyn) }, vec![bad]),
+        (
+            Shape::Fcn {
+                dom: vec![Value::Bool(false)].into(),
+                range: Box::new(Shape::Dyn),
+                witness: FcnWitness::Enumerated,
+                key_variants: std::sync::Arc::from([]),
+            },
+            vec![bad],
+        ),
         (Shape::Seq { elem: Box::new(Shape::Dyn), max_len: 2 }, vec![1, bad, 0]),
         (Shape::Set { elem: Box::new(Shape::Dyn), max_card: 2 }, vec![1, bad, 0]),
-        (Shape::Map { key: Box::new(Shape::Bool), range: Box::new(Shape::Dyn) }, vec![1, bad, 0]),
+        (Shape::Map { key: Box::new(Shape::Bool), range: Box::new(Shape::Dyn), witness: FcnWitness::Enumerated }, vec![1, bad, 0]),
         (Shape::Union(vec![Shape::Dyn].into()), vec![0, bad]),
     ];
     for (shape, words) in cases {
@@ -135,7 +143,7 @@ fn checked_layouts_reject_nested_invalid_handles() {
     // Inactive slots are padding, not handles (empty sequences and maps).
     let seq = LayoutNode::new(&Shape::Seq { elem: Box::new(Shape::Dyn), max_len: 1 });
     assert_eq!(seq.decode(&[0, bad]), Value::tuple(vec![]));
-    let map = LayoutNode::new(&Shape::Map { key: Box::new(Shape::Bool), range: Box::new(Shape::Dyn) });
+    let map = LayoutNode::new(&Shape::Map { key: Box::new(Shape::Bool), range: Box::new(Shape::Dyn), witness: FcnWitness::Enumerated });
     assert!(map.validate_words(&[0, bad, bad]).is_ok());
 }
 

@@ -74,10 +74,6 @@ KNOWN = [
      lambda tlc, tlx, mode, text, diffs: "cannot be a constant" in tlx and "view function" in tlx
      and must(tlc, None).get("result") == "success"
      and set(diffs) <= {"result", "distinct", "generated", "depth"}),
-    ("d13-empty-function",
-     "the compiled tier decodes an empty function built over {} as <<>>, so EXCEPT with a non-integer key "
-     "fails ('non integral index'); TLC leaves it unchanged (docs/compat.md D-13 family)",
-     lambda tlc, tlx, mode, text, diffs: mode != "interp" and "non integral index" in tlx and "non integral index" not in tlc),
     ("D-28",
      "TLC defect (docs/compat.md D-28): TLC's counterexample of an action property lacks the violating successor (one "
      "state) when rebuilding the step fails in another branch; tlx prints both states",

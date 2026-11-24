@@ -3,7 +3,7 @@
 TLC2 Version 2026.10.02.163556 (rev: 1813307)
 @!@!@ENDMSG 2262 @!@!@
 @!@!@STARTMSG 2187:0 @!@!@
-Running breadth-first search Model-Checking with fp 0 and seed 5586539741717889174 with 1 worker on <machine>
+Running breadth-first search Model-Checking with fp 0 and seed 299490899701054250 with 1 worker on <machine>
 @!@!@ENDMSG 2187 @!@!@
 @!@!@STARTMSG 2220:0 @!@!@
 Starting SANY...
@@ -27,15 +27,15 @@ Starting... (<date>)
 @!@!@ENDMSG 2185 @!@!@
 @!@!@STARTMSG 2144:3 @!@!@
 The EXCEPT was applied to non-existing fields of the value at
-line 11, col 9 to line 11, col 28 of module SN14
-@!@!@ENDMSG 2144 @!@!@
-@!@!@STARTMSG 2144:3 @!@!@
-The EXCEPT was applied to non-existing fields of the value at
-line 12, col 10 to line 12, col 44 of module SN14
-@!@!@ENDMSG 2144 @!@!@
-@!@!@STARTMSG 2144:3 @!@!@
-The EXCEPT was applied to non-existing fields of the value at
 line 13, col 9 to line 13, col 28 of module SN14
+@!@!@ENDMSG 2144 @!@!@
+@!@!@STARTMSG 2144:3 @!@!@
+The EXCEPT was applied to non-existing fields of the value at
+line 14, col 10 to line 14, col 44 of module SN14
+@!@!@ENDMSG 2144 @!@!@
+@!@!@STARTMSG 2144:3 @!@!@
+The EXCEPT was applied to non-existing fields of the value at
+line 15, col 9 to line 15, col 28 of module SN14
 @!@!@ENDMSG 2144 @!@!@
 @!@!@STARTMSG 2189:0 @!@!@
 Computing initial states...
@@ -46,6 +46,14 @@ Computed 2 initial states...
 @!@!@STARTMSG 2190:0 @!@!@
 Finished computing initial states: 4 distinct states generated at <date>.
 @!@!@ENDMSG 2190 @!@!@
+@!@!@STARTMSG 2144:3 @!@!@
+The EXCEPT was applied to non-existing fields of the value at
+line 24, col 32 to line 24, col 32 of module SN14
+@!@!@ENDMSG 2144 @!@!@
+@!@!@STARTMSG 2144:3 @!@!@
+The EXCEPT was applied to non-existing fields of the value at
+line 24, col 67 to line 24, col 67 of module SN14
+@!@!@ENDMSG 2144 @!@!@
 @!@!@STARTMSG 1000:1 @!@!@
 TLC threw an unexpected exception.
 This was probably caused by an error in the spec or model.
@@ -58,20 +66,23 @@ The behavior up to this point is:
 @!@!@ENDMSG 2121 @!@!@
 @!@!@STARTMSG 2217:4 @!@!@
 1: <Initial predicate>
+/\ e = (0 :> 0 @@ 1 :> 0 @@ 2 :> 0)
 /\ f = (0 :> 0 @@ 1 :> 0 @@ 2 :> 0)
 /\ g = (0 :> 0 @@ 1 :> 0)
 /\ n = 0
 
 @!@!@ENDMSG 2217 @!@!@
 @!@!@STARTMSG 2217:4 @!@!@
-2: <Next line 18, col 9 to line 21, col 39 of module SN14>
+2: <Next line 21, col 9 to line 26, col 39 of module SN14>
+/\ e = (0 :> 1 @@ 1 :> 0 @@ 2 :> 0)
 /\ f = (0 :> 1 @@ 1 :> 0 @@ 2 :> 0)
 /\ g = (0 :> 1 @@ 1 :> 0)
 /\ n = 1
 
 @!@!@ENDMSG 2217 @!@!@
 @!@!@STARTMSG 2217:4 @!@!@
-3: <Next line 18, col 9 to line 21, col 39 of module SN14>
+3: <Next line 21, col 9 to line 26, col 39 of module SN14>
+/\ e = (0 :> 1 @@ 1 :> 1 @@ 2 :> 0)
 /\ f = (0 :> 1 @@ 1 :> 1 @@ 2 :> 0)
 /\ g = (0 :> 0 @@ 1 :> 0)
 /\ n = 2
@@ -80,12 +91,14 @@ The behavior up to this point is:
 @!@!@STARTMSG 2103:1 @!@!@
 The error occurred when TLC was evaluating the nested
 expressions at the following positions:
-0. Line 18, column 9 to line 21, column 39 in SN14
-1. Line 18, column 12 to line 18, column 16 in SN14
-2. Line 19, column 12 to line 19, column 21 in SN14
-3. Line 20, column 12 to line 20, column 74 in SN14
-4. Line 20, column 17 to line 20, column 74 in SN14
-5. Line 20, column 56 to line 20, column 74 in SN14
+0. Line 21, column 9 to line 26, column 39 in SN14
+1. Line 21, column 12 to line 21, column 16 in SN14
+2. Line 22, column 12 to line 22, column 16 in SN14
+3. Line 23, column 12 to line 23, column 21 in SN14
+4. Line 24, column 12 to line 24, column 84 in SN14
+5. Line 25, column 12 to line 25, column 74 in SN14
+6. Line 25, column 17 to line 25, column 74 in SN14
+7. Line 25, column 56 to line 25, column 74 in SN14
 
 
 @!@!@ENDMSG 2103 @!@!@

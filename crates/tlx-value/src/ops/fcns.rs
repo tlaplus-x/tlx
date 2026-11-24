@@ -228,7 +228,13 @@ pub fn domain(f: &Value) -> Result<Value> {
     match f {
         Value::Tuple(t) => Ok(Value::Interval(1, t.len() as i64)),
         Value::Record(r) => Ok(Value::Set(r.iter().map(|(k, _)| Value::Str(*k)).collect())),
-        Value::Fcn(p, _) => Ok(Value::Set(p.iter().map(|(k, _)| k.clone()).collect())),
+        Value::Fcn(p, dom) => {
+            let w = match dom {
+                FcnDom::Interval => Witness::Interval,
+                FcnDom::Enumerated => Witness::Enumerated,
+            };
+            Ok(w.domain_value(p.iter().map(|(k, _)| k)))
+        }
         Value::LazyFcn(l) => l.domain(),
         _ => err(format!("Attempted to compute DOMAIN of a non-function ({}):\n{f}", kind_name(f))),
     }

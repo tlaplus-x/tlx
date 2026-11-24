@@ -4,7 +4,87 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use tlx_value::{Sym, Value};
+use tlx_value::{FcnDom, Sym, Value};
+
+/// How a function shape (`Shape::Fcn` or `Shape::Map`) records TLC's
+/// construction witness (`tlx_value::plan::Witness`).
+///
+/// - `Enumerated` and `Interval` are statically fixed: zero extra words and
+///   canonical encoding (`encode(a) == encode(b)` iff `a == b`).
+/// - `Dynamic` is chosen only when values with different witnesses share one
+///   shape (for example `<<1, 2>>` and `[i \in {1, 2} |-> i]`, or `<<>>` and
+///   `[x \in {} |-> ""]`): one trailing word records `0` for the structured /
+///   canonical witness (`Tuple`, `Record`, or `Interval` for the domain) and
+///   `1` for `Enumerated`. Semantic fingerprints, equality and symmetry orbit
+///   comparisons ignore that trailing word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FcnWitness {
+    /// Every value is `Value::Fcn(_, FcnDom::Enumerated)`.
+    Enumerated,
+    /// Every value was built over an integer interval: `Value::Tuple` for
+    /// empty / `1..n`, `Value::Fcn(_, FcnDom::Interval)` for `lo..hi` (`lo # 1`).
+    Interval,
+    /// Values with different witnesses share this shape; one trailing word
+    /// records `0` (canonical `Tuple`/`Record`/`Interval`) or `1` (`Enumerated`).
+    Dynamic,
+}
+
+impl FcnWitness {
+    #[inline]
+    pub fn from_dom(dom: FcnDom) -> Self {
+        match dom {
+            FcnDom::Enumerated => Self::Enumerated,
+            FcnDom::Interval => Self::Interval,
+        }
+    }
+
+    #[inline]
+    pub fn join(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::Dynamic
+        }
+    }
+
+    #[inline]
+    pub fn extra_words(self) -> usize {
+        usize::from(self == Self::Dynamic)
+    }
+
+    #[inline]
+    pub(crate) fn accepts_dom(self, dom: FcnDom) -> bool {
+        self == Self::Dynamic || self == Self::from_dom(dom)
+    }
+
+    #[inline]
+    pub(crate) fn accepts_map_value(self, v: &Value) -> bool {
+        matches!(
+            (self, v),
+            (Self::Enumerated, Value::Fcn(_, FcnDom::Enumerated))
+                | (Self::Interval, Value::Tuple(_) | Value::Fcn(_, FcnDom::Interval))
+                | (Self::Dynamic, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_))
+        )
+    }
+
+    pub fn decode_fcn(self, pairs: Vec<(Value, Value)>, dyn_word: impl FnOnce() -> u64) -> Value {
+        match self {
+            Self::Enumerated => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+            Self::Interval => Value::fcn_with_dom(pairs, FcnDom::Interval),
+            Self::Dynamic if dyn_word() == 0 => Value::fcn_canonical_sorted(pairs),
+            Self::Dynamic => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+        }
+    }
+
+    pub fn decode_map(self, pairs: Vec<(Value, Value)>, dyn_word: impl FnOnce() -> u64) -> Value {
+        match self {
+            Self::Enumerated => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+            Self::Interval => Value::fcn_over_interval_sorted(pairs),
+            Self::Dynamic if dyn_word() == 0 => Value::fcn_canonical_sorted(pairs),
+            Self::Dynamic => Value::fcn_with_dom(pairs, FcnDom::Enumerated),
+        }
+    }
+}
 
 /// Universes up to this many elements are encoded as bitsets.
 pub const MAX_BITSET_UNIVERSE: u64 = 4096;
@@ -16,7 +96,7 @@ pub const MAX_TUPLE_ARMS: usize = 4;
 /// Largest encoding of a `Map` (presence bitset and slots), in words.
 pub const MAX_MAP_WORDS: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Shape {
     /// No value observed yet (bottom of the lattice).
     Never,
@@ -34,20 +114,31 @@ pub enum Shape {
         elem: Box<Shape>,
         max_card: usize,
     },
-    /// Functions with the fixed finite domain `dom` (sorted, canonical,
-    /// neither `1..n` nor all strings — those are `Tuple`/`Record`).
+    /// Functions with the fixed finite domain `dom` (sorted, canonical),
+    /// construction witness `witness` (`Enumerated`, `Interval`, or `Dynamic`),
+    /// and optional per-position exact key variants `key_variants` when
+    /// TLA+-equal domain keys with different construction representations
+    /// (such as `<<0>>` and `[i \in {1} |-> 0]`) share one domain slot.
     Fcn {
         dom: Arc<[Value]>,
         range: Box<Shape>,
+        witness: FcnWitness,
+        /// Sorted by domain index `pos`; each entry lists `>= 2` exact key
+        /// representations (sorted by `Value::exact_cmp`, deduplicated by
+        /// `Value::exact_eq`), with `dom[pos]` equal to `variants[0]`.
+        /// Empty in the common case (zero extra words).
+        key_variants: Arc<[(usize, Arc<[Value]>)]>,
     },
     /// Functions whose domain varies over subsets of the finite universe of
     /// `key` (bags, functions on `0..n` with a variable `n`, ...): a
     /// presence bitset over the universe, then one `range` slot per
-    /// universe element (all zero when absent). Keys are enumerated in TLC
-    /// order (see `map_key_ok`).
+    /// universe element (all zero when absent), followed by one trailing
+    /// witness word when `witness == FcnWitness::Dynamic`. Keys are enumerated
+    /// in TLC order (see `map_key_ok`).
     Map {
         key: Box<Shape>,
         range: Box<Shape>,
+        witness: FcnWitness,
     },
     /// Records with a fixed set of fields (sorted by `Sym` order).
     Record(Arc<[(Sym, Shape)]>),
@@ -68,6 +159,77 @@ pub enum Shape {
     /// inference chose `Dyn`; inference itself never produces it. All `Ref`
     /// shapes of a run share one store (and compare equal).
     Ref(crate::store::StoreRef),
+}
+
+impl PartialEq for Shape {
+    fn eq(&self, other: &Shape) -> bool {
+        match (self, other) {
+            (Shape::Never, Shape::Never) | (Shape::Bool, Shape::Bool) | (Shape::Dyn, Shape::Dyn) => true,
+            (Shape::Int { lo: l1, hi: h1 }, Shape::Int { lo: l2, hi: h2 }) => l1 == l2 && h1 == h2,
+            (Shape::Atom(a), Shape::Atom(b)) => a == b,
+            (Shape::Set { elem: e1, max_card: m1 }, Shape::Set { elem: e2, max_card: m2 }) => m1 == m2 && e1 == e2,
+            (
+                Shape::Fcn { dom: d1, range: r1, witness: w1, key_variants: kv1 },
+                Shape::Fcn { dom: d2, range: r2, witness: w2, key_variants: kv2 },
+            ) => w1 == w2 && r1 == r2 && fcn_dom_exact_eq(d1, kv1, d2, kv2),
+            (Shape::Map { key: k1, range: r1, witness: w1 }, Shape::Map { key: k2, range: r2, witness: w2 }) => {
+                w1 == w2 && k1 == k2 && r1 == r2
+            }
+            (Shape::Record(a), Shape::Record(b)) => a == b,
+            (Shape::Tuple(a), Shape::Tuple(b)) | (Shape::Union(a), Shape::Union(b)) => a == b,
+            (Shape::Seq { elem: e1, max_len: m1 }, Shape::Seq { elem: e2, max_len: m2 }) => m1 == m2 && e1 == e2,
+            (Shape::Ref(a), Shape::Ref(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Shape {}
+
+impl std::hash::Hash for Shape {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Shape::Never | Shape::Bool | Shape::Dyn => {}
+            Shape::Int { lo, hi } => {
+                lo.hash(state);
+                hi.hash(state);
+            }
+            Shape::Atom(u) => u.hash(state),
+            Shape::Set { elem, max_card } => {
+                elem.hash(state);
+                max_card.hash(state);
+            }
+            Shape::Fcn { dom, range, witness, key_variants } => {
+                dom.len().hash(state);
+                for d in dom.iter() {
+                    d.exact_hash(state);
+                }
+                range.hash(state);
+                witness.hash(state);
+                key_variants.len().hash(state);
+                for (pos, vs) in key_variants.iter() {
+                    pos.hash(state);
+                    vs.len().hash(state);
+                    for v in vs.iter() {
+                        v.exact_hash(state);
+                    }
+                }
+            }
+            Shape::Map { key, range, witness } => {
+                key.hash(state);
+                range.hash(state);
+                witness.hash(state);
+            }
+            Shape::Record(fs) => fs.hash(state),
+            Shape::Tuple(es) | Shape::Union(es) => es.hash(state),
+            Shape::Seq { elem, max_len } => {
+                elem.hash(state);
+                max_len.hash(state);
+            }
+            Shape::Ref(s) => s.hash(state),
+        }
+    }
 }
 
 /// Discriminates union arms: two shapes with the same key are joined into
@@ -124,10 +286,12 @@ impl Shape {
     /// encoding; it also avoids one layout miss per position.
     pub fn homogenize(&self) -> Shape {
         match self {
-            Shape::Set { elem, max_card } => Shape::Set { elem: Box::new(elem.homogenize()), max_card: *max_card },
+            Shape::Set { elem, max_card } => set_shape(elem.homogenize(), *max_card),
             Shape::Seq { elem, max_len } => Shape::Seq { elem: Box::new(elem.homogenize()), max_len: *max_len },
-            Shape::Fcn { dom, range } => Shape::Fcn { dom: dom.clone(), range: Box::new(range.homogenize()) },
-            Shape::Map { key, range } => Shape::Map { key: key.clone(), range: Box::new(range.homogenize()) },
+            Shape::Fcn { dom, range, witness, key_variants } => {
+                Shape::Fcn { dom: dom.clone(), range: Box::new(range.homogenize()), witness: *witness, key_variants: key_variants.clone() }
+            }
+            Shape::Map { key, range, witness } => Shape::Map { key: key.clone(), range: Box::new(range.homogenize()), witness: *witness },
             Shape::Record(fs) => Shape::Record(fs.iter().map(|(k, f)| (*k, f.homogenize())).collect()),
             Shape::Union(arms) => Shape::Union(arms.iter().map(Shape::homogenize).collect()),
             Shape::Tuple(es) => {
@@ -164,23 +328,36 @@ fn same_family(a: &Shape, b: &Shape) -> bool {
     }
 }
 
+/// `Set { elem, max_card }` when elements have canonical encodings (or are
+/// `Shape::Dyn`, whose compiled set ops already stay boxed), else `Dyn` (a
+/// dynamic-witness element cannot be deduplicated by raw encoded words).
+pub fn set_shape(elem: Shape, max_card: usize) -> Shape {
+    if elem != Shape::Dyn && elem.has_dynamic_witness() {
+        crate::decisions::note(|| "Dyn: set elements carry dynamic function-domain witnesses".to_string());
+        return Shape::Dyn;
+    }
+    Shape::Set { elem: Box::new(elem), max_card }
+}
+
 /// Join of shapes of the same family.
 fn join_same(a: &Shape, b: &Shape) -> Shape {
     match (a, b) {
         (Shape::Bool, Shape::Bool) => Shape::Bool,
         (Shape::Int { lo: l1, hi: h1 }, Shape::Int { lo: l2, hi: h2 }) => Shape::Int { lo: (*l1).min(*l2), hi: (*h1).max(*h2) },
         (Shape::Atom(x), Shape::Atom(y)) => Shape::Atom(merge_atoms(x, y)),
-        (Shape::Set { elem: e1, max_card: m1 }, Shape::Set { elem: e2, max_card: m2 }) => {
-            Shape::Set { elem: Box::new(e1.join(e2)), max_card: (*m1).max(*m2) }
-        }
-        (Shape::Fcn { dom: d1, range: r1 }, Shape::Fcn { dom: d2, range: r2 }) if d1 == d2 => {
-            Shape::Fcn { dom: d1.clone(), range: Box::new(r1.join(r2)) }
+        (Shape::Set { elem: e1, max_card: m1 }, Shape::Set { elem: e2, max_card: m2 }) => set_shape(e1.join(e2), (*m1).max(*m2)),
+        (
+            Shape::Fcn { dom: d1, range: r1, witness: w1, key_variants: kv1 },
+            Shape::Fcn { dom: d2, range: r2, witness: w2, key_variants: kv2 },
+        ) if d1 == d2 => {
+            let (dom, key_variants) = join_fcn_domains(d1, kv1, d2, kv2);
+            Shape::Fcn { dom, range: Box::new(r1.join(r2)), witness: w1.join(*w2), key_variants }
         }
         (Shape::Fcn { .. } | Shape::Map { .. }, Shape::Fcn { .. } | Shape::Map { .. }) => {
             // Functions with different domains: a map over the union.
-            let (k1, r1) = map_view(a);
-            let (k2, r2) = map_view(b);
-            map_shape(k1.join(&k2), r1.join(&r2))
+            let (k1, r1, w1) = map_view(a);
+            let (k2, r2, w2) = map_view(b);
+            map_shape(k1.join(&k2), r1.join(&r2), w1.join(w2))
         }
         (Shape::Record(x), Shape::Record(y)) => Shape::Record(x.iter().zip(y.iter()).map(|(p, q)| (p.0, p.1.join(&q.1))).collect()),
         (Shape::Tuple(x), Shape::Tuple(y)) if x.len() == y.len() => Shape::Tuple(x.iter().zip(y.iter()).map(|(p, q)| p.join(q)).collect()),
@@ -240,13 +417,140 @@ fn tuple_alternatives(tuples: &[Shape]) -> bool {
         })
 }
 
-/// Key and range shapes of a function or map shape.
-fn map_view(s: &Shape) -> (Shape, Shape) {
+/// Key, range and witness of a function or map shape.
+fn map_view(s: &Shape) -> (Shape, Shape, FcnWitness) {
     match s {
-        Shape::Fcn { dom, range } => (join_all(dom.iter().map(Shape::of)), (**range).clone()),
-        Shape::Map { key, range } => ((**key).clone(), (**range).clone()),
+        Shape::Fcn { dom, range, witness, key_variants } => {
+            (join_all(dom.iter().chain(key_variants.iter().flat_map(|(_, vs)| vs.iter())).map(Shape::of)), (**range).clone(), *witness)
+        }
+        Shape::Map { key, range, witness } => ((**key).clone(), (**range).clone(), *witness),
         _ => unreachable!("map_view on {s:?}"),
     }
+}
+
+/// Elementwise exact equality of two value slices (`Value::exact_eq`).
+#[inline]
+pub fn values_exact_eq(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.exact_eq(y))
+}
+
+/// Representation-exact equality of two `Shape::Fcn` `(dom, key_variants)` pairs.
+pub fn fcn_dom_exact_eq(d1: &[Value], kv1: &[(usize, Arc<[Value]>)], d2: &[Value], kv2: &[(usize, Arc<[Value]>)]) -> bool {
+    values_exact_eq(d1, d2)
+        && kv1.len() == kv2.len()
+        && kv1.iter().zip(kv2.iter()).all(|((p1, v1), (p2, v2))| p1 == p2 && values_exact_eq(v1, v2))
+}
+
+/// Match `keys` against `(dom, key_variants)` by `Value::exact_eq`, invoking
+/// `on_variant(kv_slot, variant_idx)` for each dynamic key-variant position.
+pub fn match_fcn_keys_exact<'a>(
+    mut keys: impl ExactSizeIterator<Item = &'a Value>,
+    dom: &[Value],
+    key_variants: &[(usize, Arc<[Value]>)],
+    mut on_variant: impl FnMut(usize, usize),
+) -> bool {
+    if keys.len() != dom.len() {
+        return false;
+    }
+    if key_variants.is_empty() {
+        return keys.zip(dom.iter()).all(|(k, d)| k.exact_eq(d));
+    }
+    let mut kv_slot = 0usize;
+    for (pos, d) in dom.iter().enumerate() {
+        let k = keys.next().unwrap();
+        if let Some((kv_pos, variants)) = key_variants.get(kv_slot) {
+            if *kv_pos == pos {
+                let Some(idx) = variants.iter().position(|v| k.exact_eq(v)) else {
+                    return false;
+                };
+                on_variant(kv_slot, idx);
+                kv_slot += 1;
+                continue;
+            }
+        }
+        if !k.exact_eq(d) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Key at domain position `pos`, advancing `kv_slot` and selecting from
+/// `variants` via `pick_variant(kv_slot, variants)` when `pos` has variants.
+pub fn fcn_key_at<'a>(
+    dom: &'a [Value],
+    key_variants: &'a [(usize, Arc<[Value]>)],
+    kv_slot: &mut usize,
+    pos: usize,
+    pick_variant: impl FnOnce(usize, &'a [Value]) -> usize,
+) -> &'a Value {
+    if let Some((kv_pos, variants)) = key_variants.get(*kv_slot) {
+        if *kv_pos == pos {
+            let slot = *kv_slot;
+            *kv_slot += 1;
+            return &variants[pick_variant(slot, variants)];
+        }
+    }
+    &dom[pos]
+}
+
+/// Merge two TLA+-equal fixed domains (`d1 == d2`), recording per-position
+/// exact key variants whenever two keys are TLA+-equal but differ in
+/// construction representation (e.g. `<<0>>` vs `[i \in {1} |-> 0]`).
+/// Commutative, associative, and idempotent.
+fn join_fcn_domains(
+    d1: &Arc<[Value]>,
+    kv1: &Arc<[(usize, Arc<[Value]>)]>,
+    d2: &Arc<[Value]>,
+    kv2: &Arc<[(usize, Arc<[Value]>)]>,
+) -> (Arc<[Value]>, Arc<[(usize, Arc<[Value]>)]>) {
+    if fcn_dom_exact_eq(d1, kv1, d2, kv2) {
+        return (d1.clone(), kv1.clone());
+    }
+    let mut new_dom = Vec::with_capacity(d1.len());
+    let mut new_kv: Vec<(usize, Arc<[Value]>)> = Vec::new();
+    let (mut i1, mut i2) = (0usize, 0usize);
+    for pos in 0..d1.len() {
+        let s1: &[Value] = match kv1.get(i1) {
+            Some((p, vs)) if *p == pos => {
+                i1 += 1;
+                vs
+            }
+            _ => std::slice::from_ref(&d1[pos]),
+        };
+        let s2: &[Value] = match kv2.get(i2) {
+            Some((p, vs)) if *p == pos => {
+                i2 += 1;
+                vs
+            }
+            _ => std::slice::from_ref(&d2[pos]),
+        };
+        if s1.len() == 1 && s2.len() == 1 && s1[0].exact_eq(&s2[0]) {
+            new_dom.push(s1[0].clone());
+            continue;
+        }
+        if values_exact_eq(s1, s2) {
+            new_dom.push(s1[0].clone());
+            new_kv.push((pos, kv1[i1 - 1].1.clone()));
+            continue;
+        }
+        let mut variants: Vec<Value> = Vec::with_capacity(s1.len() + s2.len());
+        variants.extend(s1.iter().cloned());
+        variants.extend(s2.iter().cloned());
+        variants.sort_by(Value::exact_cmp);
+        variants.dedup_by(|a, b| a.exact_eq(b));
+        new_dom.push(variants[0].clone());
+        if variants.len() >= 2 {
+            new_kv.push((pos, Arc::from(variants)));
+        }
+    }
+    (Arc::from(new_dom), Arc::from(new_kv))
+}
+
+/// Whether function pairs `ps` match `dom` and `key_variants` by exact
+/// representation (`Value::exact_eq`).
+pub fn fcn_dom_matches_exact(ps: &[(Value, Value)], dom: &[Value], key_variants: &[(usize, Arc<[Value]>)]) -> bool {
+    match_fcn_keys_exact(ps.iter().map(|(k, _)| k), dom, key_variants, |_, _| {})
 }
 
 /// Keys whose rank order is TLC's value order (so a map's domain is
@@ -263,14 +567,14 @@ fn map_key_ok(s: &Shape) -> bool {
     }
 }
 
-/// `Map { key, range }` if it has a compact encoding, else `Dyn`.
-pub fn map_shape(key: Shape, range: Shape) -> Shape {
+/// `Map { key, range, witness }` if it has a compact encoding, else `Dyn`.
+pub fn map_shape(key: Shape, range: Shape, witness: FcnWitness) -> Shape {
     use crate::decisions::{note, summary};
     let Some(u) = crate::layout::bitset_universe(&key) else {
         note(|| format!("Dyn: function keys {} have no finite universe of at most 4096 values", summary(&key)));
         return Shape::Dyn;
     };
-    let w = crate::layout::MapDims::new(u as usize, crate::pack::SlotLayout::of(&range)).words();
+    let w = crate::layout::MapDims::new(u as usize, crate::pack::SlotLayout::of(&range)).words() + witness.extra_words();
     if !map_key_ok(&key) || w > MAX_MAP_WORDS || range == Shape::Dyn {
         note(|| {
             if !map_key_ok(&key) {
@@ -283,7 +587,7 @@ pub fn map_shape(key: Shape, range: Shape) -> Shape {
         });
         return Shape::Dyn;
     }
-    Shape::Map { key: Box::new(key), range: Box::new(range) }
+    Shape::Map { key: Box::new(key), range: Box::new(range), witness }
 }
 
 /// Whether a value of the tuple / sequence or record shape `a` can equal
@@ -326,36 +630,64 @@ enum KeyKind {
     Str,
 }
 
-/// Key and range shapes of a tuple, sequence or record shape seen as a map.
-fn fcn_view(s: &Shape) -> (Shape, Shape) {
+/// Key, range and witness of a tuple, sequence, record, function or map shape seen as a map.
+fn fcn_view(s: &Shape) -> (Shape, Shape, FcnWitness) {
     match s {
-        Shape::Record(fs) => (join_all(fs.iter().map(|(k, _)| Shape::of(&Value::Str(*k)))), join_all(fs.iter().map(|(_, f)| f.clone()))),
+        Shape::Record(fs) => {
+            (join_all(fs.iter().map(|(k, _)| Shape::of(&Value::Str(*k)))), join_all(fs.iter().map(|(_, f)| f.clone())), FcnWitness::Dynamic)
+        }
         Shape::Tuple(_) | Shape::Seq { .. } => {
             let (e, n) = seq_view(s);
-            (if n == 0 { Shape::Never } else { Shape::Int { lo: 1, hi: n as i64 } }, e)
+            (if n == 0 { Shape::Never } else { Shape::Int { lo: 1, hi: n as i64 } }, e, FcnWitness::Interval)
         }
         _ => map_view(s),
     }
 }
 
+/// Whether `dom` is the tuple domain `1..=len` (empty when `len == 0`).
+#[inline]
+pub fn fcn_dom_matches_tuple(dom: &[Value], len: usize) -> bool {
+    dom.len() == len && dom.iter().enumerate().all(|(i, d)| *d == Value::Int(i as i64 + 1))
+}
+
+/// Whether `dom` is the record domain of fields `fs` (in `Sym` order).
+#[inline]
+pub fn fcn_dom_matches_record<T>(dom: &[Value], fs: &[(Sym, T)]) -> bool {
+    dom.len() == fs.len() && dom.iter().zip(fs.iter()).all(|(d, (k, _))| *d == Value::Str(*k))
+}
+
 /// Merge union arms that can hold equal values (`equal_values_possible`)
-/// into one map; false if that has no compact encoding (the join is then
-/// `Dyn`).
+/// into one function or map; false if that has no compact encoding (the join
+/// is then `Dyn`).
 fn merge_equal_arms(arms: &mut Vec<Shape>) -> bool {
     loop {
         let pair =
             (0..arms.len()).find_map(|i| (0..arms.len()).find(|&j| j != i && equal_values_possible(&arms[i], &arms[j])).map(|j| (i, j)));
         let Some((i, j)) = pair else { return true };
-        let (k1, r1) = fcn_view(&arms[i]);
-        let (k2, r2) = fcn_view(&arms[j]);
-        let m = map_shape(k1.join(&k2), r1.join(&r2));
-        if m == Shape::Dyn {
-            return false;
-        }
+        let (k1, r1, w1) = fcn_view(&arms[i]);
+        let (k2, r2, w2) = fcn_view(&arms[j]);
+        let merged = match map_shape(k1.join(&k2), r1.join(&r2), w1.join(w2)) {
+            Shape::Dyn => match (&arms[i], &arms[j]) {
+                (Shape::Record(fs), Shape::Fcn { dom, range, .. }) | (Shape::Fcn { dom, range, .. }, Shape::Record(fs))
+                    if fcn_dom_matches_record(dom, fs) =>
+                {
+                    let rr = join_all(fs.iter().map(|(_, f)| f.clone())).join(range);
+                    Shape::Fcn { dom: dom.clone(), range: Box::new(rr), witness: FcnWitness::Dynamic, key_variants: Arc::from([]) }
+                }
+                (Shape::Tuple(es), Shape::Fcn { dom, range, .. }) | (Shape::Fcn { dom, range, .. }, Shape::Tuple(es))
+                    if fcn_dom_matches_tuple(dom, es.len()) =>
+                {
+                    let rr = join_all(es.iter().cloned()).join(range);
+                    Shape::Fcn { dom: dom.clone(), range: Box::new(rr), witness: FcnWitness::Dynamic, key_variants: Arc::from([]) }
+                }
+                _ => return false,
+            },
+            m => m,
+        };
         let (lo, hi) = (i.min(j), i.max(j));
         arms.remove(hi);
-        arms[lo] = m;
-        // (A map may now be joined with another map arm of the same family.)
+        arms[lo] = merged;
+        // (A function/map may now be joined with another arm of the same family.)
         if let Some(k) = (0..arms.len()).find(|&k| k != lo && same_family(&arms[k], &arms[lo])) {
             let j = join_same(&arms[k], &arms[lo]);
             if j == Shape::Dyn {
@@ -507,24 +839,40 @@ impl Shape {
             Value::Bool(_) => Shape::Bool,
             Value::Int(n) => Shape::Int { lo: *n, hi: *n },
             Value::Str(_) | Value::ModelValue(_) => Shape::Atom(Arc::from(vec![v.clone()])),
-            Value::Set(es) => Shape::Set { elem: Box::new(join_all(es.iter().map(Shape::of))), max_card: es.len() },
-            Value::Interval(lo, hi) => {
-                if hi < lo {
-                    Shape::Set { elem: Box::new(Shape::Never), max_card: 0 }
-                } else {
-                    Shape::Set { elem: Box::new(Shape::Int { lo: *lo, hi: *hi }), max_card: (hi - lo) as usize + 1 }
-                }
-            }
+            Value::Set(es) => set_shape(join_all(es.iter().map(Shape::of)), es.len()),
+            // Preserve `Value::Interval` vs `Value::Set` witness: `Shape::Set`
+            // always decodes as `Value::Set`, so intervals take `Shape::Dyn`
+            // (exact handle in `dynval`, canonicalized with equal sets).
+            Value::Interval(..) => Shape::Dyn,
             Value::Tuple(es) => Shape::Tuple(es.iter().map(Shape::of).collect()),
             Value::Record(fs) => Shape::Record(fs.iter().map(|(k, x)| (*k, Shape::of(x))).collect()),
-            Value::Fcn(ps, _) => {
-                Shape::Fcn { dom: ps.iter().map(|p| p.0.clone()).collect(), range: Box::new(join_all(ps.iter().map(|p| Shape::of(&p.1)))) }
-            }
+            Value::Fcn(ps, dom_kind) => Shape::Fcn {
+                dom: ps.iter().map(|p| p.0.clone()).collect(),
+                range: Box::new(join_all(ps.iter().map(|p| Shape::of(&p.1)))),
+                witness: FcnWitness::from_dom(*dom_kind),
+                key_variants: Arc::from([]),
+            },
             Value::LazySet(_) | Value::LazyFcn(_) => match force(v) {
                 Some(n) => Shape::of(&n),
                 None => Shape::Dyn,
             },
         }
+    }
+
+    /// Whether this shape or any nested shape carries non-canonical witness
+    /// state that must be canonicalized before hashing (`Shape::Dyn`,
+    /// `FcnWitness::Dynamic`, or non-empty `key_variants`).
+    pub fn has_dynamic_witness(&self) -> bool {
+        let mut found = match self {
+            Shape::Dyn => true,
+            Shape::Fcn { witness, key_variants, .. } => *witness == FcnWitness::Dynamic || !key_variants.is_empty(),
+            Shape::Map { witness, .. } => *witness == FcnWitness::Dynamic,
+            _ => false,
+        };
+        if !found {
+            self.for_each_child(|c| found |= c.has_dynamic_witness());
+        }
+        found
     }
 
     /// Least upper bound (with collapse to `Dyn` when unions grow too large).
@@ -542,16 +890,25 @@ impl Shape {
             return join_same(self, other);
         }
         // Tuples are functions on `1..n` (the empty one, `<<>>`, is also an
-        // empty map): with other functions they form a map.
+        // empty function): with a fixed-domain function over the exact same
+        // domain they stay a fixed-domain `Fcn` with a dynamic witness; with
+        // other functions/maps they form a `Map`.
         match (self, other) {
+            (Shape::Tuple(es), Shape::Fcn { dom, range, .. }) | (Shape::Fcn { dom, range, .. }, Shape::Tuple(es))
+                if fcn_dom_matches_tuple(dom, es.len()) =>
+            {
+                let rr = join_all(es.iter().cloned()).join(range);
+                return Shape::Fcn { dom: dom.clone(), range: Box::new(rr), witness: FcnWitness::Dynamic, key_variants: Arc::from([]) };
+            }
             (s @ (Shape::Tuple(_) | Shape::Seq { .. }), m @ (Shape::Fcn { .. } | Shape::Map { .. }))
             | (m @ (Shape::Fcn { .. } | Shape::Map { .. }), s @ (Shape::Tuple(_) | Shape::Seq { .. })) => {
-                let (k, r) = map_view(m);
+                let (k, r, w) = map_view(m);
                 let (e, n) = seq_view(s);
+                let w = w.join(FcnWitness::Interval);
                 if n == 0 {
-                    return map_shape(k, r);
+                    return map_shape(k, r, w);
                 }
-                let j = map_shape(k.join(&Shape::Int { lo: 1, hi: n as i64 }), r.join(&e));
+                let j = map_shape(k.join(&Shape::Int { lo: 1, hi: n as i64 }), r.join(&e), w);
                 if j != Shape::Dyn || equal_values_possible(s, m) {
                     return j;
                 }
@@ -608,7 +965,7 @@ impl Shape {
         match self {
             Shape::Set { elem, .. } | Shape::Seq { elem, .. } => f(elem),
             Shape::Fcn { range, .. } => f(range),
-            Shape::Map { key, range } => {
+            Shape::Map { key, range, .. } => {
                 f(key);
                 f(range);
             }
@@ -656,9 +1013,19 @@ impl Shape {
                 }
                 Some(total)
             }
-            Shape::Fcn { dom, range } => checked_pow(range.cardinality()?, dom.len()),
+            Shape::Fcn { dom, range, witness, key_variants } => {
+                if *witness == FcnWitness::Dynamic || !key_variants.is_empty() {
+                    return None;
+                }
+                checked_pow(range.cardinality()?, dom.len())
+            }
             // Sum over domains D of |range|^|D| = (|range| + 1)^|universe|.
-            Shape::Map { key, range } => checked_pow(range.cardinality()?.checked_add(1)?, usize::try_from(key.cardinality()?).ok()?),
+            Shape::Map { key, range, witness } => {
+                if *witness == FcnWitness::Dynamic {
+                    return None;
+                }
+                checked_pow(range.cardinality()?.checked_add(1)?, usize::try_from(key.cardinality()?).ok()?)
+            }
             Shape::Record(fs) => fs.iter().try_fold(1u64, |acc, f| acc.checked_mul(f.1.cardinality()?)),
             Shape::Tuple(es) => es.iter().try_fold(1u64, |acc, e| acc.checked_mul(e.cardinality()?)),
             Shape::Seq { elem, max_len } => {
@@ -680,14 +1047,25 @@ impl Shape {
         }
     }
 
-    /// Whether `v` is described by this shape (encoding would succeed).
+    /// Whether `v` is described by this shape in its exact representation
+    /// (encoding would succeed while preserving function-domain witnesses).
     pub fn contains(&self, v: &Value) -> bool {
+        self.contains_impl::<false>(v)
+    }
+
+    /// Whether some value of this shape is TLA+-equal to `v` (ignoring
+    /// function-domain construction witnesses; for equality/membership probes).
+    pub fn contains_semantic(&self, v: &Value) -> bool {
+        self.contains_impl::<true>(v)
+    }
+
+    fn contains_impl<const SEMANTIC: bool>(&self, v: &Value) -> bool {
         if let Shape::Ref(_) = self {
             // Every finite value has a store representation.
             return v.normalize().is_ok_and(|n| n.is_normal());
         }
         let Some(v) = force(v) else { return matches!(self, Shape::Dyn) };
-        let v = fit_shape(self, v);
+        let v = if SEMANTIC { fit_shape(self, v) } else { v };
         let v = &*v;
         match (self, v) {
             (Shape::Dyn, _) => true,
@@ -695,27 +1073,58 @@ impl Shape {
             (Shape::Int { lo, hi }, Value::Int(n)) => lo <= n && n <= hi,
             (Shape::Atom(u), Value::Str(_) | Value::ModelValue(_)) => u.binary_search(v).is_ok(),
             (Shape::Set { elem, max_card }, Value::Set(_) | Value::Interval(..)) => {
+                if !SEMANTIC && matches!(v, Value::Interval(..)) {
+                    return false;
+                }
                 if set_len(v).unwrap() > *max_card as u64 {
                     return false;
                 }
-                set_elems(v).unwrap().iter().all(|e| elem.contains(e))
+                set_elems(v).unwrap().iter().all(|e| elem.contains_impl::<SEMANTIC>(e))
             }
-            (Shape::Fcn { dom, range }, Value::Fcn(ps, _)) => {
-                ps.len() == dom.len() && ps.iter().zip(dom.iter()).all(|(p, d)| p.0 == *d) && ps.iter().all(|p| range.contains(&p.1))
+            (Shape::Fcn { dom, range, witness, key_variants }, Value::Fcn(ps, d)) => {
+                let witness_ok = SEMANTIC || witness.accepts_dom(*d);
+                let dom_ok = if SEMANTIC {
+                    ps.len() == dom.len() && ps.iter().zip(dom.iter()).all(|(p, d)| p.0 == *d)
+                } else {
+                    fcn_dom_matches_exact(ps, dom, key_variants)
+                };
+                witness_ok && dom_ok && ps.iter().all(|p| range.contains_impl::<SEMANTIC>(&p.1))
+            }
+            (Shape::Fcn { dom, range, witness: FcnWitness::Dynamic, key_variants }, Value::Tuple(vs)) => {
+                (SEMANTIC || key_variants.is_empty())
+                    && fcn_dom_matches_tuple(dom, vs.len())
+                    && vs.iter().all(|x| range.contains_impl::<SEMANTIC>(x))
+            }
+            (Shape::Fcn { dom, range, witness: FcnWitness::Dynamic, key_variants }, Value::Record(fs)) => {
+                (SEMANTIC || key_variants.is_empty())
+                    && fcn_dom_matches_record(dom, fs)
+                    && fs.iter().all(|(_, x)| range.contains_impl::<SEMANTIC>(x))
             }
             (Shape::Record(fs), Value::Record(vs)) => {
-                fs.len() == vs.len() && fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0 && f.1.contains(&x.1))
+                fs.len() == vs.len() && fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0 && f.1.contains_impl::<SEMANTIC>(&x.1))
             }
-            (Shape::Map { key, range }, _) => match fcn_pairs(v) {
-                Some(ps) => ps.iter().all(|(k, x)| key.contains(k) && range.contains(x)),
-                None => false,
-            },
-            (Shape::Tuple(ss), Value::Tuple(vs)) => ss.len() == vs.len() && ss.iter().zip(vs.iter()).all(|(s, x)| s.contains(x)),
-            (Shape::Seq { elem, max_len }, Value::Tuple(vs)) => vs.len() <= *max_len && vs.iter().all(|x| elem.contains(x)),
-            (Shape::Union(arms), _) => match arm_for(arms, v) {
-                Some(i) => arms[i].contains(v),
-                None => false,
-            },
+            (Shape::Map { key, range, witness }, _) => {
+                if !(SEMANTIC || witness.accepts_map_value(v)) {
+                    return false;
+                }
+                match fcn_pairs(v) {
+                    Some(ps) => ps.iter().all(|(k, x)| key.contains_impl::<SEMANTIC>(k) && range.contains_impl::<SEMANTIC>(x)),
+                    None => false,
+                }
+            }
+            (Shape::Tuple(ss), Value::Tuple(vs)) => {
+                ss.len() == vs.len() && ss.iter().zip(vs.iter()).all(|(s, x)| s.contains_impl::<SEMANTIC>(x))
+            }
+            (Shape::Seq { elem, max_len }, Value::Tuple(vs)) => {
+                vs.len() <= *max_len && vs.iter().all(|x| elem.contains_impl::<SEMANTIC>(x))
+            }
+            (Shape::Union(arms), _) => {
+                let arm = if SEMANTIC { arm_for_semantic(arms, v) } else { arm_for(arms, v) };
+                match arm {
+                    Some(i) => arms[i].contains_impl::<SEMANTIC>(v),
+                    None => false,
+                }
+            }
             _ => false,
         }
     }
@@ -736,32 +1145,63 @@ fn checked_pow(base: u64, exp: usize) -> Option<u64> {
     base.checked_pow(u32::try_from(exp).ok()?)
 }
 
-/// Index of the union arm whose kind matches the (normalized) value `v`.
+/// Index of the union arm whose kind and function witness match the
+/// (normalized) value `v`.
 pub(crate) fn arm_for(arms: &[Shape], v: &Value) -> Option<usize> {
+    arms.iter().position(|a| match (a, v) {
+        (Shape::Bool, Value::Bool(_))
+        | (Shape::Int { .. }, Value::Int(_))
+        | (Shape::Atom(_), Value::Str(_) | Value::ModelValue(_))
+        | (Shape::Set { .. }, Value::Set(_))
+        | (Shape::Seq { .. }, Value::Tuple(_)) => true,
+        (Shape::Tuple(ss), Value::Tuple(vs)) => ss.len() == vs.len(),
+        (Shape::Record(fs), Value::Record(vs)) => same_field_names(fs, vs),
+        (Shape::Fcn { dom, witness, key_variants, .. }, Value::Fcn(ps, d)) => {
+            witness.accepts_dom(*d) && fcn_dom_matches_exact(ps, dom, key_variants)
+        }
+        (Shape::Fcn { dom, witness: FcnWitness::Dynamic, key_variants, .. }, Value::Tuple(vs)) => {
+            key_variants.is_empty() && fcn_dom_matches_tuple(dom, vs.len())
+        }
+        (Shape::Fcn { dom, witness: FcnWitness::Dynamic, key_variants, .. }, Value::Record(fs)) => {
+            key_variants.is_empty() && fcn_dom_matches_record(dom, fs)
+        }
+        (Shape::Map { key, witness, .. }, _) if witness.accepts_map_value(v) => match v {
+            Value::Tuple(vs) => (1..=vs.len() as i64).all(|i| key.contains_semantic(&Value::Int(i))),
+            Value::Record(fs) => fs.iter().all(|(k, _)| key.contains_semantic(&Value::Str(*k))),
+            Value::Fcn(..) => true,
+            _ => unreachable!(),
+        },
+        _ => false,
+    })
+}
+
+/// Index of the union arm that can hold a value TLA+-equal to `v` (ignoring
+/// function-domain construction witnesses; for semantic equality/membership).
+pub(crate) fn arm_for_semantic(arms: &[Shape], v: &Value) -> Option<usize> {
     let direct = arms.iter().position(|a| match (a, v) {
         (Shape::Bool, Value::Bool(_))
         | (Shape::Int { .. }, Value::Int(_))
         | (Shape::Atom(_), Value::Str(_) | Value::ModelValue(_))
         | (Shape::Set { .. }, Value::Set(_) | Value::Interval(..))
-        | (Shape::Seq { .. }, Value::Tuple(_))
-        | (Shape::Fcn { .. } | Shape::Map { .. }, Value::Fcn(..)) => true,
-        // Tuple arms are discriminated by length.
+        | (Shape::Seq { .. }, Value::Tuple(_)) => true,
         (Shape::Tuple(ss), Value::Tuple(vs)) => ss.len() == vs.len(),
         (Shape::Record(fs), Value::Record(vs)) => same_field_names(fs, vs),
+        (Shape::Fcn { dom, .. }, Value::Fcn(ps, _)) => ps.len() == dom.len() && ps.iter().zip(dom.iter()).all(|(p, k)| p.0 == *k),
+        (Shape::Map { key, .. }, Value::Fcn(ps, _)) => ps.iter().all(|(k, _)| key.contains_semantic(k)),
         _ => false,
     });
-    // Tuples and records are functions too: a map arm takes them otherwise,
-    // or a function arm over their domain; a function over an enumerated
-    // `1..n` or set of strings goes to a tuple / sequence / record arm (see
-    // `fit_repr`).
     direct.or_else(|| match v {
-        Value::Tuple(_) | Value::Record(_) => arms.iter().position(|a| matches!(a, Shape::Map { .. })).or_else(|| {
-            let Value::Fcn(ps, _) = v.clone().into_fcn_rcd() else { return None };
-            arms.iter().position(
-                |a| matches!(a, Shape::Fcn { dom, .. } if ps.len() == dom.len() && ps.iter().zip(dom.iter()).all(|(p, d)| p.0 == *d)),
-            )
+        Value::Tuple(vs) => arms.iter().position(|a| match a {
+            Shape::Map { key, .. } => (1..=vs.len() as i64).all(|i| key.contains_semantic(&Value::Int(i))),
+            Shape::Fcn { dom, .. } => fcn_dom_matches_tuple(dom, vs.len()),
+            _ => false,
         }),
-        Value::Fcn(..) => v.fcn_canonical().and_then(|c| arm_for(arms, &c)),
+        Value::Record(fs) => arms.iter().position(|a| match a {
+            Shape::Map { key, .. } => fs.iter().all(|(k, _)| key.contains_semantic(&Value::Str(*k))),
+            Shape::Fcn { dom, .. } => fcn_dom_matches_record(dom, fs),
+            _ => false,
+        }),
+        Value::Fcn(..) => v.fcn_canonical().and_then(|c| arm_for_semantic(arms, &c)),
         _ => None,
     })
 }
@@ -778,8 +1218,16 @@ mod tests {
 
     #[test]
     fn empty_fcn_union_canonicality() {
-        let atom_map =
-            Shape::Map { key: Box::new(Shape::Atom(Arc::from([Value::Str(Sym::new("a"))]))), range: Box::new(Shape::Int { lo: 1, hi: 2 }) };
+        let atom_map = Shape::Map {
+            key: Box::new(Shape::Atom(Arc::from([Value::Str(Sym::new("a"))]))),
+            range: Box::new(Shape::Int { lo: 1, hi: 2 }),
+            witness: FcnWitness::Enumerated,
+        };
+        let atom_map_dyn = Shape::Map {
+            key: Box::new(Shape::Atom(Arc::from([Value::Str(Sym::new("a"))]))),
+            range: Box::new(Shape::Int { lo: 1, hi: 2 }),
+            witness: FcnWitness::Dynamic,
+        };
         let seq = Shape::Seq { elem: Box::new(Shape::Int { lo: 1, hi: 2 }), max_len: 2 };
         let empty_tuple = Shape::Tuple(Arc::from([]));
         let one_tuple = Shape::Tuple(Arc::from([Shape::Int { lo: 1, hi: 2 }]));
@@ -789,14 +1237,16 @@ mod tests {
         assert_eq!(atom_map.join(&seq), Shape::Dyn);
         assert_eq!(seq.join(&atom_map), Shape::Dyn);
 
-        // `Tuple([])` is absorbed into `Map` (its empty map represents `<<>>`).
-        assert_eq!(atom_map.join(&empty_tuple), atom_map);
-        assert_eq!(empty_tuple.join(&atom_map), atom_map);
+        // `Tuple([])` is absorbed into `Map` with a dynamic witness (so `<<>>`
+        // and `[k \in {} |-> e]` keep their witnesses while sharing one shape).
+        assert_eq!(atom_map.join(&empty_tuple), atom_map_dyn);
+        assert_eq!(empty_tuple.join(&atom_map), atom_map_dyn);
 
         // Through `merge_equal_arms` inside a multi-arm `Union`:
         let bool_or_map = Shape::Bool.join(&atom_map);
+        let bool_or_map_dyn = Shape::Bool.join(&atom_map_dyn);
         assert_eq!(bool_or_map.join(&seq), Shape::Dyn);
-        assert_eq!(bool_or_map.join(&empty_tuple), bool_or_map);
+        assert_eq!(bool_or_map.join(&empty_tuple), bool_or_map_dyn);
 
         // A non-empty `Tuple` cannot hold `<<>>` and has Int keys, so it stays
         // a disjoint `Union` arm with an Atom-keyed `Map`.

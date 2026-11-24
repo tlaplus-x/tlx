@@ -654,8 +654,8 @@ ndJson*`; no effect on state counts. tlx: `tlx-eval/src/natives/json.rs`.
      built over an interval `lo..hi` (`lo != 1`; function constructors, elements of `[lo..hi -> S]`,
      recursive functions and their EXCEPT results) as `Fcn` with `FcnDom::Interval`, which reports
      "Attempted to apply function with integer domain to the non-integer argument"
-     (`tlx-value/src/value.rs`; tests `tests/specs/SN3`-`SN5`, `SN14`). The compiled encoding has no
-     `FcnDom`; decoding infers it from whether the keys are exactly `lo..hi` (compat.md D-13).
+     (`tlx-value/src/value.rs`; tests `tests/specs/SN3`-`SN5`, `SN14`). The compiled encoding preserves
+     the construction witness through `FcnWitness` on `Shape::Fcn` and `Shape::Map` (compat.md D-13).
 8. String and model-value order is intern order (§1.3); it affects CHOOSE and so the reachable
    state set. Typed model values (`x_...`) error when compared with non-model values.
 9. `\div` is flawed when only `Naturals` is extended (§4).

@@ -61,22 +61,22 @@ pub(super) fn symmetry_order(layout: &Layout) -> Vec<usize> {
 
 /// Fingerprint of the least encoding in the SYMMETRY orbit of `words` (a
 /// canonical representative of the orbit), comparing the variables'
-/// encodings lexicographically in the fixed `order`. `offs` are the word
-/// offsets of the variables: a permutation is abandoned at the first
-/// variable whose permuted encoding is greater than the best one's. With
-/// value store handles (`sem`), encodings are compared and fingerprinted
-/// with the handles' semantic digests in their place (a handle's number is
-/// not canonical).
-pub(super) fn orbit_fp(group: &[Vec<PermPlan>], order: &[usize], offs: &[usize], words: &[u64], sem: Option<&SemFp>) -> u64 {
+/// encodings lexicographically in the fixed `order`. A permutation is
+/// abandoned at the first variable whose permuted encoding is greater than
+/// the best one's. With value store handles or dynamic witnesses (`sem`),
+/// encodings are compared and fingerprinted in canonical form.
+pub(super) fn orbit_fp(group: &[Vec<PermPlan>], order: &[usize], layout: &Layout, words: &[u64], sem: Option<&SemFp>) -> u64 {
+    let offs = &layout.offsets;
     ORBIT_BUF.with(|b| {
         let mut b = b.borrow_mut();
         let (best, buf) = &mut *b;
-        // The encoding compared: `words`, or with handles as digests.
+        // The encoding compared: `words`, or canonicalized (handles as digests,
+        // dynamic witness words zeroed).
         let mut base = Vec::new();
-        let sem = sem.filter(|s| !s.state.is_empty());
+        let sem = sem.filter(|s| s.state_needs_canonical(layout));
         let start: &[u64] = match sem {
             Some(s) => {
-                s.semantic(words, &s.state, &mut base);
+                s.semantic_state(layout, words, &mut base);
                 &base
             }
             None => words,
@@ -92,9 +92,14 @@ pub(super) fn orbit_fp(group: &[Vec<PermPlan>], order: &[usize], offs: &[usize],
 
                 // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
                 unsafe { plans[i].apply_unchecked(&words[lo..hi], &mut buf[lo..hi]) };
-                if let Some(s) = sem.filter(|s| s.ref_vars[i]) {
-                    // (A value store slot is one handle.)
-                    buf[lo] = s.store.digest(buf[lo]);
+                if let Some(s) = sem {
+                    if s.ref_vars[i] {
+                        // (A value store slot is one handle.)
+                        buf[lo] = s.store.as_ref().expect("ref_vars requires store").digest(buf[lo]);
+                    }
+                    if layout.node(i).has_dynamic_witness() {
+                        layout.node(i).canonicalize_words(&mut buf[lo..hi]);
+                    }
                 }
                 if !less {
                     match buf[lo..hi].cmp(&cur[lo..hi]) {

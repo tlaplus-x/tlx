@@ -174,9 +174,10 @@ impl Renaming<'_> {
             (SeqFilter { bind: t, seq: x1, pred: x2, slot: w }, SeqFilter { bind: u, seq: y1, pred: y2, slot: v }) => {
                 w == v && self.bind(*t, *u) && self.expr(x1, y1) && self.expr(x2, y2)
             }
-            (MapBuild { bind: t, set: x1, rank: x2, value: x3 }, MapBuild { bind: u, set: y1, rank: y2, value: y3 }) => {
-                self.bind(*t, *u) && self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3)
-            }
+            (
+                MapBuild { bind: t, set: x1, rank: x2, value: x3, witness: w1 },
+                MapBuild { bind: u, set: y1, rank: y2, value: y3, witness: w2 },
+            ) => w1 == w2 && self.bind(*t, *u) && self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3),
             (ValField(x, f), ValField(y, g)) => f == g && self.expr(x, y),
             (Slice { base: x, loc: o }, Slice { base: y, loc: p }) => o == p && self.expr(x, y),
             (Index { base: x1, arg: x2, map: m, slot: w }, Index { base: y1, arg: y2, map: n, slot: v }) => {

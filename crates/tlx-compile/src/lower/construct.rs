@@ -45,15 +45,18 @@ impl Lowerer<'_> {
             (H::Builtin { op: B::AtAt, args }, Shape::Fcn { .. }) if !self.ip.is_builtin_overridden(B::AtAt) => {
                 self.fcn_merge_into(&args[0], &args[1], env, st, sid)
             }
-            (H::Builtin { op: B::DotDot, args }, Shape::Set { elem, .. }) if !self.ip.is_builtin_overridden(B::DotDot) => {
-                self.interval_into(&args[0], &args[1], elem, env, st, sid)
-            }
             (H::SetMap { expr: f, bounds }, Shape::Set { elem, .. }) => self.set_map_into(f, bounds, elem, env, st, sid),
             (H::Builtin { op: B::Union, args }, Shape::Set { .. }) if !self.ip.is_builtin_overridden(B::Union) => {
                 self.big_union_into(&args[0], sid, env, st)
             }
+            (H::Builtin { op: B::Times, args }, Shape::Set { .. }) if !self.ip.is_builtin_overridden(B::Times) => {
+                self.typed_times(args, env, st, expr::SetMode::SetExt).map(|x| self.coerce_enc(x, sid))
+            }
             (H::Builtin { op: B::Cup, args }, Shape::Set { elem, .. })
-                if !self.ip.is_builtin_overridden(B::Cup) && typed::shapes_comparable(elem, elem) =>
+                if !self.ip.is_builtin_overridden(B::Cup)
+                    && typed::shapes_comparable(elem, elem)
+                    && self.domain_witness(&args[1], env, st) == Some(tlx_layout::FcnWitness::Enumerated)
+                    && self.domain_witness(&args[0], env, st) != Some(tlx_layout::FcnWitness::Interval) =>
             {
                 if self.is_bitset(Ty::Enc(sid)) {
                     // The destination consumes a normalized set, so lazy
@@ -70,7 +73,7 @@ impl Lowerer<'_> {
                 }
             }
             (H::SetFilter { bound, pred }, Shape::Set { elem, .. }) => {
-                let x = self.expr(e, env, st);
+                let x = self.extensional_set_expr(e, env, st);
                 if x.ty == Ty::Enc(sid) {
                     Some(x)
                 } else {
@@ -426,21 +429,65 @@ impl Lowerer<'_> {
     /// a shape of the same structure (same field names, length or domain),
     /// if every component can be converted natively.
     fn struct_coerce(&mut self, x: &Expr, sid: ShapeId) -> Option<Expr> {
+        use tlx_layout::FcnWitness as W;
         let Ty::Enc(from) = x.ty else { return None };
         let (src, dst) = (self.shape_of(Ty::Enc(from))?.clone(), self.shape_of(Ty::Enc(sid))?.clone());
         let src_fl = FieldLayout::of_shape(&src)?;
-        let pairs: Vec<(Shape, Shape)> = match (&src, &dst) {
+        #[derive(Clone, Copy)]
+        enum TrailWord {
+            Const(u64),
+            Copy(usize),
+        }
+        let (pairs, trailing): (Vec<(Shape, Shape)>, Vec<TrailWord>) = match (&src, &dst) {
             (Shape::Record(a), Shape::Record(b)) if a.len() == b.len() && a.iter().zip(b.iter()).all(|(p, q)| p.0 == q.0) => {
-                a.iter().zip(b.iter()).map(|(p, q)| (p.1.clone(), q.1.clone())).collect()
+                (a.iter().zip(b.iter()).map(|(p, q)| (p.1.clone(), q.1.clone())).collect(), Vec::new())
             }
-            (Shape::Tuple(a), Shape::Tuple(b)) if a.len() == b.len() => a.iter().cloned().zip(b.iter().cloned()).collect(),
-            (Shape::Fcn { dom: d1, range: r1 }, Shape::Fcn { dom: d2, range: r2 }) if d1 == d2 => {
-                vec![((**r1).clone(), (**r2).clone()); d1.len()]
+            (Shape::Tuple(a), Shape::Tuple(b)) if a.len() == b.len() => (a.iter().cloned().zip(b.iter().cloned()).collect(), Vec::new()),
+            (
+                Shape::Fcn { dom: d1, range: r1, witness: w1, key_variants: kv1 },
+                Shape::Fcn { dom: d2, range: r2, witness: w2, key_variants: kv2 },
+            ) if d1 == d2 && (w1 == w2 || *w2 == W::Dynamic) => {
+                let src_base = src_fl.words;
+                let mut trail = Vec::new();
+                if *w2 == W::Dynamic {
+                    trail.push(match w1 {
+                        W::Dynamic => TrailWord::Copy(src_base),
+                        W::Enumerated => TrailWord::Const(1),
+                        W::Interval => TrailWord::Const(0),
+                    });
+                }
+                if kv1.is_empty() {
+                    let kv_start = trail.len();
+                    trail.resize(kv_start + kv2.len(), TrailWord::Const(0));
+                    if !tlx_layout::shape::match_fcn_keys_exact(d1.iter(), d2, kv2, |slot, idx| {
+                        trail[kv_start + slot] = TrailWord::Const(idx as u64);
+                    }) {
+                        return None;
+                    }
+                } else if tlx_layout::shape::fcn_dom_exact_eq(d1, kv1, d2, kv2) {
+                    let kv_base = src_base + w1.extra_words();
+                    for i in 0..kv1.len() {
+                        trail.push(TrailWord::Copy(kv_base + i));
+                    }
+                } else {
+                    return None;
+                }
+                (vec![((**r1).clone(), (**r2).clone()); d1.len()], trail)
+            }
+            (Shape::Tuple(a), Shape::Fcn { dom: d2, range: r2, witness: W::Dynamic, key_variants: kv2 })
+                if kv2.is_empty() && tlx_layout::shape::fcn_dom_matches_tuple(d2, a.len()) =>
+            {
+                (a.iter().cloned().map(|s| (s, (**r2).clone())).collect(), vec![TrailWord::Const(0)])
+            }
+            (Shape::Record(a), Shape::Fcn { dom: d2, range: r2, witness: W::Dynamic, key_variants: kv2 })
+                if kv2.is_empty() && tlx_layout::shape::fcn_dom_matches_record(d2, a) =>
+            {
+                (a.iter().map(|(_, s)| (s.clone(), (**r2).clone())).collect(), vec![TrailWord::Const(0)])
             }
             _ => return None,
         };
         let (xs, bind) = self.share(x.clone());
-        let mut parts = Vec::with_capacity(pairs.len());
+        let mut parts = Vec::with_capacity(pairs.len() + trailing.len());
         for (&loc, (a, b)) in src_fl.locs.iter().zip(pairs) {
             let asid = self.sid(&a);
             let bsid = self.sid(&b);
@@ -450,6 +497,15 @@ impl Lowerer<'_> {
                 return None;
             }
             parts.push(c);
+        }
+        for t in trailing {
+            match t {
+                TrailWord::Const(w) => parts.push(self.raw_word(w)),
+                TrailWord::Copy(src_off) => {
+                    let wsid = self.sid(&Shape::Int { lo: 0, hi: 0 });
+                    parts.push(Expr::new(Ty::Enc(wsid), ExprKind::Slice { base: xs.clone(), loc: FieldLoc::Words(src_off) }));
+                }
+            }
         }
         Some(let_in(bind, self.pack_shape(sid, parts)))
     }
@@ -483,12 +539,12 @@ impl Lowerer<'_> {
                 if l1 < l2 || h1 > h2 {
                     return None;
                 }
-                self.bit_rank(&probe, &temp_ref(ety, t))?
+                self.bit_rank(&probe, &temp_ref(ety, t), false)?
             }
             _ if scalarish => {
                 let e2sid = self.sid(&e2);
                 let y = self.recode_to(temp_ref(ety, t), e2sid)?;
-                self.bit_rank(&probe, &y)?
+                self.bit_rank(&probe, &y, false)?
             }
             // Products and unions: each element converted.
             _ => {
@@ -497,7 +553,7 @@ impl Lowerer<'_> {
                 if matches!(&*y.kind, ExprKind::Convert(_)) {
                     return None;
                 }
-                self.bit_rank(&probe, &y)?
+                self.bit_rank(&probe, &y, false)?
             }
         };
         let bound = self.iter_bound(&src).map(|n| n as u64);
@@ -630,23 +686,88 @@ impl Lowerer<'_> {
         let mut ranks = Vec::new();
         for x in es {
             let lx = if self.constructs(x, env) { self.expr_into(x, env, st, esid) } else { self.expr(x, env, st) };
-            ranks.push(self.bit_rank(&set_e, &lx)?);
+            ranks.push(self.bit_rank(&set_e, &lx, false)?);
         }
         let bound = ranks.len() as u64;
         Some(self.card_checked(Expr::new(Ty::Enc(sid), ExprKind::BitSet(ranks)), Some(bound)))
     }
 
+    /// Static function-domain witness produced by `[x \in set |-> body]`
+    /// (`Interval` for `lo..hi` / `DOMAIN tuple_or_seq` / constant intervals;
+    /// `Enumerated` for set enumerations, filters, maps, non-interval set ops,
+    /// and `DOMAIN` of non-tuple functions; `None` when unknown at compile time).
+    pub(super) fn domain_witness(&mut self, set: &hir::Expr, env: &LEnv, st: &St) -> Option<tlx_layout::FcnWitness> {
+        use tlx_layout::FcnWitness as W;
+        // Prefer the evaluated constant domain: e.g. `{} \cup (0..1)` evaluates
+        // to `Value::Interval(0, 1)`, not an enumerated set.
+        if let Some(v) = self.const_value(set, env) {
+            return match v {
+                Value::Interval(..) => Some(W::Interval),
+                Value::Set(_) | Value::LazySet(_) => Some(W::Enumerated),
+                _ => None,
+            };
+        }
+        let (p, penv) = self.peel(set, env)?;
+        match &*p.kind {
+            H::Builtin { op: B::DotDot, .. } if !self.ip.is_builtin_overridden(B::DotDot) => Some(W::Interval),
+            H::SetEnum(_) | H::SetFilter { .. } | H::SetMap { .. } => Some(W::Enumerated),
+            H::Builtin { op: op @ (B::Cap | B::SetMinus | B::Subset | B::Union), .. } if !self.ip.is_builtin_overridden(*op) => {
+                Some(W::Enumerated)
+            }
+            H::Builtin { op: B::Cup, args } if args.len() == 2 && !self.ip.is_builtin_overridden(B::Cup) => {
+                // `{} \cup (0..1)` returns the interval right operand unchanged;
+                // only classify a runtime union as enumerated when both operands
+                // are provably enumerated.
+                if self.domain_witness(&args[0], &penv, st) == Some(W::Enumerated)
+                    && self.domain_witness(&args[1], &penv, st) == Some(W::Enumerated)
+                {
+                    Some(W::Enumerated)
+                } else {
+                    None
+                }
+            }
+            H::Builtin { op: B::Domain, args } if args.len() == 1 && !self.ip.is_builtin_overridden(B::Domain) => {
+                let mark = self.frame.snapshot();
+                let fx = self.expr(&args[0], &penv, st);
+                let shape = self.shape_of(fx.ty).cloned();
+                self.frame.restore(mark);
+                match shape {
+                    Some(Shape::Tuple(_) | Shape::Seq { .. } | Shape::Fcn { witness: W::Interval, .. }) => Some(W::Interval),
+                    Some(Shape::Record(_) | Shape::Fcn { witness: W::Enumerated, .. } | Shape::Map { witness: W::Enumerated, .. }) => {
+                        Some(W::Enumerated)
+                    }
+                    Some(Shape::Fcn { dom, witness: W::Dynamic, .. }) => {
+                        (!tlx_value::plan::Witness::canonical_of_sorted_keys(dom.iter()).domain_is_interval()).then_some(W::Enumerated)
+                    }
+                    _ => None,
+                }
+            }
+            _ => {
+                let mark = self.frame.snapshot();
+                let x = self.expr(&p, &penv, st);
+                let is_enum = matches!(self.shape_of(x.ty), Some(Shape::Set { .. }));
+                self.frame.restore(mark);
+                is_enum.then_some(W::Enumerated)
+            }
+        }
+    }
+
     /// `[x \in D |-> body]` for a constant domain equal to the domain of the
     /// function (or tuple) shape: the body for each key.
     fn fcn_into(&mut self, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
+        use tlx_layout::FcnWitness as W;
         if bounds.len() > 1 || matches!(&bounds.first()?.vars, BoundVars::Many(ls) if ls.len() > 1) {
             return self.fcn_product_into(bounds, body, env, st, sid);
         }
         let [b] = bounds else { return None };
+        let dw = self.domain_witness(&b.set, env, st)?;
         if self.const_domain(&b.set, env, st).is_none() {
             let BoundVars::Many(ls) = &b.vars else { return None };
             let [l] = &ls[..] else { return None };
             // A computed domain `1..n` into a tuple: n must be its length.
+            if dw != W::Interval {
+                return None;
+            }
             let Some(Shape::Tuple(es)) = self.shape_of(Ty::Enc(sid)).cloned() else { return None };
             let n = self.seq_domain_len(&b.set, env, st)?;
             let k = es.len() as i64;
@@ -663,23 +784,45 @@ impl Lowerer<'_> {
             return Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(eq(n, int_lit(k)), built, fail))));
         }
         let dom = tlx_value::ops::enumerate_normalized(&self.const_domain(&b.set, env, st)?).ok()?;
-        let (keys, slot_shapes): (Vec<Value>, Vec<Shape>) = match self.shape_of(Ty::Enc(sid))? {
-            Shape::Fcn { dom: d, range } => (d.to_vec(), vec![(**range).clone(); d.len()]),
-            Shape::Tuple(es) => ((1..=es.len() as i64).map(Value::Int).collect(), es.to_vec()),
-            // A function over strings is a record (fields in shape order).
-            Shape::Record(fs) => (fs.iter().map(|(n, _)| Value::Str(*n)).collect(), fs.iter().map(|(_, f)| f.clone()).collect()),
-            _ => return None,
-        };
-        let mut sorted = keys.clone();
-        sorted.sort();
-        if sorted != dom || dom.len() > 64 {
+        if dom.len() > 64 {
             return None;
         }
+        let (slot_shapes, trail_words): (Vec<Shape>, Vec<u64>) = match self.shape_of(Ty::Enc(sid))?.clone() {
+            Shape::Fcn { dom: d, range, witness, key_variants } => {
+                let witness_word = match (witness, dw) {
+                    (W::Enumerated, W::Enumerated) | (W::Interval, W::Interval) => None,
+                    (W::Dynamic, _) => Some(u64::from(dw == W::Enumerated)),
+                    _ => return None,
+                };
+                let mut trail = Vec::with_capacity(usize::from(witness_word.is_some()) + key_variants.len());
+                if let Some(w) = witness_word {
+                    trail.push(w);
+                }
+                let kv_start = trail.len();
+                trail.resize(kv_start + key_variants.len(), 0);
+                if !tlx_layout::shape::match_fcn_keys_exact(dom.iter(), &d, &key_variants, |slot, idx| {
+                    trail[kv_start + slot] = idx as u64;
+                }) {
+                    return None;
+                }
+                (vec![(*range).clone(); d.len()], trail)
+            }
+            Shape::Tuple(es) if dw == W::Interval => {
+                if !tlx_layout::shape::fcn_dom_matches_tuple(&dom, es.len()) {
+                    return None;
+                }
+                (es.to_vec(), Vec::new())
+            }
+            _ => return None,
+        };
         let mut parts = Vec::new();
-        for (k, ks) in keys.into_iter().zip(slot_shapes) {
+        for (k, ks) in dom.into_iter().zip(slot_shapes) {
             let env2 = binders::bind_const(&b.vars, &k, env)?;
             let ksid = self.sid(&ks);
             parts.push(self.expr_into(body, &env2, st, ksid));
+        }
+        for w in trail_words {
+            parts.push(self.raw_word(w));
         }
         Some(self.pack_shape(sid, parts))
     }
@@ -749,12 +892,12 @@ impl Lowerer<'_> {
     }
 
     /// The length `n` of a domain `1..n` (constant, or `1..hi` computed;
-    /// an empty interval has length 0).
+    /// an empty interval has length 0). Only interval domains produce a
+    /// `Tuple`/`Seq` in TLC; `[x \in {} |-> e]` is an enumerated `Fcn`.
     pub(super) fn seq_domain_len(&mut self, set: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         Some(match self.const_domain(set, env, st) {
             Some(Value::Interval(1, k)) => int_lit(k.max(0)),
             Some(Value::Interval(lo, hi)) if hi < lo => int_lit(0),
-            Some(v) if v.is_set() && tlx_value::ops::cardinality(&v).ok() == Some(0) => int_lit(0),
             Some(_) => return None,
             None => {
                 // `DOMAIN s` over a sequence: its index range `1..Len(s)`.
@@ -777,10 +920,10 @@ impl Lowerer<'_> {
     }
 
     /// `[x \in D |-> body]` without a target encoding, for a constant
-    /// (enumerated) domain: the range encoding is inferred from the bodies
-    /// (all of one encoding, booleans, or integers of known bounds), the
-    /// function is a tuple for domains `1..n` and a function shape otherwise.
-    /// Like the interpreter, every body is evaluated (in domain order).
+    /// (enumerated or interval) domain: the range encoding is inferred from
+    /// the bodies, preserving TLC's construction witness (`Tuple` only for
+    /// `1..n` intervals, `Fcn` with `Interval` for other intervals, `Fcn` with
+    /// `Enumerated` for enumerated sets).
     pub(super) fn typed_fn_construct(&mut self, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         let [b] = bounds else { return None };
         if !binders::single_binder(b) {
@@ -816,26 +959,21 @@ impl Lowerer<'_> {
         if parts.iter().any(|p| matches!(&*p.kind, ExprKind::Convert(_)) && p.ty == Ty::Enc(rsid) && !self.is_scalar_conv(p)) {
             return None;
         }
-        let ints = dom.iter().enumerate().all(|(i, d)| *d == Value::Int(i as i64 + 1));
-        if dom.iter().all(|d| matches!(d, Value::Str(_))) {
-            // A record: its fields in name order.
-            let mut fields: Vec<(Sym, Expr)> =
-                dom.iter().zip(parts).map(|(d, p)| (if let Value::Str(n) = d { *n } else { unreachable!() }, p)).collect();
-            let (shared, binds): (Vec<(Sym, Expr)>, Vec<Option<(Temp, Expr)>>) = fields
-                .drain(..)
-                .map(|(n, p)| {
-                    let (p, b) = self.share(p);
-                    ((n, p), b)
-                })
-                .unzip();
-            let mut fields = shared;
-            fields.sort_by_key(|f| f.0);
-            let shape = Shape::Record(fields.iter().map(|(n, _)| (*n, range.clone())).collect());
-            let sid = self.sid(&shape);
-            let body = self.pack_shape(sid, fields.into_iter().map(|(_, p)| p).collect());
-            return Some(let_in(binds.into_iter().rev().flatten(), body));
-        }
-        let shape = if ints { Shape::Tuple(vec![range; dom.len()].into()) } else { Shape::Fcn { dom: dom.into(), range: Box::new(range) } };
+        let shape = match dv {
+            Value::Interval(1, _) => Shape::Tuple(vec![range; dom.len()].into()),
+            Value::Interval(..) => Shape::Fcn {
+                dom: dom.into(),
+                range: Box::new(range),
+                witness: tlx_layout::FcnWitness::Interval,
+                key_variants: Arc::from([]),
+            },
+            _ => Shape::Fcn {
+                dom: dom.into(),
+                range: Box::new(range),
+                witness: tlx_layout::FcnWitness::Enumerated,
+                key_variants: Arc::from([]),
+            },
+        };
         let sid = self.sid(&shape);
         Some(self.pack_shape(sid, parts))
     }
@@ -947,8 +1085,12 @@ impl Lowerer<'_> {
             }
             Ty::Val => return None,
         };
-        let sid = self.sid(&Shape::Map { key: Box::new(Shape::Int { lo: klo, hi: khi }), range: Box::new(range) });
-        if self.words(sid) > 1 << 12 {
+        let sid = self.sid(&Shape::Map {
+            key: Box::new(Shape::Int { lo: klo, hi: khi }),
+            range: Box::new(range.clone()),
+            witness: tlx_layout::FcnWitness::Interval,
+        });
+        if self.words(sid) > 1 << 12 || !self.preserves_lazy_into(body, env, &range, sets::EAGER_DEPTH) {
             return None;
         }
         self.map_build_into(bounds, body, env, st, sid)
@@ -1004,7 +1146,8 @@ impl Lowerer<'_> {
                 for x in xs.iter_mut() {
                     if x.ty != Ty::Enc(j) {
                         let y = match &*x.kind {
-                            ExprKind::Const(v) => self.const_words(v, j)?,
+                            ExprKind::Const(v) if !typed::has_non_reducible_lazy_set(v) => self.const_words(v, j)?,
+                            ExprKind::Const(_) => return None,
                             _ => self.recode_to(x.clone(), j)?,
                         };
                         *x = y;
@@ -1019,8 +1162,8 @@ impl Lowerer<'_> {
     /// `[x \in S, y \in T |-> e]`: one slot per tuple of the (constant)
     /// product domain, each built with the binders bound to its components.
     fn fcn_product_into(&mut self, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
-        let Some(Shape::Fcn { dom, range }) = self.shape_of(Ty::Enc(sid)).cloned() else { return None };
-        if dom.len() > 256 {
+        let Some(Shape::Fcn { dom, range, witness, key_variants }) = self.shape_of(Ty::Enc(sid)).cloned() else { return None };
+        if witness == tlx_layout::FcnWitness::Interval || !key_variants.is_empty() || dom.len() > 256 {
             return None;
         }
         let mut vars: Vec<(LocalId, Vec<Value>)> = Vec::new();
@@ -1036,7 +1179,7 @@ impl Lowerer<'_> {
         for (_, set) in &vars {
             keys = keys.into_iter().flat_map(|k| set.iter().map(move |x| [k.clone(), vec![x.clone()]].concat())).collect();
         }
-        if keys.len() != dom.len() || keys.iter().zip(dom.iter()).any(|(k, d)| *d != Value::Tuple(k.clone().into())) {
+        if keys.len() != dom.len() || keys.iter().zip(dom.iter()).any(|(k, d)| !d.exact_eq(&Value::Tuple(k.clone().into()))) {
             return None;
         }
         let rsid = self.sid(&range);
@@ -1048,28 +1191,16 @@ impl Lowerer<'_> {
             }
             parts.push(self.expr_into(body, &env2, st, rsid));
         }
-        Some(self.pack_shape(sid, parts))
-    }
-
-    /// `lo..hi` into a bitset of integers.
-    fn interval_into(&mut self, lo: &hir::Expr, hi: &hir::Expr, elem: &Shape, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
-        let Shape::Int { lo: base, .. } = *elem else { return None };
-        if !self.is_bitset(Ty::Enc(sid)) {
-            return None;
+        if witness == tlx_layout::FcnWitness::Dynamic {
+            parts.push(self.raw_word(1));
         }
-        let (l, h) = (self.expr(lo, env, st), self.expr(hi, env, st));
-        let (l, h) = (self.as_int(l).ok()?, self.as_int(h).ok()?);
-        let t = self.temp(Ty::Int);
-        let rank = Expr::new(Ty::Int, ExprKind::IntBin(IntOp::Sub, temp_ref(Ty::Int, t), int_lit(base)));
-        let src = Expr::new(Ty::Val, ExprKind::IntRange(l, h));
-        let bound = self.iter_bound(&src).map(|n| n as u64);
-        Some(self.card_checked(Expr::new(Ty::Enc(sid), ExprKind::MapSet { bind: t, set: src, elem: rank, cond: None }), bound))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// `{f(x) : x \in S}` over an encoded or iterable `S`, each `f(x)` built
     /// in the element encoding (a rank, for bitsets).
     fn set_map_into(&mut self, f: &hir::Expr, bounds: &[hir::Bound], elem: &Shape, env: &LEnv, st: &St, sid: ShapeId) -> Option<Expr> {
-        if !typed::shapes_comparable(elem, elem) {
+        if !typed::shapes_comparable(elem, elem) || elem.has_dynamic_witness() {
             return None;
         }
         let [b] = bounds else { return None };
@@ -1080,7 +1211,7 @@ impl Lowerer<'_> {
         if bits && !rankable(elem) {
             return None;
         }
-        let s = self.expr(&b.set, env, st);
+        let s = self.extensional_set_expr(&b.set, env, st);
         let (src, ety) = self.typed_iter_in(s, true);
         if !src.is_typed_source() {
             return None;
@@ -1092,7 +1223,7 @@ impl Lowerer<'_> {
         let x = binders::checked(check, self.coerce_enc(x, esid));
         let x = if bits {
             let probe = self.zero_enc(sid);
-            self.bit_rank(&probe, &x)?
+            self.bit_rank(&probe, &x, false)?
         } else {
             x
         };
@@ -1111,14 +1242,14 @@ impl Lowerer<'_> {
         st: &St,
         sid: ShapeId,
     ) -> Option<Expr> {
-        if !binders::single_binder(bound) {
+        if elem.has_dynamic_witness() || !binders::single_binder(bound) {
             return None;
         }
         let bits = bitset_universe(elem).is_some();
         if bits && !rankable(elem) {
             return None;
         }
-        let s = self.expr(&bound.set, env, st);
+        let s = self.extensional_set_expr(&bound.set, env, st);
         let (src, ety) = self.typed_iter_in(s, true);
         if !src.is_typed_source() {
             return None;
@@ -1131,7 +1262,7 @@ impl Lowerer<'_> {
         let x = self.coerce_enc(x, esid);
         let x = if bits {
             let probe = self.zero_enc(sid);
-            self.bit_rank(&probe, &x)?
+            self.bit_rank(&probe, &x, false)?
         } else {
             x
         };

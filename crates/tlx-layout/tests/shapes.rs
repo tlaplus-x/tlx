@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tlx_layout::infer::{widen, widen_int, widen_repeated, Hints, Observer};
 use tlx_layout::layout::{decode, encode, rank, unrank, words};
 use tlx_layout::shape::{KindKey, MAX_UNION_ARMS};
-use tlx_layout::{dynval, Layout, Shape};
+use tlx_layout::{dynval, FcnWitness, Layout, Shape};
 use tlx_value::{Sym, Value};
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ fn srec(fs: &[(&str, Shape)]) -> Shape {
 fn sfcn(dom: Vec<Value>, range: Shape) -> Shape {
     let mut dom = dom;
     dom.sort();
-    Shape::Fcn { dom: Arc::from(dom), range: Box::new(range) }
+    Shape::Fcn { dom: Arc::from(dom), range: Box::new(range), witness: FcnWitness::Enumerated, key_variants: Arc::from([]) }
 }
 
 fn enc(s: &Shape, v: &Value) -> Result<Vec<u64>, tlx_layout::Miss> {
@@ -148,8 +148,8 @@ fn shape_of() {
     assert_eq!(Shape::of(&mv("m")), satom(vec![mv("m")]));
     assert_eq!(Shape::of(&set(vec![int(1), int(3)])), sset(sint(1, 3), 2));
     assert_eq!(Shape::of(&Value::empty_set()), sset(Shape::Never, 0));
-    assert_eq!(Shape::of(&Value::Interval(2, 4)), sset(sint(2, 4), 3));
-    assert_eq!(Shape::of(&Value::Interval(2, 1)), sset(Shape::Never, 0));
+    assert_eq!(Shape::of(&Value::Interval(2, 4)), Shape::Dyn);
+    assert_eq!(Shape::of(&Value::Interval(2, 1)), Shape::Dyn);
     assert_eq!(Shape::of(&tup(vec![])), stup(vec![]));
     assert_eq!(Shape::of(&tup(vec![int(1), st("a")])), stup(vec![sint(1, 1), satom(vec![st("a")])]));
     assert_eq!(Shape::of(&rec(&[("b", int(1)), ("a", Value::TRUE)])), srec(&[("a", Shape::Bool), ("b", sint(1, 1))]));
@@ -176,14 +176,17 @@ fn join_basic() {
     let d = vec![mv("p"), mv("q")];
     assert_eq!(sfcn(d.clone(), sint(0, 1)).join(&sfcn(d.clone(), sint(3, 3))), sfcn(d.clone(), sint(0, 3)));
     // Different domains: a map over the union of the keys.
-    let m = Shape::Map { key: Box::new(satom(vec![mv("p"), mv("q")])), range: Box::new(sint(0, 1)) };
+    let m = Shape::Map { key: Box::new(satom(vec![mv("p"), mv("q")])), range: Box::new(sint(0, 1)), witness: FcnWitness::Enumerated };
     assert_eq!(sfcn(d, sint(0, 1)).join(&sfcn(vec![mv("p")], sint(0, 1))), m);
     // Tuples are functions on 1..n: with other functions they form a map.
     let ints = sfcn(vec![Value::Int(0)], sint(5, 5));
-    let im = Shape::Map { key: Box::new(sint(0, 2)), range: Box::new(sint(1, 5)) };
+    let im = Shape::Map { key: Box::new(sint(0, 2)), range: Box::new(sint(1, 5)), witness: FcnWitness::Dynamic };
     assert_eq!(ints.join(&stup(vec![sint(1, 1), sint(2, 2)])), im);
     assert_eq!(sseq(sint(1, 1), 2).join(&ints), im);
-    assert_eq!(stup(vec![]).join(&ints), Shape::Map { key: Box::new(sint(0, 0)), range: Box::new(sint(5, 5)) });
+    assert_eq!(
+        stup(vec![]).join(&ints),
+        Shape::Map { key: Box::new(sint(0, 0)), range: Box::new(sint(5, 5)), witness: FcnWitness::Dynamic }
+    );
     // Records.
     assert_eq!(srec(&[("a", sint(0, 0))]).join(&srec(&[("a", sint(2, 2))])), srec(&[("a", sint(0, 2))]));
     let u = srec(&[("a", sint(0, 0))]).join(&srec(&[("b", sint(0, 0))]));
@@ -229,7 +232,7 @@ fn join_unions() {
     assert_eq!(s, Shape::Dyn);
     // Fcn arms with different domains inside a union -> a map arm.
     let f = Shape::Bool.join(&sfcn(vec![mv("p")], Shape::Bool));
-    let m = Shape::Map { key: Box::new(satom(vec![mv("p"), mv("q")])), range: Box::new(Shape::Bool) };
+    let m = Shape::Map { key: Box::new(satom(vec![mv("p"), mv("q")])), range: Box::new(Shape::Bool), witness: FcnWitness::Enumerated };
     assert_eq!(f.join(&sfcn(vec![mv("q")], Shape::Bool)), Shape::Union(Arc::from(vec![Shape::Bool, m])));
     // Dyn absorbs unions.
     assert_eq!(f.join(&Shape::Dyn), Shape::Dyn);
@@ -400,22 +403,26 @@ fn words_per_shape() {
 fn sorted_array_sets() {
     // Element universe too large for a bitset.
     let s = sset(sint(-10_000, 10_000), 4);
-    let vals = [
-        Value::empty_set(),
-        set(vec![int(-10_000)]),
-        set(vec![int(3), int(-5), int(10_000)]),
-        set(vec![int(1), int(2), int(3), int(4)]),
-        Value::Interval(1, 4),
-    ];
+    let vals =
+        [Value::empty_set(), set(vec![int(-10_000)]), set(vec![int(3), int(-5), int(10_000)]), set(vec![int(1), int(2), int(3), int(4)])];
     for v in &vals {
         let e = enc(&s, v).unwrap();
         assert_eq!(decode(&s, &e), *v);
         assert!(s.contains(v));
     }
-    assert_eq!(enc(&s, &vals[3]).unwrap(), enc(&s, &vals[4]).unwrap());
+    // Intervals are rejected by exact `Shape::Set` (to preserve their witness)
+    // but share the canonical semantic encoding with equal enumerated sets.
+    let iv = Value::Interval(1, 4);
+    assert!(!s.contains(&iv));
+    assert!(enc(&s, &iv).is_err());
+    assert!(s.contains_semantic(&iv));
+    let mut sem = vec![0u64; words(&s)];
+    tlx_layout::layout::encode_semantic(&s, &iv, &mut sem).unwrap();
+    assert_eq!(enc(&s, &vals[3]).unwrap(), sem);
     assert_ne!(enc(&s, &vals[1]).unwrap(), enc(&s, &vals[2]).unwrap());
     assert!(enc(&s, &set(vec![int(1), int(2), int(3), int(4), int(5)])).is_err());
     assert!(enc(&s, &Value::Interval(1, 5)).is_err());
+    assert!(!s.contains_semantic(&Value::Interval(1, 5)));
     assert!(enc(&s, &set(vec![int(10_001)])).is_err());
 
     // Dyn elements.
@@ -844,8 +851,8 @@ fn packed_industrial_shapes_achieve_over_3x_compression_and_canonical_words() {
     let vals = vec![mv("v1"), mv("v2")];
     let acc_state =
         sfcn(accs, srec(&[("maxBal", sint(-1, 7)), ("maxVBal", sint(-1, 7)), ("maxVal", satom(vec![mv("none"), mv("v1"), mv("v2")]))]));
-    let slot_bal = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(sint(0, 7)) };
-    let slot_val = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(satom(vals)) };
+    let slot_bal = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(sint(0, 7)), witness: FcnWitness::Enumerated };
+    let slot_val = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(satom(vals)), witness: FcnWitness::Enumerated };
     let paxos_layout = Layout::new(vec![acc_state, slot_bal, slot_val]);
     assert_eq!(paxos_layout.words, 7, "expected >3.8x compression (27 -> 7 words)");
 
@@ -939,7 +946,7 @@ fn validate_words_rejects_corrupted_packed_bits_and_padding() {
 
     // 2. Packed Map: key 1..4, range Int 0..2 (2 bits).
     //    Absent key slots and presence-word tail bits must be 0.
-    let map_shape = Shape::Map { key: Box::new(sint(1, 4)), range: Box::new(sint(0, 2)) };
+    let map_shape = Shape::Map { key: Box::new(sint(1, 4)), range: Box::new(sint(0, 2)), witness: FcnWitness::Enumerated };
     let map_node = LayoutNode::new(&map_shape);
     let mut map_w = vec![0u64; map_node.words()];
     map_node.encode(&fcn(vec![(int(1), int(2)), (int(3), int(1))]), &mut map_w).unwrap();
@@ -1029,5 +1036,5 @@ fn large_child_widths_preserve_host_size_and_map_budget() {
     assert_eq!(words(&inner), 1usize << 32);
     let outer = sseq(inner.clone(), 1);
     assert_eq!(words(&outer), (1usize << 32) + 1);
-    assert_eq!(tlx_layout::shape::map_shape(Shape::Bool, inner), Shape::Dyn);
+    assert_eq!(tlx_layout::shape::map_shape(Shape::Bool, inner, FcnWitness::Enumerated), Shape::Dyn);
 }

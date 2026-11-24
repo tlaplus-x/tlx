@@ -2,7 +2,9 @@
 //! property-style round trips on random shapes and on shapes inferred from
 //! random values.
 
-use tlx_layout::shape::Shape;
+use std::sync::Arc;
+
+use tlx_layout::shape::{FcnWitness, Shape};
 use tlx_layout::{dynval, ser, Layout};
 use tlx_value::ser::{Reader, Writer};
 use tlx_value::{Sym, Value};
@@ -40,11 +42,38 @@ fn shape(r: &mut Rng, depth: u32) -> Shape {
     let n = r.below(5) as usize;
     match r.below(8) {
         0 => Shape::Set { elem: Box::new(shape(r, d)), max_card: r.below(1 << 20) as usize },
-        1 => Shape::Fcn {
-            dom: (0..n).map(|i| if i % 2 == 0 { atom(r) } else { Value::Int(r.below(9) as i64) }).collect(),
+        1 => {
+            if n > 0 && r.below(4) == 0 {
+                let tup_key = Value::tuple(vec![Value::Int(0)]);
+                let enum_key = Value::fcn_with_dom(vec![(Value::Int(1), Value::Int(0))], tlx_value::FcnDom::Enumerated);
+                Shape::Fcn {
+                    dom: Arc::from([tup_key.clone()]),
+                    range: Box::new(shape(r, d)),
+                    witness: FcnWitness::Enumerated,
+                    key_variants: Arc::from([(0usize, Arc::from([tup_key, enum_key]))]),
+                }
+            } else {
+                Shape::Fcn {
+                    dom: (0..n).map(|i| if i % 2 == 0 { atom(r) } else { Value::Int(r.below(9) as i64) }).collect(),
+                    range: Box::new(shape(r, d)),
+                    witness: match r.below(3) {
+                        0 => FcnWitness::Enumerated,
+                        1 => FcnWitness::Interval,
+                        _ => FcnWitness::Dynamic,
+                    },
+                    key_variants: Arc::from([]),
+                }
+            }
+        }
+        2 => Shape::Map {
+            key: Box::new(shape(r, d)),
             range: Box::new(shape(r, d)),
+            witness: match r.below(3) {
+                0 => FcnWitness::Enumerated,
+                1 => FcnWitness::Interval,
+                _ => FcnWitness::Dynamic,
+            },
         },
-        2 => Shape::Map { key: Box::new(shape(r, d)), range: Box::new(shape(r, d)) },
         3 => Shape::Record((0..n).map(|_| (Sym::new(NAMES[r.below(6) as usize]), shape(r, d))).collect()),
         4 => Shape::Tuple((0..n).map(|_| shape(r, d)).collect()),
         5 => Shape::Seq { elem: Box::new(shape(r, d)), max_len: r.below(1000) as usize },
@@ -156,4 +185,61 @@ fn dyn_table_round_trip_in_process() {
     bad[si][0] = Value::str("ser_not_there");
     assert!(dynval::restore(&bad).is_err());
     assert!(dynval::restore(&back[1..]).is_err());
+}
+
+#[test]
+fn rejects_invalid_fcn_key_variants() {
+    use std::sync::Arc;
+    use tlx_layout::FcnWitness;
+
+    let tup = Value::tuple(vec![Value::Int(0)]);
+    let fcn = Value::fcn_rcd_from_pairs(vec![(Value::Int(1), Value::Int(0))]).unwrap();
+    let (lo, hi) = if tup.exact_cmp(&fcn) == std::cmp::Ordering::Less { (tup, fcn) } else { (fcn, tup) };
+
+    let bad_shapes = [
+        // Two distinct integer keys in one variant slot (not TLA+-equal).
+        Shape::Fcn {
+            dom: Arc::from([Value::Int(1)]),
+            range: Box::new(Shape::Int { lo: 0, hi: 0 }),
+            witness: FcnWitness::Enumerated,
+            key_variants: Arc::from([(0, Arc::from([Value::Int(1), Value::Int(2)]))]),
+        },
+        // First variant key does not exact_eq dom[pos].
+        Shape::Fcn {
+            dom: Arc::from([hi.clone()]),
+            range: Box::new(Shape::Int { lo: 0, hi: 0 }),
+            witness: FcnWitness::Enumerated,
+            key_variants: Arc::from([(0, Arc::from([lo.clone(), hi.clone()]))]),
+        },
+        // Variants not strictly increasing under exact_cmp.
+        Shape::Fcn {
+            dom: Arc::from([hi.clone()]),
+            range: Box::new(Shape::Int { lo: 0, hi: 0 }),
+            witness: FcnWitness::Enumerated,
+            key_variants: Arc::from([(0, Arc::from([hi.clone(), lo.clone()]))]),
+        },
+        // Duplicate exact variants.
+        Shape::Fcn {
+            dom: Arc::from([lo.clone()]),
+            range: Box::new(Shape::Int { lo: 0, hi: 0 }),
+            witness: FcnWitness::Enumerated,
+            key_variants: Arc::from([(0, Arc::from([lo.clone(), lo.clone()]))]),
+        },
+    ];
+    for s in &bad_shapes {
+        let mut w = Writer::new();
+        ser::write_shape(&mut w, s);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(ser::read_shape(&mut r).is_err(), "decoder must reject invalid key_variants: {s:?}");
+    }
+
+    // Valid sparse variant list still round-trips.
+    let good = Shape::Fcn {
+        dom: Arc::from([lo.clone()]),
+        range: Box::new(Shape::Int { lo: 0, hi: 0 }),
+        witness: FcnWitness::Enumerated,
+        key_variants: Arc::from([(0, Arc::from([lo, hi]))]),
+    };
+    assert_eq!(round_trip(&good), good);
 }

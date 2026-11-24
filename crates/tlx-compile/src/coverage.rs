@@ -173,7 +173,7 @@ impl Histogram<'_> {
     /// Short description of an encoded shape.
     fn shape_desc(&self, sid: ShapeId) -> String {
         match self.typing.shape(sid) {
-            Shape::Fcn { dom, range } => {
+            Shape::Fcn { dom, range, .. } => {
                 let dk = if dom.iter().all(|d| matches!(d, Value::Int(_))) {
                     "ints"
                 } else if dom.iter().all(|d| matches!(d, Value::ModelValue(_) | Value::Str(_))) {

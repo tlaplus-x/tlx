@@ -92,7 +92,7 @@ Inv2 == Len(q) = 0 \/ Head(q)[2] \/ q[Len(q)][1] # 7
 /// Functions with a varying domain (maps) to records.
 fn map_shapes() -> Vec<Shape> {
     let rec = record(&[("a", int(0, 3)), ("b", Shape::Bool)]);
-    vec![Shape::Map { key: Box::new(int(0, 4)), range: Box::new(rec) }, int(0, 4)]
+    vec![Shape::Map { key: Box::new(int(0, 4)), range: Box::new(rec), witness: tlx_layout::FcnWitness::Enumerated }, int(0, 4)]
 }
 
 const MAPS: Family = Family {

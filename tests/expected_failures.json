@@ -127,11 +127,6 @@
   },
   {
    "suite": "fuzz*",
-   "id": "replay/FzEmptyFcnExcept/paranoid",
-   "reason": "compiled-tier difference found by fuzz_spec (docs/compat.md D-13 family): an empty function built over {} is decoded as <<>>, so EXCEPT with a string key fails ('non integral index') where TLC leaves it unchanged"
-  },
-  {
-   "suite": "fuzz*",
    "id": "replay/FzLivePredErrorCounts/interp",
    "reason": "D-27: TLC diagnostic doInit(true) reuses its FPSet after an initial liveness error, changing counts or replacing the first error with an invariant violation; tlx preserves the first error"
   },

@@ -41,34 +41,40 @@ fn certified_phase_projection_reduces_states_in_every_tier() {
 
 #[test]
 fn certified_map_field_projection_reduces_each_entry() {
-    let spec = SPEC
-        .replace("r = [mode |-> \"idle\", data |-> 0]", "r = [s \\in {1, 2} |-> [mode |-> \"idle\", data |-> 0]]")
-        .replace("Start ==", "Start(s) ==")
-        .replace("Finish ==", "Finish(s) ==")
-        .replace("r.mode", "r[s].mode")
-        .replace("r.data", "r[s].data")
-        .replace("!.", "![s].")
-        .replace("Next == Start \\/ Finish", "Next == \\E s \\in {1, 2}: Start(s) \\/ Finish(s)")
-        .replace("r \\in [mode: {\"idle\", \"busy\"}, data: {0, 1}]", "r \\in [{1, 2} -> [mode: {\"idle\", \"busy\"}, data: {0, 1}]]");
-    let dir = tlx_testkit::TempDir::with_spec("phase-map", &spec, CFG);
-    for (tier, args, env) in tlx_testkit::cli::TIERS {
-        for optimize in [false, true] {
-            let run = tlx_testkit::tlx_default!()
-                .check("Phase.tla")
-                .args(args)
-                .args(if optimize { vec!["-optimize"] } else { vec![] })
-                .arg("-noautosymmetry")
-                .envs(env.iter().copied())
-                .env("TLX_PARANOID", "1")
-                .dir(&dir)
-                .timeout(Duration::from_secs(60))
-                .run();
-            assert_eq!(run.code, 0, "{tier}: {}", run.text());
-            assert!(
-                run.stdout.contains(if optimize { "9 distinct states found" } else { "16 distinct states found" }),
-                "{tier}: {}",
-                run.text()
+    for (label, dom) in [("enum", "{1, 2}"), ("interval", "0..1")] {
+        let spec = SPEC
+            .replace("r = [mode |-> \"idle\", data |-> 0]", &format!("r = [s \\in {dom} |-> [mode |-> \"idle\", data |-> 0]]"))
+            .replace("Start ==", "Start(s) ==")
+            .replace("Finish ==", "Finish(s) ==")
+            .replace("r.mode", "r[s].mode")
+            .replace("r.data", "r[s].data")
+            .replace("!.", "![s].")
+            .replace("Next == Start \\/ Finish", &format!("Next == \\E s \\in {dom}: Start(s) \\/ Finish(s)"))
+            .replace(
+                "r \\in [mode: {\"idle\", \"busy\"}, data: {0, 1}]",
+                &format!("r \\in [{dom} -> [mode: {{\"idle\", \"busy\"}}, data: {{0, 1}}]]"),
             );
+        let dir = tlx_testkit::TempDir::with_spec(&format!("phase-map-{label}"), &spec, CFG);
+        for (tier, args, env) in tlx_testkit::cli::TIERS {
+            for optimize in [false, true] {
+                let run = tlx_testkit::tlx_default!()
+                    .check("Phase.tla")
+                    .args(args)
+                    .args(if optimize { vec!["-optimize"] } else { vec![] })
+                    .arg("-noautosymmetry")
+                    .envs(env.iter().copied())
+                    .env("TLX_PARANOID", "1")
+                    .env("TLX_PRERUN_REUSE", "0")
+                    .dir(&dir)
+                    .timeout(Duration::from_secs(60))
+                    .run();
+                assert_eq!(run.code, 0, "{label}/{tier}: {}", run.text());
+                assert!(
+                    run.stdout.contains(if optimize { "9 distinct states found" } else { "16 distinct states found" }),
+                    "{label}/{tier}: {}",
+                    run.text()
+                );
+            }
         }
     }
 }

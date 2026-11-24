@@ -309,7 +309,7 @@ struct Speculation {
 
 /// The version of `Speculation::encode`, and of the compiled tier's
 /// checkpoint files with it (2: `Dyn` handles with kind tags).
-const SPECULATION_VERSION: u64 = 2;
+const SPECULATION_VERSION: u64 = 3;
 
 impl Speculation {
     /// The state of the speculation at attempt `attempt`, for a checkpoint:
@@ -856,6 +856,6 @@ mod tests {
         assert_eq!(old[0], SPECULATION_VERSION as u8);
         old[0] = 1;
         let Err(e) = recover(&old, &bad) else { panic!("a checkpoint of version 1 was recovered") };
-        assert_eq!(e, "the checkpoint's compiled-tier shapes are of version 1, this tlx reads version 2");
+        assert_eq!(e, "the checkpoint's compiled-tier shapes are of version 1, this tlx reads version 3");
     }
 }

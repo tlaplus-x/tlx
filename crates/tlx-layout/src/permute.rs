@@ -64,10 +64,12 @@ pub enum PermPlan {
     /// A union: arm index word, then the arm's payload (padded).
     Union { arms: Box<[PermPlan]>, words: usize },
     /// A map: presence bitset (`bitset_words`) over the key universe, then
-    /// one `range_words` slot per key. Key rank `r` moves to `keys[r]`.
-    Map { keys: Box<[u32]>, bitset_words: usize, range: Box<PermPlan>, range_words: usize, words: usize },
-    /// A map with sub-word packed values (`bits`-wide, mapped through `map` if atoms).
-    MapBits { keys: Box<[u32]>, bitset_words: usize, bits: u8, map: Option<Arc<[u64]>>, words: usize },
+    /// one `range_words` slot per key, plus an optional trailing witness word.
+    /// Key rank `r` moves to `keys[r]`.
+    Map { keys: Box<[u32]>, bitset_words: usize, range: Box<PermPlan>, range_words: usize, words: usize, dynamic_witness: bool },
+    /// A map with sub-word packed values (`bits`-wide, mapped through `map` if atoms),
+    /// plus an optional trailing witness word.
+    MapBits { keys: Box<[u32]>, bitset_words: usize, bits: u8, map: Option<Arc<[u64]>>, words: usize, dynamic_witness: bool },
     /// A `Dyn` handle: permute the interned value and re-intern it (memoized
     /// per thread by handle; the number identifies the plan, see
     /// `DYN_MEMO`).
@@ -159,19 +161,39 @@ impl PermPlan {
                 let parts: Vec<&Shape> = es.iter().collect();
                 product_slots(&parts, perm, n)?
             }
-            Shape::Fcn { dom, range } => {
+            Shape::Fcn { dom, range, witness, key_variants } => {
                 // Slot of key k moves to the slot of perm(k).
+                let extra = witness.extra_words() + key_variants.len();
                 let mut moved = Vec::with_capacity(dom.len());
-                for k in dom.iter() {
-                    let pk = permute_value(k)?;
-                    moved.push(dom.iter().position(|d| *d == pk)?);
+                if key_variants.is_empty() {
+                    for k in dom.iter() {
+                        let pk = permute_value(k)?;
+                        moved.push(dom.iter().position(|d| d.exact_eq(&pk))?);
+                    }
+                } else {
+                    // Key-variant indices are fixed per position; only permute in
+                    // place when every key (and every variant) is fixed by `perm`.
+                    for (i, k) in dom.iter().enumerate() {
+                        if !permute_value(k)?.exact_eq(k) {
+                            return None;
+                        }
+                        moved.push(i);
+                    }
+                    for (_, vs) in key_variants.iter() {
+                        for k in vs.iter() {
+                            if !permute_value(k)?.exact_eq(k) {
+                                return None;
+                            }
+                        }
+                    }
                 }
-                fcn_slots(range, dom.len(), &moved, perm, n)?
+                fcn_slots(range, dom.len(), &moved, extra, perm, n)?
             }
-            Shape::Map { key, range } => {
+            Shape::Map { key, range, witness } => {
                 let keys = rank_map(key, &permute_value)?;
                 let d = MapDims::new(keys.len(), SlotLayout::of(range));
                 let range_plan = PermPlan::compile(range, perm)?;
+                let dynamic_witness = *witness == crate::FcnWitness::Dynamic;
                 if is_identity(keys.iter().map(|k| *k as usize)) && matches!(range_plan, PermPlan::Copy(_)) {
                     PermPlan::Copy(n)
                 } else {
@@ -182,6 +204,7 @@ impl PermPlan {
                             range: Box::new(range_plan),
                             range_words: rw,
                             words: n,
+                            dynamic_witness,
                         },
                         SlotLayout::Bits(bits) => {
                             let map = match range_plan {
@@ -189,7 +212,7 @@ impl PermPlan {
                                 PermPlan::Atom(m) => Some(m),
                                 _ => unreachable!("packed scalar plan must be Copy or Atom"),
                             };
-                            PermPlan::MapBits { keys: keys.into(), bitset_words: d.bitset_words, bits, map, words: n }
+                            PermPlan::MapBits { keys: keys.into(), bitset_words: d.bitset_words, bits, map, words: n, dynamic_witness }
                         }
                     }
                 }
@@ -288,7 +311,7 @@ impl PermPlan {
                     dst[0] = src[0];
                     arms[src[0] as usize].apply_impl::<TRUSTED>(&src[1..*words], &mut dst[1..*words]);
                 }
-                PermPlan::Map { keys, bitset_words, range, range_words, words } => {
+                PermPlan::Map { keys, bitset_words, range, range_words, words, dynamic_witness } => {
                     let (bw, rw) = (*bitset_words, *range_words);
                     dst[..*words].fill(0);
                     for (i, &w) in src[..bw].iter().enumerate() {
@@ -301,8 +324,11 @@ impl PermPlan {
                             range.apply_impl::<TRUSTED>(&src[bw + r * rw..bw + (r + 1) * rw], &mut dst[bw + t * rw..bw + (t + 1) * rw]);
                         }
                     }
+                    if *dynamic_witness {
+                        dst[*words - 1] = src[*words - 1];
+                    }
                 }
-                PermPlan::MapBits { keys, bitset_words, bits, map, words } => {
+                PermPlan::MapBits { keys, bitset_words, bits, map, words, dynamic_witness } => {
                     let bw = *bitset_words;
                     dst[..*words].fill(0);
                     for (i, &w) in src[..bw].iter().enumerate() {
@@ -316,6 +342,9 @@ impl PermPlan {
                             let mapped = map.as_ref().map_or(raw, |m| m[raw as usize]);
                             SlotLayout::set_zeroed(*bits, &mut dst[bw..], t, mapped);
                         }
+                    }
+                    if *dynamic_witness {
+                        dst[*words - 1] = src[*words - 1];
                     }
                 }
                 PermPlan::Dyn(perm, id) | PermPlan::Ref(perm, _, id) => {
@@ -353,7 +382,7 @@ impl PermPlan {
                         // (A full store keeps the handle: the run stops on it.)
                         Ok(Some(p)) => match store {
                             Some(s) => s.freeze(&p).unwrap_or(src[0]),
-                            None => dynval::intern(&p),
+                            None => dynval::intern_exact(&p),
                         },
                         _ => src[0],
                     };
@@ -458,29 +487,39 @@ fn product_slots(parts: &[&Shape], perm: &AtomPerm, n: usize) -> Option<PermPlan
     Some(PermPlan::Slots { src, dst, plans: unit_plans.into() })
 }
 
-/// Plan for a `Fcn` over `len` domain elements where slot `i` moves to `moved[i]`.
-fn fcn_slots(range: &Shape, len: usize, moved: &[usize], perm: &AtomPerm, n: usize) -> Option<PermPlan> {
+/// Plan for a `Fcn` over `len` domain elements where slot `i` moves to `moved[i]`,
+/// followed by `extra` invariant trailing witness / key-variant words.
+fn fcn_slots(range: &Shape, len: usize, moved: &[usize], extra: usize, perm: &AtomPerm, n: usize) -> Option<PermPlan> {
     let rp = PermPlan::compile(range, perm)?;
     let identity_moves = is_identity(moved.iter().copied());
     if identity_moves && rp.is_identity() {
         return Some(PermPlan::Copy(n));
     }
-    match SlotLayout::of(range) {
+    let slot = SlotLayout::of(range);
+    let payload_words = slot.array_words(len);
+    match slot {
         SlotLayout::Words(rw) => {
             if rw == 0 {
-                return Some(PermPlan::Copy(0));
+                return Some(PermPlan::Copy(n));
             }
-            let offs: Vec<usize> = (0..len).map(|i| i * rw).collect();
-            let dst: Vec<usize> = (0..len).map(|i| moved[i] * rw).collect();
+            let mut offs: Vec<usize> = (0..len).map(|i| i * rw).collect();
+            let mut dst: Vec<usize> = (0..len).map(|i| moved[i] * rw).collect();
             let mut ops = Vec::new();
-            if offs.iter().zip(&dst).all(|(&s, &d)| flatten(&rp, s, d, &mut ops)) {
+            if offs.iter().zip(&dst).all(|(&s, &d)| flatten(&rp, s, d, &mut ops))
+                && (extra == 0 || flatten(&PermPlan::Copy(extra), payload_words, payload_words, &mut ops))
+            {
                 return Some(PermPlan::Flat(merge_flat_ops(ops).into()));
             }
-            let plans: Vec<PermPlan> = vec![rp; len];
+            let mut plans: Vec<PermPlan> = vec![rp; len];
+            if extra > 0 {
+                offs.push(payload_words);
+                dst.push(payload_words);
+                plans.push(PermPlan::Copy(extra));
+            }
             Some(PermPlan::Slots { src: offs.into(), dst: dst.into(), plans: plans.into() })
         }
         SlotLayout::Bits(bits) => {
-            let mut ops = vec![FlatOp::Zero { dst: 0, len: n as u32 }];
+            let mut ops = vec![FlatOp::Zero { dst: 0, len: payload_words as u32 }];
             for (i, &target) in moved.iter().enumerate() {
                 let FieldLoc::Bits(s) = SlotLayout::Bits(bits).loc(0, i) else { unreachable!() };
                 let FieldLoc::Bits(d) = SlotLayout::Bits(bits).loc(0, target) else { unreachable!() };
@@ -489,6 +528,9 @@ fn fcn_slots(range: &Shape, len: usize, moved: &[usize], perm: &AtomPerm, n: usi
                     PermPlan::Atom(map) => ops.push(FlatOp::BitAtom { src: s, dst: d, map: map.clone() }),
                     _ => unreachable!("packed scalar plan must be Copy or Atom"),
                 }
+            }
+            if extra > 0 {
+                ops.push(FlatOp::Copy { src: payload_words as u32, dst: payload_words as u32, len: extra as u32 });
             }
             Some(PermPlan::Flat(merge_flat_ops(ops).into()))
         }
@@ -617,10 +659,24 @@ mod tests {
     #[test]
     fn maps_permute_keys_and_values() {
         let a = atoms(&["a", "b", "c"]);
-        let m = Shape::Map { key: Box::new(a.clone()), range: Box::new(a.clone()) };
+        let m = Shape::Map { key: Box::new(a.clone()), range: Box::new(a.clone()), witness: crate::FcnWitness::Enumerated };
         check_all(&m, &swap("a", "c"));
-        let m2 = Shape::Map { key: Box::new(Shape::Int { lo: 0, hi: 2 }), range: Box::new(a.clone()) };
+        let m2 =
+            Shape::Map { key: Box::new(Shape::Int { lo: 0, hi: 2 }), range: Box::new(a.clone()), witness: crate::FcnWitness::Enumerated };
         check_all(&m2, &swap("a", "b"));
+        // Dynamic-witness map preserves its trailing witness word under permutation.
+        let md = Shape::Map { key: Box::new(a.clone()), range: Box::new(a.clone()), witness: crate::FcnWitness::Dynamic };
+        let perm = swap("a", "c");
+        let plan = PermPlan::compile(&md, &perm).unwrap();
+        let v = Value::fcn_rcd_from_pairs(vec![(mv("a"), mv("b"))]).unwrap();
+        let mut src = vec![0u64; words(&md)];
+        encode(&md, &v, &mut src).unwrap();
+        let mut dst = vec![u64::MAX; words(&md)];
+        plan.apply(&src, &mut dst);
+        let want = Value::fcn_rcd_from_pairs(vec![(mv("c"), mv("b"))]).unwrap();
+        assert_eq!(decode(&md, &dst), want);
+        assert!(matches!(decode(&md, &dst), Value::Fcn(_, tlx_value::FcnDom::Enumerated)));
+        assert_eq!(dst[words(&md) - 1], 1);
     }
 
     #[test]
@@ -634,7 +690,7 @@ mod tests {
         let mut dom = vec![mv("a"), mv("b")];
         dom.sort();
         let r = Shape::Record(fields.into());
-        let f = Shape::Fcn { dom: dom.into(), range: Box::new(r) };
+        let f = Shape::Fcn { dom: dom.into(), range: Box::new(r), witness: crate::FcnWitness::Enumerated, key_variants: Arc::from([]) };
         let p = PermPlan::compile(&f, &swap("a", "b")).unwrap();
         assert!(matches!(p, PermPlan::Flat(_)), "{p:?}");
         check_all(&f, &swap("a", "b"));

@@ -12,6 +12,23 @@ use tlx_value::plan::{Absent, Witness};
 
 use crate::ir::{MapPutPlan, ShapeId, Ty};
 
+/// Canonical non-empty witness for a `Shape::Map` whose key universe is `key`
+/// (`Record` when string keys exist, else `Tuple`).
+pub(crate) fn map_canonical_witness(key: &Shape) -> Witness {
+    fn has_str_keys(s: &Shape) -> bool {
+        match s {
+            Shape::Atom(vs) => vs.iter().any(|v| matches!(v, tlx_value::Value::Str(_))),
+            Shape::Union(arms) => arms.iter().any(has_str_keys),
+            _ => false,
+        }
+    }
+    if has_str_keys(key) {
+        Witness::Record
+    } else {
+        Witness::Tuple
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Typing {
     pub layout: Arc<Layout>,
@@ -133,10 +150,11 @@ impl Typing {
     }
 
     /// The plan of an update of a map of type `ty` (`ExprKind::MapPut`):
-    /// for an EXCEPT (`Absent::Unchanged`), the ranks whose keys the empty
-    /// map's witness rejects on its missing-key branch (an empty map
-    /// decodes as `<<>>`, see `MapPutPlan`).
-    pub(crate) fn map_put_plan(&self, ty: Ty, absent: Absent) -> MapPutPlan {
+    /// for an EXCEPT (`Absent::Unchanged`), the ranks rejected on missing-key
+    /// lookups when the map is canonical (`Interval`, or `Dynamic` with
+    /// witness word 0); for an insert (`Absent::Insert`), `insert_witness`
+    /// sets the trailing witness word of a `Dynamic` map.
+    pub(crate) fn map_put_plan(&self, ty: Ty, absent: Absent, insert_witness: Option<u64>) -> MapPutPlan {
         fn push(out: &mut Vec<Range<u64>>, range: Range<u64>) {
             if let Some(last) = out.last_mut().filter(|r| r.end == range.start) {
                 last.end = range.end;
@@ -144,10 +162,10 @@ impl Typing {
                 out.push(range);
             }
         }
-        fn collect(s: &Shape, base: u64, out: &mut Vec<Range<u64>>) {
-            let admitted = Witness::Tuple.key_type();
+        fn collect(s: &Shape, witness: Witness, base: u64, out: &mut Vec<Range<u64>>) {
+            let admitted = witness.key_type();
             match s {
-                Shape::Int { .. } => {}
+                Shape::Int { .. } if witness == Witness::Tuple => {}
                 Shape::Atom(values) => {
                     for (i, v) in values.iter().enumerate() {
                         if !admitted.admits(v) {
@@ -159,20 +177,35 @@ impl Typing {
                 Shape::Union(arms) => {
                     let mut base = base;
                     for arm in arms.iter() {
-                        collect(arm, base, out);
+                        collect(arm, witness, base, out);
                         base += arm.cardinality().expect("finite map keys");
                     }
                 }
                 _ => push(out, base..base + s.cardinality().expect("finite map keys")),
             }
         }
-        let mut out = Vec::new();
+        let mut reject_when_empty = Vec::new();
+        let mut reject_when_canonical = Vec::new();
         if let (Absent::Unchanged, Ty::Enc(sid)) = (absent, ty) {
-            if let Shape::Map { key, .. } = self.shape(sid) {
-                collect(key, 0, &mut out);
+            if let Shape::Map { key, witness, .. } = self.shape(sid) {
+                match witness {
+                    tlx_layout::FcnWitness::Enumerated => {}
+                    tlx_layout::FcnWitness::Interval => {
+                        collect(key, Witness::Tuple, 0, &mut reject_when_canonical);
+                    }
+                    tlx_layout::FcnWitness::Dynamic => {
+                        collect(key, Witness::Tuple, 0, &mut reject_when_empty);
+                        collect(key, map_canonical_witness(key), 0, &mut reject_when_canonical);
+                    }
+                }
             }
         }
-        MapPutPlan { absent, reject_when_empty: out.into() }
+        MapPutPlan {
+            absent,
+            insert_witness: (absent == Absent::Insert).then_some(insert_witness).flatten(),
+            reject_when_empty: reject_when_empty.into(),
+            reject_when_canonical: reject_when_canonical.into(),
+        }
     }
 
     pub fn id(&mut self, s: &Shape) -> ShapeId {
