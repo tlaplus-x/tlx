@@ -984,6 +984,8 @@ mod tests {
             (&b.init, &b.fps, &b.off, &b.tgt, &b.edge_pat, &b.state_pat)
         );
         assert_eq!((a.state_pats, a.action_pats), (b.state_pats, b.action_pats));
+        spill.wait_for_writes();
+        spill.wait_for_reads();
         assert!(spill.counters().read > 0 && spill.error().is_none());
         assert!(!dir.exists());
     }

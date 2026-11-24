@@ -313,6 +313,11 @@ fn spilled_levels_read_back_in_order() {
             assert_eq!(c.used, 0, "disk space given back");
             assert!(sp.error().is_none());
             drop(q);
+            // IO threads own their store references until they finish each
+            // request, even after publishing its result. Wait for both
+            // barriers before checking spill-directory cleanup.
+            sp.wait_for_writes();
+            sp.wait_for_reads();
             assert!(sp.dir().is_none());
         }
     }
