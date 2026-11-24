@@ -15,8 +15,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_TEST_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_TEST_RELEASE_OPT_LEVEL: "1"
   RUST_BACKTRACE: "1"
   CC: clang
   AWS_EC2_METADATA_DISABLED: "true"
@@ -33,30 +33,20 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: .github/requirements-ci.txt
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
       - name: Select the repository Rust toolchain
         run: rustup show active-toolchain
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: cargo-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: cargo-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+          shared-key: "quality-opt1"
       - name: Test dependencies
         run: |
           python3 -m pip install -r .github/requirements-ci.txt
@@ -95,20 +85,6 @@ jobs:
           python3 scripts/knobs_check.py
           python3 scripts/doccheck.py --require-examples
           python3 scripts/bench.py report --check
-      - name: Prune target directory for cache
-        if: always()
-        run: |
-          rm -rf target/ci target/tmp target/tlx-* target/*/incremental target/*/examples
-          python3 -c '
-          import os, pathlib, shutil
-          keep_ext = {".rlib", ".rmeta", ".d", ".so", ".dylib", ".a", ".lib", ".dll"}
-          for deps in pathlib.Path("target").glob("*/deps"):
-              for p in deps.iterdir():
-                  if p.is_dir() and p.suffix == ".dSYM":
-                      shutil.rmtree(p, ignore_errors=True)
-                  elif p.is_file() and p.suffix not in keep_ext and os.access(p, os.X_OK):
-                      p.unlink()
-          '
 
   test:
     name: Rust and specs (${{ matrix.os }})
@@ -128,33 +104,29 @@ jobs:
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
       RUST_TEST_THREADS: ${{ matrix.jobs }}
       TLX_TLC_XMX: 2g
+      TLX_CACHE: ${{ runner.temp }}/tlx-cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
       - name: Select the repository Rust toolchain
         run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "tests-opt1"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: target
-          key: cargo-target-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: cargo-target-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+          path: ${{ runner.temp }}/tlx-cache
+          key: tlx-c-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/tlx-compile/**', 'crates/tlx-native/**', 'crates/tlx-layout/**') }}
+          restore-keys: tlx-c-cache-${{ runner.os }}-${{ runner.arch }}-
       - name: Test dependencies
         run: |
           echo "TLX_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
@@ -180,20 +152,6 @@ jobs:
           path: target/ci/
           if-no-files-found: ignore
           retention-days: 14
-      - name: Prune target directory for cache
-        if: always()
-        run: |
-          rm -rf target/ci target/tmp target/tlx-* target/*/incremental target/*/examples
-          python3 -c '
-          import os, pathlib, shutil
-          keep_ext = {".rlib", ".rmeta", ".d", ".so", ".dylib", ".a", ".lib", ".dll"}
-          for deps in pathlib.Path("target").glob("*/deps"):
-              for p in deps.iterdir():
-                  if p.is_dir() and p.suffix == ".dSYM":
-                      shutil.rmtree(p, ignore_errors=True)
-                  elif p.is_file() and p.suffix not in keep_ext and os.access(p, os.X_OK):
-                      p.unlink()
-          '
 
   ci:
     name: CI
