@@ -74,6 +74,12 @@ impl<S> Writer<S> {
         self.len
     }
 
+    /// Number of sealed blocks (encoded or object) finished by this writer.
+    #[inline]
+    pub(crate) fn sealed_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Append `t`.
     #[inline]
     pub(super) fn push(&mut self, q: &Queue<'_, S>, t: Task<S>) {

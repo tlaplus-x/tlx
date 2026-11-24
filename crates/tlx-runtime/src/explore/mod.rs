@@ -295,6 +295,8 @@ pub struct Report<S> {
     pub live_atoms_ok: bool,
     /// The states each action generated and found (`Options::coverage`).
     pub coverage: Option<Coverage>,
+    /// Peak resident bytes held by the frontier queue's blocks.
+    pub frontier_peak: usize,
 }
 
 /// A full fingerprint set: the message the CLI prints (with the numbers of

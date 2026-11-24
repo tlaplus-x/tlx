@@ -344,6 +344,12 @@ impl<'c, S> Queue<'c, S> {
         self.spills.load(Ordering::Relaxed)
     }
 
+    /// Segments kept resident ahead of claims per list.
+    #[inline]
+    pub(crate) fn window(&self) -> usize {
+        self.window
+    }
+
     /// The store of the spilled segments (None if it cannot be created: the
     /// error is recorded in the disk layer, which stops the search).
     fn store(&self) -> Option<Arc<BlockStore>> {
@@ -633,6 +639,11 @@ impl<'c, S> Queue<'c, S> {
         }
         self.unclaimed.store(next.iter().flatten().map(|b| b.len() as u64).sum(), Ordering::Relaxed);
         *lists = next.into_iter().map(List::new).collect();
+        // Rotate the backing spill store at each level boundary: installed
+        // segments retain their `Arc<BlockStore>` until read and unlink it once
+        // the level finishes, bounding sparse length and extent-tree metadata
+        // across arbitrarily many overlapping BFS levels.
+        *self.store.lock() = None;
         if let (Some(spill), true) = (&self.spill, self.spilled.load(Ordering::Relaxed)) {
             for list in lists.iter() {
                 let upto = self.window.min(list.segs.len());

@@ -97,6 +97,13 @@ impl Charge {
         Charge { bytes, mem: self.mem.clone() }
     }
 
+    /// Transfer the full charged byte count out of `self` into a new `Charge`
+    /// without releasing the memory accounting in between.
+    pub(super) fn take(&mut self) -> Charge {
+        let bytes = std::mem::replace(&mut self.bytes, 0);
+        Charge { bytes, mem: self.mem.clone() }
+    }
+
     /// Count these bytes in `mem` from now on.
     pub(super) fn move_to(&mut self, mem: &Arc<Mem>) {
         if !Arc::ptr_eq(&self.mem, mem) {

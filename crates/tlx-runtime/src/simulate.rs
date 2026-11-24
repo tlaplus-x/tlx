@@ -203,6 +203,7 @@ pub fn simulate<'a, M: Model>(
         live_error: None,
         live_atoms_ok: false,
         coverage: None,
+        frontier_peak: 0,
     };
     // All initial states (TLC does not drop duplicates here).
     let mut all = Vec::new();
@@ -314,6 +315,7 @@ pub fn simulate<'a, M: Model>(
         live_error: None,
         live_atoms_ok: false,
         coverage: None,
+        frontier_peak: 0,
     }
 }
 

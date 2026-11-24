@@ -93,6 +93,103 @@ fn disk_quota_stops_the_search() {
     assert!(sp.counters().peak <= 32 << 10);
 }
 
+/// Linear chain `0 -> 1 -> ... -> max` that sabotages `trace-0.spill` unlink on
+/// the final state (by renaming it aside and creating a directory at its path,
+/// causing `remove_file` to fail deterministically regardless of privileges).
+struct SabotageTraceCleanup {
+    max: u32,
+    bad_at: Option<u32>,
+    dir: PathBuf,
+    spill: Spill,
+    inv: Vec<String>,
+    acts: Vec<String>,
+}
+
+impl Model for SabotageTraceCleanup {
+    type State = u32;
+    tlx_runtime::model_without_checks!();
+    fn init_states(&self, out: &mut dyn FnMut(u32)) -> Result<(), ModelError> {
+        out(0);
+        Ok(())
+    }
+    fn successors(&self, &s: &u32, out: &mut dyn FnMut(u32, u32) -> bool) -> Result<(), ModelError> {
+        if s < self.max {
+            out(s + 1, 0);
+        }
+        Ok(())
+    }
+    fn fingerprint(&self, &s: &u32) -> u64 {
+        (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5A5A
+    }
+    fn check_invariants(&self, &s: &u32) -> Result<Option<usize>, ModelError> {
+        if s == self.max {
+            self.spill.wait_for_writes();
+            let target = std::fs::read_dir(&self.dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("trace-") && n.ends_with(".spill")))
+                .expect("expected a spilled trace-*.spill file in metadir");
+            let retained = self.dir.join("retained-trace.spill");
+            std::fs::rename(&target, &retained).unwrap();
+            std::fs::create_dir(&target).unwrap();
+        }
+        Ok((self.bad_at == Some(s)).then_some(0))
+    }
+    fn invariant_names(&self) -> &[String] {
+        &self.inv
+    }
+    fn action_names(&self) -> &[String] {
+        &self.acts
+    }
+    fn render(&self, s: &u32) -> String {
+        format!("x = {s}")
+    }
+}
+
+#[test]
+fn cleanup_unlink_error_surfaces_on_ok_and_preserves_model_failure_precedence() {
+    // 1. Otherwise successful run: final trace-store unlink failure must return
+    //    `Outcome::Io` instead of `Outcome::Ok`.
+    let scratch_ok = tlx_testkit::TempDir::new("spill-cleanup-ok");
+    let dir_ok = scratch_ok.child_path("meta");
+    let sp_ok = Spill::new(SpillConfig { mode: SpillMode::Always, dir: Some(dir_ok.clone()), ..Default::default() });
+    let m_ok = SabotageTraceCleanup {
+        max: 5000,
+        bad_at: None,
+        dir: dir_ok,
+        spill: sp_ok.clone(),
+        inv: vec!["Inv".into()],
+        acts: vec!["Step".into()],
+    };
+    let r_ok = explore(&m_ok, &opts(1, sp_ok.clone()));
+    sp_ok.wait_for_writes();
+    sp_ok.wait_for_reads();
+    match &r_ok.outcome {
+        Outcome::Io(msg) => assert!(msg.contains("cannot remove the spill file") && msg.contains("trace-"), "{msg}"),
+        other => panic!("expected Outcome::Io for failed final spill unlink, got {other:?}"),
+    }
+
+    // 2. Model failure precedence: an invariant violation must not be replaced
+    //    by a subsequent cleanup unlink error.
+    let scratch_inv = tlx_testkit::TempDir::new("spill-cleanup-inv");
+    let dir_inv = scratch_inv.child_path("meta");
+    let sp_inv = Spill::new(SpillConfig { mode: SpillMode::Always, dir: Some(dir_inv.clone()), ..Default::default() });
+    let m_inv = SabotageTraceCleanup {
+        max: 5000,
+        bad_at: Some(5000),
+        dir: dir_inv,
+        spill: sp_inv.clone(),
+        inv: vec!["Inv".into()],
+        acts: vec!["Step".into()],
+    };
+    let r_inv = explore(&m_inv, &opts(1, sp_inv.clone()));
+    assert_eq!(r_inv.outcome, Outcome::InvariantViolated("Inv".into()));
+    sp_inv.wait_for_writes();
+    sp_inv.wait_for_reads();
+    assert!(sp_inv.error().is_some_and(|e| e.0.contains("cannot remove the spill file")), "expected cleanup error to be triggered on drop");
+}
+
 #[test]
 fn memory_pressure_spills_trace_logs() {
     // A budget far below what the process uses: stage 2 starts at once.

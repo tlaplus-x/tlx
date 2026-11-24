@@ -458,3 +458,147 @@ fn corrupt_segment_fails_its_claim() {
     assert!(q.claim(0, &mut prev).is_err());
     assert!(sp.error().is_some());
 }
+
+/// Pending asynchronous spill writes and failed writes that retain their
+/// buffers must remain charged in `Queue::mem()` (and its peak) until the
+/// buffers are actually freed.
+#[test]
+fn pending_and_failed_writes_stay_charged_in_queue_mem() {
+    // 1. Slow async writes keep pending segment buffers charged until written.
+    let codec = Words(64);
+    let (_scratch1, sp_slow) = spill_at("pending-charge", |c| {
+        c.write_delay = Some(std::time::Duration::from_millis(25));
+    });
+    let q_slow: Queue<'_, Vec<u64>> =
+        Queue::new(Some(&codec as &dyn StateCodec<_>), Config { seg_bytes: 4096, kinds: BlockKinds::Raw, compress_above: 0 }, 1)
+            .with_spill(&sp_slow, "queue");
+    q_slow.spill_on(true);
+    let mut wr = q_slow.writer();
+    let mut prev = q_slow.scratch();
+    // Push enough states to fill > window (8) + several pending segments.
+    for i in 0..160u64 {
+        q_slow.push(&mut wr, Task { state: state(64, i), log: i, depth: 1 });
+    }
+    q_slow.spill_writer(&mut wr);
+    assert!(q_slow.spilled_segments() >= 4, "expected multiple pending spilled segments, got {}", q_slow.spilled_segments());
+    let while_pending = q_slow.mem().bytes();
+    sp_slow.wait_for_writes();
+    let after_written = q_slow.mem().bytes();
+    assert!(
+        while_pending > after_written,
+        "pending async write buffers must stay charged until written (pending={while_pending}, after={after_written})"
+    );
+    assert!(q_slow.mem().peak() >= while_pending);
+    q_slow.submit(0, &mut wr);
+    q_slow.install();
+    let mut next = 160;
+    assert_eq!(read_level(&q_slow, &mut wr, &mut prev, &mut next, false), (0..160).collect::<Vec<_>>());
+    assert_eq!(q_slow.mem().bytes(), 0);
+
+    // 2. Failed async writes keep their retained buffers charged until consumed.
+    let (_scratch2, sp_fail) = spill_at("failed-charge", |c| {
+        c.fail_after = Some(0);
+    });
+    let q_fail: Queue<'_, Vec<u64>> =
+        Queue::new(Some(&codec as &dyn StateCodec<_>), Config { seg_bytes: 4096, kinds: BlockKinds::Raw, compress_above: 0 }, 1)
+            .with_spill(&sp_fail, "queue");
+    q_fail.spill_on(true);
+    let mut wr = q_fail.writer();
+    for i in 0..200u64 {
+        q_fail.push(&mut wr, Task { state: state(64, i), log: i, depth: 1 });
+    }
+    q_fail.submit(0, &mut wr);
+    sp_fail.wait_for_writes();
+    assert!(sp_fail.error().is_some(), "expected injected write failure");
+    // All segments (~25+ x 4 KiB) must remain charged even after failed spills.
+    let failed_resident = q_fail.mem().bytes();
+    assert!(failed_resident >= 16 * 4096, "failed spill buffers lost their memory charge: {failed_resident}");
+    assert!(q_fail.mem().peak() >= failed_resident);
+    q_fail.install();
+    let mut next = 200;
+    assert_eq!(read_level(&q_fail, &mut wr, &mut prev, &mut next, false), (0..200).collect::<Vec<_>>());
+    assert_eq!(q_fail.mem().bytes(), 0);
+}
+
+/// Draining non-page-aligned queue segments (e.g. 4,088-byte raw segments)
+/// across many levels must coalesce adjacent deleted fragments and reclaim dead
+/// boundary/tail pages so the queue can reuse its `-maxdisk` quota indefinitely.
+#[test]
+fn drained_non_aligned_queue_levels_reclaim_quota() {
+    use std::os::unix::fs::MetadataExt;
+    let codec = Words(5);
+    let limit = 256 << 10;
+    let (_scratch, sp) = spill_at("drained-levels", |c| c.maxdisk = Some(limit));
+    let q = Queue::new(Some(&codec as &dyn StateCodec<_>), Config { seg_bytes: 4096, kinds: BlockKinds::Raw, compress_above: 0 }, 1)
+        .with_spill(&sp, "queue");
+    q.spill_on(true);
+    let mut wr = q.writer();
+    let mut prev = q.scratch();
+    for level in 0..32 {
+        for i in 0..1000 {
+            q.push(&mut wr, Task { state: state(5, i), log: i, depth: level });
+        }
+        q.submit(0, &mut wr);
+        sp.wait_for_writes();
+        let store = q.store().unwrap();
+        if let Some(e) = sp.error() {
+            let f = std::fs::File::open(store.path()).unwrap();
+            f.sync_all().unwrap();
+            panic!(
+                "level {level}, logical {}, peak {}, physical {}, quota {limit}: {e}",
+                store.bytes(),
+                sp.counters().peak,
+                f.metadata().unwrap().blocks() * 512
+            );
+        }
+        q.install();
+        let got = read_level(&q, &mut wr, &mut prev, &mut 0, false);
+        assert_eq!(got, (0..1000).collect::<Vec<_>>());
+        assert_eq!(store.bytes(), 0);
+    }
+}
+
+/// Overlapping constant-width BFS levels (generating level N+1 while claiming
+/// level N) must rotate backing stores so sparse length and metadata
+/// reservations never exhaust `-maxdisk` across many levels.
+#[test]
+fn overlapping_levels_reuse_quota_across_rotations() {
+    use std::os::unix::fs::MetadataExt;
+    const WIDTH: u64 = 3000;
+    let codec = Words(5);
+    let (_scratch, sp) = spill_at("overlapping-levels", |c| c.maxdisk = Some(256 << 10));
+    let q = Queue::new(Some(&codec as &dyn StateCodec<_>), Config { seg_bytes: 4096, kinds: BlockKinds::Raw, compress_above: 0 }, 1)
+        .with_spill(&sp, "queue");
+    q.spill_on(true);
+    let mut wr = q.writer();
+    let mut prev = q.scratch();
+    let mut next = WIDTH;
+    for i in 0..WIDTH {
+        q.push(&mut wr, Task { state: state(5, i), log: i, depth: 1 });
+    }
+    for level in 0..192 {
+        q.submit(0, &mut wr);
+        sp.wait_for_writes();
+        if let Some(e) = sp.error() {
+            let store = q.store().unwrap();
+            let f = std::fs::File::open(store.path()).unwrap();
+            f.sync_all().unwrap();
+            panic!(
+                "level {level}, file len {}, allocated {}, live {}, peak {}: {e}",
+                f.metadata().unwrap().len(),
+                f.metadata().unwrap().blocks() * 512,
+                store.bytes(),
+                sp.counters().peak
+            );
+        }
+        q.install();
+        let got = read_level(&q, &mut wr, &mut prev, &mut next, level < 191);
+        assert_eq!(got, (level * WIDTH..(level + 1) * WIDTH).collect::<Vec<_>>());
+    }
+    drop(q);
+    sp.wait_for_writes();
+    sp.wait_for_reads();
+    assert_eq!(sp.counters().used, 0);
+    assert!(sp.error().is_none());
+    assert!(sp.dir().is_none());
+}

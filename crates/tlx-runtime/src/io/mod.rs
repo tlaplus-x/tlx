@@ -206,6 +206,11 @@ pub struct SpillConfig {
     /// Testing: writes fail once this many bytes
     /// were written.
     pub fail_after: Option<u64>,
+    /// Testing: delay each asynchronous write by this duration.
+    pub write_delay: Option<std::time::Duration>,
+    /// Testing: disable hole punching in `BlockStore::delete_reclaimable` so
+    /// tests can exercise the unlink-on-drop fallback path.
+    pub no_punch: bool,
     /// `dir` was made by an earlier run of tlx (`-recover`): at the end it
     /// is removed if nothing else is left in it (and the `states`
     /// directory it is in, if empty), as if this run had made it.
@@ -232,9 +237,15 @@ pub(crate) struct Ctx {
     /// Bytes written and read.
     pub(crate) written: AtomicU64,
     pub(crate) read: AtomicU64,
-    /// Bytes the spill files hold, and the most they held.
+    /// Bytes the spill files hold (logical), and the most they held.
     pub(crate) used: AtomicU64,
     pub(crate) peak: AtomicU64,
+    /// Conservative upper bound on physical disk bytes allocated across all
+    /// live spill files: allocation-unit-rounded live data plus worst-case
+    /// extent-tree metadata (including partial failed writes retained until
+    /// unlink). Checked before issuing any write so `-maxdisk` is never
+    /// exceeded even transiently.
+    pub(crate) phys_used: AtomicU64,
     /// Blocks written.
     pub(crate) blocks: AtomicU64,
 }
@@ -308,6 +319,7 @@ impl Spill {
             read: AtomicU64::new(0),
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            phys_used: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
         };
         Spill(Arc::new(Inner { ctx: Arc::new(ctx), dir: Mutex::new(Weak::new()), files: AtomicU64::new(0), threads: OnceLock::new() }))
@@ -396,12 +408,18 @@ impl Spill {
         self.0.threads.get_or_init(|| {
             let (wtx, wrx) = sync_channel::<WriteRequest>(WRITE_QUEUE);
             let (rtx, rrx) = sync_channel::<ReadRequest>(READ_QUEUE);
+            let write_delay = self.0.ctx.cfg.write_delay;
             // (The threads end when the `Spill` is dropped: its senders
             // close the channels.)
             tlx_base::stack::spawn(std::thread::Builder::new().name("tlx-spill-writer".into()), move || {
                 while let Ok(request) = wrx.recv() {
                     match request {
-                        WriteRequest::Block(store, p) => p.write(&store),
+                        WriteRequest::Block(store, p) => {
+                            if let Some(delay) = write_delay {
+                                std::thread::sleep(delay);
+                            }
+                            p.write(&store);
+                        }
                         WriteRequest::Barrier(done) => {
                             let _ = done.send(());
                         }
@@ -769,9 +787,9 @@ pub fn append_to(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(bytes))
 }
 
-/// The space available to this process on the file system of `path`, and
-/// the size of that file system (bytes).
-pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+/// The space available to this process on the file system of `path`, the size
+/// of that file system, and its fundamental allocation unit (bytes).
+pub(crate) fn fs_info(path: &Path) -> Option<(u64, u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -783,17 +801,24 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
-        let frsize = st.f_frsize;
+        #[allow(clippy::unnecessary_cast)]
+        let frsize = st.f_frsize as u64;
         // (fsblkcnt_t is u32 on macOS, u64 on Linux.)
         #[allow(clippy::unnecessary_cast)]
         let (avail, blocks) = (st.f_bavail as u64, st.f_blocks as u64);
-        Some((avail * frsize, blocks * frsize))
+        Some((avail * frsize, blocks * frsize, frsize))
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         None
     }
+}
+
+/// The space available to this process on the file system of `path`, and
+/// the size of that file system (bytes).
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    fs_info(path).map(|(avail, total, _)| (avail, total))
 }
 
 /// The free space tlx leaves on a file system of `total` bytes: the

@@ -101,6 +101,7 @@ pub(super) fn finalize<'m, M: Model>(
         && outs.iter().all(|o| o.archive.is_some());
     let logs_spilled: usize = logs.iter().map(|l| l.spilled_blocks()).sum();
     let meters = shared.budget.meters();
+    let frontier_peak = shared.frontier.peak_bytes().0;
     let mem = search_memory(&shared, levels0, &logs, &outs);
     let (outcome, trace, trace_note) = failure_report(model, &shared, &logs, failure, results);
     let resume = resumable.then(|| keep_resume(&shared, &stats, &base_outdegree, opts, logs, outs));
@@ -121,9 +122,32 @@ pub(super) fn finalize<'m, M: Model>(
             // when the search's own IO fails.)
             Err(LiveStop::Io(e)) => outcome = Outcome::Io(e.0),
         }
+    } else {
+        drop((edges, pre));
+    }
+    if matches!(outcome, Outcome::Ok) && live_error.is_none() {
+        // Wait for any background spill I/O holding run-owned stores to finish
+        // releasing them, then surface any cleanup I/O failure (e.g. failed unlink).
+        opts.spill.wait_for_writes();
+        opts.spill.wait_for_reads();
+        if let Some(e) = opts.spill.error() {
+            outcome = Outcome::Io(e.0);
+        }
     }
     (
-        Report { stats, outcome, trace, trace_note, elapsed: start.elapsed(), in_init, live_graph, live_error, live_atoms_ok, coverage },
+        Report {
+            stats,
+            outcome,
+            trace,
+            trace_note,
+            elapsed: start.elapsed(),
+            in_init,
+            live_graph,
+            live_error,
+            live_atoms_ok,
+            coverage,
+            frontier_peak,
+        },
         resume,
     )
 }
@@ -281,6 +305,7 @@ pub(super) fn in_init_failed<'m, M: Model>(run: &Run<'m, M>, e: ModelError) -> R
         live_error: None,
         live_atoms_ok: false,
         coverage,
+        frontier_peak: shared.frontier.peak_bytes().0,
     }
 }
 

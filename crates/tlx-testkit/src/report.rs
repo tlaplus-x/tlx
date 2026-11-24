@@ -146,6 +146,7 @@ mod tests {
             live_error: None,
             live_atoms_ok: true,
             coverage: Some(Coverage { init_generated: 2, generated: vec![3, 4], distinct: vec![1, 2] }),
+            frontier_peak: 0,
         }
     }
 

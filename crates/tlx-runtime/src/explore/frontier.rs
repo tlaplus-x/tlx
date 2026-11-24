@@ -144,6 +144,11 @@ impl<'m, S> Frontier<'m, S> {
         self.queue.spilling()
     }
 
+    /// Segments kept resident ahead of claims per list.
+    pub(super) fn queue_window(&self) -> usize {
+        self.queue.window()
+    }
+
     /// While the queue spills: offer the segments of the current level far
     /// from the claims to the disk.
     pub(super) fn spill_tail(&self) {
@@ -322,6 +327,12 @@ impl<S> Local<'_, '_, S> {
     #[inline]
     pub(super) fn next_len(&self) -> usize {
         self.writer.len()
+    }
+
+    /// Number of sealed blocks finished by this worker's writer.
+    #[inline]
+    pub(super) fn sealed_blocks(&self) -> usize {
+        self.writer.sealed_blocks()
     }
 
     /// Submit the tasks of the next level (level-synchronous search, before

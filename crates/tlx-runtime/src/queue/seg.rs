@@ -24,8 +24,9 @@ pub(crate) struct Seg {
 
 enum State {
     Mem(Arc<Segment>),
-    /// Handed to the writer thread (its memory is no longer counted: it is
-    /// freed once written).
+    /// Handed to the writer thread (its memory stays counted in `ChargedBytes`
+    /// until the write succeeds and frees the buffer; a failed write keeps the
+    /// buffer and its charge alive).
     Pending {
         store: Arc<BlockStore>,
         p: Arc<Pending>,
@@ -46,6 +47,24 @@ enum State {
     },
     /// (Transient, while the state changes.)
     Empty,
+}
+
+/// Segment buffer handed to the asynchronous spill writer while retaining its
+/// `Mem` charge until the write succeeds (or the failed buffer is taken back /
+/// dropped).
+struct ChargedBytes {
+    data: Vec<u8>,
+    _charge: Charge,
+}
+
+impl crate::io::Bytes for ChargedBytes {
+    fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        Box::new(self.data)
+    }
 }
 
 /// Bytes of a segment for reading records (`Seg::bytes`): the segment in
@@ -153,9 +172,9 @@ impl Seg {
         let State::Mem(s) = &mut *st else { return Spilled::Done };
         let Some(seg) = Arc::get_mut(s) else { return Spilled::Busy };
         let data = std::mem::take(&mut seg.data);
-        let mem = seg.charge.get_mut().mem.clone();
-        // (The segment's charge goes with it.)
-        *st = State::Pending { store: store.clone(), p: spill.write_async(store, Box::new(data)), mem };
+        let charge = seg.charge.get_mut().take();
+        let mem = charge.mem.clone();
+        *st = State::Pending { store: store.clone(), p: spill.write_async(store, Box::new(ChargedBytes { data, _charge: charge })), mem };
         Spilled::Now
     }
 
