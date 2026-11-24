@@ -147,9 +147,23 @@ The connected symmetry certificates (`KeyedCertificate`, `EquivSymCertificate`,
 **CEX** within their supported observation set: state invariants and deadlocks. Initialization and
 successors correspond from every orbit representative, and every reduced violation lifts to a
 concrete witness. Counts and depths describe the quotient. Temporal properties exclude automatic
-application. [optimization.md](optimization.md#proof-coverage) owns the certificate inventory and
-[certified automatic symmetry](optimization.md#certified-keyed-symmetry) details the lowered rule IR
-and the trust boundary between formal orbit keys and runtime canonicalization.
+application.
+
+What `"generated-lean"` proves is **per-instance quotient equivalence** (`Certificate before after
+project`) for the lowered transition system — not invariant satisfaction of the user's specification
+(which BFS still checks) and not formal verification of the Rust implementation. Representative-wide
+successor lifting (`∀ s`, not `∃ s`) ensures deduplicating equivalent orbits during BFS cannot drop
+transitions or synthesize spurious paths, using only Lean 4's standard axioms. Outside the Lean
+proof, soundness relies on Rust's `.tla`-to-Lean lowering, static domain/totality gates
+(`sym_totality`) where semantic leaves are modeled as total Lean functions rather than TLC runtime
+errors, runtime transposition closure and minimum-key orbit selection (cross-checked within bounds
+by `symcheck`), and offline execution of the `lean` kernel (`tlx check` persists the mandatory
+`.lean` file before exploration without running `lean`).
+[optimization.md](optimization.md#proof-coverage) owns the certificate inventory,
+[certificate goal and soundness boundary](optimization.md#certificate-goal-and-soundness-boundary)
+owns the shared Lean specification and trust boundary, and
+[certified automatic symmetry](optimization.md#certified-keyed-symmetry) details the lowered symmetry
+rule IRs.
 
 ## 3. The labelling contract
 

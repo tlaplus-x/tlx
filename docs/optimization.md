@@ -57,19 +57,79 @@ negative mutation checks are explicit.
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean`: unobserved-variable erasure composed with certified keyed symmetry (including disjoint products of full keyed groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed symmetry certifies the retained tuple |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
-Every checking certificate proves initialization correspondence, successor lifting from every
-equivalent representative, preservation of selected state invariants, concrete counterexample
-lifting, and plain-`Next` deadlock preservation, without assuming preservation premises or custom
-axioms. Temporal properties, `CONSTRAINT` / `ACTION_CONSTRAINT`, action or implied-init properties,
-`ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration constant overrides remain outside the
-certified checking subset. Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract
-and decline automatic projection.
+Temporal properties, `CONSTRAINT` / `ACTION_CONSTRAINT`, action or implied-init properties, `ALIAS`,
+`POSTCONDITION`, `_POSSIBLE`, and configuration constant overrides remain outside the certified
+checking subset. Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline
+automatic projection.
 
 When `-optimize` runs, `InterpModel::project_state` tries projection families in priority order —
 unobserved variables, relative ages (including combined age/history), standalone finite history,
 phase-dependent fields, sequence lengths, and ordered allocation — and installs the first candidate
 that produces a connected certificate; an uncertified candidate never preempts a certified later
 rule.
+
+### Certificate goal and soundness boundary
+
+Lean does not prove that the user's TLA+ specification satisfies its invariants — exhaustive search
+in `tlx` still checks the reduced state graph. Instead, each generated file combines embedded Lean 4
+rule libraries (`crates/tlx-sema/src/optimize/Rules.lean` and the active `*Certificate.lean`
+modules) with compiler-emitted definitions lowered from the configured `.tla` and `.cfg` HIR to
+prove **exact safety-quotient equivalence** (`Certificate before after project`):
+
+```lean
+structure Certificate {S A : Type}
+    (before : System S) (after : System A) (project : S → A) : Prop where
+  initial : ∀ a, after.initial a ↔ ∃ s, before.initial s ∧ project s = a
+  next    : ∀ s a, after.next (project s) a ↔ ∃ t, before.next s t ∧ project t = a
+  observe : ∀ s, before.safe s ↔ after.safe (project s)
+```
+
+- **Representative-independent lifting (`∀ s`):** during explicit-state BFS with an internal `VIEW`
+  or symmetry quotient, `tlx` retains whichever concrete state `s` arrives first and deduplicates
+  later states `s'` with `project s' = project s`. Quantifying `next` over **every** concrete
+  representative `s` (rather than `∃ s`) guarantees that expanding from any retained representative
+  produces the exact same projected successors, neither dropping reachable paths nor inventing
+  spurious transitions.
+- **No circular premises or custom axioms:** when a reduction relies on reachability facts (for
+  example in `PipelineCertificate.lean` or `ChooseSymCertificate.lean`), Lean proves an inductive
+  invariant strictly from `Init` and `Next` — never assuming checked `INVARIANT`s — before
+  discharging the shared theorem goals: `certificate`, `optimization_correct` (reachable safety
+  `↔`), `specification_correct` (`[Next]_vars` stuttering safety `↔`), `counterexample_lifts`
+  (every reduced violation lifts to a reachable concrete violation), and `deadlock_preserved`
+  (plain-`Next` deadlock `↔`), plus formal key/orbit equivalence (`runtime_key_equivalent` or
+  `orbit_key_equivalent`) where applicable.
+- **Kernel and non-vacuity audit:** [proofs/check_generated.py](../proofs/check_generated.py) runs
+  `lean -t0 -DwarningAsError=true`, restricts `#print axioms` to Lean 4's three standard logical
+  axioms (`propext`, `Classical.choice`, `Quot.sound`), and under `--negative` requires Lean to
+  reject targeted soundness mutations across every certificate family.
+
+Because Lean verifies the lowered mathematical transition system rather than the Rust binary,
+end-to-end soundness relies on five cross-cutting boundaries (alongside each rule's specific
+`Refusals & Trusted Computing Base (TCB)` section below):
+
+1. **Rust `.tla`-to-Lean lowering:** parsing (`tlx-front`), name/level resolution (`tlx-sema`),
+   operator/`LET` branch normalization, and variable-read / single-binding checks emit the Lean
+   `Model`.
+2. **Total semantic leaves vs. TLC evaluation errors:** except in `ChooseSymCertificate.lean` (which
+   models `EvalOutcome.error` for empty `CHOOSE`), untouched TLA+ subexpressions are parameterized
+   as total Lean functions and predicates (`sem.value`, `sem.test`). Preserving TLC runtime errors
+   (such as out-of-domain lookups, incomparable comparisons, or 32-bit overflow in concrete
+   expressions) relies on Rust's static domain, totality, and read-scanning gates
+   (`phase/domain.rs`, `phase/sym_totality/`).
+3. **Mathematical `Nat`/`Int` vs. 32-bit machine overflow (`-optimize` and `tlx optimize`):** clock,
+   frontier, and counter reductions (`AgeCertificate`, `OrderedCertificate`, `NestedCertificate`,
+   `LiveCertificate`, `PipelineCertificate`) prove correspondence over mathematical integers; an
+   unbounded counter that would eventually hit 32-bit overflow in an unreduced run may collapse to a
+   finite quotient under `-optimize` (disabled in `-tlc`).
+4. **Runtime projection and orbit canonicalization:** Lean proves soundness of the formal `project`
+   map (including `Quotient (orbits ...)` and rank keys), while Rust executes `VIEW` evaluation,
+   structural rank-key construction (`crates/tlx-eval/src/model/ordered.rs`), and minimum-key
+   selection across permutations generated from adjacent transpositions (symmetry generators are
+   cross-checked against the unreduced graph within `autosym`'s bounded `symcheck` budget, and
+   compiled key evaluation is cross-checked against the interpreter under `TLX_PARANOID=1`).
+5. **Offline Lean execution:** `tlx check` and `tlx optimize` write the mandatory `.lean` file
+   before state exploration or export without invoking a `lean` process at run time; kernel checking
+   is run explicitly via `proofs/check_generated.py` and `crates/tlx-cli/tests/optimization_lean.rs`.
 
 ## Overlap with execution optimization
 
