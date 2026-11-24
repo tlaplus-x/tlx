@@ -368,7 +368,7 @@ pub fn subseteq(s: &Value, t: &Value) -> Result<bool> {
         }
     }
     let mut res = true;
-    for_each_element(s, &mut |e| {
+    super::for_each_enumerated(s, &mut |e| {
         if member(&e, t)? {
             Ok(true)
         } else {

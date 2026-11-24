@@ -462,27 +462,23 @@ impl Program {
         &self.files[id.0 as usize]
     }
 
-    /// Whether `d` is a bundled standard- or community-module definition that
-    /// TLC overrides by a Java method taking eagerly evaluated arguments
-    /// (`TLC_STD_STRICT` / `TLC_OVERRIDES`).
+    /// Whether `d` is a standard- or community-module definition that TLC
+    /// overrides by a Java method taking eagerly evaluated arguments
+    /// (`TLC_STD_STRICT` / `TLC_OVERRIDES`), matched by `(module, operator)`
+    /// wherever the module was found (as in TLC; see `CG1`, `CG2`).
     ///
-    /// User modules (even if named after a bundled module such as `Bitwise.tla`)
-    /// and `LET`-local definitions always take their arguments lazily.
+    /// Ordinary TLA+ definitions and `LET`-local definitions always take their
+    /// arguments lazily.
     pub fn is_strict_call_def(&self, d: DefId) -> bool {
         if self.def_is_let(d) {
             return false;
         }
         let Some(def) = self.defs.get(d.idx()) else { return false };
         let Some(src) = self.def_src.get(d.idx()) else { return false };
-        let Some(file) = self.files.get(def.span.file.0 as usize) else { return false };
-        let table = match file.origin {
-            ModuleOrigin::Stdlib => crate::builtins::TLC_STD_STRICT,
-            ModuleOrigin::Community => crate::builtins::TLC_OVERRIDES,
-            ModuleOrigin::User => return false,
-        };
         let module = &*self.mods[src.module].name;
         let name = def.name.rsplit('!').next().unwrap_or(&def.name);
-        table.iter().any(|(m, ops)| *m == module && ops.contains(&name))
+        crate::builtins::TLC_STD_STRICT.iter().any(|(m, ops)| *m == module && ops.contains(&name))
+            || crate::builtins::TLC_OVERRIDES.iter().any(|(m, ops)| *m == module && ops.contains(&name))
     }
 
     /// The instance context definition `d` belongs to, if it was

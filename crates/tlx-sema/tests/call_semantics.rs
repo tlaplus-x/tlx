@@ -25,7 +25,10 @@ fn def_id(prog: &mut Program, name: &str) -> tlx_sema::hir::DefId {
 }
 
 #[test]
-fn user_bitwise_module_origin_is_user_and_not_strict() {
+fn disk_module_origin_is_recorded_while_strict_overrides_match_by_module_name() {
+    // As in TLC (`CG1`, `CG2`), Java overrides bind by `(module_name, op_name)`
+    // even when a module such as `SequencesExt` or `Bitwise` is loaded from `-I`
+    // or disk (`ModuleOrigin::User`), so `SymNormalizer` and runtime agree.
     let (_dir, mut prog) = load(
         "Bitwise",
         "---- MODULE Bitwise ----\n\
@@ -35,7 +38,7 @@ fn user_bitwise_module_origin_is_user_and_not_strict() {
     );
     let xor = def_id(&mut prog, "Xor");
     assert_eq!(prog.file(prog.defs[xor.idx()].span.file).origin, ModuleOrigin::User);
-    assert!(!prog.is_strict_call_def(xor), "user Bitwise.tla must not be misclassified as a CommunityModule override");
+    assert!(prog.is_strict_call_def(xor), "Java overrides bind by module name regardless of load path");
 }
 
 #[test]

@@ -223,8 +223,15 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
             }
             for_each_element(a, &mut |e| if member(&e, b)? { Ok(true) } else { f(e) })
         }
-        LazySet::Custom(c) => match c.for_each(f)? {
-            Some(done) => Ok(done),
+        LazySet::Custom(c) => match c.enumerate()? {
+            Some(elems) => {
+                for e in elems {
+                    if !f(e)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             None => Err(c.not_enumerable(s)),
         },
     }
@@ -258,14 +265,50 @@ pub fn enumerate(s: &Value) -> Result<Vec<Value>> {
 /// is evaluated element by element, interleaved with `f`, like TLC's
 /// `SetPredValue.elements()` (where an error in `P` surfaces only when its
 /// element is reached). Used where `x \in S` enumerates the values of a
-/// variable (Init).
+/// variable (Init), `isEmpty()`, and `\subseteq`.
 pub fn for_each_enumerated(s: &Value, f: &mut dyn FnMut(Value) -> Result<bool>) -> Result<bool> {
     if let Value::LazySet(l) = s {
-        if let LazySet::Custom(c) = &**l {
-            return match c.for_each(f)? {
-                Some(done) => Ok(done),
-                None => Err(c.not_enumerable(s)),
-            };
+        match &**l {
+            LazySet::Custom(c) => {
+                return match c.for_each(f)? {
+                    Some(done) => Ok(done),
+                    None => Err(c.not_enumerable(s)),
+                };
+            }
+            LazySet::Union(sets) => {
+                if !is_enumerable(sets) {
+                    return err(format!("Attempted to enumerate the nonenumerable set:\n{s}"));
+                }
+                return for_each_enumerated(sets, &mut |e| {
+                    if !is_enumerable(&e) {
+                        return err("Attempted to enumerate UNION(s), but some element of s is nonenumerable.");
+                    }
+                    for_each_enumerated(&e, f)
+                });
+            }
+            LazySet::Cup(a, b) => {
+                if !is_enumerable(a) || !is_enumerable(b) {
+                    return err(format!("Attempted to enumerate S \\cup T when S:\n{a}\nand T:\n{b}\nare not both enumerable"));
+                }
+                return Ok(for_each_enumerated(a, f)? && for_each_enumerated(b, f)?);
+            }
+            LazySet::Cap(a, b) => {
+                let (src, other) = if is_enumerable(a) {
+                    (a, b)
+                } else if is_enumerable(b) {
+                    (b, a)
+                } else {
+                    return err(format!("Attempted to enumerate S \\cap T when neither S:\n{a}\nnor T:\n{b}\nis enumerable"));
+                };
+                return for_each_enumerated(src, &mut |e| if member(&e, other)? { f(e) } else { Ok(true) });
+            }
+            LazySet::Diff(a, b) => {
+                if !is_enumerable(a) {
+                    return err(format!("Attempted to enumerate S \\ T when S:\n{a}\nis not enumerable."));
+                }
+                return for_each_enumerated(a, &mut |e| if member(&e, b)? { Ok(true) } else { f(e) });
+            }
+            _ => {}
         }
     }
     // No size check: this is TLC's `Enumerable.elements()` (the default
@@ -485,12 +528,13 @@ mod tests {
         }
         let s = Value::LazySet(Arc::new(LazySet::Custom(Box::new(FailAfterFirst))));
         let mut got = Vec::new();
-        let done = for_each_element(&s, &mut |v| {
+        let done = crate::ops::for_each_enumerated(&s, &mut |v| {
             got.push(v);
             Ok(false)
         })
         .unwrap();
         assert!(!done);
         assert_eq!(got, vec![Value::Int(1)]);
+        assert!(!crate::ops::is_empty_checked(&s).unwrap());
     }
 }

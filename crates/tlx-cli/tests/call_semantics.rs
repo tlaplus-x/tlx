@@ -22,10 +22,11 @@ fn run_spec(tag: &str, name: &str, spec: &str, cfg: &str, args: &[&str], env: &[
 }
 
 #[test]
-fn user_bitwise_module_is_lazy_and_bundled_strict_error_is_preserved() {
-    // A user root module named `Bitwise.tla` must NOT be misclassified as the
-    // bundled CommunityModule `Bitwise`: `Xor(a, b) == TRUE` takes its
-    // arguments lazily, so `Xor(1 \div 0, 0)` does not error in any mode.
+fn bitwise_module_and_bundled_strict_errors_are_preserved() {
+    // As in TLC (`CG1`, `CG2`), Java `@TLAPlusOperator` overrides match by
+    // `(module, operator)` regardless of load path: `Bitwise!Xor(1 \div 0, 0)`
+    // evaluates `1 \div 0` strictly, and `SymNormalizer` must refuse erasing
+    // it so default mode, `-tlc`, and `TLX_PARANOID=1` all report exit 75.
     let user_spec = r#"---- MODULE Bitwise ----
 EXTENDS Naturals
 CONSTANT Proc
@@ -40,11 +41,11 @@ Inv  == \E p \in Proc : p = owner \/ Xor(1 \div 0, 0)
     for (tag, args, env) in [
         ("user-bitwise-default", &[][..], &[][..]),
         ("user-bitwise-tlc", &["-tlc"][..], &[][..]),
-        ("user-bitwise-paranoid", &["-compile"][..], &[("TLX_PARANOID", "1"), ("TLX_PRERUN_REUSE", "0")][..]),
+        ("user-bitwise-paranoid", &["-compile", "-tlc"][..], &[("TLX_PARANOID", "1"), ("TLX_PRERUN_REUSE", "0")][..]),
     ] {
         let (code, out) = run_spec(tag, "Bitwise", user_spec, cfg, args, env);
-        assert_eq!(code, 0, "{tag}:\n{out}");
-        assert!(out.contains("No error has been found"), "{tag}:\n{out}");
+        assert_eq!(code, 75, "{tag}:\n{out}");
+        assert!(!out.contains("(symmetry-reduced)"), "{tag}:\n{out}");
     }
 
     // Conversely, when extending the bundled CommunityModule `Bitwise`,

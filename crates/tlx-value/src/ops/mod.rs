@@ -115,7 +115,7 @@ pub fn is_empty_checked(s: &Value) -> Result<bool> {
             // (Value.isEmpty: whether the enumeration has a first element.)
             LazySet::Union(_) | LazySet::Cup(..) | LazySet::Cap(..) | LazySet::Diff(..) | LazySet::Custom(_) => {
                 let mut none = true;
-                for_each_element(s, &mut |_| {
+                for_each_enumerated(s, &mut |_| {
                     none = false;
                     Ok(false)
                 })?;

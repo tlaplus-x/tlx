@@ -924,29 +924,29 @@ fn choose_does_not_mask_non_choose_breakers() {
 
 #[test]
 fn symcheck_error_refuses_automatic_symmetry_and_runs_unreduced() {
-    // 1. S-1 defense-in-depth (`Bitwise.tla`): evaluation error on a permuted initial state
-    //    must never be swallowed by `autosym::apply` and must exit 75 in default mode.
-    let bitwise_dir = tlx_testkit::TempDir::with_spec(
-        "Bitwise",
-        "---- MODULE Bitwise ----\n\
-         EXTENDS Naturals\n\
+    // 1. S-1 (`SVG!NodeOfRingNetwork` bundled strict override): evaluation error in an unused
+    //    argument on a permuted initial state must never be erased or swallowed by `autosym`,
+    //    and must exit 75 in default mode.
+    let strict_dir = tlx_testkit::TempDir::with_spec(
+        "StrictSymErr",
+        "---- MODULE StrictSymErr ----\n\
+         EXTENDS Naturals, SVG\n\
          CONSTANT Proc\n\
          VARIABLE owner\n\
-         Xor(a, b) == TRUE\n\
          Init == owner \\in Proc\n\
          Next == owner' \\in Proc\n\
-         Inv == \\E p \\in Proc : p = owner \\/ Xor(1 \\div 0, 0)\n\
+         Inv == \\E p \\in Proc : p = owner \\/ NodeOfRingNetwork(0, 0, 0, 0, 1 \\div 0).x = 0\n\
          ====\n",
         "CONSTANT Proc = {p1, p2}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
     );
     for tier in ["-interp", "-compile"] {
         let r = tlx_testkit::tlx_default!()
-            .args(["check", "Bitwise.tla", tier])
-            .env("TLX_PROOF_DIR", bitwise_dir.join("proofs"))
-            .dir(&bitwise_dir)
+            .args(["check", "StrictSymErr.tla", tier])
+            .env("TLX_PROOF_DIR", strict_dir.join("proofs"))
+            .dir(&strict_dir)
             .run();
-        assert_eq!(r.code, 75, "Bitwise {tier} must report division by zero:\n{}", r.text());
-        assert!(!r.stdout.contains("(symmetry-reduced)"), "Bitwise {tier}: {}", r.text());
+        assert_eq!(r.code, 75, "StrictSymErr {tier} must report division by zero:\n{}", r.text());
+        assert!(!r.stdout.contains("(symmetry-reduced)"), "StrictSymErr {tier}: {}", r.text());
     }
 
     // 2. When `symcheck::check_perms` returns `Err` (here exceeding the 10,000-edge cross-check
