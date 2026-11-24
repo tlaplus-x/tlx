@@ -76,7 +76,7 @@ selects the java of TLC (see scripts/tlc.py).
 """
 import tempdirs
 
-import argparse, difflib, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, concurrent.futures, difflib, itertools, json, os, re, shutil, subprocess, sys, tempfile, threading, time
 
 from modelcheck.results import must, layout_free  # re-export for existing driver consumers
 from contract import compare as compare_contract
@@ -211,7 +211,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("names", nargs="*", metavar="NAME")
     ap.add_argument("--refresh", action="store_true")
-    ap.add_argument("-j", "--jobs", type=int, default=1, help="accepted for driver consistency; cases run serially")
+    ap.add_argument("-j", "--jobs", type=int, default=1, help="number of parallel spec jobs (default 1)")
     ap.add_argument("--extra", default="", help="extra tlx arguments (write --extra=-compile)")
     ap.add_argument("--default-mode", action="store_true",
                     help="run tlx in its default mode and tier (no -tlc) and compare by verdict: the result, the violated "
@@ -224,8 +224,6 @@ def main():
     a = ap.parse_args()
     if a.jobs < 1:
         ap.error("-j must be positive")
-    if a.jobs != 1:
-        print("spectest: cases run serially; -j is accepted and ignored", file=sys.stderr)
     names = resolve_names(a.names)
     with build_tlx(profile=profile_of(a), build=not a.no_build, prefix="tlx-spectest-bin-") as binary:
         run_specs(a, names, binary)
@@ -235,28 +233,44 @@ def run_specs(a, names, binary):
     refresh = a.refresh
     extra = a.extra.split()
     workers = extra_workers(extra)
+    jobs = max(1, getattr(a, "jobs", 1))
     exp_path = os.path.join(SPECS, "expected.json")
     expected = {}
     if os.path.exists(exp_path):
         with open(exp_path) as source:
             expected = json.load(source)
-    # tlx runs in a private copy of the spec directory (specs that write files
-    # next to themselves, e.g. RS3-RS5, must not race with another process).
+    # Each worker thread gets its own private copy of the spec directory so specs
+    # that write files next to themselves (e.g. RS3-RS5) never race with another
+    # worker or another spectest process in the same checkout.
     scratch = tempdirs.TemporaryDirectory(prefix="tlx-spectest-")
-    run_dir = os.path.join(scratch.name, "specs")
-    shutil.copytree(SPECS, run_dir)
+    worker_local = threading.local()
+    worker_lock = threading.Lock()
+    worker_ids = itertools.count()
+
+    def worker_run_dir():
+        run_dir = getattr(worker_local, "run_dir", None)
+        if run_dir is None:
+            with worker_lock:
+                idx = next(worker_ids)
+            run_dir = os.path.join(scratch.name, f"specs-{idx}")
+            shutil.copytree(SPECS, run_dir)
+            worker_local.run_dir = run_dir
+        return run_dir
+
     validated = {}
     if os.path.exists(VALIDATED):
         with open(VALIDATED) as source:
             validated = json.load(source)
     validated_before = dict(validated)
+    validated_lock = threading.Lock()
     results, notes = [], {}
     entries = load_expected_cases()
     suite = a.suite or ("spectest-default" if getattr(a, "default_mode", False) else "spectest-compile" if "-compile" in extra else "spectest")
-    args_of = (lambda flags: [*flags, *extra]) if getattr(a, "default_mode", False) else (lambda flags: parity_args(binary, [*flags, *extra]))
     if not a.suite and workers != 1:
         suite += f"-w{workers}"
-    for n in names:
+
+    def run_one(n):
+        lines_out = []
         try:
             fpath = os.path.join(SPECS, n + ".flags")
             lines = []
@@ -268,15 +282,16 @@ def run_specs(a, names, binary):
             simulation = "-simulate" in flags or "-generate" in flags
             tlc_out, tlc_rc, random = tlc_output(n, flags, refresh, timeout=a.timeout)
             want = must(tlc_out, tlc_rc)
-            expected[n] = {k: want[k] for k in ("result", "violated", "distinct", "generated", "exit", "depth")}
+            expected_entry = {k: want[k] for k in ("result", "violated", "distinct", "generated", "exit", "depth")}
             if random:
-                expected[n]["trace_random"] = True
-            env = tlx_env(extra=parity_env(args_of(flags)))
+                expected_entry["trace_random"] = True
+            tlx_args = [*flags, *extra] if getattr(a, "default_mode", False) else parity_args(binary, [*flags, *extra])
+            env = tlx_env(extra=parity_env(tlx_args))
             env.update(kv.split("=", 1) for line in lines if line.startswith("# env ") for kv in line.split()[2:])
             timeout = min([a.timeout, *[float(line.split()[2]) for line in lines if line.startswith("# timeout ")]])
             cpu_limit = next((float(line.split()[2]) for line in lines if line.startswith("# cpu-timeout ")), None)
-            p = run_proc([binary, "check", n + ".tla", "-config", n + ".cfg", "-tool", *INCLUDES, *args_of(flags)],
-                         timeout=timeout, cwd=run_dir, env=env, rusage=cpu_limit is not None)
+            p = run_proc([binary, "check", n + ".tla", "-config", n + ".cfg", "-tool", *INCLUDES, *tlx_args],
+                         timeout=timeout, cwd=worker_run_dir(), env=env, rusage=cpu_limit is not None)
             if cpu_limit is not None and p.rusage.ru_utime + p.rusage.ru_stime > cpu_limit:
                 cpu = p.rusage.ru_utime + p.rusage.ru_stime
                 raise subprocess.TimeoutExpired(f"{n} (CPU timeout: {cpu:.3f}s > {cpu_limit:g}s)", cpu_limit)
@@ -287,7 +302,8 @@ def run_specs(a, names, binary):
             if workers != 1:
                 diff, note, detail = compare_workers(n, want, got, simulation, getattr(a, "default_mode", False))
             else:
-                diff, note, detail = compare(n, want, got, simulation, deterministic, validated, getattr(a, "default_mode", False))
+                with validated_lock:
+                    diff, note, detail = compare(n, want, got, simulation, deterministic, validated, getattr(a, "default_mode", False))
             contract = compare_contract(want, got, workers=workers, simulation=simulation,
                                         deterministic=deterministic, allow_unnamed_liveness=workers == 1,
                                         schedule_dependent=workers != 1 and schedule_dependent(n), optimized=getattr(a, "default_mode", False))
@@ -297,28 +313,48 @@ def run_specs(a, names, binary):
                     contract.checked.append("trace validity")
                 else:
                     contract.skipped["trace validity"] = note
-            notes[note] = notes.get(note, 0) + 1
             # A known difference (docs/compat.md): `# xfail ID` in NAME.flags.
             xfail = next((line.split()[2] for line in lines if line.startswith("# xfail ")), None)
             case = judge_case(CaseResult(n, "fail" if diff else "pass", {"kind": got["result"], "differs": diff, "note": note, **contract.details()}),
                               entries, suite, known={"reason": xfail} if xfail else None)
-            results.append(case)
             status = case.status.upper()
             show = lambda r: {k: r[k] for k in ("result", "violated", "exit", "distinct", "generated", "depth")}
-            print(f'{status} {n:12} tlc={show(want)} tlx={show(got)}' + (f" differs: {diff}" if diff else "")
-                  + (f" ({note})" if note else "") + (f" (known: {xfail})" if xfail else "") + f" checked={','.join(contract.checked)}")
+            lines_out.append(f'{status} {n:12} tlc={show(want)} tlx={show(got)}' + (f" differs: {diff}" if diff else "")
+                             + (f" ({note})" if note else "") + (f" (known: {xfail})" if xfail else "") + f" checked={','.join(contract.checked)}")
             if detail:
-                print("    " + detail.replace("\n", "\n    "))
+                lines_out.append("    " + detail.replace("\n", "\n    "))
             if "trace" in diff or "trace length" in diff:
-                print("    tlc trace:", want["trace"], "\n    tlx trace:", got["trace"])
+                lines_out.append(f"    tlc trace: {want['trace']} \n    tlx trace: {got['trace']}")
+            return n, case, expected_entry, note, lines_out
         except Exception as error:
             status = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "error"
-            results.append(CaseResult(n, status, {"message": repr(error)}))
-            print(f"FAIL {n:12} execution {status}: {error}")
-    if refresh or not a.names:
-        with open(exp_path, "w") as output:
-            json.dump(expected, output, indent=1, sort_keys=True)
-    scratch.cleanup()
+            case = CaseResult(n, status, {"message": repr(error)})
+            lines_out.append(f"FAIL {n:12} execution {status}: {error}")
+            return n, case, None, None, lines_out
+
+    try:
+        if jobs == 1 or len(names) <= 1:
+            outcomes = (run_one(n) for n in names)
+        else:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(jobs, len(names)))
+            try:
+                futures = [pool.submit(run_one, n) for n in names]
+                outcomes = [fut.result() for fut in futures]
+            finally:
+                pool.shutdown(wait=True)
+        for n, case, expected_entry, note, lines_out in outcomes:
+            if expected_entry is not None:
+                expected[n] = expected_entry
+            if note is not None:
+                notes[note] = notes.get(note, 0) + 1
+            results.append(case)
+            for line in lines_out:
+                print(line)
+        if refresh or not a.names:
+            with open(exp_path, "w") as output:
+                json.dump(expected, output, indent=1, sort_keys=True)
+    finally:
+        scratch.cleanup()
     if validated != validated_before:
         with open(VALIDATED, "w") as f:
             json.dump(validated, f, indent=1, sort_keys=True)

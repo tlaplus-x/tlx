@@ -3,6 +3,11 @@ name = "tlx-sema"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 tlx-front.workspace = true

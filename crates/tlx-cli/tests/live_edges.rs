@@ -3,9 +3,7 @@
 //! (tests/specs/expected.json), in both tiers and with several workers, and
 //! the violated property is that of one interpreter worker.
 
-mod common;
-
-use common::{liveness_lines, liveness_specs, run_spec};
+use crate::common::{liveness_lines, liveness_specs, run_spec};
 use tlx_testkit::cli::tests_specs as specs;
 
 /// What TLC reports for spec `name` (tests/specs/expected.json): exit code,

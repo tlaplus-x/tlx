@@ -3,10 +3,19 @@ name = "tlx-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [[bin]]
 name = "tlx"
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "optimization"
+path = "tests/optimization.rs"
 
 [dependencies]
 tlx-base.workspace = true

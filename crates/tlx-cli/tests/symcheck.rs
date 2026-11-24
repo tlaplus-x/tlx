@@ -1,6 +1,5 @@
 //! Bounded checks of declared symmetry use unreduced states.
-mod common;
-use common::run_spec;
+use crate::common::run_spec;
 
 #[test]
 fn sound_symmetry_checks_generators() {

@@ -6,9 +6,7 @@
 //! which create run-time strings, in the order one worker does; without
 //! them, the interpreter's CHOOSE picked another string and Inv failed.)
 
-mod common;
-
-use common::{coverage_lines, liveness_lines, liveness_specs, run_spec};
+use crate::common::{coverage_lines, liveness_lines, liveness_specs, run_spec};
 
 /// Check spec `name` with `args`: exit code, the result lines and the
 /// coverage statistics of the output, and the output.

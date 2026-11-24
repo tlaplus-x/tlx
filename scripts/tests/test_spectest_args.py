@@ -5,7 +5,9 @@ argument handling is exercised).
 
 usage: python3 scripts/tests/test_spectest_args.py [-v]
 """
-import contextlib, io, os, sys, unittest
+import contextlib, io, json, os, sys, tempfile, threading, time, unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import spectest
@@ -65,6 +67,77 @@ class ResolveNames(unittest.TestCase):
         self.assertIn("A1", known)
         self.assertIn("B8", known)
         self.assertEqual(spectest.resolve_names(known), known)
+
+
+class ParallelJobs(unittest.TestCase):
+    def test_parallel_runs_in_isolated_dirs_and_preserves_order(self):
+        tlc_ok = (
+            "@!@!@STARTMSG 2185:0 @!@!@\n"
+            "Model checking completed. No error has been found.\n"
+            "@!@!@ENDMSG 2185 @!@!@\n"
+            "@!@!@STARTMSG 2190:0 @!@!@\n"
+            "2 states generated, 2 distinct states found, 0 states left on queue.\n"
+            "@!@!@ENDMSG 2190 @!@!@\n"
+            "@!@!@STARTMSG 2194:0 @!@!@\n"
+            "The depth of the complete state graph search is 1.\n"
+            "@!@!@ENDMSG 2194 @!@!@\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            specs = os.path.join(root, "specs")
+            tlc_dir = os.path.join(specs, "tlc")
+            os.makedirs(tlc_dir)
+            names = ["S1", "S2", "S3", "S4"]
+            for n in names:
+                with open(os.path.join(specs, f"{n}.tla"), "w") as f:
+                    f.write(f"---- MODULE {n} ----\n====\n")
+                with open(os.path.join(specs, f"{n}.cfg"), "w") as f:
+                    f.write("INIT Init\n")
+                with open(os.path.join(tlc_dir, f"{n}.out"), "w") as f:
+                    f.write(f"# exit 0\n{tlc_ok}")
+
+            barrier = threading.Barrier(2, timeout=5)
+            seen_cwds = []
+            lock = threading.Lock()
+
+            def fake_run_proc(cmd, **kw):
+                name = cmd[2][:-4]
+                if name in ("S1", "S2"):
+                    barrier.wait()
+                with lock:
+                    seen_cwds.append((name, kw["cwd"]))
+                return SimpleNamespace(stdout=tlc_ok, stderr="", returncode=0, rusage=None)
+
+            report_path = os.path.join(root, "report.json")
+            a = SimpleNamespace(
+                names=names,
+                refresh=False,
+                jobs=2,
+                extra="",
+                default_mode=False,
+                timeout=30.0,
+                results_json=report_path,
+                suite="spectest",
+            )
+            out = io.StringIO()
+            with patch.object(spectest, "SPECS", specs), \
+                 patch.object(spectest, "TLC_OUT", tlc_dir), \
+                 patch.object(spectest, "VALIDATED", os.path.join(tlc_dir, "validated.json")), \
+                 patch.object(spectest, "load_expected_cases", return_value=[]), \
+                 patch.object(spectest, "parity_args", side_effect=lambda _b, args: args), \
+                 patch.object(spectest, "parity_env", return_value={}), \
+                 patch.object(spectest, "run_proc", side_effect=fake_run_proc), \
+                 contextlib.redirect_stdout(out), \
+                 self.assertRaises(SystemExit) as exited:
+                spectest.run_specs(a, names, "fake-tlx")
+
+            self.assertEqual(exited.exception.code, 0)
+            cwds_by_name = dict(seen_cwds)
+            self.assertNotEqual(cwds_by_name["S1"], cwds_by_name["S2"])
+            with open(report_path) as f:
+                report = json.load(f)
+            self.assertEqual([c["id"] for c in report["cases"]], names)
+            pass_lines = [line for line in out.getvalue().splitlines() if line.startswith("PASS ")]
+            self.assertEqual([line.split()[1] for line in pass_lines], names)
 
 
 if __name__ == "__main__":

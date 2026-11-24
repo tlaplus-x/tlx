@@ -8,8 +8,6 @@
 //! keeps a committed checkpoint; a checkpoint of another run, or a damaged
 //! one, is refused.
 
-#![cfg(unix)]
-
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;

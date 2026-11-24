@@ -3,6 +3,20 @@ name = "tlx-compile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# Process-wide TLX_VALUE_STORE / TLX_NATIVE_SYNC mutations stay in their own binaries.
+[[test]]
+name = "value_store_runs"
+path = "tests/value_store_runs.rs"
+
+[[test]]
+name = "value_store_switch"
+path = "tests/value_store_switch.rs"
 
 [dependencies]
 tlx-base.workspace = true

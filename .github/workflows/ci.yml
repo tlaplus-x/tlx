@@ -15,6 +15,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_RELEASE_DEBUG: "0"
   RUST_BACKTRACE: "1"
   CC: clang
   AWS_EC2_METADATA_DISABLED: "true"
@@ -25,7 +27,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
-      CARGO_BUILD_JOBS: "3"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,11 +47,16 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: cargo-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: cargo-target-quality-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
       - name: Test dependencies
         run: |
           python3 -m pip install -r .github/requirements-ci.txt
@@ -62,13 +69,46 @@ jobs:
       - name: Build binary for Python tests and documentation examples
         run: cargo build --profile test-release --locked
       - name: Python driver tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+        run: |
+          python3 -c '
+          import concurrent.futures, os, pathlib, subprocess, sys
+          tests = sorted(str(p) for p in pathlib.Path("scripts").rglob("test_*.py"))
+          env = {**os.environ, "PYTHONPATH": "scripts" + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else "")}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+              futs = [(t, pool.submit(subprocess.run, [sys.executable, "-m", "unittest", t], capture_output=True, text=True, env=env)) for t in tests]
+              failed = 0
+              for t, fut in futs:
+                  r = fut.result()
+                  if r.returncode != 0:
+                      failed += 1
+                      print(f"FAIL {t} (exit {r.returncode})", file=sys.stderr)
+                      if r.stdout:
+                          print(r.stdout, file=sys.stderr)
+                      if r.stderr:
+                          print(r.stderr, file=sys.stderr)
+          print(f"Ran {len(tests)} Python test modules ({failed} failed)")
+          sys.exit(1 if failed else 0)
+          '
       - name: Public source and documentation checks
         run: |
           python3 scripts/check_imports.py
           python3 scripts/knobs_check.py
           python3 scripts/doccheck.py --require-examples
           python3 scripts/bench.py report --check
+      - name: Prune target directory for cache
+        if: always()
+        run: |
+          rm -rf target/ci target/tmp target/tlx-* target/*/incremental target/*/examples
+          python3 -c '
+          import os, pathlib, shutil
+          keep_ext = {".rlib", ".rmeta", ".d", ".so", ".dylib", ".a", ".lib", ".dll"}
+          for deps in pathlib.Path("target").glob("*/deps"):
+              for p in deps.iterdir():
+                  if p.is_dir() and p.suffix == ".dSYM":
+                      shutil.rmtree(p, ignore_errors=True)
+                  elif p.is_file() and p.suffix not in keep_ext and os.access(p, os.X_OK):
+                      p.unlink()
+          '
 
   test:
     name: Rust and specs (${{ matrix.os }})
@@ -77,11 +117,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            jobs: 3
+            jobs: 4
           - os: ubuntu-24.04-arm
-            jobs: 3
+            jobs: 4
           - os: macos-15
-            jobs: 2
+            jobs: 3
     runs-on: ${{ matrix.os }}
     timeout-minutes: 50
     env:
@@ -91,7 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -105,11 +145,16 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
-          restore-keys: cargo-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: cargo-target-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: cargo-target-tests-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
       - name: Test dependencies
         run: |
           echo "TLX_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
@@ -120,13 +165,13 @@ jobs:
       - name: Build checker for conformance tests
         run: cargo build --profile test-release --locked
       - name: Interpreter conformance
-        run: python3 scripts/spectest.py --no-build --profile test-release --extra=-interp --results-json target/ci/interpreter.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-interp --results-json target/ci/interpreter.json
       - name: Compiled conformance
-        run: python3 scripts/spectest.py --no-build --profile test-release --extra=-compile --results-json target/ci/compiled.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/compiled.json
       - name: Paranoid compiled conformance
         env:
           TLX_PARANOID: "1"
-        run: python3 scripts/spectest.py --no-build --profile test-release --extra=-compile --results-json target/ci/paranoid.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/paranoid.json
       - name: Retain conformance results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -135,6 +180,20 @@ jobs:
           path: target/ci/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Prune target directory for cache
+        if: always()
+        run: |
+          rm -rf target/ci target/tmp target/tlx-* target/*/incremental target/*/examples
+          python3 -c '
+          import os, pathlib, shutil
+          keep_ext = {".rlib", ".rmeta", ".d", ".so", ".dylib", ".a", ".lib", ".dll"}
+          for deps in pathlib.Path("target").glob("*/deps"):
+              for p in deps.iterdir():
+                  if p.is_dir() and p.suffix == ".dSYM":
+                      shutil.rmtree(p, ignore_errors=True)
+                  elif p.is_file() and p.suffix not in keep_ext and os.access(p, os.X_OK):
+                      p.unlink()
+          '
 
   ci:
     name: CI

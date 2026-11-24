@@ -4,9 +4,7 @@
 //! properties and subexpressions), in every tier and with any number of
 //! workers.
 
-mod common;
-
-use common::coverage_lines;
+use crate::common::coverage_lines;
 
 /// Run `spec` (files `(name, text)`, the first the root module, `cfg` its
 /// configuration) with `-coverage 1` and `args`: the lines of the coverage

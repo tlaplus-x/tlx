@@ -12,7 +12,6 @@
 //! - `*_search_matches_the_interpreter`: whole searches of `EncModel`s on
 //!   the JIT library alone under `TLX_PARANOID`, and on the default tiers
 //!   with the C library replacing the JIT library during the search.
-#![cfg(feature = "jit")]
 
 use std::sync::Arc;
 

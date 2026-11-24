@@ -8,8 +8,6 @@
 //! still searching when the signal arrives, so the spill directory (created
 //! by `-spill always` from the start) exists and must be gone afterwards.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};

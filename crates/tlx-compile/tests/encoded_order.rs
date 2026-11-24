@@ -1,6 +1,7 @@
 //! Fixed wire fixtures executed independently by Rust and generated C.
 
 // Exercise private runtime helpers without adding a public testing ABI.
+#[allow(clippy::module_inception, reason = "test module wraps private src/encoded_order.rs")]
 #[path = "../src/encoded_order.rs"]
 mod encoded_order;
 

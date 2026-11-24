@@ -23,8 +23,10 @@ class BenchmarkProcessGroups(unittest.TestCase):
         # A checker, its compiler child, and the compiler's child. The leaf
         # announces readiness only after all three exist, then holds stdout.
         leaf = ("import json,os,sys,time; "
-                "json.dump([int(sys.argv[2]),os.getppid(),os.getpid(),os.getpgrp()],"
-                "open(sys.argv[1],'w')); print('ready',flush=True); time.sleep(10)")
+                "print('ready',flush=True); "
+                "tmp=sys.argv[1]+'.tmp'; "
+                "f=open(tmp,'w'); json.dump([int(sys.argv[2]),os.getppid(),os.getpid(),os.getpgrp()],f); "
+                "f.close(); os.replace(tmp,sys.argv[1]); time.sleep(10)")
         compiler = ("import subprocess,sys; "
                     f"subprocess.run([sys.executable,'-c',{leaf!r},*sys.argv[1:]])")
         checker = ("import os,subprocess,sys,time; "
