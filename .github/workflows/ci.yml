@@ -129,7 +129,6 @@ jobs:
       - name: Test dependencies
         run: |
           echo "TLX_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
-          echo "TLX_CACHE=$RUNNER_TEMP/tlx-cache" >> "$GITHUB_ENV"
           bash scripts/fetch-deps.sh
           mkdir -p target/ci
       - name: Rust unit and integration tests
@@ -139,10 +138,13 @@ jobs:
       - name: Interpreter conformance
         run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-interp --results-json target/ci/interpreter.json
       - name: Compiled conformance
+        env:
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
         run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/compiled.json
       - name: Paranoid compiled conformance
         env:
           TLX_PARANOID: "1"
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
         run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/paranoid.json
       - name: Retain conformance results
         if: always()
