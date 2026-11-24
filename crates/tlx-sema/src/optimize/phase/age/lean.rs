@@ -13,9 +13,9 @@ pub(super) fn emit(
     proof: &Proof<'_>,
     initial: &[Branch],
     steps: &[Branch],
-    observations: &[Expr],
+    spec: super::super::CheckSpec<'_>,
     history: Option<&super::super::history::Candidate>,
-) -> Option<String> {
+) -> Option<super::super::OpenCert> {
     let mut slots = vec![];
     for (i, stamp) in proof.stamps.iter().enumerate() {
         let Domain::Function(keys, _) = &proof.domains.vars[stamp.var.idx()] else { return None };
@@ -37,7 +37,10 @@ pub(super) fn emit(
     let history_code = e.history_code(initial, steps)?;
     let initial = initial.iter().map(|b| e.branch(b, false)).collect::<Option<Vec<_>>>()?;
     let steps = steps.iter().map(|b| e.branch(b, true)).collect::<Option<Vec<_>>>()?;
-    let observations = observations.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
+    let observations = spec.invariants.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|o| e.test(o, true)).collect::<Option<Vec<_>>>()?;
+    let constrained = spec.is_constrained();
     let mut out = String::from(include_str!("../../AgeCertificate.lean"));
     if history.is_some() {
         out.push_str(include_str!("../../HistoryCertificate.lean"));
@@ -98,13 +101,19 @@ pub(super) fn emit(
     }
     out.push_str("  | _ => Decision.pure Change.keep\n");
     if let Some(code) = history_code {
-        e.emit_history(&mut out, params, code, observations);
+        Some(e.emit_history(out, params, code, observations, init_obs, constraints, constrained))
     } else {
         writeln!(out, "def observe {params} (c : C) (p : Key → Bool) : Test caps := {}", fold(observations, "conj", "True")).unwrap();
+        if constrained {
+            writeln!(out, "def initObserve {params} (c : C) (p : Key → Bool) : Test caps := {}", fold(init_obs, "conj", "True")).unwrap();
+            writeln!(out, "def constraint {params} (c : C) (p : Key → Bool) : Test caps := {}", fold(constraints, "conj", "True")).unwrap();
+        }
         out.push_str("def model : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := guard sem\n  change := change sem\n  observe := observe sem\n");
-        out.push_str(include_str!("certificate.lean"));
+        if constrained {
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        }
+        Some(super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedAge", constrained, false, false))
     }
-    Some(out)
 }
 
 struct Emitter<'a, 'd> {

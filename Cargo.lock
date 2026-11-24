@@ -603,6 +603,7 @@ version = "0.1.1"
 dependencies = [
  "libc",
  "mimalloc",
+ "serde_json",
  "tlx-base",
  "tlx-compile",
  "tlx-eval",

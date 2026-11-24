@@ -25,11 +25,12 @@ class LeanConcurrency(unittest.TestCase):
         # Only scheduling is under test; fake Lean accepts the original and
         # rejects each mutation with the same diagnostic contract as Lean.
         source = "\n".join([
-            "namespace TlxOptimization.GeneratedHistory",
             "fun i => s.2 i ∧ q i e",
             "m.step s.1 t.1 w s.2",
             "m.transfer s.1 t.1 w s.2",
+            "namespace TlxOptimization.GeneratedHistory",
             "def after := (model sem).reduced",
+            "end TlxOptimization.GeneratedHistory",
         ]) + "\n"
         for jobs in (1, 2):
             with self.subTest(jobs=jobs), TemporaryDirectory() as tmp:

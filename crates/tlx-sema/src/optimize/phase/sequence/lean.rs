@@ -6,11 +6,20 @@ use super::super::{binding, variable, Branch};
 use super::{Domain, Domains};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 
-pub(super) fn emit(vars: &[VarId], domains: &Domains, initial: &[Branch], steps: &[Branch], observations: &[Expr]) -> Option<String> {
+pub(super) fn emit(
+    vars: &[VarId],
+    domains: &Domains,
+    initial: &[Branch],
+    steps: &[Branch],
+    spec: super::super::CheckSpec<'_>,
+) -> Option<super::super::OpenCert> {
     let mut e = Emitter { vars, domains, atoms: vec![] };
     let (initial_guards, seeds) = e.branches(initial, false)?;
     let (guards, transfers) = e.branches(steps, true)?;
-    let observations = observations.iter().map(|o| e.leaf(o, "observe", true)).collect::<Option<Vec<_>>>()?;
+    let observations = spec.invariants.iter().map(|o| e.leaf(o, "observe", true)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|o| e.leaf(o, "observe", true)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|o| e.leaf(o, "observe", true)).collect::<Option<Vec<_>>>()?;
+    let constrained = spec.is_constrained();
     let mut out = String::from(include_str!("../../LengthCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedLength\nopen TlxOptimization LengthRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
     writeln!(out, "abbrev Key := Fin {}", vars.len()).unwrap();
@@ -49,9 +58,15 @@ pub(super) fn emit(vars: &[VarId], domains: &Domains, initial: &[Branch], steps:
     }
     out.push_str("  | _ => Transfer.keep\n");
     writeln!(out, "def observe {params} (c : C) (n : Key → Nat) : Prop := {}", conjunction(&observations)).unwrap();
+    if constrained {
+        writeln!(out, "def initObserve {params} (c : C) (n : Key → Nat) : Prop := {}", conjunction(&init_obs)).unwrap();
+        writeln!(out, "def constraint {params} (c : C) (n : Key → Nat) : Prop := {}", conjunction(&constraints)).unwrap();
+    }
     out.push_str("def model : LengthRule.Model C Key E (Nat × W) where\n  initial := initial sem\n  seed := seed sem\n  step := step sem\n  transfer := transfer sem\n  observe := observe sem\n");
-    out.push_str(include_str!("certificate.lean"));
-    Some(out)
+    if constrained {
+        out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+    }
+    Some(super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedLength", constrained, false, false))
 }
 
 struct Emitter<'a> {

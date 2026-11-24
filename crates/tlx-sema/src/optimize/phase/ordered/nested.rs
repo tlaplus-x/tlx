@@ -21,8 +21,8 @@ pub(super) fn emit(
     plan: &OrderedPlan,
     initial: &[Branch],
     steps: &[Branch],
-    observations: &[Expr],
-) -> Option<String> {
+    spec: super::super::CheckSpec<'_>,
+) -> Option<super::super::OpenCert> {
     if initial.is_empty() || steps.is_empty() {
         return None;
     }
@@ -44,7 +44,7 @@ pub(super) fn emit(
             fresh = fresh.max(max_local(term));
         }
     }
-    for o in observations {
+    for o in spec.all_state_preds() {
         fresh = fresh.max(max_local(o));
     }
     let mut context = Context { domains: &domains, schemas: vec![], aliases: BTreeMap::new(), fresh: fresh.checked_add(1)? };
@@ -70,8 +70,10 @@ pub(super) fn emit(
     let mut e = Emitter { context, families, plan, slots, plain, atoms: vec![], anchors: plan.anchors.clone(), targets: vec![] };
     let seeds = initial.iter().map(|b| e.seed(b)).collect::<Option<Vec<_>>>()?;
     let cases = steps.iter().map(|b| e.case(b)).collect::<Option<Vec<_>>>()?;
-    let observation = e.tests(observations, Mode::Observe)?;
-    Some(e.output(&seeds, &cases, &observation))
+    let observation = e.tests(spec.invariants, Mode::Observe)?;
+    let init_obs = e.tests(spec.init_props, Mode::Observe)?;
+    let constraint = e.tests(spec.constraints, Mode::Observe)?;
+    Some(e.output(&seeds, &cases, &observation, &init_obs, &constraint, spec.is_constrained()))
 }
 
 struct Context<'a> {

@@ -57,10 +57,17 @@ negative mutation checks are explicit.
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean`: unobserved-variable erasure composed with certified keyed symmetry (including disjoint products of full keyed groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed symmetry certifies the retained tuple |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
-Temporal properties, `CONSTRAINT` / `ACTION_CONSTRAINT`, action or implied-init properties, `ALIAS`,
-`POSTCONDITION`, `_POSSIBLE`, and configuration constant overrides remain outside the certified
-checking subset. Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline
-automatic projection.
+State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-arity
+`CONSTANT C <- Def` substitutions are covered across all certified checking projections and
+automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTION_CONSTRAINT`
+predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
+`ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`, and
+`ErasedKeyedCertificate`; state-only projections (`Field`, `Length`, `History`, `Age`, `AgeHistory`,
+`Ordered`, `Nested`, `Live`) fail closed when action constraints or action properties are present.
+Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
+builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
+Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
+projection.
 
 When `-optimize` runs, `InterpModel::project_state` tries projection families in priority order —
 unobserved variables, relative ages (including combined age/history), standalone finite history,
@@ -98,10 +105,23 @@ structure Certificate {S A : Type}
   (every reduced violation lifts to a reachable concrete violation), and `deadlock_preserved`
   (plain-`Next` deadlock `↔`), plus formal key/orbit equivalence (`runtime_key_equivalent` or
   `orbit_key_equivalent`) where applicable.
+- **Constrained safety and action properties (`ConstrainedCertificate`):** when a model declares
+  `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init `PROPERTY`, or `[][A]_sub` action `PROPERTY`
+  conjuncts, `Rules.lean` defines `ConstrainedSystem`, `AdmittedReachable`, `ConstrainedSafe`, and
+  `ConstrainedCertificate` matching `tlx-runtime`'s exact checking boundary: `INVARIANT` and
+  implied-init `PROPERTY` are checked on every `Init` state (even when `!constraint(s)`), `INVARIANT`
+  and `[][A]_sub` are checked on every `Next(s, t)` successor of an admitted state `s` (even when
+  `!constraint(t)` or `!action_constraint(s, t)`), deadlocks are plain-`Next` deadlocks on admitted
+  states, and only admitted states are expanded further. Generated constrained certificates
+  additionally discharge `constrained_certificate`, `constrained_optimization_correct`,
+  `constrained_init_counterexample_lifts`, `constrained_step_counterexample_lifts`, and
+  `admitted_deadlock_preserved` (plus `erasure_constrained_certificate` for composed erasure+symmetry),
+  without ever assuming `CONSTRAINT` or `INVARIANT` as an inductive reachability premise.
 - **Kernel and non-vacuity audit:** [proofs/check_generated.py](../proofs/check_generated.py) runs
   `lean -t0 -DwarningAsError=true`, restricts `#print axioms` to Lean 4's three standard logical
   axioms (`propext`, `Classical.choice`, `Quot.sound`), and under `--negative` requires Lean to
-  reject targeted soundness mutations across every certificate family.
+  reject targeted soundness mutations across every certificate family (including constrained
+  `constraint`, `initSafe`, `actionSafe`, and `actionConstraint` obligations when active).
 
 Because Lean verifies the lowered mathematical transition system rather than the Rust binary,
 end-to-end soundness relies on five cross-cutting boundaries (alongside each rule's specific

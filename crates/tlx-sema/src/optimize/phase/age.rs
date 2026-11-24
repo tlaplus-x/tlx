@@ -32,10 +32,27 @@ struct Proof<'a> {
 /// Prove a quotient for one logical clock. The caller must explicitly permit
 /// mathematical clock semantics and apply the ordinary safety-only boundary.
 pub fn age_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
-    let mut expand = Normalizer::new(program);
+    age_projection_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations))
+}
+
+/// Prove a quotient for one logical clock covering invariants, state constraints,
+/// and init properties.
+pub fn age_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    let spec = spec.state_only()?;
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config(program, cfg);
     let initial = branches(&expand.root(init)?)?;
     let steps = branches(&expand.root(next)?)?;
-    let normalized_observations = observations.iter().map(|e| expand.root(e)).collect::<Option<Vec<_>>>()?;
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &initial, &steps)?;
     for i in 0..program.vars.len() {
         let clock = VarId(i as u32);
@@ -69,17 +86,18 @@ pub fn age_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr,
         let mut proof = Proof { clock, stamps, domains: &domains };
         if !initial.iter().all(|b| proof.branch(b, false))
             || !steps.iter().all(|b| proof.branch(b, true))
-            || !normalized_observations.iter().all(|e| proof.read(e))
+            || !norm_spec.all_state_preds().all(|e| proof.read(e))
+            || (spec.is_constrained() && !super::sym_totality::check_age_observations_total(program, cfg, init, next, spec, clock))
         {
             continue;
         }
         let mut projection = proof.view(program);
         let mut combined = None;
         for (j, domain) in domains.vars.iter().enumerate() {
-            let Some(history) = super::history::candidate(program, &domains, j, domain, &initial, &steps, &normalized_observations) else {
+            let Some(history) = super::history::candidate(program, &domains, j, domain, &initial, &steps, norm_spec) else {
                 continue;
             };
-            if let Some(certificate) = lean::emit(&proof, &initial, &steps, &normalized_observations, Some(&history)) {
+            if let Some(certificate) = lean::emit(&proof, &initial, &steps, norm_spec, Some(&history)) {
                 let ExprKind::Tuple(values) = std::sync::Arc::make_mut(&mut projection.view.kind) else { unreachable!() };
                 values[j] = history.summary;
                 projection.fields.push(format!("{}.history", program.vars[j].name));
@@ -87,7 +105,10 @@ pub fn age_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr,
                 break;
             }
         }
-        let Some(certificate) = combined.or_else(|| lean::emit(&proof, &initial, &steps, &normalized_observations, None)) else { continue };
+        let Some(certificate) = combined.or_else(|| lean::emit(&proof, &initial, &steps, norm_spec, None)) else { continue };
+        let Some(certificate) = expand.attach_const_subst(certificate) else {
+            continue;
+        };
         projection.certificate = Some(certificate);
         return Some(projection);
     }

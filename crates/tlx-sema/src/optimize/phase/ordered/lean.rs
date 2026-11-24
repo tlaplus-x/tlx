@@ -4,7 +4,13 @@ use super::{binding, syntax, variable, Branch, Family, OrderedPlan};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
 use std::fmt::Write;
 
-pub(super) fn emit(families: &[Family], plan: &OrderedPlan, initial: &[Branch], steps: &[Branch], observations: &[Expr]) -> Option<String> {
+pub(super) fn emit(
+    families: &[Family],
+    plan: &OrderedPlan,
+    initial: &[Branch],
+    steps: &[Branch],
+    spec: super::super::CheckSpec<'_>,
+) -> Option<super::super::OpenCert> {
     let [family] = families else { return None };
     if plan.history.is_some()
         || plan.anchors != [vec![family.initial]]
@@ -31,7 +37,10 @@ pub(super) fn emit(families: &[Family], plan: &OrderedPlan, initial: &[Branch], 
         deltas.push(delta.to_string());
         guards.push(e.branch(branch, true)?);
     }
-    let observations = observations.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
+    let observations = spec.invariants.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
+    let constrained = spec.is_constrained();
     let mut out = String::from(include_str!("../../OrderedCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedOrdered\nopen TlxOptimization OrderedRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
     out.push_str("\n-- C contains exactly retained state; W contains independent local choices.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → W → Prop\n  observe : Nat → C → Prop\n");
@@ -57,9 +66,15 @@ pub(super) fn emit(families: &[Family], plan: &OrderedPlan, initial: &[Branch], 
     }
     out.push_str("  | _ => Test.pure False\n");
     writeln!(out, "def observe {params} (c : C) : Test := {}", fold(observations, "conj", "True")).unwrap();
+    if constrained {
+        writeln!(out, "def initObserve {params} (c : C) : Test := {}", fold(init_obs, "conj", "True")).unwrap();
+        writeln!(out, "def constraint {params} (c : C) : Test := {}", fold(constraints, "conj", "True")).unwrap();
+    }
     writeln!(out, "def model : OrderedRule.Model C (Nat × W) where\n  seed := {seed}\n  initial := initial sem\n  delta := delta\n  guard := guard sem\n  observe := observe sem").unwrap();
-    out.push_str(
-        "def before := (model sem).concrete\n\
+    if constrained {
+        out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+    }
+    let tail = "def before := (model sem).concrete\n\
          def after := (model sem).reduced\n\
          def project := (model sem).project\n\
          theorem runtime_key_equivalent (s t : State C (model sem).seed) :\n\
@@ -86,10 +101,8 @@ pub(super) fn emit(families: &[Family], plan: &OrderedPlan, initial: &[Branch], 
          #print axioms optimization_correct\n\
          #print axioms specification_correct\n\
          #print axioms counterexample_lifts\n\
-         #print axioms deadlock_preserved\n\
-         end\nend TlxOptimization.GeneratedOrdered\n",
-    );
-    Some(out)
+         #print axioms deadlock_preserved\n";
+    Some(super::super::OpenCert::new(out, tail, "GeneratedOrdered", constrained, false, false))
 }
 
 struct Emitter {

@@ -8,12 +8,13 @@
 mod lower;
 mod output;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use tlx_front::cfg::{CfgValue, Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config, EffectiveConst};
 
 use super::sym_norm::SymNormalizer;
+use super::CheckSpec;
 use crate::{hir::*, Program};
 
 pub(in crate::optimize::phase) type GroupMask = u16;
@@ -55,25 +56,49 @@ pub fn symmetry_certificate(
     observations: &[Expr],
     groups: &[Vec<String>],
 ) -> Option<String> {
+    symmetry_certificate_with_spec(program, cfg, init, next, CheckSpec::invariants_only(observations), groups)
+}
+
+/// Generate a connected `EquivRule` certificate covering invariants, init properties,
+/// constraints, action constraints, and action properties.
+pub fn symmetry_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[Vec<String>],
+) -> Option<String> {
     let (groups, all_keys) = validate_groups(groups)?;
-    let mut norm = SymNormalizer::for_equiv(program);
+    let const_bindings = collect_const_bindings(program, cfg)?;
+    let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
     let init_norm = norm.normalize(init)?;
     let next_norm = norm.normalize(next)?;
-    let obs_norm: Vec<Expr> = observations.iter().map(|e| norm.normalize(e)).collect::<Option<_>>()?;
+    let owned_spec = spec.try_map(|e| norm.normalize(e))?;
+    let norm_spec = owned_spec.as_spec();
 
-    let const_bindings = collect_const_bindings(program, cfg)?;
-    let totality = super::sym_totality::TotalityChecker::new(program, &groups, &all_keys, &const_bindings, &init_norm, &next_norm);
-    if !totality.check_all(&init_norm, &next_norm, &obs_norm) {
+    let const_info = super::sym_totality::collect_const_info(program, cfg);
+    let totality =
+        super::sym_totality::TotalityChecker::with_const_info(program, &groups, &all_keys, const_info, &init_norm, &next_norm, None);
+    if !totality.check_all_with_spec(&init_norm, &next_norm, norm_spec, &[]) {
         return None;
     }
     let mut ctx = lower::LowerCtx::new(program, &groups, &all_keys, &const_bindings, &totality);
     let init_form = ctx.lower_form(&init_norm, false)?;
     let next_form = ctx.lower_form(&next_norm, true)?;
-    let mut obs_form = String::from("(Form.truth true)");
-    for obs in &obs_norm {
-        let f = ctx.lower_form(obs, false)?;
-        obs_form = if obs_form == "(Form.truth true)" { f } else { format!("(Form.conj {obs_form} {f})") };
-    }
+    let lower_conj = |ctx: &mut lower::LowerCtx<'_>, es: &[Expr], action: bool| -> Option<String> {
+        let mut acc = String::from("(Form.truth true)");
+        for e in es {
+            let f = if action { ctx.lower_action_pred(e)? } else { ctx.lower_form(e, false)? };
+            acc = if acc == "(Form.truth true)" { f } else { format!("(Form.conj {acc} {f})") };
+        }
+        Some(acc)
+    };
+    let obs_form = lower_conj(&mut ctx, norm_spec.invariants, false)?;
+    let init_obs_form = lower_conj(&mut ctx, norm_spec.init_props, false)?;
+    let constraint_form = lower_conj(&mut ctx, norm_spec.constraints, false)?;
+    let action_constraint_form = lower_conj(&mut ctx, norm_spec.action_constraints, true)?;
+    let action_obs_form = lower_conj(&mut ctx, norm_spec.action_props, true)?;
 
     // Refuse if any group in the product is never referenced by the spec.
     let full_mask: GroupMask = ((1u32 << groups.len()) - 1) as GroupMask;
@@ -81,7 +106,17 @@ pub fn symmetry_certificate(
         return None;
     }
 
-    Some(output::render(program, &groups, &ctx, init, &init_form, &next_form, &obs_form))
+    let forms = output::Forms {
+        init: &init_form,
+        next: &next_form,
+        obs: &obs_form,
+        init_obs: &init_obs_form,
+        constraint: &constraint_form,
+        action_constraint: &action_constraint_form,
+        action_obs: &action_obs_form,
+        constrained: spec.is_constrained(),
+    };
+    norm.attach_const_subst(output::render(program, &groups, &ctx, init, &forms))
 }
 
 pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, BTreeSet<Arc<str>>)> {
@@ -115,21 +150,12 @@ fn collect_const_bindings<'a>(program: &Program, cfg: &'a Config) -> Option<BTre
     if super::sym_totality::cfg_overrides_or_tables(program, cfg) {
         return None;
     }
-    let mut by_name: HashMap<&str, &'a CfgValue> = HashMap::new();
-    for b in &cfg.constants {
-        match b {
-            ConstBinding::Value { name, value, module: None } => {
-                by_name.insert(name.as_str(), value);
-            }
-            _ => return None,
-        }
-    }
     let mut out = BTreeMap::new();
     for (i, c) in program.consts.iter().enumerate() {
         if c.arity != 0 {
             continue;
         }
-        if let Some(&val) = by_name.get(c.name.as_ref()) {
+        if let Some(EffectiveConst::Value(val)) = cfg.effective_constant(&c.name) {
             out.insert(ConstId(i as u32), val);
         }
     }

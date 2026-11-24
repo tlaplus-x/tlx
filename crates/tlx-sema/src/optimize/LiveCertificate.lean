@@ -71,6 +71,8 @@ structure Model (C F W V : Type) (I A : F → Type) where
   guard : C → C → W → (Reference (I family) (A family) → Option V) → FamilyTest F I A
   payload : C → C → W → (Reference (I family) (A family) → Option V) → V
   observe : C → (Reference (I family) (A family) → Option V) → FamilyTest F I A
+  initObserve : C → (Reference (I family) (A family) → Option V) → FamilyTest F I A := fun _ _ => .pure True
+  constraint : C → (Reference (I family) (A family) → Option V) → FamilyTest F I A := fun _ _ => .pure True
 
 namespace Model
 variable {C F W V : Type} {I A : F → Type} (m : Model C F W V I A)
@@ -293,6 +295,38 @@ theorem deadlock_preserved (s : m.State) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+noncomputable def constrainedConcrete : ConstrainedSystem m.State where
+  toSystem := m.concrete
+  initSafe s := (m.initObserve s.core (m.roots s)).eval m.layout s.numbers
+  constraint s := (m.constraint s.core (m.roots s)).eval m.layout s.numbers
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem initSafe_related (s t : m.State) (same : m.related s t) :
+    m.constrainedConcrete.initSafe s ↔ m.constrainedConcrete.initSafe t := by
+  change (m.initObserve s.core (m.roots s)).eval m.layout s.numbers ↔ (m.initObserve t.core (m.roots t)).eval m.layout t.numbers
+  rw [same.1, same.2.2]
+  exact FamilyTest.congr m.layout s.numbers t.numbers same.2.1 _
+
+theorem constraint_related (s t : m.State) (same : m.related s t) :
+    m.constrainedConcrete.constraint s ↔ m.constrainedConcrete.constraint t := by
+  change (m.constraint s.core (m.roots s)).eval m.layout s.numbers ↔ (m.constraint t.core (m.roots t)).eval m.layout t.numbers
+  rw [same.1, same.2.2]
+  exact FamilyTest.congr m.layout s.numbers t.numbers same.2.1 _
+
+noncomputable def constrainedReduced : ConstrainedSystem (Quotient m.equivalence) where
+  toSystem := m.reduced
+  initSafe a := Quotient.liftOn a m.constrainedConcrete.initSafe (fun s t h => propext (m.initSafe_related s t h))
+  constraint a := Quotient.liftOn a m.constrainedConcrete.constraint (fun s t h => propext (m.constraint_related s t h))
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun _ => Iff.rfl) (fun _ => Iff.rfl)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 
 end Model
 end TlxOptimization.LiveRule

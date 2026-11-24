@@ -34,6 +34,8 @@ structure Model (C K E W : Type) where
   step : C → C → W → (K → Nat) → Prop
   transfer : C → C → W → (K → Nat) → K → Transfer E
   observe : C → (K → Nat) → Prop
+  initObserve : C → (K → Nat) → Prop := fun _ _ => True
+  constraint : C → (K → Nat) → Prop := fun _ _ => True
 
 namespace Model
 variable {C K E W : Type} (m : Model C K E W)
@@ -110,5 +112,25 @@ theorem deadlock_preserved (s : C × (K → List E)) :
     exact noStep ⟨t, ht⟩
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
+
+def constrainedConcrete : ConstrainedSystem (C × (K → List E)) where
+  toSystem := m.concrete
+  initSafe s := m.initObserve s.1 (lengths s.2)
+  constraint s := m.constraint s.1 (lengths s.2)
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+def constrainedReduced : ConstrainedSystem (C × (K → Nat)) where
+  toSystem := m.reduced
+  initSafe s := m.initObserve s.1 s.2
+  constraint s := m.constraint s.1 s.2
+  actionConstraint _ _ := True
+  actionSafe _ _ := True
+
+theorem constrained_certificate :
+    ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
+  constrainedOfStatePreds m.certificate
+    (fun _ => Iff.rfl) (fun _ => Iff.rfl)
+    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
 end Model
 end TlxOptimization.LengthRule

@@ -29,5 +29,3 @@ theorem deadlock_preserved (s : State C Key) :
 #print axioms specification_correct
 #print axioms counterexample_lifts
 #print axioms deadlock_preserved
-end
-end TlxOptimization.GeneratedAge

@@ -226,6 +226,10 @@ impl<'a> TotalityChecker<'a> {
             ExprKind::At => env.at_shape.clone().unwrap_or(Shape::Top),
             ExprKind::Const(c) => match self.consts.get(c) {
                 Some(ConstInfo::Value(v)) => self.cfg_value_shape(v),
+                Some(ConstInfo::Builtin(op)) => {
+                    let b = Expr::new(ExprKind::Builtin { op: *op, args: vec![] }, e.span);
+                    self.infer_expr(&b, false, vars, &CheckEnv::default(), steps)
+                }
                 Some(ConstInfo::Subst(def_id)) => match &self.program.defs[def_id.idx()].kind {
                     DefKind::Op(body) => self.infer_expr(body, false, vars, &CheckEnv::default(), steps),
                     _ => Shape::Top,

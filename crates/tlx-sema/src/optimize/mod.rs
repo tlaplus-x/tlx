@@ -11,9 +11,12 @@ mod projection;
 
 pub use lean::projection_lean;
 pub use phase::{
-    age_projection, choose_symmetry_certificate, equiv_symmetry_certificate, history_projection, infer_var_domains, ordered_projection,
-    phase_projection, proves_var_membership, sequence_length_projection, symmetry_certificate, symmetry_projection_certificate,
-    unobserved_projection, FieldProjection, OrderedHistory, OrderedPlan, OrderedShape, SymNormalizer,
+    age_projection, age_projection_with_spec, cfg_constants_supported, choose_symmetry_certificate, choose_symmetry_certificate_with_spec,
+    equiv_symmetry_certificate, equiv_symmetry_certificate_with_spec, history_projection, history_projection_with_spec, infer_var_domains,
+    ordered_projection, ordered_projection_with_spec, phase_projection, phase_projection_with_spec, proves_var_membership,
+    sequence_length_projection, sequence_length_projection_with_spec, symmetry_certificate, symmetry_certificate_with_spec,
+    symmetry_projection_certificate, symmetry_projection_certificate_with_spec, unobserved_projection, unobserved_projection_with_spec,
+    CheckSpec, FieldProjection, OrderedHistory, OrderedPlan, OrderedShape, SymNormalizer,
 };
 pub use projection::unobserved_variables;
 mod certify;

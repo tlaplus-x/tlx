@@ -1,20 +1,41 @@
 //! Connected certificates for deleting unobserved variables with total updates.
 use std::fmt::Write;
 
-use super::{binding, branches, normalize, variable, Branch, FieldProjection};
+use super::{binding, branches, normalize, variable, Branch, CheckSpec, FieldProjection};
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit, Program};
+use tlx_front::cfg::Config;
 
 pub fn unobserved_projection(program: &Program, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
-    let omitted = crate::optimize::unobserved_variables(program, init, next, observations);
+    unobserved_projection_with_spec(program, &Config::default(), init, next, CheckSpec::invariants_only(observations))
+}
+
+pub fn unobserved_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = normalize::Normalizer::with_config(program, cfg);
+    let init_norm = expand.root(init)?;
+    let next_norm = expand.root(next)?;
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
+    let all_obs: Vec<_> = norm_spec.all_exprs().cloned().collect();
+    let omitted = crate::optimize::unobserved_variables(program, &init_norm, &next_norm, &all_obs);
     if omitted.is_empty() {
         return None;
     }
-    let mut expand = normalize::Normalizer::new(program);
-    let initial = branches(&expand.root(init)?)?;
-    let steps = branches(&expand.root(next)?)?;
-    let observations = observations.iter().map(|e| expand.root(e)).collect::<Option<Vec<_>>>()?;
+    if spec.is_constrained() && !super::sym_totality::check_constrained_observations_total(program, cfg, init, next, spec) {
+        return None;
+    }
+    let initial = branches(&init_norm)?;
+    let steps = branches(&next_norm)?;
     let mut emitter = Emitter { omitted: &omitted, atoms: vec![] };
-    let certificate = emitter.emit(&initial, &steps, &observations)?;
+    let certificate = expand.attach_const_subst(emitter.emit(&initial, &steps, norm_spec)?)?;
     let retained = program
         .vars
         .iter()
@@ -110,13 +131,24 @@ impl Emitter<'_> {
         Some((format!("sem.test {id} c {d} choice.2"), update))
     }
 
-    fn emit(&mut self, initial: &[Branch], steps: &[Branch], observations: &[Expr]) -> Option<String> {
+    fn emit(&mut self, initial: &[Branch], steps: &[Branch], spec: CheckSpec<'_>) -> Option<super::OpenCert> {
         let initial = initial.iter().map(|b| self.branch(b, false)).collect::<Option<Vec<_>>>()?;
         let steps = steps.iter().map(|b| self.branch(b, true)).collect::<Option<Vec<_>>>()?;
-        let observations = observations.iter().map(|e| Some(format!("sem.observe {} c", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let observations = spec.invariants.iter().map(|e| Some(format!("sem.observe {} c", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let init_obs = spec.init_props.iter().map(|e| Some(format!("sem.observe {} c", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let constraints = spec.constraints.iter().map(|e| Some(format!("sem.observe {} c", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let action_constraints =
+            spec.action_constraints.iter().map(|e| Some(format!("sem.actionObserve {} c d", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let action_obs =
+            spec.action_props.iter().map(|e| Some(format!("sem.actionObserve {} c d", self.atom(e)?))).collect::<Option<Vec<_>>>()?;
+        let constrained = spec.is_constrained();
         let mut out = String::from(include_str!("../ErasureCertificate.lean"));
         out.push_str("\nnamespace TlxOptimization.GeneratedErasure\nopen TlxOptimization ErasureRule\nnoncomputable section\nset_option linter.unusedVariables false\n");
-        out.push_str("\nstructure Semantics (C V W : Type) where\n  test : Nat → C → C → W → Prop\n  value : Nat → C → V\n  observe : Nat → C → Prop\n  number : Int → V\n  string : String → V\n  boolean : Bool → V\n");
+        if constrained {
+            out.push_str("\nstructure Semantics (C V W : Type) where\n  test : Nat → C → C → W → Prop\n  value : Nat → C → V\n  observe : Nat → C → Prop\n  actionObserve : Nat → C → C → Prop\n  number : Int → V\n  string : String → V\n  boolean : Bool → V\n");
+        } else {
+            out.push_str("\nstructure Semantics (C V W : Type) where\n  test : Nat → C → C → W → Prop\n  value : Nat → C → V\n  observe : Nat → C → Prop\n  number : Int → V\n  string : String → V\n  boolean : Bool → V\n");
+        }
         for (i, atom) in self.atoms.iter().enumerate() {
             writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
         }
@@ -139,23 +171,34 @@ impl Emitter<'_> {
             }
             out.push_str("  | _ => fun _ => sem.boolean false\n");
         }
-        let observe = if observations.is_empty() { "True".into() } else { observations.join(" ∧ ") };
-        writeln!(out, "def observe {params} (c : C) : Prop := {observe}").unwrap();
+        let join_conj = |parts: &[String]| if parts.is_empty() { "True".into() } else { parts.join(" ∧ ") };
+        writeln!(out, "def observe {params} (c : C) : Prop := {}", join_conj(&observations)).unwrap();
+        if constrained {
+            writeln!(out, "def initObserve {params} (c : C) : Prop := {}", join_conj(&init_obs)).unwrap();
+            writeln!(out, "def constraint {params} (c : C) : Prop := {}", join_conj(&constraints)).unwrap();
+            writeln!(out, "def actionConstraint {params} (c d : C) : Prop := {}", join_conj(&action_constraints)).unwrap();
+            writeln!(out, "def actionObserve {params} (c d : C) : Prop := {}", join_conj(&action_obs)).unwrap();
+        }
         writeln!(out, "def model : ErasureRule.Model C (Fin {count} → V) (Nat × W) where").unwrap();
         for field in ["initial", "seed", "step", "update", "observe"] {
             writeln!(out, "  {field} := @{field} C V W sem").unwrap();
         }
-        out.push_str("def before := (model sem).concrete\ndef after := (model sem).reduced\ndef project := (model sem).project\n");
-        out.push_str("theorem certificate : Certificate (before sem) (after sem) (project sem) := (model sem).certificate\n");
-        out.push_str("theorem optimization_correct :\n  (∀ s, Reachable (before sem) s → (before sem).safe s) ↔\n  (∀ a, Reachable (after sem) a → (after sem).safe a) := (model sem).optimization_correct\n");
-        out.push_str("theorem specification_correct :\n  (∀ s, Reachable (withStuttering (before sem)) s → (before sem).safe s) ↔\n  (∀ a, Reachable (withStuttering (after sem)) a → (after sem).safe a) := (model sem).specification_correct\n");
-        out.push_str("theorem counterexample_lifts {a} (ha : Reachable (after sem) a) (bad : ¬ (after sem).safe a) :\n  ∃ s, Reachable (before sem) s ∧ project sem s = a ∧ ¬ (before sem).safe s := (model sem).counterexample_lifts ha bad\n");
-        writeln!(out, "theorem deadlock_preserved (s : C × (Fin {count} → V)) :\n  (¬ ∃ t, (before sem).next s t) ↔ (¬ ∃ a, (after sem).next (project sem s) a) := (model sem).deadlock_preserved s").unwrap();
-        for theorem in ["certificate", "optimization_correct", "specification_correct", "counterexample_lifts", "deadlock_preserved"] {
-            writeln!(out, "#print axioms {theorem}").unwrap();
+        if constrained {
+            for field in ["initObserve", "constraint", "actionConstraint", "actionObserve"] {
+                writeln!(out, "  {field} := @{field} C V W sem").unwrap();
+            }
         }
-        out.push_str("end\nend TlxOptimization.GeneratedErasure\n");
-        Some(out)
+        let mut tail = String::new();
+        tail.push_str("def before := (model sem).concrete\ndef after := (model sem).reduced\ndef project := (model sem).project\n");
+        tail.push_str("theorem certificate : Certificate (before sem) (after sem) (project sem) := (model sem).certificate\n");
+        tail.push_str("theorem optimization_correct :\n  (∀ s, Reachable (before sem) s → (before sem).safe s) ↔\n  (∀ a, Reachable (after sem) a → (after sem).safe a) := (model sem).optimization_correct\n");
+        tail.push_str("theorem specification_correct :\n  (∀ s, Reachable (withStuttering (before sem)) s → (before sem).safe s) ↔\n  (∀ a, Reachable (withStuttering (after sem)) a → (after sem).safe a) := (model sem).specification_correct\n");
+        tail.push_str("theorem counterexample_lifts {a} (ha : Reachable (after sem) a) (bad : ¬ (after sem).safe a) :\n  ∃ s, Reachable (before sem) s ∧ project sem s = a ∧ ¬ (before sem).safe s := (model sem).counterexample_lifts ha bad\n");
+        writeln!(tail, "theorem deadlock_preserved (s : C × (Fin {count} → V)) :\n  (¬ ∃ t, (before sem).next s t) ↔ (¬ ∃ a, (after sem).next (project sem s) a) := (model sem).deadlock_preserved s").unwrap();
+        for theorem in ["certificate", "optimization_correct", "specification_correct", "counterexample_lifts", "deadlock_preserved"] {
+            writeln!(tail, "#print axioms {theorem}").unwrap();
+        }
+        Some(super::OpenCert::new(out, &tail, "GeneratedErasure", constrained, false, false))
     }
 }
 

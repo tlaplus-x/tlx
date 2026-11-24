@@ -148,10 +148,25 @@ fn cardinality_must_not_hide_an_allocation_anchor() {
 }
 
 #[test]
-fn unsupported_certificate_observations_refuse_the_ordered_rule() {
+fn constrained_ordered_rule_emits_constrained_certificate() {
     let dir = tlx_testkit::TempDir::with_spec("ordered-constraint", SPEC, &format!("{CFG}CONSTRAINT Inv\n"));
     let program = tlx_sema::Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
     let cfg = tlx_front::cfg::parse_cfg(&format!("{CFG}CONSTRAINT Inv\n")).unwrap();
+    let mut model = tlx_eval::model::InterpModel::new(tlx_eval::Interp::new(program, cfg).unwrap()).unwrap();
+    let (rule, _) = model.project_state().expect("ordered projection with state CONSTRAINT");
+    assert_eq!(rule, "ordered-allocation-projection");
+    let cert = model.projection_certificate().unwrap();
+    assert!(cert.contains("namespace TlxOptimization.GeneratedOrdered"));
+    assert!(cert.contains("theorem constrained_certificate"));
+}
+
+#[test]
+fn unsupported_certificate_observations_refuse_the_ordered_rule() {
+    let source = SPEC.replace("====", "ActLimit == bit' \\in BOOLEAN\n====");
+    let cfg_str = format!("{CFG}ACTION_CONSTRAINT ActLimit\n");
+    let dir = tlx_testkit::TempDir::with_spec("ordered-action-constraint", &source, &cfg_str);
+    let program = tlx_sema::Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
+    let cfg = tlx_front::cfg::parse_cfg(&cfg_str).unwrap();
     let mut model = tlx_eval::model::InterpModel::new(tlx_eval::Interp::new(program, cfg).unwrap()).unwrap();
     assert!(model.project_state().is_none());
     assert!(model.projection_certificate().is_none());

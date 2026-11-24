@@ -21,7 +21,14 @@ fn plan(source: &str) -> Option<FieldProjection> {
         let DefKind::Op(e) = &def.kind else { panic!() };
         e.clone()
     };
-    candidate(&program, &tlx_front::cfg::parse_cfg(cfg).unwrap(), &expr("Init"), &expr("Next"), &[expr("Inv")])
+    let invs = [expr("Inv")];
+    candidate(
+        &program,
+        &tlx_front::cfg::parse_cfg(cfg).unwrap(),
+        &expr("Init"),
+        &expr("Next"),
+        super::super::CheckSpec::invariants_only(&invs),
+    )
 }
 
 #[test]

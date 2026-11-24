@@ -23,10 +23,27 @@ pub fn sequence_length_projection(
     next: &Expr,
     observations: &[Expr],
 ) -> Option<FieldProjection> {
-    let mut expand = Normalizer::new(program);
+    sequence_length_projection_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations))
+}
+
+/// Prove a length-only key for top-level sequences covering invariants,
+/// state constraints, and init properties.
+pub fn sequence_length_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    let spec = spec.state_only()?;
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config(program, cfg);
     let initial = branches(&expand.root(init)?)?;
     let steps = branches(&expand.root(next)?)?;
-    let observations: Vec<_> = observations.iter().map(|e| expand.root(e)).collect::<Option<_>>()?;
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &initial, &steps)?;
     let mut projected = Vec::new();
     for (i, domain) in domains.vars.iter().enumerate() {
@@ -37,12 +54,15 @@ pub fn sequence_length_projection(
         let proof = Proof { v, domains: &domains };
         if initial.iter().all(|b| proof.branch(b, false))
             && steps.iter().all(|b| proof.branch(b, true))
-            && observations.iter().all(|e| proof.read(e))
+            && norm_spec.all_state_preds().all(|e| proof.read(e))
         {
             projected.push(v);
         }
     }
     if projected.is_empty() {
+        return None;
+    }
+    if spec.is_constrained() && !super::sym_totality::check_projection_observations_total(program, cfg, init, next, spec) {
         return None;
     }
     let values = program
@@ -59,10 +79,14 @@ pub fn sequence_length_projection(
             }
         })
         .collect();
+    let certificate = match lean::emit(&projected, &domains, &initial, &steps, norm_spec) {
+        Some(c) => Some(expand.attach_const_subst(c)?),
+        None => None,
+    };
     Some(FieldProjection {
         ordered: None,
         view: Expr::new(ExprKind::Tuple(values), init.span),
-        certificate: lean::emit(&projected, &domains, &initial, &steps, &observations),
+        certificate,
         fields: projected.iter().map(|v| format!("{}.contents", program.vars[v.idx()].name)).collect(),
     })
 }

@@ -62,16 +62,31 @@ struct Analysis<'a> {
 }
 
 pub fn ordered_projection(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
-    let candidate = candidate(program, cfg, init, next, observations)?;
+    ordered_projection_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations))
+}
+
+pub fn ordered_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    let candidate = candidate(program, cfg, init, next, spec)?;
     candidate.certificate.as_ref()?;
     Some(candidate)
 }
 
-fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<FieldProjection> {
-    let mut expand = Normalizer::new(program);
+fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, spec: super::CheckSpec<'_>) -> Option<FieldProjection> {
+    let spec = spec.state_only()?;
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config(program, cfg);
     let initial = branches(&syntax::conditionals(&expand.root(init)?))?;
     let steps = branches(&syntax::conditionals(&syntax::lift_frames(&expand.root(next)?, program, cfg)))?;
-    let observations = observations.iter().map(|e| expand.root(e)).collect::<Option<Vec<_>>>()?;
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
     let mut families = Vec::new();
     for i in 0..program.vars.len() {
         let v = VarId(i as u32);
@@ -101,8 +116,16 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observat
     let history = syntax::history(&initial, &steps, &families, program.vars.len());
     let mut constants = HashMap::new();
     for (i, c) in program.consts.iter().enumerate() {
-        let value = (c.arity == 0).then(|| cfg.last_constant_value(&c.name)).flatten()?;
-        constants.insert(ConstId(i as u32), config_shape(value)?);
+        if c.arity != 0 {
+            return None;
+        }
+        match cfg.effective_constant(&c.name) {
+            Some(tlx_front::cfg::EffectiveConst::Value(value)) => {
+                constants.insert(ConstId(i as u32), config_shape(value)?);
+            }
+            Some(tlx_front::cfg::EffectiveConst::Subst { .. }) => {}
+            None => return None,
+        }
     }
     let mut analysis = Analysis {
         shapes: vec![Shape::default(); program.vars.len()],
@@ -142,7 +165,7 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observat
         }
     }
     analysis.increments = analysis.families.iter().map(|_| Expr::new(ExprKind::Num(0), init.span)).collect();
-    for e in &observations {
+    for e in norm_spec.all_state_preds() {
         analysis.value(e, &HashMap::new(), 0)?;
     }
     if let Some(h) = &analysis.history {
@@ -165,8 +188,15 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, observat
         fields.push(format!("{}.live-versions", program.vars[h.variable.idx()].name));
     }
     let values = program.vars.iter().enumerate().map(|(i, v)| Expr::new(ExprKind::Var(VarId(i as u32)), v.span)).collect();
-    let certificate = lean::emit(&analysis.families, &plan, &initial, &steps, &observations)
-        .or_else(|| nested::emit(program, cfg, &analysis.families, &plan, &initial, &steps, &observations));
+    if spec.is_constrained() && !super::sym_totality::check_projection_observations_total(program, cfg, init, next, spec) {
+        return None;
+    }
+    let certificate = match lean::emit(&analysis.families, &plan, &initial, &steps, norm_spec)
+        .or_else(|| nested::emit(program, cfg, &analysis.families, &plan, &initial, &steps, norm_spec))
+    {
+        Some(c) => Some(expand.attach_const_subst(c)?),
+        None => None,
+    };
     Some(FieldProjection { view: Expr::new(ExprKind::Tuple(values), init.span), fields, certificate, ordered: Some(plan) })
 }
 

@@ -185,14 +185,17 @@ impl CheckEnv {
     }
 }
 
-/// Constant binding values (supports both literal `CfgValue` and `C <- Def` substitutions).
+/// Constant binding values (supports literal `CfgValue`, pure builtin targets
+/// such as `C <- Nat`, and non-builtin `C <- Def` substitutions).
 #[derive(Clone)]
 pub(crate) enum ConstInfo<'a> {
     Value(&'a CfgValue),
+    Builtin(B),
     Subst(DefId),
 }
 
-pub(crate) fn collect_const_info<'a>(program: &Program, cfg: &'a Config) -> BTreeMap<ConstId, ConstInfo<'a>> {
+fn collect_raw_const_info<'a>(program: &Program, cfg: &'a Config) -> BTreeMap<ConstId, ConstInfo<'a>> {
+    use super::ConstSubstTarget;
     use tlx_front::cfg::EffectiveConst;
     let mut out = BTreeMap::new();
     for (i, c) in program.consts.iter().enumerate() {
@@ -204,68 +207,230 @@ pub(crate) fn collect_const_info<'a>(program: &Program, cfg: &'a Config) -> BTre
             Some(EffectiveConst::Value(value)) => {
                 out.insert(id, ConstInfo::Value(value));
             }
-            Some(EffectiveConst::Subst(target)) => {
-                if let Some(RootSymbol::Def(def_id)) = program.lookup_resolved_root(target) {
-                    if program.defs[def_id.idx()].params.is_empty() && !program.def_is_let(def_id) {
-                        out.insert(id, ConstInfo::Subst(def_id));
-                    }
+            Some(EffectiveConst::Subst(target)) => match super::resolve_const_subst_name(program, target) {
+                Some(ConstSubstTarget::PureBuiltin(op, _)) => {
+                    out.insert(id, ConstInfo::Builtin(op));
                 }
-            }
+                Some(ConstSubstTarget::Def(def_id)) => {
+                    out.insert(id, ConstInfo::Subst(def_id));
+                }
+                Some(ConstSubstTarget::Const(_)) | None => {}
+            },
             None => {}
         }
     }
+    out
+}
+
+pub(crate) fn collect_const_info<'a>(program: &Program, cfg: &'a Config) -> BTreeMap<ConstId, ConstInfo<'a>> {
+    let mut out = collect_raw_const_info(program, cfg);
     // Drop cyclic or overly deep `ConstInfo::Subst` chains so downstream
     // checkers (`infer_expr`, `check_expr`, `const_exact_i32`, `is_exact_static_set`)
     // never diverge on cyclic constant substitutions.
-    let cyclic: Vec<ConstId> = out
-        .keys()
-        .copied()
-        .filter(|&id| matches!(out.get(&id), Some(ConstInfo::Subst(_))) && !subst_is_acyclic(program, &out, id, &mut Vec::new(), 0))
-        .collect();
+    let mut checker = SubstAcyclicity::new(program, &out);
+    let cyclic: Vec<ConstId> =
+        out.keys().copied().filter(|&id| matches!(out.get(&id), Some(ConstInfo::Subst(_))) && !checker.is_acyclic(id)).collect();
     for id in cyclic {
         out.remove(&id);
     }
     out
 }
 
-fn expr_const_refs(program: &Program, e: &Expr, seen_defs: &mut Vec<DefId>, out: &mut Vec<ConstId>) {
-    match &*e.kind {
-        ExprKind::Const(c) => out.push(*c),
-        ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => {
-            if !seen_defs.contains(d) {
-                seen_defs.push(*d);
-                if let DefKind::Op(body) = &program.defs[d.idx()].kind {
-                    expr_const_refs(program, body, seen_defs, out);
+const MAX_SUBST_DEPTH: usize = 32;
+const MAX_SUBST_WORK: usize = 100_000;
+
+struct ConstFrame {
+    c: ConstId,
+    deps: Arc<[ConstId]>,
+    next_idx: usize,
+    max_child: usize,
+}
+
+struct SubstAcyclicity<'a> {
+    program: &'a Program,
+    info: &'a BTreeMap<ConstId, ConstInfo<'a>>,
+    /// Cached deduplicated constant references reachable from each `DefId`, shared across DFS frames.
+    def_const_deps: HashMap<DefId, Option<Arc<[ConstId]>>>,
+    /// Memoized maximum substitution-chain height (`0` for non-subst leaf,
+    /// `Some(h)` with `h < MAX_SUBST_DEPTH` for valid acyclic subst, `None` for
+    /// cyclic, non-op, or too-deep subst). Never caches budget exhaustion.
+    heights: HashMap<ConstId, Option<usize>>,
+    /// Initial work budget (used for deterministic work accounting in tests).
+    #[cfg(test)]
+    initial_budget: usize,
+    /// Bounded remaining work budget across AST visits, cached set merges, and DFS edges.
+    budget: usize,
+}
+
+impl<'a> SubstAcyclicity<'a> {
+    fn new(program: &'a Program, info: &'a BTreeMap<ConstId, ConstInfo<'a>>) -> Self {
+        Self::with_budget(program, info, MAX_SUBST_WORK)
+    }
+
+    fn with_budget(program: &'a Program, info: &'a BTreeMap<ConstId, ConstInfo<'a>>, budget: usize) -> Self {
+        Self {
+            program,
+            info,
+            def_const_deps: HashMap::new(),
+            heights: HashMap::new(),
+            #[cfg(test)]
+            initial_budget: budget,
+            budget,
+        }
+    }
+
+    #[cfg(test)]
+    fn work_used(&self) -> usize {
+        self.initial_budget - self.budget
+    }
+
+    fn debit(&mut self, cost: usize) -> bool {
+        let Some(rem) = self.budget.checked_sub(cost) else {
+            self.budget = 0;
+            return false;
+        };
+        self.budget = rem;
+        true
+    }
+
+    fn collect_expr_const_refs(&mut self, root: &Expr, seen_defs: &mut BTreeSet<DefId>, out: &mut BTreeSet<ConstId>) -> bool {
+        let mut stack: Vec<Expr> = vec![root.clone()];
+        while let Some(e) = stack.pop() {
+            if !self.debit(1) {
+                return false;
+            }
+            match &*e.kind {
+                ExprKind::Const(c) => {
+                    out.insert(*c);
+                }
+                ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => {
+                    if let Some(cached) = self.def_const_deps.get(d).cloned() {
+                        let Some(deps) = cached else {
+                            return false;
+                        };
+                        if !self.debit(deps.len()) {
+                            return false;
+                        }
+                        out.extend(deps.iter().copied());
+                    } else if seen_defs.insert(*d) {
+                        if let DefKind::Op(body) = &self.program.defs[d.idx()].kind {
+                            stack.push(body.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            crate::visit::children(&e, &mut |child| stack.push(child.clone()));
+        }
+        true
+    }
+
+    fn deps_of_def(&mut self, def_id: DefId) -> Option<Arc<[ConstId]>> {
+        if let Some(cached) = self.def_const_deps.get(&def_id).cloned() {
+            if !self.debit(1) {
+                return None;
+            }
+            return cached;
+        }
+        let DefKind::Op(body) = &self.program.defs[def_id.idx()].kind else {
+            self.def_const_deps.insert(def_id, None);
+            return None;
+        };
+        let mut seen_defs = BTreeSet::from([def_id]);
+        let mut refs = BTreeSet::new();
+        if !self.collect_expr_const_refs(body, &mut seen_defs, &mut refs) {
+            return None;
+        }
+        let deps: Arc<[ConstId]> = refs.into_iter().collect();
+        self.def_const_deps.insert(def_id, Some(deps.clone()));
+        Some(deps)
+    }
+
+    fn push_frame(&mut self, c: ConstId, visiting: &mut BTreeSet<ConstId>, frames: &mut Vec<ConstFrame>) -> Result<Option<usize>, bool> {
+        if !self.debit(1) {
+            return Err(false);
+        }
+        if let Some(&cached) = self.heights.get(&c) {
+            return cached.map(Some).ok_or(true);
+        }
+        if visiting.contains(&c) {
+            return Err(true);
+        }
+        let Some(ConstInfo::Subst(def_id)) = self.info.get(&c) else {
+            self.heights.insert(c, Some(0));
+            return Ok(Some(0));
+        };
+        let def_id = *def_id;
+        let Some(deps) = self.deps_of_def(def_id) else {
+            if self.budget == 0 {
+                return Err(false);
+            }
+            self.heights.insert(c, None);
+            return Err(true);
+        };
+        visiting.insert(c);
+        frames.push(ConstFrame { c, deps, next_idx: 0, max_child: 0 });
+        Ok(None)
+    }
+
+    fn const_height(&mut self, root: ConstId) -> Option<usize> {
+        let mut visiting = BTreeSet::new();
+        let mut frames = Vec::new();
+        match self.push_frame(root, &mut visiting, &mut frames) {
+            Ok(Some(h)) => return Some(h),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        while let Some(top) = frames.last_mut() {
+            if top.next_idx < top.deps.len() {
+                let dep = top.deps[top.next_idx];
+                top.next_idx += 1;
+                match self.push_frame(dep, &mut visiting, &mut frames) {
+                    Ok(Some(h)) => {
+                        let parent = frames.last_mut().unwrap();
+                        parent.max_child = parent.max_child.max(h);
+                    }
+                    Ok(None) => {}
+                    Err(permanent) => {
+                        // Every ancestor in `frames` reaches this permanently invalid
+                        // dependency (cycle, non-op, or height >= MAX_SUBST_DEPTH),
+                        // so caching `None` is path-independent. On budget exhaustion
+                        // (`!permanent`), leave `heights` untouched.
+                        for f in frames.drain(..) {
+                            visiting.remove(&f.c);
+                            if permanent {
+                                self.heights.insert(f.c, None);
+                            }
+                        }
+                        return None;
+                    }
+                }
+            } else {
+                let frame = frames.pop().unwrap();
+                visiting.remove(&frame.c);
+                let height = frame.max_child + 1;
+                if height >= MAX_SUBST_DEPTH {
+                    self.heights.insert(frame.c, None);
+                    for f in frames.drain(..) {
+                        visiting.remove(&f.c);
+                        self.heights.insert(f.c, None);
+                    }
+                    return None;
+                }
+                self.heights.insert(frame.c, Some(height));
+                if let Some(parent) = frames.last_mut() {
+                    parent.max_child = parent.max_child.max(height);
+                } else {
+                    return Some(height);
                 }
             }
         }
-        _ => {}
+        None
     }
-    crate::visit::children(e, &mut |child| expr_const_refs(program, child, seen_defs, out));
-}
 
-fn subst_is_acyclic(
-    program: &Program,
-    info: &BTreeMap<ConstId, ConstInfo<'_>>,
-    c: ConstId,
-    stack: &mut Vec<ConstId>,
-    depth: usize,
-) -> bool {
-    if depth >= 32 || stack.contains(&c) {
-        return false;
+    fn is_acyclic(&mut self, c: ConstId) -> bool {
+        self.const_height(c).is_some()
     }
-    let Some(ConstInfo::Subst(def_id)) = info.get(&c) else {
-        return true;
-    };
-    let DefKind::Op(body) = &program.defs[def_id.idx()].kind else {
-        return false;
-    };
-    stack.push(c);
-    let mut refs = Vec::new();
-    expr_const_refs(program, body, &mut Vec::new(), &mut refs);
-    let ok = refs.into_iter().all(|next| subst_is_acyclic(program, info, next, stack, depth + 1));
-    stack.pop();
-    ok
 }
 
 pub(crate) struct TotalityChecker<'a> {
@@ -275,54 +440,285 @@ pub(crate) struct TotalityChecker<'a> {
     consts: BTreeMap<ConstId, ConstInfo<'a>>,
     var_shapes: Vec<Shape>,
     allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
+    /// Scoped to state-projection emitters: permits reading `Len(seq)` and
+    /// iterating `1..Len(seq)` on unbounded sequences while keeping all arithmetic
+    /// strictly 32-bit overflow-checked.
+    allow_unbounded_seq_len: bool,
+    /// Scoped strictly to certified relative-age clock projections: permits
+    /// `(stamp + d) cmp clock` comparisons on the proven mathematical clock variable.
+    age_clock: Option<VarId>,
 }
 
 /// True if `cfg` contains any definition override (`Def = v`, `Def <- Other`, or module-scoped
-/// override) or operator constant table (`F(a) = v`), which symmetry normalizers do not model.
+/// override), operator constant table (`F(a) = v`), nonzero-arity constant substitution,
+/// or invalid `CONSTANT C <- target` substitution, which proof normalizers refuse.
 ///
 /// Mirrors `bind_cfg` (`tlx-eval/src/interp/cfg.rs`): detects overrides of operators imported
 /// via anonymous `INSTANCE` (visible in root scope) as well as named `INSTANCE` definitions.
 pub(crate) fn cfg_overrides_or_tables(program: &Program, cfg: &Config) -> bool {
+    !cfg_constants_supported(program, cfg)
+}
+
+/// Iteratively verify that `root_def` is transitively pure through all called
+/// definitions, `LET` bindings, operator arguments, and referenced substituted
+/// constants, with cycle handling and a bounded work budget.
+fn def_is_pure(program: &Program, cfg: &Config, root_def: DefId, budget: &mut usize) -> bool {
+    use crate::builtins::Effect;
+    let mut visited_defs = BTreeSet::new();
+    let mut visited_consts = BTreeSet::new();
+    let mut stack: Vec<Expr> = Vec::new();
+
+    let push_def = |did: DefId, visited_defs: &mut BTreeSet<DefId>, stack: &mut Vec<Expr>| -> bool {
+        let d = &program.defs[did.idx()];
+        if let Some(op) = d.builtin {
+            return op.metadata().effect == Effect::Pure;
+        }
+        if !visited_defs.insert(did) {
+            return true;
+        }
+        match &d.kind {
+            DefKind::Op(body) => {
+                stack.push(body.clone());
+                true
+            }
+            DefKind::Fn { bounds, body } => {
+                for b in bounds {
+                    stack.push(b.set.clone());
+                }
+                stack.push(body.clone());
+                true
+            }
+            DefKind::Pending => false,
+        }
+    };
+
+    if !push_def(root_def, &mut visited_defs, &mut stack) {
+        return false;
+    }
+
+    while let Some(e) = stack.pop() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match &*e.kind {
+            ExprKind::Builtin { op, .. } => {
+                if op.metadata().effect != Effect::Pure {
+                    return false;
+                }
+            }
+            ExprKind::Apply { op, .. } | ExprKind::OpArg(op) => match op {
+                OpRef::Builtin(b) => {
+                    if b.metadata().effect != Effect::Pure {
+                        return false;
+                    }
+                }
+                OpRef::Def(d) => {
+                    if !push_def(*d, &mut visited_defs, &mut stack) {
+                        return false;
+                    }
+                }
+                OpRef::Const(c) => {
+                    let name = &program.consts[c.idx()].name;
+                    let Some(target) = cfg.last_constant_subst(name) else {
+                        return false;
+                    };
+                    if visited_consts.insert(*c) {
+                        match program.lookup_resolved_root(target) {
+                            Some(RootSymbol::Def(d)) => {
+                                if !push_def(d, &mut visited_defs, &mut stack) {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                }
+                OpRef::Param(_) => {}
+            },
+            ExprKind::Let { defs, .. } => {
+                for &d in defs {
+                    if !push_def(d, &mut visited_defs, &mut stack) {
+                        return false;
+                    }
+                }
+            }
+            ExprKind::Const(c) => {
+                if program.consts[c.idx()].arity == 0
+                    && visited_consts.insert(*c)
+                    && cfg.last_constant_subst(&program.consts[c.idx()].name).is_some()
+                {
+                    match super::resolve_const_subst_target(program, cfg, *c) {
+                        Some(super::ConstSubstTarget::PureBuiltin(_, _)) => {}
+                        Some(super::ConstSubstTarget::Def(d)) => {
+                            if !push_def(d, &mut visited_defs, &mut stack) {
+                                return false;
+                            }
+                        }
+                        Some(super::ConstSubstTarget::Const(other)) => {
+                            stack.push(Expr::new(ExprKind::Const(other), e.span));
+                        }
+                        None => return false,
+                    }
+                }
+            }
+            _ => {}
+        }
+        crate::visit::children(&e, &mut |child| stack.push(child.clone()));
+    }
+    true
+}
+
+/// True iff every constant binding in `cfg` is either an unqualified value binding on a
+/// non-override constant or an unqualified zero-arity `CONSTANT C <- target` substitution
+/// targeting a pure, non-`LET` zero-arity root definition or zero-arity constant.
+pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
     let any_non_let_def =
         |target: &str| program.defs.iter().enumerate().any(|(i, d)| &*d.name == target && !program.def_is_let(DefId(i as u32)));
-    cfg.constants.iter().any(|b| match b {
-        ConstBinding::Value { name, module, .. } | ConstBinding::Subst { name, module, .. } => {
-            module.is_some()
-                || match program.lookup_resolved_root(name) {
-                    Some(RootSymbol::Const(_)) => false,
-                    Some(RootSymbol::Def(_)) => true,
-                    _ => any_non_let_def(name),
+    let mut purity_budget = MAX_SUBST_WORK;
+    cfg.constants.iter().all(|b| match b {
+        ConstBinding::Value { name, module, .. } => {
+            module.is_none()
+                && match program.lookup_resolved_root(name) {
+                    Some(RootSymbol::Const(cid)) => program.consts[cid.idx()].arity == 0,
+                    Some(RootSymbol::Def(_)) => false,
+                    _ => !any_non_let_def(name),
                 }
         }
-        ConstBinding::OpValue { .. } => true,
+        ConstBinding::Subst { name, op, module } => {
+            if module.is_some() {
+                return false;
+            }
+            let valid_lhs = match program.lookup_resolved_root(name) {
+                Some(RootSymbol::Const(cid)) => program.consts[cid.idx()].arity == 0,
+                _ => false,
+            };
+            if !valid_lhs {
+                return false;
+            }
+            match super::resolve_const_subst_name(program, op) {
+                Some(super::ConstSubstTarget::PureBuiltin(_, _) | super::ConstSubstTarget::Const(_)) => true,
+                Some(super::ConstSubstTarget::Def(did)) => def_is_pure(program, cfg, did, &mut purity_budget),
+                None => false,
+            }
+        }
+        ConstBinding::OpValue { .. } => false,
     })
 }
 
-/// Top-level shared totality gate called before `keyed`, `erased`, and `equiv_sym`.
-pub(crate) fn check_model_totality_with_omitted(
+/// Verify totality of all newly added constrained observations (`init_props`,
+/// `constraints`, `action_constraints`, and `action_props`, including primed
+/// reads in action predicates) for non-symmetry emitters such as erasure.
+pub(crate) fn check_constrained_observations_total(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
-    observations: &[Expr],
+    spec: super::CheckSpec<'_>,
+) -> bool {
+    check_observations_total_inner(program, cfg, init, next, spec, false, None)
+}
+
+/// Verify totality of constrained observations for state-projection emitters
+/// (`phase`, `sequence`, `history`, `ordered`). Permits reading `Len(seq)` and
+/// `1..Len(seq)` on unbounded sequences while requiring strict 32-bit safe
+/// bounds for all arithmetic (`+`, `-`, `*`, `\div`, `%`, `^`, `Gcd`, unary `-`)
+/// and strictly checking indexing, fields, `Head`/`Tail`, `Choose`, and sets.
+pub(crate) fn check_projection_observations_total(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> bool {
+    check_observations_total_inner(program, cfg, init, next, spec, true, None)
+}
+
+/// Verify totality of constrained observations for a certified relative-age
+/// projection with proven mathematical clock `clock`: permits relative-age
+/// deadline comparisons `(stamp + d) cmp clock` while requiring strict 32-bit
+/// safe bounds for all other arithmetic.
+pub(crate) fn check_age_observations_total(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+    clock: VarId,
+) -> bool {
+    check_observations_total_inner(program, cfg, init, next, spec, true, Some(clock))
+}
+
+fn normalize_for_totality<'a>(
+    program: &Program,
+    cfg: &'a Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+) -> Option<(Expr, Expr, super::OwnedCheckSpec, BTreeMap<ConstId, ConstInfo<'a>>)> {
+    if cfg_overrides_or_tables(program, cfg) {
+        return None;
+    }
+    let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
+    let init_norm = norm.normalize(init)?;
+    let next_norm = norm.normalize(next)?;
+    let spec_norm = spec.try_map(|e| norm.normalize(e))?;
+    let consts = collect_const_info(program, cfg);
+    Some((init_norm, next_norm, spec_norm, consts))
+}
+
+fn check_observations_total_inner(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+    allow_unbounded_seq_len: bool,
+    age_clock: Option<VarId>,
+) -> bool {
+    if !spec.is_constrained() {
+        return true;
+    }
+    let obs_only = super::CheckSpec { invariants: &[], ..spec };
+    let Some((init_norm, next_norm, spec_norm, consts)) = normalize_for_totality(program, cfg, init, next, obs_only) else {
+        return false;
+    };
+    let empty_keys = BTreeSet::new();
+    let mut checker = TotalityChecker::with_const_info(program, &[], &empty_keys, consts, &init_norm, &next_norm, None);
+    checker.allow_unbounded_seq_len = allow_unbounded_seq_len;
+    checker.age_clock = age_clock;
+    let obs_env = CheckEnv::default();
+    for obs in spec_norm.init_props.iter().chain(spec_norm.constraints.iter()) {
+        if !checker.check_form_total(obs, false, false, &obs_env) {
+            return false;
+        }
+    }
+    for act in spec_norm.action_constraints.iter().chain(spec_norm.action_props.iter()) {
+        if !checker.check_form_total(act, true, false, &obs_env) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Top-level shared totality gate called before `keyed`, `erased`, and `equiv_sym`.
+pub(crate) fn check_model_totality_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
     raw_groups: &[Vec<String>],
     omitted: &[VarId],
 ) -> bool {
-    if cfg_overrides_or_tables(program, cfg) {
-        return false;
-    }
     let Some((groups, all_keys)) = super::equiv_sym::validate_groups(raw_groups) else {
         return false;
     };
-    let mut norm = SymNormalizer::for_equiv(program);
-    let Some(init_norm) = norm.normalize(init) else { return false };
-    let Some(next_norm) = norm.normalize(next) else { return false };
-    let Some(obs_norm) = observations.iter().map(|e| norm.normalize(e)).collect::<Option<Vec<_>>>() else {
+    let Some((init_norm, next_norm, spec_norm, consts)) = normalize_for_totality(program, cfg, init, next, spec) else {
         return false;
     };
-    let consts = collect_const_info(program, cfg);
     let checker = TotalityChecker::with_const_info(program, &groups, &all_keys, consts, &init_norm, &next_norm, None);
-    checker.check_all_with_omitted(&init_norm, &next_norm, &obs_norm, omitted)
+    checker.check_all_with_spec(&init_norm, &next_norm, spec_norm.as_spec(), omitted)
 }
 
 /// Build and run the shared `TotalityChecker` for `choose_sym` on its already-normalized
@@ -336,7 +732,7 @@ pub(crate) fn build_choose_totality_checker<'a>(
     all_keys: &'a BTreeSet<Arc<str>>,
     init_norm: &Expr,
     next_norm: &Expr,
-    obs_norm: &[Expr],
+    spec_norm: super::CheckSpec<'_>,
     fold_vars: &'a HashMap<LocalId, Option<Expr>>,
     bound_hints: &[Option<IntBoundHint>],
 ) -> Option<TotalityChecker<'a>> {
@@ -350,22 +746,10 @@ pub(crate) fn build_choose_totality_checker<'a>(
             *shape = tighten_shape_with_hint(shape, h);
         }
     }
-    checker.check_all(init_norm, next_norm, obs_norm).then_some(checker)
+    checker.check_all_with_spec(init_norm, next_norm, spec_norm, &[]).then_some(checker)
 }
 
 impl<'a> TotalityChecker<'a> {
-    pub(crate) fn new(
-        program: &'a Program,
-        groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
-        consts: &BTreeMap<ConstId, &'a CfgValue>,
-        init_norm: &Expr,
-        next_norm: &Expr,
-    ) -> Self {
-        let info = consts.iter().map(|(&id, &v)| (id, ConstInfo::Value(v))).collect();
-        Self::with_const_info(program, groups, all_keys, info, init_norm, next_norm, None)
-    }
-
     pub(crate) fn with_const_info(
         program: &'a Program,
         groups: &'a [GroupInfo],
@@ -375,19 +759,23 @@ impl<'a> TotalityChecker<'a> {
         next_norm: &Expr,
         allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
     ) -> Self {
-        let mut checker =
-            Self { program, groups, all_keys, consts, var_shapes: vec![Shape::Bottom; program.vars.len()], allow_choose_folds };
+        let mut checker = Self {
+            program,
+            groups,
+            all_keys,
+            consts,
+            var_shapes: vec![Shape::Bottom; program.vars.len()],
+            allow_choose_folds,
+            allow_unbounded_seq_len: false,
+            age_clock: None,
+        };
         checker.var_shapes = checker.infer_var_shapes(init_norm, next_norm);
         checker
     }
 
-    /// Check complete observations, value-position expressions in `Init`/`Next`, and
-    /// runtime orbit-canonicalizer comparability of all retained state variables.
-    pub(crate) fn check_all(&self, init_norm: &Expr, next_norm: &Expr, obs_norm: &[Expr]) -> bool {
-        self.check_all_with_omitted(init_norm, next_norm, obs_norm, &[])
-    }
-
-    pub(crate) fn check_all_with_omitted(&self, init_norm: &Expr, next_norm: &Expr, obs_norm: &[Expr], omitted: &[VarId]) -> bool {
+    /// Check complete observations, constraints, action predicates, value-position expressions
+    /// in `Init`/`Next`, and runtime orbit-canonicalizer comparability of all retained state variables.
+    pub(crate) fn check_all_with_spec(&self, init_norm: &Expr, next_norm: &Expr, spec: super::CheckSpec<'_>, omitted: &[VarId]) -> bool {
         // Runtime orbit canonicalization compares `state` with `π(state)` across all
         // retained state variables; every retained variable must therefore be self-comparable
         // and have safe <= i32::MAX set cardinality bounds.
@@ -397,8 +785,13 @@ impl<'a> TotalityChecker<'a> {
             }
         }
         let obs_env = CheckEnv::default();
-        for obs in obs_norm {
+        for obs in spec.all_state_preds() {
             if !self.check_form_total(obs, false, false, &obs_env) {
+                return false;
+            }
+        }
+        for act in spec.action_constraints.iter().chain(spec.action_props.iter()) {
+            if !self.check_form_total(act, true, false, &obs_env) {
                 return false;
             }
         }
@@ -450,6 +843,17 @@ impl<'a> TotalityChecker<'a> {
     pub(crate) fn bound_elem_info(&self, set: &Expr, in_prime: bool, env: &CheckEnv) -> (Shape, Option<(Expr, bool)>) {
         let origin = match &*set.kind {
             ExprKind::Builtin { op: B::Domain, args } if args.len() == 1 => Some((args[0].clone(), in_prime)),
+            ExprKind::Builtin { op: B::DotDot, args } if args.len() == 2 && matches!(&*args[0].kind, ExprKind::Num(1)) => {
+                if let ExprKind::Builtin { op: B::Len, args: la } = &*args[1].kind {
+                    if la.len() == 1 && self.is_definitely_seq(&la[0], in_prime, env) {
+                        Some((la[0].clone(), in_prime))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
         let mut steps = MAX_STEPS;
@@ -509,5 +913,153 @@ impl<'a> TotalityChecker<'a> {
             }
         }
         Some(env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tlx_front::cfg::parse_cfg;
+
+    fn raw_subst_map<'a>(program: &Program, cfg: &'a Config) -> BTreeMap<ConstId, ConstInfo<'a>> {
+        collect_raw_const_info(program, cfg)
+    }
+
+    #[test]
+    fn collect_const_info_caches_deep_dag_and_drops_cycles_and_excess_depth() {
+        // 30-level acyclic doubling DAG: D_i == C_{i+1} + C_{i+1} (2^29 uncached paths).
+        let levels = 30usize;
+        let mut tla = String::from("---- MODULE SubstDag ----\nEXTENDS Naturals\nCONSTANT ");
+        tla.push_str(&(0..levels).map(|i| format!("C{i}")).collect::<Vec<_>>().join(", "));
+        tla.push_str("\nVARIABLE x\n");
+        for i in 0..(levels - 1) {
+            tla.push_str(&format!("D{i} == C{} + C{}\n", i + 1, i + 1));
+        }
+        tla.push_str(&format!("D{} == 1\nInit == x = 0\nNext == x' = x\n====\n", levels - 1));
+        let mut cfg_src = String::from("INIT Init\nNEXT Next\nCONSTANTS\n");
+        for i in 0..levels {
+            cfg_src.push_str(&format!("  C{i} <- D{i}\n"));
+        }
+        let dir = tlx_testkit::TempDir::with_spec("subst-dag", &tla, &cfg_src);
+        let program = Program::load(&dir.join("SubstDag.tla"), &[]).unwrap();
+        let cfg = parse_cfg(&cfg_src).unwrap();
+        let raw = raw_subst_map(&program, &cfg);
+        let mut checker = SubstAcyclicity::new(&program, &raw);
+        for id in raw.keys().copied() {
+            assert!(checker.is_acyclic(id));
+        }
+        assert!(checker.work_used() < 300, "memoized 30-level DAG should take O(levels) work, got {}", checker.work_used());
+        assert_eq!(collect_const_info(&program, &cfg).len(), levels, "all 30 acyclic levels must be retained");
+
+        // Cyclic substitution `A <- DA`, `DA == B`, `B <- DB`, `DB == A` must be dropped.
+        let cyc_tla = "---- MODULE SubstCycle ----\nCONSTANT A, B, Good\nVARIABLE x\nDA == B\nDB == A\nDGood == 1\nInit == x = 0\nNext == x' = x\n====\n";
+        let cyc_cfg = "INIT Init\nNEXT Next\nCONSTANTS\n  A <- DA\n  B <- DB\n  Good <- DGood\n";
+        let dir = tlx_testkit::TempDir::with_spec("subst-cycle", cyc_tla, cyc_cfg);
+        let program = Program::load(&dir.join("SubstCycle.tla"), &[]).unwrap();
+        let cfg = parse_cfg(cyc_cfg).unwrap();
+        let info = collect_const_info(&program, &cfg);
+        assert_eq!(info.len(), 1, "only acyclic Good should remain, got {}", info.len());
+
+        // 35-level chain exceeds MAX_SUBST_DEPTH (32): deepest 31 survive, top 4 are dropped.
+        let deep = 35usize;
+        let mut deep_tla = String::from("---- MODULE SubstDeep ----\nCONSTANT ");
+        deep_tla.push_str(&(0..deep).map(|i| format!("C{i}")).collect::<Vec<_>>().join(", "));
+        deep_tla.push_str("\nVARIABLE x\n");
+        for i in 0..(deep - 1) {
+            deep_tla.push_str(&format!("D{i} == C{}\n", i + 1));
+        }
+        deep_tla.push_str(&format!("D{} == 1\nInit == x = 0\nNext == x' = x\n====\n", deep - 1));
+        let mut deep_cfg = String::from("INIT Init\nNEXT Next\nCONSTANTS\n");
+        for i in 0..deep {
+            deep_cfg.push_str(&format!("  C{i} <- D{i}\n"));
+        }
+        let dir = tlx_testkit::TempDir::with_spec("subst-deep", &deep_tla, &deep_cfg);
+        let program = Program::load(&dir.join("SubstDeep.tla"), &[]).unwrap();
+        let cfg = parse_cfg(&deep_cfg).unwrap();
+        assert_eq!(collect_const_info(&program, &cfg).len(), MAX_SUBST_DEPTH - 1);
+
+        // Long 2,000-level acyclic chain: iterative explicit stack uses O(N) work without
+        // stack overflow and preserves the valid MAX_SUBST_DEPTH - 1 shorter suffix.
+        let long = 2_000usize;
+        let mut long_tla = String::from("---- MODULE SubstLong ----\nCONSTANT ");
+        long_tla.push_str(&(0..long).map(|i| format!("C{i}")).collect::<Vec<_>>().join(", "));
+        long_tla.push_str("\nVARIABLE x\n");
+        for i in 0..(long - 1) {
+            long_tla.push_str(&format!("D{i} == C{}\n", i + 1));
+        }
+        long_tla.push_str(&format!("D{} == 1\nInit == x = 0\nNext == x' = x\n====\n", long - 1));
+        let mut long_cfg = String::from("INIT Init\nNEXT Next\nCONSTANTS\n");
+        for i in 0..long {
+            long_cfg.push_str(&format!("  C{i} <- D{i}\n"));
+        }
+        let dir = tlx_testkit::TempDir::with_spec("subst-long", &long_tla, &long_cfg);
+        let program = Program::load(&dir.join("SubstLong.tla"), &[]).unwrap();
+        let cfg = parse_cfg(&long_cfg).unwrap();
+        let raw = raw_subst_map(&program, &cfg);
+        let mut checker = SubstAcyclicity::new(&program, &raw);
+        let kept = raw.keys().copied().filter(|&id| checker.is_acyclic(id)).count();
+        assert_eq!(kept, MAX_SUBST_DEPTH - 1);
+        assert!(checker.work_used() < 12_000, "2000-level chain should use linear work, got {}", checker.work_used());
+        assert_eq!(collect_const_info(&program, &cfg).len(), MAX_SUBST_DEPTH - 1);
+    }
+
+    #[test]
+    fn subst_acyclicity_charges_cached_dep_merges_and_cached_height_edges() {
+        // 8 leaf constants L0..L7 and 16 constants A0..A15 whose definitions D0..D15
+        // all call `Shared` (`<<L0, ..., L7>>`). After D0 scans `Shared` and caches
+        // its 8-element dep set + L0..L7 heights, D1..D15 hit cached `def_const_deps`
+        // (charging 8 per merge) and cached `heights` (charging 1 per edge).
+        let mut tla = String::from("---- MODULE SubstCacheBudget ----\nCONSTANT ");
+        let leaves: Vec<String> = (0..8).map(|i| format!("L{i}")).collect();
+        let callers: Vec<String> = (0..16).map(|i| format!("A{i}")).collect();
+        tla.push_str(&leaves.iter().chain(&callers).cloned().collect::<Vec<_>>().join(", "));
+        tla.push_str("\nVARIABLE x\nShared == <<");
+        tla.push_str(&leaves.join(", "));
+        tla.push_str(">>\n");
+        for i in 0..16 {
+            tla.push_str(&format!("D{i} == Shared\n"));
+        }
+        tla.push_str("Init == x = 0\nNext == x' = x\n====\n");
+        let mut cfg_src = String::from("INIT Init\nNEXT Next\nCONSTANTS\n");
+        for l in &leaves {
+            cfg_src.push_str(&format!("  {l} = 1\n"));
+        }
+        for i in 0..16 {
+            cfg_src.push_str(&format!("  A{i} <- D{i}\n"));
+        }
+        let dir = tlx_testkit::TempDir::with_spec("subst-cache-budget", &tla, &cfg_src);
+        let program = Program::load(&dir.join("SubstCacheBudget.tla"), &[]).unwrap();
+        let cfg = parse_cfg(&cfg_src).unwrap();
+        let raw = raw_subst_map(&program, &cfg);
+
+        // Budget 45 suffices to validate `A0` (scanning `Shared`, caching its 8 deps, and
+        // caching `L0..L7` heights), then exhausts on subsequent cached merges / cached height edges.
+        let mut tight = SubstAcyclicity::with_budget(&program, &raw, 45);
+        let a0 = ConstId(8);
+        assert!(tight.is_acyclic(a0), "A0 should succeed and populate caches");
+        let mut accepted = 1usize;
+        for idx in 9..24 {
+            if tight.is_acyclic(ConstId(idx)) {
+                accepted += 1;
+            }
+        }
+        assert!(accepted < 4, "cached dep merges and cached height edges must consume budget (accepted {accepted}/16)");
+        assert_eq!(tight.budget, 0);
+
+        // Sharing `D0` directly across `A0..A15` hits both `deps_of_def` cache and `heights` cache:
+        // each `A_i` still charges 1 root + 1 cached `deps_of_def` + 8 cached `heights` edges = 10 work.
+        let mut shared_cfg = String::from("INIT Init\nNEXT Next\nCONSTANTS\n");
+        for l in &leaves {
+            shared_cfg.push_str(&format!("  {l} = 1\n"));
+        }
+        for i in 0..16 {
+            shared_cfg.push_str(&format!("  A{i} <- D0\n"));
+        }
+        let shared_cfg = parse_cfg(&shared_cfg).unwrap();
+        let shared_raw = raw_subst_map(&program, &shared_cfg);
+        let mut edge_tight = SubstAcyclicity::with_budget(&program, &shared_raw, 60);
+        assert!(edge_tight.is_acyclic(a0));
+        let shared_accepted = (9..24).filter(|&idx| edge_tight.is_acyclic(ConstId(idx))).count();
+        assert!(shared_accepted < 5, "cached height edges on shared D0 must consume budget (accepted {shared_accepted}/15)");
     }
 }

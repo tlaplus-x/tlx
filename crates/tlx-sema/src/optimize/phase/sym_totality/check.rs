@@ -328,6 +328,14 @@ impl<'a> TotalityChecker<'a> {
                 }
                 self.check_form(body, allow_prime, in_prime, &local_env, steps)
             }
+            ExprKind::BoxAction { action, sub } | ExprKind::AngleAction { action, sub } if allow_prime && !in_prime => {
+                if !self.check_form(action, allow_prime, false, env, steps) {
+                    return false;
+                }
+                let Some(s0) = self.check_expr(sub, true, false, env, steps) else { return false };
+                let Some(s1) = self.check_expr(sub, true, true, env, steps) else { return false };
+                shapes_comparable(&s0, &s1) && shape_has_safe_set_cards(&s0, self.groups) && shape_has_safe_set_cards(&s1, self.groups)
+            }
             ExprKind::Builtin { op, args } => match (op, args.as_slice()) {
                 (B::Not, [a]) => self.check_form(a, allow_prime, in_prime, env, steps),
                 (B::Implies, [a, b]) => {
@@ -342,11 +350,17 @@ impl<'a> TotalityChecker<'a> {
                     self.check_form(a, allow_prime, in_prime, env, steps) && self.check_form(b, allow_prime, in_prime, env, steps)
                 }
                 (B::Eq | B::Neq, [a, b]) => {
+                    if self.check_age_deadline_cmp(a, b, allow_prime, in_prime, env, steps) {
+                        return true;
+                    }
                     let Some(sa) = self.check_expr(a, allow_prime, in_prime, env, steps) else { return false };
                     let Some(sb) = self.check_expr(b, allow_prime, in_prime, env, steps) else { return false };
                     shapes_comparable(&sa, &sb) && shape_has_safe_set_cards(&sa, self.groups) && shape_has_safe_set_cards(&sb, self.groups)
                 }
                 (B::Lt | B::Le | B::Gt | B::Ge, [a, b]) => {
+                    if self.check_age_deadline_cmp(a, b, allow_prime, in_prime, env, steps) {
+                        return true;
+                    }
                     let Some(sa) = self.check_expr(a, allow_prime, in_prime, env, steps) else { return false };
                     let Some(sb) = self.check_expr(b, allow_prime, in_prime, env, steps) else { return false };
                     is_int_shape(&sa) && is_int_shape(&sb)
@@ -372,6 +386,11 @@ impl<'a> TotalityChecker<'a> {
                             && shape_has_safe_set_cards(&d, self.groups)
                             && shape_has_safe_set_cards(&r, self.groups)
                     })
+                }
+                (B::Unchanged, [a]) if allow_prime && !in_prime => {
+                    let Some(s0) = self.check_expr(a, true, false, env, steps) else { return false };
+                    let Some(s1) = self.check_expr(a, true, true, env, steps) else { return false };
+                    shapes_comparable(&s0, &s1) && shape_has_safe_set_cards(&s0, self.groups) && shape_has_safe_set_cards(&s1, self.groups)
                 }
                 (B::Prime, [a]) if allow_prime && !in_prime => self.check_form(a, allow_prime, true, env, steps),
                 (B::TLCEval, [a]) => self.check_form(a, allow_prime, in_prime, env, steps),
@@ -419,6 +438,10 @@ impl<'a> TotalityChecker<'a> {
                 ConstInfo::Value(v) => {
                     let s = self.cfg_value_shape(v);
                     (!shape_contains_top(&s) && shape_self_comparable(&s) && shape_has_safe_set_cards(&s, self.groups)).then_some(s)
+                }
+                ConstInfo::Builtin(op) => {
+                    let b = Expr::new(ExprKind::Builtin { op: *op, args: vec![] }, e.span);
+                    self.check_expr(&b, false, false, &CheckEnv::default(), steps)
                 }
                 ConstInfo::Subst(def_id) => match &self.program.defs[def_id.idx()].kind {
                     DefKind::Op(body) => self.check_expr(body, false, false, &CheckEnv::default(), steps),
@@ -582,6 +605,17 @@ impl<'a> TotalityChecker<'a> {
                             return field_of_shape_total(&fs, field);
                         }
                     }
+                    // Proven `x \in DOMAIN f` (or `x \in 1..Len(seq)`) via DomOrigin:
+                    if let ExprKind::Local(l) = &*args[0].kind {
+                        if let Some((orig_expr, orig_prime)) = env.local_dom.get(l) {
+                            if expr_struct_eq(func, in_prime, orig_expr, *orig_prime) && fnapp_index_valid_for(&fs, &key_shape, self.groups)
+                            {
+                                if let Some((_, range, _)) = fn_dom_range(&fs) {
+                                    return Some(range);
+                                }
+                            }
+                        }
+                    }
                     if let Shape::Tuple(ts) = &fs {
                         if let Shape::Int(Some((lo, hi))) = key_shape {
                             if lo >= 1 && (hi as usize) <= ts.len() {
@@ -601,17 +635,6 @@ impl<'a> TotalityChecker<'a> {
                             }
                         }
                         return None;
-                    }
-                    // Proven `x \in DOMAIN f` via DomOrigin:
-                    if let ExprKind::Local(l) = &*args[0].kind {
-                        if let Some((orig_expr, orig_prime)) = env.local_dom.get(l) {
-                            if expr_struct_eq(func, in_prime, orig_expr, *orig_prime) && fnapp_index_valid_for(&fs, &key_shape, self.groups)
-                            {
-                                if let Some((_, range, _)) = fn_dom_range(&fs) {
-                                    return Some(range);
-                                }
-                            }
-                        }
                     }
                 }
                 // General fixed-domain function application: requires `exact_dom == true` so
@@ -768,11 +791,23 @@ impl<'a> TotalityChecker<'a> {
             ) => self.check_form(e, allow_prime, in_prime, env, steps).then_some(Shape::Bool),
             (B::Boolean, []) => Some(Shape::Set { elem: Box::new(Shape::Bool), finite: true, max_card: Some(2) }),
             (B::DotDot, [a, b]) => {
-                let Shape::Int(Some((al, ah))) = self.check_expr(a, allow_prime, in_prime, env, steps)? else { return None };
-                let Shape::Int(Some((_bl, bh))) = self.check_expr(b, allow_prime, in_prime, env, steps)? else { return None };
-                let max_card = if bh < al { 0 } else { u32::try_from(bh as i128 - al as i128 + 1).ok().filter(|&v| v <= MAX_I32_U32)? };
-                let elem = if bh < al { Shape::Bottom } else { Shape::Int(Some((al, bh.max(ah)))) };
-                Some(Shape::Set { elem: Box::new(elem), finite: true, max_card: Some(max_card) })
+                let sa = self.check_expr(a, allow_prime, in_prime, env, steps)?;
+                let sb = self.check_expr(b, allow_prime, in_prime, env, steps)?;
+                match (sa, sb) {
+                    (Shape::Int(Some((al, ah))), Shape::Int(Some((_bl, bh)))) => {
+                        let max_card =
+                            if bh < al { 0 } else { u32::try_from(bh as i128 - al as i128 + 1).ok().filter(|&v| v <= MAX_I32_U32)? };
+                        let elem = if bh < al { Shape::Bottom } else { Shape::Int(Some((al, bh.max(ah)))) };
+                        Some(Shape::Set { elem: Box::new(elem), finite: true, max_card: Some(max_card) })
+                    }
+                    (Shape::Int(Some((1, 1))), Shape::Int(None))
+                        if self.allow_unbounded_seq_len
+                            && matches!(&*b.kind, ExprKind::Builtin { op: B::Len, args } if args.len() == 1 && self.is_definitely_seq(&args[0], in_prime, env)) =>
+                    {
+                        Some(Shape::Set { elem: Box::new(Shape::Int(None)), finite: true, max_card: None })
+                    }
+                    _ => None,
+                }
             }
             (B::Cup, [a, b]) => {
                 let (ea, ca) = self.check_enumerable_set(a, allow_prime, in_prime, env, steps)?;
@@ -889,6 +924,7 @@ impl<'a> TotalityChecker<'a> {
                 Shape::Seq { min_len, max_len: Some(hi), .. } if hi <= MAX_I32_U32 => {
                     Some(Shape::Int(Some((min_len.min(MAX_I32_U32) as i32, hi as i32))))
                 }
+                Shape::Seq { .. } if self.allow_unbounded_seq_len => Some(Shape::Int(None)),
                 _ => None,
             },
             (B::Append, [s, x]) => {
@@ -967,7 +1003,7 @@ impl<'a> TotalityChecker<'a> {
                     max_dom: Some(card),
                 })
             }
-            // Strict checked 32-bit signed arithmetic!
+            // Strict checked 32-bit signed arithmetic across all modes.
             (B::Plus, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_add),
             (B::Minus, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_sub),
             (B::Mul, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_mul),
@@ -998,6 +1034,33 @@ impl<'a> TotalityChecker<'a> {
         }
     }
 
+    /// Scoped strictly to certified relative-age projections: accepts
+    /// `(stamp + d) cmp clock` / `clock cmp (stamp + d)` (or `stamp cmp clock`)
+    /// where `clock` is the proven mathematical clock variable, `0 <= d <= i32::MAX / 2`,
+    /// and `stamp` itself passes strict totality as an integer expression.
+    fn check_age_deadline_cmp(&self, a: &Expr, b: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> bool {
+        let Some(clock) = self.age_clock else {
+            return false;
+        };
+        let is_clock = |e: &Expr| matches!(&*e.kind, ExprKind::Var(v) if *v == clock);
+        let other = if is_clock(a) {
+            b
+        } else if is_clock(b) {
+            a
+        } else {
+            return false;
+        };
+        let stamp = match &*other.kind {
+            ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => match (&*args[0].kind, &*args[1].kind) {
+                (_, ExprKind::Num(d)) if *d >= 0 && *d <= (i32::MAX / 2) as i128 => &args[0],
+                (ExprKind::Num(d), _) if *d >= 0 && *d <= (i32::MAX / 2) as i128 => &args[1],
+                _ => return false,
+            },
+            _ => other,
+        };
+        self.check_expr(stamp, allow_prime, in_prime, env, steps).is_some_and(|s| is_int_shape(&s))
+    }
+
     fn check_arith_bin(
         &self,
         (a, b): (&Expr, &Expr),
@@ -1026,7 +1089,20 @@ impl<'a> TotalityChecker<'a> {
                     if !shape_self_comparable(&elem) || !shape_has_safe_set_cards(&elem, self.groups) {
                         return None;
                     }
-                    let bound = max_card.or_else(|| shape_universe_size(&elem, self.groups)).filter(|&v| v <= MAX_I32_U32)?;
+                    let bound = max_card
+                        .or_else(|| shape_universe_size(&elem, self.groups))
+                        .or_else(|| {
+                            (self.allow_unbounded_seq_len
+                                && matches!(
+                                    &*s.kind,
+                                    ExprKind::Builtin { op: B::DotDot, args }
+                                        if args.len() == 2
+                                            && matches!(&*args[0].kind, ExprKind::Num(1))
+                                            && matches!(&*args[1].kind, ExprKind::Builtin { op: B::Len, args: la } if la.len() == 1)
+                                ))
+                            .then_some(MAX_I32_U32)
+                        })
+                        .filter(|&v| v <= MAX_I32_U32)?;
                     Some((*elem, bound))
                 }
                 _ => None,

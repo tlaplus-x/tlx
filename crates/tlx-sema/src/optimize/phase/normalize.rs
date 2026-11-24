@@ -1,12 +1,18 @@
 //! Bounded, analysis-only expansion. Executable definitions remain untouched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
+use tlx_front::cfg::Config;
+
+use super::ConstSubstTarget;
 use crate::{builtins::Effect, hir::*, visit, Program};
 
 pub(super) struct Normalizer<'a> {
     program: &'a Program,
+    cfg: &'a Config,
     stack: Vec<DefId>,
+    const_stack: Vec<ConstId>,
+    expanded_substs: BTreeMap<ConstId, String>,
     remaining: usize,
     local: u32,
     at_stack: Vec<(Expr, bool)>,
@@ -14,14 +20,64 @@ pub(super) struct Normalizer<'a> {
 }
 
 impl<'a> Normalizer<'a> {
-    pub fn new(program: &'a Program) -> Self {
+    pub fn with_config(program: &'a Program, cfg: &'a Config) -> Self {
         Self {
             program,
+            cfg,
             stack: Vec::new(),
+            const_stack: Vec::new(),
+            expanded_substs: BTreeMap::new(),
             remaining: 100_000,
             local: program.locals.len() as u32,
             at_stack: Vec::new(),
             let_at: HashMap::new(),
+        }
+    }
+
+    fn def_body(d: &Def) -> Option<Expr> {
+        match &d.kind {
+            DefKind::Op(body) => Some(body.clone()),
+            DefKind::Fn { bounds, body } => Some(Expr::new(ExprKind::FnConstruct { bounds: bounds.clone(), body: body.clone() }, d.span)),
+            DefKind::Pending => None,
+        }
+    }
+
+    pub fn attach_const_subst(&self, cert: super::OpenCert) -> Option<String> {
+        super::attach_const_subst_obligation(
+            self.program,
+            self.cfg,
+            &self.expanded_substs,
+            |cid| Self::expand_declared_const_subst(self.program, self.cfg, cid),
+            cert,
+        )
+    }
+
+    pub fn expand_declared_const_subst(program: &'a Program, cfg: &'a Config, c: ConstId) -> Option<String> {
+        let (seen, terminal) = super::resolve_const_subst_chain(program, cfg, c)?;
+        let resolved = match terminal {
+            ConstSubstTarget::PureBuiltin(op, span) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            ConstSubstTarget::Const(other) => Expr::new(ExprKind::Const(other), Span::default()),
+            ConstSubstTarget::Def(id) => {
+                let body = Self::def_body(&program.defs[id.idx()])?;
+                let mut fresh = Self::with_config(program, cfg);
+                fresh.const_stack.extend_from_slice(&seen);
+                fresh.stack.push(id);
+                fresh.expand(&body, &HashMap::new(), None, 1)?
+            }
+        };
+        super::canonical_expr_repr(program, &resolved)
+    }
+
+    fn record_const_subst(&mut self, c: ConstId, res: &Expr) -> bool {
+        let Some(repr) = super::canonical_expr_repr(self.program, res) else {
+            return false;
+        };
+        match self.expanded_substs.get(&c) {
+            Some(prev) => prev == &repr,
+            None => {
+                self.expanded_substs.insert(c, repr);
+                true
+            }
         }
     }
 
@@ -57,6 +113,37 @@ impl<'a> Normalizer<'a> {
             .collect()
     }
 
+    fn expand_const(&mut self, c: ConstId, span: Span, env: &HashMap<LocalId, Expr>, lex_at: Option<usize>, depth: usize) -> Option<Expr> {
+        if self.program.consts[c.idx()].arity != 0 || self.cfg.last_constant_subst(&self.program.consts[c.idx()].name).is_none() {
+            return Some(Expr::new(ExprKind::Const(c), span));
+        }
+        if self.const_stack.contains(&c) {
+            return None;
+        }
+        let res = match super::resolve_const_subst_target(self.program, self.cfg, c)? {
+            ConstSubstTarget::PureBuiltin(op, _) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            ConstSubstTarget::Def(id) => {
+                if self.stack.contains(&id) {
+                    return None;
+                }
+                let body = Self::def_body(&self.program.defs[id.idx()])?;
+                self.const_stack.push(c);
+                self.stack.push(id);
+                let res = self.expand(&body, &HashMap::new(), None, depth + 1);
+                self.stack.pop();
+                self.const_stack.pop();
+                res?
+            }
+            ConstSubstTarget::Const(other) => {
+                self.const_stack.push(c);
+                let res = self.expand(&Expr::new(ExprKind::Const(other), span), env, lex_at, depth + 1);
+                self.const_stack.pop();
+                res?
+            }
+        };
+        self.record_const_subst(c, &res).then_some(res)
+    }
+
     fn expand(&mut self, e: &Expr, env: &HashMap<LocalId, Expr>, lex_at: Option<usize>, depth: usize) -> Option<Expr> {
         if depth >= 128 || self.remaining == 0 {
             return None;
@@ -64,6 +151,7 @@ impl<'a> Normalizer<'a> {
         self.remaining -= 1;
         let kind = match &*e.kind {
             ExprKind::Local(l) => return Some(env.get(l).unwrap_or(e).clone()),
+            ExprKind::Const(c) => return self.expand_const(*c, e.span, env, lex_at, depth),
             ExprKind::At => {
                 let idx = lex_at?;
                 let (expr, used) = self.at_stack.get_mut(idx)?;
@@ -105,13 +193,7 @@ impl<'a> Normalizer<'a> {
                             // expansion above still refuses effectful actuals.
                             let mut scope = env.clone();
                             scope.extend(d.params.iter().copied().zip(args));
-                            let body = match &d.kind {
-                                DefKind::Op(body) => body.clone(),
-                                DefKind::Fn { bounds, body } => {
-                                    Expr::new(ExprKind::FnConstruct { bounds: bounds.clone(), body: body.clone() }, d.span)
-                                }
-                                DefKind::Pending => return None,
-                            };
+                            let body = Self::def_body(d)?;
                             let def_at = self.let_at.get(id).copied().unwrap_or(None);
                             self.stack.push(*id);
                             let result = self.expand(&body, &scope, def_at, depth + 1);

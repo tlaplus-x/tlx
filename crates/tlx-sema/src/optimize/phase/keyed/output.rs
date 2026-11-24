@@ -1,10 +1,11 @@
 //! Instantiate the proved keyed-state IR with this model's exact operations.
+use super::super::ObsBundle;
 use super::{Case, Emitter};
 use crate::{hir::Expr, optimize::lean::literal};
 use std::fmt::Write;
 
 impl Emitter<'_> {
-    pub(super) fn output(&self, initial: &Expr, cases: &[Case], observation: &str) -> String {
+    pub(super) fn output(&self, initial: &Expr, cases: &[Case], obs: &ObsBundle<'_>) -> super::super::OpenCert {
         let mut out = String::from(include_str!("../../KeyedCertificate.lean"));
         let namespace = if self.omitted.is_empty() {
             "GeneratedSymmetry"
@@ -65,8 +66,11 @@ impl Emitter<'_> {
         out.push_str("-- C, A and W contain no renamed keys; V contains only key-free payloads.\n-- Lowering, inferred domains, leaf interpretation, totality, group closure and\n-- runtime canonicalization remain trusted. Init need not be symmetric.\n");
         if self.omitted.is_empty() {
             out.push_str("structure Semantics (C V A W : Type) where\n  initial : State C MapId SlotId (Key groupSizes) V A → Prop\n  fixedAtom : Nat → A\n  test : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → Prop\n  value : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → V\n  fixedVal : Nat → C → C → W → List V → List (Option V) → List (Option A) → List Nat → A\n  observe : Nat → C → List V → List (Option V) → List (Option A) → List Nat → Prop\n");
+            if obs.constrained {
+                out.push_str("  actionObserve : Nat → C → C → List V → List (Option V) → List (Option A) → List Nat → Prop\n");
+            }
         } else {
-            self.erasure_semantics(&mut out);
+            self.erasure_semantics(&mut out, obs.constrained);
         }
         out.push_str("def guard (b : BranchId) : Test GroupCount MapId SlotId :=\n  match b.val with\n");
         for (i, c) in cases.iter().enumerate() {
@@ -83,13 +87,20 @@ impl Emitter<'_> {
             writeln!(out, "  | {i} => [{}]", c.slot_writes.join(", ")).unwrap();
         }
         out.push_str("  | _ => []\n");
-        writeln!(out, "def observation : Test GroupCount MapId SlotId := {observation}").unwrap();
+        writeln!(out, "def observation : Test GroupCount MapId SlotId := {}", obs.observation).unwrap();
+        if obs.constrained {
+            writeln!(out, "def initObservation : Test GroupCount MapId SlotId := {}", obs.init_observation).unwrap();
+            writeln!(out, "def constraintTest : Test GroupCount MapId SlotId := {}", obs.constraint_test).unwrap();
+            writeln!(out, "def actionConstraintTest : ActionTest GroupCount MapId SlotId := {}", obs.action_constraint_test).unwrap();
+            writeln!(out, "def actionObservation : ActionTest GroupCount MapId SlotId := {}", obs.action_observation).unwrap();
+        }
         if !self.omitted.is_empty() {
-            self.erasure_model(&mut out, cases);
-            return out;
+            return self.erasure_model(out, cases, obs.constrained);
         }
         out.push_str("variable {C V A W : Type} (sem : Semantics C V A W)\ndef model : KeyedRule.Model GroupCount groupSizes C MapId SlotId V A BranchId W where\n  initial := sem.initial\n  fixedAtom := sem.fixedAtom\n  guard := guard\n  test := fun _ c d w id inputs sinputs finputs nats => sem.test id c d w inputs sinputs finputs nats\n  writes := writes\n  value := fun _ c d w id inputs sinputs finputs nats => sem.value id c d w inputs sinputs finputs nats\n  slotWrites := slotWrites\n  fixedVal := fun _ c d w id inputs sinputs finputs nats => sem.fixedVal id c d w inputs sinputs finputs nats\n  observation := observation\n  observe := fun c id inputs sinputs finputs nats => sem.observe id c inputs sinputs finputs nats\n");
-        out.push_str(include_str!("certificate.lean"));
-        out
+        if obs.constrained {
+            out.push_str("  initObservation := initObservation\n  constraintTest := constraintTest\n  actionConstraintTest := actionConstraintTest\n  actionObservation := actionObservation\n  actionObserve := fun c d id inputs sinputs finputs nats => sem.actionObserve id c d inputs sinputs finputs nats\n");
+        }
+        super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedSymmetry", obs.constrained, false, false)
     }
 }

@@ -74,7 +74,17 @@ impl Emitter<'_, '_> {
         })
     }
 
-    pub(super) fn emit_history(&self, out: &mut String, params: &str, code: Code, observations: Vec<String>) {
+    #[allow(clippy::too_many_arguments)] // combines age preamble, history lowering tables, and state-level check vectors in one emitter pass
+    pub(super) fn emit_history(
+        &self,
+        mut out: String,
+        params: &str,
+        code: Code,
+        observations: Vec<String>,
+        init_obs: Vec<String>,
+        constraints: Vec<String>,
+        constrained: bool,
+    ) -> super::super::super::OpenCert {
         let count = code.predicates.len();
         for (i, atom) in self.history.as_ref().unwrap().atoms.iter().enumerate() {
             writeln!(out, "def historyAtom{i}HIR : String := {}", literal(atom)).unwrap();
@@ -100,12 +110,26 @@ impl Emitter<'_, '_> {
             fold(observations, "conj", "True")
         )
         .unwrap();
+        if constrained {
+            writeln!(
+                out,
+                "def initObserve {params} (c : C) (p : Key → Bool) (s : Summary V (Fin {count})) : Test caps := {}",
+                fold(init_obs, "conj", "True")
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "def constraint {params} (c : C) (p : Key → Bool) (s : Summary V (Fin {count})) : Test caps := {}",
+                fold(constraints, "conj", "True")
+            )
+            .unwrap();
+        }
         out.push_str("def ageModel : AgeRule.Model C Key (Nat × W) where\n  caps := caps\n  initial := initial sem\n  seed := fun _ w => seed w\n  delta := delta\n  guard := fun _ _ _ _ => Test.pure True\n  change := fun _ _ _ _ _ => Decision.pure Change.keep\n  observe := fun _ _ => Test.pure True\n");
         writeln!(out, "def model : AgeHistoryRule.Model C Key V (Fin {count}) (Nat × W) where\n  age := ageModel sem\n  predicate := historyPredicate sem\n  historySeed := historySeed sem\n  historyTransfer := historyTransfer sem\n  change := change sem\n  guard := guard sem\n  observe := observe sem").unwrap();
-        out.push_str(
-            &include_str!("../certificate.lean")
-                .replace("State C Key", "(State C Key × History V)")
-                .replace("TlxOptimization.GeneratedAge", "TlxOptimization.GeneratedAgeHistory"),
-        );
+        if constrained {
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        }
+        let tail = include_str!("../certificate.lean").replace("State C Key", "(State C Key × History V)");
+        super::super::super::OpenCert::new(out, &tail, "GeneratedAgeHistory", constrained, false, false)
     }
 }

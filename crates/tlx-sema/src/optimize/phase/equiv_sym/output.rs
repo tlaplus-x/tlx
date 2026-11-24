@@ -6,15 +6,24 @@ use std::fmt::Write;
 use super::{lower::LowerCtx, GroupInfo};
 use crate::{hir::Expr, optimize::lean::literal, Program};
 
+pub(super) struct Forms<'a> {
+    pub(super) init: &'a str,
+    pub(super) next: &'a str,
+    pub(super) obs: &'a str,
+    pub(super) init_obs: &'a str,
+    pub(super) constraint: &'a str,
+    pub(super) action_constraint: &'a str,
+    pub(super) action_obs: &'a str,
+    pub(super) constrained: bool,
+}
+
 pub(super) fn render(
     program: &Program,
     groups: &[GroupInfo],
     ctx: &LowerCtx<'_>,
     initial: &Expr,
-    init_form: &str,
-    next_form: &str,
-    obs_form: &str,
-) -> String {
+    forms: &Forms<'_>,
+) -> super::super::OpenCert {
     let mut out = String::from(include_str!("../../EquivSymCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedEquivSymmetry\n");
     out.push_str(
@@ -66,17 +75,35 @@ pub(super) fn render(
          -- canonicalization remain trusted.\n\
          abbrev Semantics (A : Type) := EquivRule.AtomOps A\n",
     );
-    writeln!(out, "def initForm : Form GroupCount VarId := {init_form}").unwrap();
-    writeln!(out, "def nextForm : Form GroupCount VarId := {next_form}").unwrap();
-    writeln!(out, "def obsForm : Form GroupCount VarId := {obs_form}").unwrap();
-    out.push_str(
-        "variable {A : Type} [HasNatAtom A] (sem : Semantics A)\n\
-         def model : EquivRule.Model GroupCount groupSizes VarId A where\n\
-         \x20 ops := sem\n\
-         \x20 initForm := initForm\n\
-         \x20 nextForm := nextForm\n\
-         \x20 obsForm := obsForm\n",
-    );
-    out.push_str(include_str!("certificate.lean"));
-    out
+    writeln!(out, "def initForm : Form GroupCount VarId := {}", forms.init).unwrap();
+    writeln!(out, "def nextForm : Form GroupCount VarId := {}", forms.next).unwrap();
+    writeln!(out, "def obsForm : Form GroupCount VarId := {}", forms.obs).unwrap();
+    if forms.constrained {
+        writeln!(out, "def initObsForm : Form GroupCount VarId := {}", forms.init_obs).unwrap();
+        writeln!(out, "def constraintForm : Form GroupCount VarId := {}", forms.constraint).unwrap();
+        writeln!(out, "def actionConstraintForm : Form GroupCount VarId := {}", forms.action_constraint).unwrap();
+        writeln!(out, "def actionObsForm : Form GroupCount VarId := {}", forms.action_obs).unwrap();
+        out.push_str(
+            "variable {A : Type} [HasNatAtom A] (sem : Semantics A)\n\
+             def model : EquivRule.Model GroupCount groupSizes VarId A where\n\
+             \x20 ops := sem\n\
+             \x20 initForm := initForm\n\
+             \x20 nextForm := nextForm\n\
+             \x20 obsForm := obsForm\n\
+             \x20 initObsForm := initObsForm\n\
+             \x20 constraintForm := constraintForm\n\
+             \x20 actionConstraintForm := actionConstraintForm\n\
+             \x20 actionObsForm := actionObsForm\n",
+        );
+    } else {
+        out.push_str(
+            "variable {A : Type} [HasNatAtom A] (sem : Semantics A)\n\
+             def model : EquivRule.Model GroupCount groupSizes VarId A where\n\
+             \x20 ops := sem\n\
+             \x20 initForm := initForm\n\
+             \x20 nextForm := nextForm\n\
+             \x20 obsForm := obsForm\n",
+        );
+    }
+    super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedEquivSymmetry", forms.constrained, false, false)
 }

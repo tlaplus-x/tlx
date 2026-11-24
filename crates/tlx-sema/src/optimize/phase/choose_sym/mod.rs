@@ -19,7 +19,7 @@ mod pure_expr;
 mod step;
 
 use super::domain::{Atom, Domain, Domains, Locals};
-use super::sym_groups::{subst_local, GroupInfo, GroupMask, KeyRef};
+use super::sym_groups::{subst_local, ActionKeyRef, GroupInfo, GroupMask, KeyRef};
 use super::sym_norm::{mentions_local, SymNormalizer};
 use super::{max_local, variable, Branch};
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
@@ -80,15 +80,39 @@ pub fn choose_symmetry_certificate(
     observations: &[Expr],
     raw_groups: &[Vec<String>],
 ) -> Option<String> {
+    choose_symmetry_certificate_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations), raw_groups)
+}
+
+/// Generate a connected `ChooseSymCertificate.lean` proof covering invariants,
+/// init properties, state constraints, action constraints, and action properties.
+pub fn choose_symmetry_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+    raw_groups: &[Vec<String>],
+) -> Option<String> {
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
     let (groups, all_keys) = validate_groups(raw_groups)?;
-    let mut norm = SymNormalizer::for_choose(program);
+    let mut norm = SymNormalizer::for_choose_with_config(program, cfg);
     let initial = norm.normalize(init)?;
     let init_branches = split_branches(&initial)?;
     let next_norm = norm.normalize(next)?;
     let steps = split_branches(&next_norm)?;
-    let obs_norm = observations.iter().map(|o| norm.normalize(o)).collect::<Option<Vec<_>>>()?;
+    let owned_spec = spec.try_map(|o| norm.normalize(o))?;
+    let norm_spec = owned_spec.as_spec();
 
-    if norm.fold_vars.is_empty() && !expr_has_choose(&initial) && !expr_has_choose(&next_norm) && !obs_norm.iter().any(expr_has_choose) {
+    if norm_spec.action_constraints.iter().chain(norm_spec.action_props).any(expr_has_choose) {
+        return None;
+    }
+    if norm.fold_vars.is_empty()
+        && !expr_has_choose(&initial)
+        && !expr_has_choose(&next_norm)
+        && !norm_spec.all_state_preds().any(expr_has_choose)
+    {
         return None;
     }
     if init_branches.is_empty() || steps.is_empty() {
@@ -100,7 +124,7 @@ pub fn choose_symmetry_certificate(
     let mut proj_fields: HashMap<VarId, BTreeSet<Arc<str>>> = HashMap::new();
     collect_projected_fields(&initial, &norm.fold_vars, &mut proj_fields);
     collect_projected_fields(&next_norm, &norm.fold_vars, &mut proj_fields);
-    for o in &obs_norm {
+    for o in norm_spec.all_exprs() {
         collect_projected_fields(o, &norm.fold_vars, &mut proj_fields);
     }
 
@@ -141,7 +165,7 @@ pub fn choose_symmetry_certificate(
         &equiv_all_keys,
         &initial,
         &next_norm,
-        &obs_norm,
+        norm_spec,
         &norm.fold_vars,
         &bound_hints,
     )?;
@@ -150,7 +174,7 @@ pub fn choose_symmetry_certificate(
         .local
         .max(max_local_in_branches(&init_branches))
         .max(max_local_in_branches(&steps))
-        .max(obs_norm.iter().map(max_local).max().unwrap_or(0))
+        .max(norm_spec.all_exprs().map(max_local).max().unwrap_or(0))
         + 1;
 
     let mut e = Emitter {
@@ -181,29 +205,7 @@ pub fn choose_symmetry_certificate(
         req_uniform_msgs: BTreeSet::new(),
     };
 
-    let mut init_cases = Vec::with_capacity(init_branches.len());
-    for ib in &init_branches {
-        init_cases.push(e.lower_init_branch(ib)?);
-        if init_cases.len() > 128 {
-            return None;
-        }
-    }
-
-    let mut step_cases = Vec::new();
-    for sb in &steps {
-        step_cases.push(e.lower_step_branch(sb)?);
-        if step_cases.len() > 512 {
-            return None;
-        }
-    }
-
-    let observation = e.choice_tests(&obs_norm, &[], &AuxScope::default())?;
-    if !e.used_choose {
-        return None;
-    }
-
-    let inv_plan = e.synthesize_inv_plan(&init_cases, &step_cases)?;
-    Some(e.output(&initial, &init_cases, &step_cases, &observation, &inv_plan))
+    norm.attach_const_subst(e.finish(&initial, &init_branches, &steps, norm_spec)?)
 }
 
 pub(super) fn mentions_any_var(e: &Expr) -> bool {
@@ -366,7 +368,7 @@ impl Emitter<'_> {
         (eqs, ins, unchanged)
     }
 
-    fn lower_init_branch(&mut self, ib: &Branch) -> Option<InitCase> {
+    pub(super) fn lower_init_branch(&mut self, ib: &Branch) -> Option<InitCase> {
         let mut keys: Vec<(LocalId, GroupMask)> = Vec::new();
         let locals = self.domains.locals(&ib.bounds);
         for bnd in &ib.bounds {
