@@ -440,17 +440,20 @@ impl Lowerer<'_> {
             }
             OpRef::Const(c) => match self.ip.const_op_ref(c) {
                 Some(OpRef::Def(d)) => self.go_call(d, args, e, env, k, st),
+                Some(OpRef::Builtin(b)) => self.go_builtin_ref(b, args, e, env, k, st),
                 _ => self.test(e, env, k, st),
             },
             OpRef::Param(l) => match env.lookup(l, &self.ip.prog) {
                 Some(LBind::Op(LOp::Ref(OpRef::Def(d)))) => self.go_call(d, args, e, env, k, st),
+                Some(LBind::Op(LOp::Ref(OpRef::Builtin(b)))) => self.go_builtin_ref(b, args, e, env, k, st),
+                Some(LBind::Op(LOp::Ref(OpRef::Const(c)))) => self.go_apply(e, OpRef::Const(c), args, env, k, st),
                 Some(LBind::Op(LOp::Lambda(params, body, lenv))) => {
                     let env2 = self.bind_params(&params, args, env, lenv)?;
                     self.go(&body, &env2, k, &st.deeper())
                 }
                 _ => self.test(e, env, k, st),
             },
-            OpRef::Builtin(_) => self.test(e, env, k, st),
+            OpRef::Builtin(b) => self.go_builtin_ref(b, args, e, env, k, st),
         }
     }
 
@@ -458,6 +461,13 @@ impl Lowerer<'_> {
     /// override or an operator argument).
     fn go_call(&mut self, d: hir::DefId, args: &[hir::Expr], at: &hir::Expr, env: &LEnv, k: &Cont, st: &St) -> LResult<Stmt> {
         let call = hir::Expr::new(H::Apply { op: OpRef::Def(d), args: args.to_vec() }, at.span);
+        self.go(&call, env, k, st)
+    }
+
+    /// Enumerate builtin `op(args)` (when reached through an operator
+    /// parameter or constant override).
+    fn go_builtin_ref(&mut self, op: B, args: &[hir::Expr], at: &hir::Expr, env: &LEnv, k: &Cont, st: &St) -> LResult<Stmt> {
+        let call = hir::Expr::new(H::Builtin { op, args: args.to_vec() }, at.span);
         self.go(&call, env, k, st)
     }
 

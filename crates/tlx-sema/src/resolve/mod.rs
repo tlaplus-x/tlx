@@ -256,8 +256,11 @@ enum DefState {
 enum LocalBinding {
     Local(LocalId, usize),
     LetDef(DefId),
-    /// An instance parameter bound to an already-resolved argument (`J(1)!K`).
+    /// An instance parameter bound to an already-resolved 0-ary expression (`J(1)!K`).
     Value(Expr),
+    /// An operator-valued instance parameter bound to an already-resolved
+    /// operator expression (`OpArg` or `Lambda`) of the declared arity (`> 0`).
+    Op(Expr, usize),
     /// `LET I == INSTANCE M ...`
     Instance(InstId),
 }
@@ -266,8 +269,10 @@ enum LocalBinding {
 struct Env {
     ctx: CtxId,
     module: ModIdx,
-    /// LocalIds bound to the current context's instance params.
-    inst_locals: Vec<LocalId>,
+    /// Resolved expressions for the current context's instance params
+    /// (`Local` / `OpArg(Param)` inside a definition body, or arbitrary
+    /// resolved expressions forwarded through nested substitutions).
+    inst_args: Vec<Expr>,
     names: Vec<(Arc<str>, LocalBinding)>,
     /// Whether `@` is allowed (inside an EXCEPT update value).
     in_except: bool,
@@ -285,7 +290,7 @@ impl Env {
         Env {
             ctx,
             module,
-            inst_locals: Vec::new(),
+            inst_args: Vec::new(),
             names: Vec::new(),
             in_except: false,
             in_arg: false,
@@ -348,6 +353,13 @@ pub struct Program {
     entry_of: HashMap<DefId, DefId>,
     qualified_entry: HashMap<DefId, DefId>,
     worklist: Vec<DefId>,
+    /// Stack of definitions currently being resolved (for recording instance
+    /// substitution level constraints on their parameters).
+    resolving_def: Vec<DefId>,
+    /// Substituted declaration expressions used in each definition, paired with
+    /// the maximum level allowed by the declaration (`0` for constants of
+    /// non-constant modules, `1` for variables).
+    def_subst_bounds: Vec<Vec<(Expr, u8)>>,
     /// Level summaries of the definitions, computed by `check_levels`.
     level_memo: Vec<Option<Arc<level::Summary>>>,
 }
@@ -399,6 +411,8 @@ impl Program {
             entry_of: HashMap::new(),
             qualified_entry: HashMap::new(),
             worklist: Vec::new(),
+            resolving_def: Vec::new(),
+            def_subst_bounds: Vec::new(),
             level_memo: Vec::new(),
         };
         let src = std::fs::read_to_string(path).map_err(|e| vec![err(Span::default(), format!("cannot read {}: {e}", path.display()))])?;
@@ -1028,11 +1042,12 @@ impl Program {
     fn resolve_def(&mut self, d: DefId) {
         self.def_src[d.idx()].state = DefState::InProgress;
         let (ctx, module) = (self.def_src[d.idx()].ctx, self.def_src[d.idx()].module);
+        let span = self.defs[d.idx()].span;
         let mut env = Env::new(ctx, module);
         let mut params = Vec::new();
         for (n, a) in self.ctxs[ctx].inst_params.clone() {
-            let l = self.new_local(n, a, self.defs[d.idx()].span);
-            env.inst_locals.push(l);
+            let l = self.new_local(n, a, span);
+            env.inst_args.push(self.local_ref(l, span));
             params.push(l);
         }
         let unit = self.def_src[d.idx()].unit.clone();
@@ -1040,10 +1055,22 @@ impl Program {
         self.def_src[d.idx()].state = DefState::Done;
     }
 
+    /// Reference to local parameter `l` (`Local` for 0-ary, `OpArg(Param)` for
+    /// higher-order operator parameters).
+    pub(super) fn local_ref(&self, l: LocalId, span: Span) -> Expr {
+        if self.locals[l.idx()].arity == 0 {
+            Expr::new(ExprKind::Local(l), span)
+        } else {
+            Expr::new(ExprKind::OpArg(OpRef::Param(l)), span)
+        }
+    }
+
     /// Resolve `unit` in `env` and store the result as definition `d`.
     /// `params` are leading parameters already bound in `env` (instance params).
     fn fill_def(&mut self, env: &mut Env, d: DefId, unit: &DefUnit, mut params: Vec<LocalId>) -> Result<(), ()> {
+        self.resolving_def.push(d);
         let r = self.def_body(env, unit, &mut params);
+        self.resolving_def.pop();
         self.defs[d.idx()].params = params;
         self.defs[d.idx()].kind = r?;
         Ok(())
@@ -1075,6 +1102,7 @@ impl Program {
         self.defs.push(Def { name, params: Vec::new(), kind: DefKind::Pending, builtin, span });
         self.def_src.push(src);
         self.def_inst.push(inst);
+        self.def_subst_bounds.push(Vec::new());
         id
     }
 

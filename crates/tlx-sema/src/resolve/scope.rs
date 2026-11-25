@@ -201,7 +201,7 @@ impl Program {
     /// declarations (and parameters) share the root context.
     fn instance_ctx(&mut self, ctx: CtxId, m: ModIdx, inst: &ast::Instance, captured: Option<super::Captured>) -> Option<(CtxId, ModIdx)> {
         let target = self.find_instance_module(m, &inst.module)?;
-        if inst.params.is_empty() && !self.has_decls(target, &mut Vec::new()) {
+        if inst.params.is_empty() && !self.has_decls(target, &mut Vec::new()) && (ctx == ROOT_CTX || self.mods[target].parent.is_none()) {
             return Some((ROOT_CTX, target));
         }
         let outer_inst = self.ctxs[ctx].inst_params.len();
@@ -228,13 +228,13 @@ impl Program {
         if let Some(c) = self.ctxs[ctx].fresh {
             return Some(c);
         }
-        let copy = Ctx {
-            inst_params: self.ctxs[ctx].inst_params.clone(),
-            subst: self.ctxs[ctx].subst.clone(),
-            uses_capture: false,
-            fresh: None,
-            copy_of: Some(ctx),
-        };
+        let mut subst = self.ctxs[ctx].subst.clone();
+        if let Some(s) = &mut subst {
+            if let Some(fresh_outer) = self.enabled_ctx(s.outer_ctx) {
+                s.outer_ctx = fresh_outer;
+            }
+        }
+        let copy = Ctx { inst_params: self.ctxs[ctx].inst_params.clone(), subst, uses_capture: false, fresh: None, copy_of: Some(ctx) };
         let id = self.ctxs.len();
         self.ctxs.push(copy);
         self.ctxs[ctx].fresh = Some(id);

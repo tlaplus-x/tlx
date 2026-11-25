@@ -20,7 +20,7 @@ use tlx_front::ast;
 use crate::hir::*;
 
 use super::level::{Info, ACTION, TEMPORAL};
-use super::names::{bound_vars, fn_def_entry, op_def_entry, pos, simple_entry, Entry, Kind, NameScope, Origin};
+use super::names::{bound_vars, fn_def_entry, instance_entry, op_def_entry, pos, simple_entry, Entry, Kind, NameScope, Origin};
 
 impl super::names::Checker<'_> {
     /// `label(params):: body`: the parameters of labels inside are the
@@ -113,7 +113,7 @@ impl super::names::Checker<'_> {
                     }
                     self.instance(sc, m, inst);
                     if let Some(n) = &inst.name {
-                        let e = simple_entry(Kind::Instance, inst.params.len(), n.span, Origin::Local, &mname);
+                        let e = instance_entry(inst, n.span, Origin::Local, &mname);
                         self.bind_own(sc, &n.name, e, true);
                     }
                 }

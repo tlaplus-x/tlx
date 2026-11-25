@@ -57,12 +57,14 @@ impl Program {
         l
     }
 
-    /// Resolve the arguments `es` of an operator application.
-    pub(super) fn arg_exprs(&mut self, env: &mut Env, es: &[ast::Expr]) -> Result<Vec<Expr>, ()> {
+    /// Resolve the arguments `es` of an operator or instance application,
+    /// marking position `i` as an operator-argument position (`env.in_arg`)
+    /// only when its expected parameter arity `param_arities[i] > 0`.
+    pub(super) fn arg_exprs_for(&mut self, env: &mut Env, es: &[ast::Expr], param_arities: &[usize]) -> Result<Vec<Expr>, ()> {
         let mut out = Vec::with_capacity(es.len());
         let mut ok = true;
-        for e in es {
-            env.in_arg = true;
+        for (i, e) in es.iter().enumerate() {
+            env.in_arg = param_arities.get(i).copied().unwrap_or(0) > 0;
             match self.expr(env, e) {
                 Ok(x) => out.push(x),
                 Err(()) => ok = false,

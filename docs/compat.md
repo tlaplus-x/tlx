@@ -211,9 +211,8 @@ This is the single source for known limitations ([design.md](design.md) and
 
 - **Language**: real numbers are not supported (as in TLC, `Reals` only has placeholder
   definitions: real literals are rejected at start-up, `x \in Real`, `/` and `Infinity` fail when
-  evaluated), nor are the temporal quantifiers `\EE` / `\AA`, nor a few `INSTANCE` corner cases
-  (references to declarations through nested parameterized instances, operator-valued instance
-  parameters). PlusCal is not translated: tlx checks the TLA+ translation that is in the file.
+  evaluated), nor are the temporal quantifiers `\EE` / `\AA`. PlusCal is not translated: tlx checks
+  the TLA+ translation that is in the file.
 - **Sets whose size overflows TLC's int**: `Cardinality` (TLC's `Value.size`) refuses `SUBSET S`
   with `|S| >= 31` and a `[S -> T]`, `\X` or record set whose product of component sizes does not
   fit an int ([tlc-semantics.md](tlc-semantics.md) section 4). Enumeration itself needs no size:

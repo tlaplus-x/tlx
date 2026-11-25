@@ -110,11 +110,33 @@ pub fn children(e: &Expr, f: &mut impl FnMut(&Expr)) {
 /// every binding site has a unique `LocalId`). LET definition bodies are
 /// separate `Def`s and are not rewritten.
 pub fn subst_locals(e: &mut Expr, map: &HashMap<LocalId, Expr>) {
-    if let ExprKind::Local(l) = &*e.kind {
-        if let Some(r) = map.get(l) {
-            *e = r.clone();
+    match &*e.kind {
+        ExprKind::Local(l) | ExprKind::OpArg(OpRef::Param(l)) => {
+            if let Some(r) = map.get(l) {
+                *e = r.clone();
+            }
+            return;
         }
-        return;
+        ExprKind::Apply { op: OpRef::Param(l), args } if map.contains_key(l) => {
+            let mut args = args.clone();
+            for a in &mut args {
+                subst_locals(a, map);
+            }
+            let span = e.span;
+            match &*map[l].kind {
+                ExprKind::OpArg(OpRef::Builtin(b)) => *e = Expr::new(ExprKind::Builtin { op: *b, args }, span),
+                ExprKind::OpArg(op) => *e = Expr::new(ExprKind::Apply { op: *op, args }, span),
+                ExprKind::Lambda { params, body } if params.len() == args.len() => {
+                    let inner: HashMap<LocalId, Expr> = params.iter().copied().zip(args).collect();
+                    let mut b = body.clone();
+                    subst_locals(&mut b, &inner);
+                    *e = b;
+                }
+                _ => *e = Expr::new(ExprKind::Apply { op: OpRef::Param(*l), args }, span),
+            }
+            return;
+        }
+        _ => {}
     }
     children_mut(e, &mut |c| subst_locals(c, map));
 }

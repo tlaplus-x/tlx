@@ -152,6 +152,17 @@ pub(super) fn simple_entry(kind: Kind, arity: usize, span: Span, origin: Origin,
     Entry { origin, kind, arity: Some(arity), params: vec![0; arity].into(), span, module: module.clone() }
 }
 
+pub(super) fn instance_entry(inst: &ast::Instance, span: Span, origin: Origin, module: &Arc<str>) -> Entry {
+    Entry {
+        origin,
+        kind: Kind::Instance,
+        arity: Some(inst.params.len()),
+        params: inst.params.iter().map(|p| p.arity).collect(),
+        span,
+        module: module.clone(),
+    }
+}
+
 pub(super) fn bound_vars(v: &ast::BoundVars) -> &[ast::Ident] {
     match v {
         ast::BoundVars::Many(v) | ast::BoundVars::Tuple(v) => v,
@@ -322,7 +333,7 @@ impl Checker<'_> {
                 ast::Unit::OpDef(od) if !od.local => push(&mut out, &od.name.name, op_def_entry(od, o(0), &mname)),
                 ast::Unit::FnDef(fd) if !fd.local => push(&mut out, &fd.name.name, fn_def_entry(fd, o(0), &mname)),
                 ast::Unit::Instance(inst) if !inst.local => match &inst.name {
-                    Some(n) => push(&mut out, &n.name, simple_entry(Kind::Instance, inst.params.len(), n.span, o(0), &mname)),
+                    Some(n) => push(&mut out, &n.name, instance_entry(inst, n.span, o(0), &mname)),
                     None => {
                         if let Some(t) = self.instance_target(m, inst) {
                             for (n, x) in self.exports_of(t).iter() {
@@ -506,7 +517,7 @@ impl Checker<'_> {
                     self.instance(&mut sc, m, inst);
                     match &inst.name {
                         Some(n) => {
-                            let e = simple_entry(Kind::Instance, inst.params.len(), n.span, o(0), &mname);
+                            let e = instance_entry(inst, n.span, o(0), &mname);
                             self.bind_own(&mut sc, &n.name, e, false);
                         }
                         None => {
@@ -703,7 +714,7 @@ impl Checker<'_> {
         for (k, p) in prefix.iter().enumerate() {
             let op = if k == 0 && !p.args.is_empty() {
                 self.lookup(sc, &p.name.name)
-                    .filter(|e| e.kind == Kind::Op && !matches!(e.origin, Origin::Recursive(..)))
+                    .filter(|e| matches!(e.kind, Kind::Op | Kind::Instance) && !matches!(e.origin, Origin::Recursive(..)))
                     .map(|e| e.params.clone())
             } else {
                 None

@@ -439,6 +439,7 @@ impl<'a> Enumerator<'a> {
             ExprKind::Apply { op: OpRef::Const(c), args } => self.apply_const(c, args, e, env, k),
             ExprKind::Apply { op: OpRef::Param(l), args } => self.apply_param(l, args, e, env, k),
             ExprKind::Apply { op: OpRef::Def(d), args } => self.go_call(*d, args, e, env, k),
+            ExprKind::Apply { op: OpRef::Builtin(b), args } => self.go_builtin(*b, args, e, env, k),
             ExprKind::Local(l) => self.local_expr(l, e, env, k),
             ExprKind::Builtin { op: B::Eq, args } => self.assign_eq(args, e, env, k),
             ExprKind::Builtin { op: B::In, args } => self.assign_in(args, e, env, k),

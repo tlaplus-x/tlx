@@ -139,6 +139,200 @@ fn instance_with_substitution() {
 }
 
 #[test]
+fn nested_parameterized_instances() {
+    let mut p = load(&[
+        (
+            "Top",
+            "---- MODULE Top ----\n\
+             EXTENDS Naturals\n\
+             VARIABLE x\n\
+             I(p1) == INSTANCE Mid WITH a <- p1 * 10, u <- x\n\
+             IExpr(p1) == INSTANCE Mid WITH a <- p1 * 10, u <- x * 2\n\
+             R2 == I(2)!J(3)!Val\n\
+             R3 == I(1)!J(2)!K(3)!LeafVal\n\
+             RNested == I(4)!Sub!FromMid\n\
+             E3 == IExpr(1)!J(2)!K(3)!CanStep\n\
+             WithLet == I(5)!ViaLet\n\
+             ====\n",
+        ),
+        (
+            "Mid",
+            "---- MODULE Mid ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT a\n\
+             VARIABLE u\n\
+             J(p2) == INSTANCE Inner WITH b <- a + p2, v <- u\n\
+             ---- MODULE SubMod ----\n\
+             FromMid == a + u\n\
+             ====\n\
+             Sub == INSTANCE SubMod\n\
+             ViaLet == LET L == INSTANCE Leaf WITH c <- a + 1, w <- u IN L!LeafVal\n\
+             ====\n",
+        ),
+        (
+            "Inner",
+            "---- MODULE Inner ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT b\n\
+             VARIABLE v\n\
+             K(p3) == INSTANCE Leaf WITH c <- b + p3, w <- v\n\
+             Val == b + v\n\
+             ====\n",
+        ),
+        (
+            "Leaf",
+            "---- MODULE Leaf ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT c\n\
+             VARIABLE w\n\
+             LeafVal == c + w\n\
+             Step == w' = w + c\n\
+             CanStep == ENABLED Step\n\
+             ====\n",
+        ),
+    ]);
+    assert_eq!(p.vars.len(), 1);
+    assert_eq!(p.consts.len(), 0);
+    // No definition left pending (including LET INSTANCE created inside WITH/bodies).
+    assert!(p.defs.iter().all(|d| !matches!(d.kind, DefKind::Pending)));
+
+    // 2-level nested parameterized instance passes both instance arguments.
+    let (r2, n2) = applied(&mut p, "R2");
+    assert_eq!(n2, 2);
+    assert_eq!(p.defs[r2.idx()].params.len(), 2);
+
+    // 3-level nested parameterized instance passes all three instance arguments.
+    let (r3, n3) = applied(&mut p, "R3");
+    assert_eq!(n3, 3);
+    assert_eq!(p.defs[r3.idx()].params.len(), 3);
+
+    // Nested module instantiated inside a parameterized instance retains the outer parameter.
+    let (rn, nn) = applied(&mut p, "RNested");
+    assert_eq!(nn, 1);
+    assert_eq!(p.defs[rn.idx()].params.len(), 1);
+
+    // ENABLED inside a 3-level nested parameterized instance with expression variable substitution
+    // produces an InstVar reference inside `CanStep`'s body.
+    let (can_step, n_e3) = applied(&mut p, "E3");
+    assert_eq!(n_e3, 3);
+    assert!(p.mentions_inst_var(op_body(&p, can_step)), "expected InstVar under ENABLED in nested instance");
+    assert!(!p.inst_vars.is_empty(), "expected an allocated InstVar slot");
+}
+
+#[test]
+fn enabled_inside_nested_module_preserves_aliased_parent_vars() {
+    let mut p = load(&[(
+        "Top",
+        "---- MODULE Top ----\n\
+         EXTENDS Naturals\n\
+         ---- MODULE Mid ----\n\
+         CONSTANT k\n\
+         VARIABLE v, w\n\
+         ---- MODULE Inner ----\n\
+         Can == ENABLED (v' = k /\\ w' = k + 1)\n\
+         ====\n\
+         J == INSTANCE Inner\n\
+         ====\n\
+         VARIABLE x\n\
+         I(p) == INSTANCE Mid WITH k <- p, v <- x, w <- x\n\
+         Inv == I(2)!J!Can\n\
+         ====\n",
+    )]);
+    let (can_d, argc) = applied(&mut p, "Inv");
+    assert_eq!(argc, 1);
+    assert!(p.mentions_inst_var(op_body(&p, can_d)), "inherited aliased parent variables must become InstVars under ENABLED");
+    assert_eq!(p.inst_vars.len(), 2, "v and w must receive distinct InstVar slots");
+}
+
+#[test]
+fn operator_valued_instance_parameters() {
+    let mut p = load(&[
+        (
+            "Top",
+            "---- MODULE Top ----\n\
+             EXTENDS Naturals\n\
+             VARIABLE x\n\
+             Inc(z) == z + 1\n\
+             U(F(_)) == INSTANCE Unary WITH Op <- F\n\
+             B(Op(_, _)) == INSTANCE Binary WITH Bin <- Op\n\
+             W(F(_)) == INSTANCE Applied WITH c <- F(3)\n\
+             Outer(F(_)) == INSTANCE NestHO WITH OutF <- F\n\
+             WithLetInst(F(_)) == INSTANCE Applied WITH c <- LET L == INSTANCE Applied WITH c <- F(2) IN L!Val\n\
+             R1 == U(Inc)!Main(x)\n\
+             R2 == U(LAMBDA z : z * 2)!Main(x)\n\
+             R3 == U(LAMBDA z : LET w == z + 1 IN w * 2)!Main(x)\n\
+             R4 == B( + )!Wrap(x, 1)\n\
+             R5 == B(/\\)!Wrap(TRUE, FALSE)\n\
+             R6 == W(Inc)!Val\n\
+             R7 == Outer(Inc)!In(LAMBDA z : z * 3)!Combine(x)\n\
+             R8 == WithLetInst(Inc)!Val\n\
+             ====\n",
+        ),
+        (
+            "Unary",
+            "---- MODULE Unary ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT Op(_)\n\
+             Helper(a) == Op(a) + 1\n\
+             Main(b) == Helper(b) * 2\n\
+             ====\n",
+        ),
+        (
+            "Binary",
+            "---- MODULE Binary ----\n\
+             CONSTANT Bin(_, _)\n\
+             Apply2(a, b) == Bin(a, b)\n\
+             Wrap(a, b) == Apply2(a, b)\n\
+             ====\n",
+        ),
+        (
+            "Applied",
+            "---- MODULE Applied ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT c\n\
+             Val == c + 10\n\
+             ====\n",
+        ),
+        (
+            "NestHO",
+            "---- MODULE NestHO ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT OutF(_)\n\
+             ---- MODULE InHO ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT InG(_)\n\
+             CONSTANT base\n\
+             Combine(v) == InG(v) + base\n\
+             ====\n\
+             In(H(_)) == INSTANCE InHO WITH InG <- H, base <- OutF(1)\n\
+             ====\n",
+        ),
+    ]);
+    assert!(p.defs.iter().all(|d| !matches!(d.kind, DefKind::Pending)));
+
+    // Main(b) calls Helper(b), forwarding the operator-valued instance parameter as
+    // `OpArg(OpRef::Param(_))` (not `ExprKind::Local(_)`) with declared arity 1.
+    let (main_d, main_argc) = applied(&mut p, "R1");
+    assert_eq!(main_argc, 2);
+    let inst_param = p.defs[main_d.idx()].params[0];
+    assert_eq!(p.locals[inst_param.idx()].arity, 1);
+    let ExprKind::Builtin { args: mul_args, .. } = &*op_body(&p, main_d).kind else { panic!() };
+    let ExprKind::Apply { args: helper_args, .. } = &*mul_args[0].kind else { panic!() };
+    assert!(
+        matches!(&*helper_args[0].kind, ExprKind::OpArg(OpRef::Param(l)) if *l == inst_param),
+        "cross-def call must forward higher-order instance param as OpArg(Param), got {:?}",
+        helper_args[0].kind
+    );
+
+    // Nested operator-parameterized instance carries both higher-order params (arity 1 each) plus v (arity 0).
+    let (comb_d, comb_argc) = applied(&mut p, "R7");
+    assert_eq!(comb_argc, 3);
+    assert_eq!(p.locals[p.defs[comb_d.idx()].params[0].idx()].arity, 1);
+    assert_eq!(p.locals[p.defs[comb_d.idx()].params[1].idx()].arity, 1);
+    assert_eq!(p.locals[p.defs[comb_d.idx()].params[2].idx()].arity, 0);
+}
+
+#[test]
 fn anonymous_instance_and_local() {
     load(&[
         (

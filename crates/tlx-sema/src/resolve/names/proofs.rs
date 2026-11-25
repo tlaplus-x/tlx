@@ -258,7 +258,7 @@ impl Checker<'_> {
         let m = self.cur_mod;
         self.instance(sc, m, inst);
         if let Some(n) = &inst.name {
-            let e = simple_entry(Kind::Instance, inst.params.len(), n.span, Origin::Local, &self.mod_name(m));
+            let e = super::instance_entry(inst, n.span, Origin::Local, &self.mod_name(m));
             self.bind_own(sc, &n.name, e, true);
         }
     }
