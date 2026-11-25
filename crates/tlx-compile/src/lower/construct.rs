@@ -192,6 +192,9 @@ impl Lowerer<'_> {
             let bound = self.bitset_bound(x.ty);
             return self.card_checked(r, bound);
         }
+        if let Some(r) = self.sorted_set_coerce(&x, sid) {
+            return r;
+        }
         if let Some(r) = self.union_arm_coerce(&x, sid) {
             return r;
         }
@@ -204,7 +207,7 @@ impl Lowerer<'_> {
         if let Some(r) = self.struct_coerce(&x, sid) {
             return r;
         }
-        if let Some(r) = self.union_to_union(&x, sid) {
+        if let Some(r) = self.union_to_union(&x, sid, true) {
             return r;
         }
         if let Some(r) = self.set_recode(&x, sid) {
@@ -292,11 +295,42 @@ impl Lowerer<'_> {
         None
     }
 
+    /// A sorted-array set re-encoded into another capacity of the same element
+    /// shape: zero-padded when growing, length-checked prefix when shrinking.
+    fn sorted_set_coerce(&mut self, x: &Expr, sid: ShapeId) -> Option<Expr> {
+        let Ty::Enc(from) = x.ty else { return None };
+        let (Shape::Set { elem: e1, max_card: m1 }, Shape::Set { elem: e2, max_card: m2 }) =
+            (self.shape_of(Ty::Enc(from))?.clone(), self.shape_of(Ty::Enc(sid))?.clone())
+        else {
+            return None;
+        };
+        if e1 != e2 || self.is_bitset(x.ty) || self.is_bitset(Ty::Enc(sid)) {
+            return None;
+        }
+        if m2 >= m1 {
+            let pad = self.words(sid) as usize - self.words(from) as usize;
+            let mut parts = vec![x.clone()];
+            parts.extend(self.zero_pad(pad));
+            Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        } else {
+            let (xs, bind) = self.share(x.clone());
+            let len = self.int_word(xs.clone(), 0, m1 as i64);
+            let fits = Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, len, int_lit(m2 as i64)));
+            let prefix = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: xs, loc: FieldLoc::Words(0) });
+            let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail("set larger than the layout allows".into()));
+            Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(fits, prefix, fail))))
+        }
+    }
+
     /// A union value re-encoded into another union shape `sid`: each arm
     /// goes to the target arm of its kind (converted if the arm shapes
-    /// differ; a value not fitting it is a runtime layout miss). None if an
-    /// arm has no counterpart or cannot be converted natively.
-    pub(super) fn union_to_union(&mut self, x: &Expr, sid: ShapeId) -> Option<Expr> {
+    /// differ; a value not fitting it is a runtime layout miss). When
+    /// `allow_missing_arms` is true (coercions, never equality), an arm whose
+    /// kind cannot fit any arm of `dst` falls through to a runtime layout miss
+    /// so partially overlapping unions (e.g. `messages` -> `messages_discard`)
+    /// stay native. None if no arm matches or a matching arm cannot convert
+    /// natively.
+    pub(super) fn union_to_union(&mut self, x: &Expr, sid: ShapeId, allow_missing_arms: bool) -> Option<Expr> {
         let (Some(Shape::Union(src)), Some(Shape::Union(dst))) = (self.shape_of(x.ty).cloned(), self.shape_of(Ty::Enc(sid)).cloned())
         else {
             return None;
@@ -304,19 +338,36 @@ impl Lowerer<'_> {
         if src.len() > 16 {
             return None;
         }
+        let mark = self.frame.snapshot();
         let (xs, bind) = self.share(x.clone());
         let tag = self.int_word(xs.clone(), 0, src.len() as i64 - 1);
         let mut out = Expr::new(Ty::Enc(sid), ExprKind::Fail("value of an unexpected kind".into()));
+        let mut matched = 0usize;
         for (i, arm) in src.iter().enumerate().rev() {
-            let target = dst.iter().find(|d| d.kind_key() == arm.kind_key())?;
+            let Some(target) = dst.iter().find(|d| d.kind_key() == arm.kind_key()) else {
+                if allow_missing_arms && arm_cannot_fit_dst(arm, &dst) {
+                    continue;
+                }
+                self.frame.restore(mark);
+                return None;
+            };
             let (asid, tsid) = (self.sid(arm), self.sid(target));
             let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: xs.clone(), loc: FieldLoc::Words(1) });
             let conv = self.coerce_enc(payload, tsid);
             if matches!(&*conv.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Val | Ty::Enc(_))) {
+                self.frame.restore(mark);
                 return None;
             }
-            let wrapped = self.union_arm_coerce(&conv, sid)?;
+            let Some(wrapped) = self.union_arm_coerce(&conv, sid) else {
+                self.frame.restore(mark);
+                return None;
+            };
+            matched += 1;
             out = Expr::new(Ty::Enc(sid), ExprKind::If(eq(tag.clone(), int_lit(i as i64)), wrapped, out));
+        }
+        if matched == 0 {
+            self.frame.restore(mark);
+            return None;
         }
         Some(let_in(bind, out))
     }
@@ -522,6 +573,9 @@ impl Lowerer<'_> {
         else {
             return None;
         };
+        if e1.cardinality() == Some(0) {
+            return Some(self.after_eval(x.clone(), self.zero_enc(sid)));
+        }
         let scalarish = is_scalarish(&e1) && is_scalarish(&e2);
         if !(scalarish || rankable(&e2)) || !self.is_bitset(Ty::Enc(sid)) {
             return None;
@@ -931,7 +985,9 @@ impl Lowerer<'_> {
         }
         let Some(dv) = self.const_domain(&b.set, env, st) else {
             let BoundVars::Many(ls) = &b.vars else { return None };
-            return self.interval_fn_construct(bounds, ls[0], &b.set, body, env, st);
+            return self
+                .interval_fn_construct(bounds, ls[0], &b.set, body, env, st)
+                .or_else(|| self.bitset_fn_construct(bounds, ls[0], &b.set, body, env, st));
         };
         if !matches!(dv, Value::Set(_) | Value::Interval(..)) {
             return None; // a lazy function in TLC
@@ -1091,6 +1147,66 @@ impl Lowerer<'_> {
             witness: tlx_layout::FcnWitness::Interval,
         });
         if self.words(sid) > 1 << 12 || !self.preserves_lazy_into(body, env, &range, sets::EAGER_DEPTH) {
+            return None;
+        }
+        self.map_build_into(bounds, body, env, st, sid)
+    }
+
+    /// `[x \in S |-> body]` over a runtime encoded bitset `S` with an
+    /// enumerated domain witness: builds a `Shape::Map` over `S`'s element
+    /// universe with range shape inferred from `body`. Declines under
+    /// `keep_lazy` (where TLC evaluates only the applied point), when `body`
+    /// has observable evaluation (volatile builtins or string creation), or
+    /// when `tlx_layout::shape::map_shape` rejects the key/range (e.g.
+    /// set-valued keys whose bitset rank order differs from TLC order, or
+    /// maps exceeding `MAX_MAP_WORDS`).
+    fn bitset_fn_construct(
+        &mut self,
+        bounds: &[hir::Bound],
+        l: LocalId,
+        set: &hir::Expr,
+        body: &hir::Expr,
+        env: &LEnv,
+        st: &St,
+    ) -> Option<Expr> {
+        if self.keep_lazy || self.volatile_expr(body, env) || self.expr_makes_strings(body, env) {
+            return None;
+        }
+        if self.domain_witness(set, env, st) != Some(tlx_layout::FcnWitness::Enumerated) {
+            return None;
+        }
+        let mark = self.frame.snapshot();
+        let s = self.expr(set, env, st);
+        let s = self.set_operand(s);
+        let Some(Shape::Set { elem, .. }) = self.shape_of(s.ty).cloned() else {
+            self.frame.restore(mark);
+            return None;
+        };
+        let Some(u) = bitset_universe(&elem) else {
+            self.frame.restore(mark);
+            return None;
+        };
+        if u == 0 || u > 1024 || !rankable(&elem) {
+            self.frame.restore(mark);
+            return None;
+        }
+        let esid = self.sid(&elem);
+        let t = self.temp(Ty::Enc(esid));
+        let probe = self.expr(body, &env.bind(l, LBind::Ir(temp_ref(Ty::Enc(esid), t))), st);
+        let range = match probe.ty {
+            Ty::Enc(sid) => Some(self.typing.shape(sid).clone()),
+            Ty::Bool => Some(Shape::Bool),
+            Ty::Int => self.int_range(&probe).map(|(a, b)| Shape::Int { lo: a, hi: b }),
+            Ty::Val => None,
+        };
+        self.frame.restore(mark);
+        let range = range?;
+        let shape = tlx_layout::shape::map_shape(*elem, range.clone(), tlx_layout::FcnWitness::Enumerated);
+        if !matches!(shape, Shape::Map { .. }) {
+            return None;
+        }
+        let sid = self.sid(&shape);
+        if !self.preserves_lazy_into(body, env, &range, sets::EAGER_DEPTH) {
             return None;
         }
         self.map_build_into(bounds, body, env, st, sid)
@@ -1313,6 +1429,18 @@ pub(super) fn is_constructor(e: &hir::Expr) -> bool {
                 | H::SetMap { .. }
                 | H::SetFilter { .. }
         ),
+    }
+}
+
+/// Conservative check that no value of `arm` can fit any arm in `dst`
+/// (used when `dst` has no arm with `arm.kind_key()`).
+fn arm_cannot_fit_dst(arm: &Shape, dst: &[Shape]) -> bool {
+    match arm {
+        Shape::Bool | Shape::Int { .. } | Shape::Atom(_) | Shape::Set { .. } => dst.iter().all(|d| d.kind_key() != arm.kind_key()),
+        Shape::Record(fs) if !fs.is_empty() => {
+            dst.iter().all(|d| !matches!(d, Shape::Fcn { .. } | Shape::Map { .. }) && d.kind_key() != arm.kind_key())
+        }
+        _ => false,
     }
 }
 

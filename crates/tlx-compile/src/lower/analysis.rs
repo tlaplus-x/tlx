@@ -260,6 +260,47 @@ impl Lowerer<'_> {
         env.binds.iter().any(|(_, b)| matches!(b, LBind::Thunk(t, _) if self.expr_volatile(t)))
     }
 
+    /// Whether evaluating `e` may create new strings (also through by-name
+    /// arguments and operator lambdas captured in `env`): string creation
+    /// order affects TLC's string order. Deduplicates shared captured
+    /// environments so multi-parameter recursive inlining stays linear.
+    pub(super) fn expr_makes_strings(&self, e: &hir::Expr, env: &LEnv) -> bool {
+        use std::sync::Arc;
+        if self.strings.expr_in(e, &env.base) {
+            return true;
+        }
+        if env.binds.is_empty() {
+            return false;
+        }
+        let mut seen_env = std::collections::HashSet::new();
+        let mut seen_expr = std::collections::HashSet::new();
+        let mut todo: Vec<&LEnv> = Vec::new();
+        // `LEnv` is immutable and only copied as a whole `(binds, base)` pair,
+        // so `Arc::as_ptr(&binds)` uniquely identifies the non-empty bindings
+        // list and its accompanying `base`.
+        if seen_env.insert(Arc::as_ptr(&env.binds) as usize) {
+            todo.push(env);
+        }
+        while let Some(cur) = todo.pop() {
+            for (_, b) in cur.binds.iter() {
+                let (x, xenv) = match b {
+                    LBind::Thunk(t, tenv) => (t, tenv),
+                    LBind::Op(super::LOp::Lambda(_, body, lenv)) => (body, lenv),
+                    _ => continue,
+                };
+                if seen_expr.insert((Arc::as_ptr(&x.kind) as usize, Arc::as_ptr(&xenv.binds) as usize))
+                    && self.strings.expr_in(x, &xenv.base)
+                {
+                    return true;
+                }
+                if !xenv.binds.is_empty() && seen_env.insert(Arc::as_ptr(&xenv.binds) as usize) {
+                    todo.push(xenv);
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn expr_volatile(&self, e: &hir::Expr) -> bool {
         let here = match &*e.kind {
             H::Builtin { op, .. } => is_volatile_builtin(*op),

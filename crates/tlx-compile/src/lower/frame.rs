@@ -62,6 +62,9 @@ pub struct Frame {
     pub(super) fn_result: Vec<(hir::DefId, Ty)>,
     /// Lowering the argument of a prime: variables read the next state.
     pub(super) primed: bool,
+    /// Lowering the function operand of a `FnApp` (TLC's `KeepLazy`):
+    /// function constructors must not be built eagerly.
+    pub(super) keep_lazy: bool,
 }
 
 impl Frame {

@@ -31,6 +31,16 @@ fn shape_may_hold_set(s: &Shape) -> bool {
     found
 }
 
+fn value_has_lazy_or_interval(v: &Value) -> bool {
+    match v {
+        Value::Interval(..) | Value::LazySet(_) | Value::LazyFcn(_) => true,
+        Value::Set(es) | Value::Tuple(es) => es.iter().any(value_has_lazy_or_interval),
+        Value::Record(fs) => fs.iter().any(|(_, x)| value_has_lazy_or_interval(x)),
+        Value::Fcn(ps, _) => ps.iter().any(|(k, x)| value_has_lazy_or_interval(k) || value_has_lazy_or_interval(x)),
+        _ => false,
+    }
+}
+
 impl Lowerer<'_> {
     /// `s \subseteq t`, also membership in an already lowered powerset.
     /// Only total comparable element universes may bypass boxed membership.
@@ -679,6 +689,80 @@ impl Lowerer<'_> {
         self.preserves_lazy_into_in(e, env, shape, depth, mode, &mut seen)
     }
 
+    /// Whether an already-lowered IR expression `x` cannot hold any lazy set
+    /// or interval whose representation `target` would lose.
+    fn ir_preserves_lazy(&self, x: &Expr, target: &Shape, extensional: bool) -> bool {
+        match x.ty {
+            Ty::Bool | Ty::Int => true,
+            Ty::Enc(xsid) => {
+                let xs = self.typing.shape(xsid);
+                matches!(target, Shape::Ref(_))
+                    || (!xs.has_dynamic_witness()
+                        && !tlx_layout::layout::has_ref(xs)
+                        && (!matches!(target, Shape::Set { .. }) || matches!(xs, Shape::Set { .. })))
+            }
+            Ty::Val => match &*x.kind {
+                ExprKind::Const(v) => {
+                    let ext_set = extensional && matches!(target, Shape::Set { .. });
+                    typed::const_preserves_lazy(v, ext_set)
+                        && (!matches!(target, Shape::Set { .. }) || ext_set || matches!(v, Value::Set(_)))
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Whether `x` is guaranteed to hold no `LazySet` or `Value::Interval`
+    /// anywhere inside it (so any field/element projection or sequence slice
+    /// of it is also free of lazy sets and intervals).
+    fn ir_free_of_lazy(&self, x: &Expr) -> bool {
+        match x.ty {
+            Ty::Bool | Ty::Int => true,
+            Ty::Enc(xsid) => {
+                let xs = self.typing.shape(xsid);
+                !xs.has_dynamic_witness() && !tlx_layout::layout::has_ref(xs)
+            }
+            Ty::Val => matches!(&*x.kind, ExprKind::Const(v) if !value_has_lazy_or_interval(v)),
+        }
+    }
+
+    /// Whether `e` is guaranteed to evaluate to a value containing no
+    /// `LazySet` or `Value::Interval` anywhere inside it.
+    fn expr_free_of_lazy(&self, e: &hir::Expr, env: &LEnv, depth: usize) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if let Some(v) = self.const_value(e, env) {
+            return !value_has_lazy_or_interval(&v);
+        }
+        let (p, penv) = self.peel(e, env).unwrap_or_else(|| (e.clone(), env.clone()));
+        match &*p.kind {
+            H::Var(v) => {
+                !self.primed
+                    && self.shape_of(self.var_ty(v.idx())).is_some_and(|vs| !vs.has_dynamic_witness() && !tlx_layout::layout::has_ref(vs))
+            }
+            H::Local(l) => matches!(penv.lookup(*l, &self.ip.prog), Some(LBind::Ir(x)) if self.ir_free_of_lazy(&x)),
+            H::Apply { op: hir::OpRef::Def(d), args } if args.is_empty() && !self.primed => {
+                matches!(penv.lookup(tlx_eval::env::let_cache_key(*d), &self.ip.prog), Some(LBind::Ir(x)) if self.ir_free_of_lazy(&x))
+            }
+            H::At => self.at.as_ref().is_some_and(|x| self.ir_free_of_lazy(x)),
+            H::Field { record, .. } | H::FnApp { func: record, .. } => self.expr_free_of_lazy(record, &penv, depth - 1),
+            H::Builtin { op: op @ (B::Head | B::Tail | B::SubSeq), args } if !self.ip.is_builtin_overridden(*op) && !args.is_empty() => {
+                self.expr_free_of_lazy(&args[0], &penv, depth - 1)
+            }
+            H::Builtin { op: op @ (B::Concat | B::Append), args } if !self.ip.is_builtin_overridden(*op) && args.len() == 2 => {
+                self.expr_free_of_lazy(&args[0], &penv, depth - 1) && self.expr_free_of_lazy(&args[1], &penv, depth - 1)
+            }
+            H::If { then, els, .. } => self.expr_free_of_lazy(then, &penv, depth - 1) && self.expr_free_of_lazy(els, &penv, depth - 1),
+            H::Case { arms, other } => {
+                arms.iter().all(|(_, v)| self.expr_free_of_lazy(v, &penv, depth - 1))
+                    && other.as_ref().is_none_or(|o| self.expr_free_of_lazy(o, &penv, depth - 1))
+            }
+            H::Let { body, .. } => self.expr_free_of_lazy(body, &penv, depth - 1),
+            _ => false,
+        }
+    }
+
     fn preserves_lazy_into_in(
         &self,
         e: &hir::Expr,
@@ -707,8 +791,30 @@ impl Lowerer<'_> {
                     && (matches!(shape, Shape::Ref(_))
                         || matches!(
                             self.shape_of(self.var_ty(v.idx())),
-                            Some(vs) if !vs.has_dynamic_witness() && (!matches!(shape, Shape::Set { .. }) || matches!(vs, Shape::Set { .. }))
+                            Some(vs) if !vs.has_dynamic_witness()
+                                && !tlx_layout::layout::has_ref(vs)
+                                && (!matches!(shape, Shape::Set { .. }) || matches!(vs, Shape::Set { .. }))
                         ));
+            }
+            H::Local(l) => {
+                if let Some(LBind::Ir(x)) = penv.lookup(*l, &self.ip.prog) {
+                    return self.ir_preserves_lazy(&x, shape, extensional);
+                }
+            }
+            H::Apply { op: hir::OpRef::Def(d), args } if args.is_empty() && !self.primed => {
+                if let Some(LBind::Ir(x)) = penv.lookup(tlx_eval::env::let_cache_key(*d), &self.ip.prog) {
+                    return self.ir_preserves_lazy(&x, shape, extensional);
+                }
+            }
+            H::At => {
+                if let Some(at) = &self.at {
+                    return self.ir_preserves_lazy(at, shape, extensional);
+                }
+            }
+            H::Field { .. } | H::FnApp { .. } => {
+                if self.expr_free_of_lazy(&p, &penv, depth) {
+                    return true;
+                }
             }
             H::If { then, els, .. } => {
                 return self.preserves_lazy_into_in(then, &penv, shape, depth - 1, mode, seen)
@@ -724,9 +830,18 @@ impl Lowerer<'_> {
                 if seen.contains(&def) {
                     return mode == expr::SetMode::SetExt && matches!(shape, Shape::Set { elem, .. } if !shape_may_hold_set(elem));
                 }
-                return self.def_target(*d, &penv).is_some_and(|(_, body, base, _)| {
+                return self.def_target(*d, &penv).is_some_and(|(params, body, base, _)| {
+                    if params.len() != args.len() {
+                        return false;
+                    }
+                    let mut env2 = base;
+                    for (param, arg) in params.iter().zip(args) {
+                        if self.ip.prog.locals[param.idx()].arity == 0 {
+                            env2 = env2.bind(*param, LBind::Thunk(arg.clone(), penv.clone()));
+                        }
+                    }
                     seen.push(def);
-                    let ok = self.preserves_lazy_into_in(&body, &base, shape, depth - 1, mode, seen);
+                    let ok = self.preserves_lazy_into_in(&body, &env2, shape, depth - 1, mode, seen);
                     seen.pop();
                     ok
                 });
@@ -776,9 +891,29 @@ impl Lowerer<'_> {
                     self.preserves_lazy_into_in(&args[0], &penv, &outer, depth - 1, expr::SetMode::Exact, seen)
                 }
             }
-            (H::Builtin { op: B::Cup, args }, Shape::Set { .. }) if !self.ip.is_builtin_overridden(B::Cup) => {
+            (H::Builtin { op: op @ (B::Cup | B::Cap | B::SetMinus), args }, Shape::Set { .. })
+                if !self.ip.is_builtin_overridden(*op) && args.len() == 2 =>
+            {
                 self.preserves_lazy_into_in(&args[0], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
                     && self.preserves_lazy_into_in(&args[1], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Builtin { op: B::Concat, args }, Shape::Seq { .. }) if !self.ip.is_builtin_overridden(B::Concat) && args.len() == 2 => {
+                self.preserves_lazy_into_in(&args[0], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+                    && self.preserves_lazy_into_in(&args[1], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Builtin { op: op @ (B::SubSeq | B::Tail), args }, Shape::Seq { .. })
+                if !self.ip.is_builtin_overridden(*op) && !args.is_empty() =>
+            {
+                self.preserves_lazy_into_in(&args[0], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Builtin { op: B::Append, args }, Shape::Seq { elem, .. })
+                if !self.ip.is_builtin_overridden(B::Append) && args.len() == 2 =>
+            {
+                self.preserves_lazy_into_in(&args[0], &penv, shape, depth - 1, expr::SetMode::Exact, seen)
+                    && self.preserves_lazy_into_in(&args[1], &penv, elem, depth - 1, expr::SetMode::Exact, seen)
+            }
+            (H::Builtin { op: B::Head, args }, _) if !self.ip.is_builtin_overridden(B::Head) && args.len() == 1 => {
+                self.expr_free_of_lazy(&args[0], &penv, depth - 1)
             }
             (H::Record(fields), Shape::Record(fs)) if fields.len() == fs.len() => fs.iter().all(|(name, fshape)| {
                 fields

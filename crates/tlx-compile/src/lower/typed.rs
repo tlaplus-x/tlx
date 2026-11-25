@@ -114,7 +114,9 @@ impl Lowerer<'_> {
                     return Some(x);
                 }
                 // f[a, b] = f[<<a, b>>] on a product domain.
+                let prev_lazy = std::mem::replace(&mut self.keep_lazy, true);
                 let f = self.expr(func, env, st);
+                self.keep_lazy = prev_lazy;
                 let f = self.encode_const_fn(f);
                 let comps: Vec<Expr> = args.iter().map(|a| self.expr(a, env, st)).collect();
                 self.apply_product(f, comps)
@@ -755,10 +757,10 @@ impl Lowerer<'_> {
             return Some((w, b.clone()));
         }
         // Two unions: one embedded into the other.
-        if let Some(a2) = self.union_to_union(a, y) {
+        if let Some(a2) = self.union_to_union(a, y, false) {
             return Some((a2, b.clone()));
         }
-        if let Some(b2) = self.union_to_union(b, x) {
+        if let Some(b2) = self.union_to_union(b, x, false) {
             return Some((a.clone(), b2));
         }
         // A union and a value of the kind of one of its arms: the value
