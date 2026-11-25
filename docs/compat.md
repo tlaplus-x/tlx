@@ -246,8 +246,10 @@ This is the single source for known limitations ([design.md](design.md) and
   uses the result of the faithful pre-run only when that pre-run exhausts the state space
   ([design.md](design.md) section 6.5.1), a non-faithful pre-run that exhausts it still leads to compilation.
 - **Runtime** (results are not affected): NUMA sharding is not done ([design.md](design.md)
-  section 7.7); with oversubscription a descheduled worker still holds the block it claimed and the
-  level barrier waits for it.
+  section 7.7); with oversubscription the level barrier waits for a descheduled worker — the blocks
+  claimed near the end of a level are staged so that the other workers expand their states
+  ([scale.md](scale.md) section 5.2), but a block claimed earlier in the level, and the state a worker
+  is expanding, stay with it.
 - **Output** (outside the contract, section 2): the wording of some evaluation errors differs from
   TLC's; the nested-expressions call stack of `-tool` message 2103, the message text and location
   suffix of general evaluation errors are not reproduced; the extra behaviors TLC's simulator

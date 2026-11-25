@@ -8,6 +8,13 @@
 //! worker submits its blocks before the barrier, and the barrier leader
 //! installs the next level (`Frontier::install`).
 //!
+//! Near the end of a parallel level (few states left to claim) a worker
+//! stages the block it claims (`Staged`) instead of keeping it to itself:
+//! the workers that find nothing more to claim then steal its states in
+//! batches, so that a descheduled worker does not hold up the level barrier
+//! with the block it claimed (docs/scale.md §5.2). A narrow level that one
+//! worker expands alone stages nothing (`Local::share`).
+//!
 //! While the search may be resumed (`super::resume`), every worker also
 //! keeps the states it is done with in its part of the archive
 //! (docs/scale.md §6): compressed blocks move there whole once read,
@@ -21,9 +28,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::io::{IoError, Spill};
 use crate::queue::codec::XorPrev;
-use crate::queue::{Block, Config, Mem, Queue, Reader, StateCodec, Writer};
+use crate::queue::{Block, Config, Mem, Queue, Reader, StateCodec, Writer, BLOCK};
 
 pub(super) use crate::queue::Task;
 
@@ -31,6 +40,19 @@ pub(super) use crate::queue::Task;
 #[repr(align(128))]
 #[derive(Default)]
 struct Held(AtomicU64);
+
+/// A block claimed near the end of a level, which the other workers may
+/// steal the states of (`Local::steal`); see `docs/scale.md` §5.2.
+struct Staged<S> {
+    reader: Reader<S>,
+    /// The previous record of an encoded block, kept with it: whichever
+    /// worker reads the next state decodes it from here.
+    prev: XorPrev,
+    /// The block is a compressed one, moved to the archive of the worker
+    /// that claimed it, whole, once read: its states are not archived one by
+    /// one (see `Local::retire`).
+    moving: bool,
+}
 
 /// The shared part of the frontier.
 pub(super) struct Frontier<'m, S> {
@@ -40,24 +62,44 @@ pub(super) struct Frontier<'m, S> {
     /// Per worker: the states left in its claimed block and its next-level
     /// states.
     held: Box<[Held]>,
+    /// Per worker, with several workers: the block it claimed near the end
+    /// of a level, which the others steal the states of.
+    staged: Box<[Mutex<Option<Staged<S>>>]>,
+    /// Per worker: the states left in the block it staged, updated under the
+    /// slot's lock as they are read (whoever reads them), so that `queued`
+    /// counts them without taking the lock.
+    staged_left: Box<[AtomicU64]>,
 }
 
 /// A worker's part of the frontier.
 pub(super) struct Local<'f, 'm, S> {
     fr: &'f Frontier<'m, S>,
     me: usize,
-    /// The claimed block being expanded.
+    /// The claimed block being expanded, while this worker keeps it (with
+    /// one worker, or with several early in a level: near the end of a
+    /// level the block is staged, see `Frontier::staged`).
     reader: Option<Reader<S>>,
     prev: XorPrev,
     /// A state done with, whose storage a decoded state may reuse.
     spare: Option<S>,
+    /// States taken from a staged block, to expand next: the block's slot is
+    /// locked once per batch (`STAGED_BATCH` states, `STAGED_BATCH_BYTES`
+    /// bytes), not per state. (Their own memory is not charged to the
+    /// queue's: a batch is bounded, and the block keeps the charge of its
+    /// records.)
+    batch: Vec<Task<S>>,
     /// The states of the next level.
     writer: Writer<S>,
     /// This worker's part of the archive, while archiving.
     archive: Option<Writer<S>>,
-    /// The claimed block is compressed: moved to the archive once read
-    /// (its states are not archived one by one).
+    /// The block of the states being expanded is compressed (and this worker
+    /// archives): it moves to the archive whole, so its states are not
+    /// archived one by one.
     moving: bool,
+    /// The blocks this worker claims are staged for the others to steal
+    /// from: a level expanded in parallel (`Local::share`). The blocks of a
+    /// narrow level expanded by this worker alone stay private.
+    sharing: bool,
     /// An error reading a spilled segment back (the search stops).
     io_error: Option<IoError>,
 }
@@ -68,10 +110,13 @@ impl<'m, S> Frontier<'m, S> {
     /// go to `spill`.
     pub(super) fn new(n: usize, codec: Option<&'m dyn StateCodec<S>>, cfg: Config, archive: Arc<Mem>, spill: &Spill) -> Frontier<'m, S> {
         let words = codec.map_or(0, |c| c.words());
+        let workers = n.max(1);
         Frontier {
-            queue: Queue::new(codec, cfg, n).with_spill(spill, "queue"),
+            queue: Queue::new(codec, cfg, workers).with_spill(spill, "queue"),
             archive: Queue::archive(codec, words, cfg.seg_bytes, archive).with_spill(spill, "archive"),
-            held: (0..n).map(|_| Held::default()).collect(),
+            held: (0..workers).map(|_| Held::default()).collect(),
+            staged: (0..workers).map(|_| Mutex::new(None)).collect(),
+            staged_left: (0..workers).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 
@@ -85,16 +130,22 @@ impl<'m, S> Frontier<'m, S> {
             reader: None,
             prev: self.queue.scratch(),
             spare: None,
+            batch: Vec::new(),
             writer: self.queue.writer(),
             archive,
             moving: false,
+            sharing: self.staged.len() > 1,
             io_error: None,
         }
     }
 
     /// The number of tasks queued (current level and next one).
     pub(super) fn queued(&self) -> u64 {
-        self.queue.unclaimed() + self.held.iter().map(|h| h.0.load(Ordering::Relaxed)).sum::<u64>()
+        // (The states of a staged block are counted where they are taken
+        // from, by whoever takes them.)
+        let staged: u64 = self.staged_left.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        let held: u64 = self.held.iter().map(|h| h.0.load(Ordering::Relaxed)).sum();
+        self.queue.unclaimed() + staged + held
     }
 
     /// Level-synchronous search, by the barrier leader: make the blocks
@@ -184,11 +235,45 @@ impl<'m, S> Frontier<'m, S> {
     }
 }
 
+/// The states left to claim below which a claimed block is staged for
+/// stealing: the last two blocks of each worker of a level, where the states
+/// a descheduled worker holds would otherwise hold up the level barrier.
+/// (Guided self-scheduling takes about `1/(2 * workers)` of the states left,
+/// but an XOR block is claimed whole.)
+fn staging_below(workers: usize) -> u64 {
+    2 * workers as u64 * BLOCK as u64
+}
+
+/// The states a worker takes from a staged block at a time, under one lock:
+/// sharing a block costs a lock (and a move of the slot's cache line) per
+/// batch, and a worker descheduled with a batch left costs at most this many
+/// expansions at the barrier. Never more than half of what is left, so that
+/// the rest stays stealable.
+const STAGED_BATCH: usize = 32;
+
+/// The bytes of decoded states a batch may hold: a batch is not charged to
+/// the queue's memory (the block is, for its encoded records), so a wide
+/// state is taken alone, decoded into the buffer the worker recycles after
+/// each expansion, rather than 32 of them being held per worker.
+const STAGED_BATCH_BYTES: usize = 64 << 10;
+
 impl<S> Local<'_, '_, S> {
     #[inline]
     fn publish(&self) {
-        let n = self.reader.as_ref().map_or(0, |r| r.left()) + self.writer.len();
+        // (A staged block's states are counted at its slot, see
+        // `Frontier::queued`: publishing takes no lock.)
+        let n = self.reader.as_ref().map_or(0, |r| r.left()) + self.batch.len() + self.writer.len();
         self.fr.held[self.me].0.store(n as u64, Ordering::Relaxed);
+    }
+
+    /// Stage the blocks this worker claims for the others to steal (`on`):
+    /// a level expanded in parallel. A narrow level that this worker expands
+    /// alone keeps its blocks private: its peers wait at the barrier, so
+    /// staging them would only add locks (and the scan of their slots).
+    pub(super) fn share(&mut self, on: bool) {
+        debug_assert!(self.batch.is_empty(), "a batch left at the end of a level");
+        debug_assert!(on || !self.sharing || self.fr.staged[self.me].lock().is_none(), "a staged block left");
+        self.sharing = on && self.fr.staged.len() > 1;
     }
 
     /// Queue a task of the next level (or of the first one: an initial or
@@ -199,42 +284,155 @@ impl<S> Local<'_, '_, S> {
         self.publish();
     }
 
-    /// The next task of the current level: from the claimed block, else
-    /// from a newly claimed one.
+    /// The next task of the current level: from the block this worker
+    /// claimed (or stolen from another worker's, near the end of a level),
+    /// else from a newly claimed one.
     #[inline]
     pub(super) fn pop(&mut self) -> Option<Task<S>> {
+        let t = match self.batch.pop() {
+            Some(t) => Some(t),
+            None => match self.read_own() {
+                Some(t) => Some(t),
+                None => match self.claim() {
+                    Some(t) => Some(t),
+                    None => self.steal(),
+                },
+            },
+        };
+        self.publish();
+        t
+    }
+
+    /// Take up to `STAGED_BATCH` states of the block in `slot` into the
+    /// batch, under its lock: one state of them.
+    fn take_batch(&mut self, slot: &mut parking_lot::MutexGuard<'_, Option<Staged<S>>>, me: usize) -> Option<Task<S>> {
+        debug_assert!(self.batch.is_empty(), "a batch is read before another is taken");
+        let st = slot.as_mut()?;
+        let left = st.reader.left();
+        // (A decoded state takes about its words; an object state is not
+        // decoded here, and counts by state only.)
+        let state_bytes = (8 * self.fr.queue.words()).max(1);
+        let by_bytes = (STAGED_BATCH_BYTES / state_bytes).max(1);
+        let k = left.min(STAGED_BATCH).min(left.div_ceil(2)).min(by_bytes);
+        for _ in 0..k {
+            match self.fr.queue.read(&mut st.reader, &mut st.prev, &mut self.spare) {
+                Some(t) => self.batch.push(t),
+                None => break,
+            }
+        }
+        self.fr.staged_left[me].store(st.reader.left() as u64, Ordering::Relaxed);
+        self.moving = st.moving;
+        // (The batch is read from its end.)
+        self.batch.reverse();
+        self.batch.pop()
+    }
+
+    /// The next state of the block this worker claimed, if it has one left;
+    /// the block is dropped once read (and moved to the archive whole if it
+    /// is compressed).
+    fn read_own(&mut self) -> Option<Task<S>> {
         let q = &self.fr.queue;
-        loop {
-            if let Some(r) = &mut self.reader {
-                if let Some(t) = q.read(r, &mut self.prev, &mut self.spare) {
-                    self.publish();
-                    return Some(t);
-                }
+        if let Some(r) = self.reader.as_mut() {
+            if let Some(t) = q.read(r, &mut self.prev, &mut self.spare) {
+                return Some(t);
             }
-            if self.moving {
-                self.move_read();
+        }
+        if let Some(r) = self.reader.take() {
+            // (Taken with the last state: an exhausted reader must not
+            // outlive its block, or the `moving` of a block read later — a
+            // stolen batch, say — would move it to the archive. Whether it
+            // is whole is the reader's own business.)
+            self.moving = false;
+            if let (Some(a), true) = (&mut self.archive, r.compressed()) {
+                self.fr.archive.append(a, r.into_block());
             }
-            self.reader = match q.claim(self.me, &mut self.prev) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.io_error = Some(e);
-                    None
+            return None;
+        }
+        if !self.sharing {
+            return None;
+        }
+        let mut slot = self.fr.staged[self.me].lock();
+        let st = slot.as_mut()?;
+        if st.reader.left() == 0 {
+            let st = slot.take().expect("the block claimed last");
+            drop(slot);
+            self.moving = false;
+            if let (Some(a), true) = (&mut self.archive, st.moving) {
+                self.fr.archive.append(a, st.reader.into_block());
+            }
+            return None;
+        }
+        self.take_batch(&mut slot, self.me)
+    }
+
+    /// Claim a block of the current level: one state of it. Near the end of
+    /// a level the block is staged where the other workers can steal its
+    /// states, so that a descheduled worker does not hold up the level
+    /// barrier with them.
+    fn claim(&mut self) -> Option<Task<S>> {
+        let q = &self.fr.queue;
+        if self.sharing && q.unclaimed() <= staging_below(self.fr.staged.len()) {
+            let mut slot = self.fr.staged[self.me].lock();
+            debug_assert!(slot.is_none(), "the block claimed last is still staged");
+            debug_assert!(self.reader.is_none(), "a kept block left before a claim");
+            match q.claim(self.me, &mut self.prev) {
+                Ok(Some(r)) => {
+                    let moving = self.archive.is_some() && r.compressed();
+                    self.fr.staged_left[self.me].store(r.left() as u64, Ordering::Relaxed);
+                    *slot = Some(Staged { reader: r, prev: q.scratch(), moving });
                 }
-            };
-            match &self.reader {
-                Some(r) => self.moving = self.archive.is_some() && r.compressed(),
-                None => return None,
+                Ok(None) => {}
+                Err(e) => self.io_error = Some(e),
+            }
+            drop(slot);
+            return self.read_own();
+        }
+        // (A unit test lets another worker claim the rest of the level here,
+        // so that the private claim below finds nothing.)
+        #[cfg(test)]
+        if let Some(gate) = tests::CLAIM_GATE.take() {
+            gate.wait();
+            gate.wait();
+        }
+        match q.claim(self.me, &mut self.prev) {
+            Ok(Some(r)) => {
+                self.moving = self.archive.is_some() && r.compressed();
+                self.reader = Some(r);
+                self.read_own()
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.io_error = Some(e);
+                None
             }
         }
     }
 
-    /// Move the compressed block read (all of it) to the archive.
-    #[cold]
-    fn move_read(&mut self) {
-        self.moving = false;
-        if let (Some(r), Some(a)) = (self.reader.take(), &mut self.archive) {
-            self.fr.archive.append(a, r.into_block());
+    /// A state of a block another worker staged near the end of the level,
+    /// which this worker would otherwise wait for at the barrier.
+    fn steal(&mut self) -> Option<Task<S>> {
+        if !self.sharing {
+            return None;
         }
+        let n = self.fr.staged.len();
+        for k in 1..n {
+            let i = (self.me + k) % n;
+            // (The states left are counted at the slot: an empty one costs a
+            // load, not a lock.)
+            if self.fr.staged_left[i].load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let mut slot = self.fr.staged[i].lock();
+            let Some(st) = slot.as_mut() else { continue };
+            // (Read: its worker moves it to the archive.)
+            if st.reader.left() == 0 {
+                continue;
+            }
+            if let Some(t) = self.take_batch(&mut slot, i) {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// Done with state `s` (expanded): its storage may be reused.
@@ -358,13 +556,25 @@ impl<S> Local<'_, '_, S> {
     }
 
     /// At the end of the search: remove the tasks left that this worker
-    /// holds or can claim (its claimed block, unclaimed blocks of the
-    /// current level, its next-level tasks). Returns their number. While
-    /// archiving, those of the current level are archived (in queue order).
+    /// holds or can claim (its claimed block, staged or not, unclaimed
+    /// blocks of the current level, its next-level tasks). Returns their
+    /// number. While archiving, those of the current level are archived (in
+    /// queue order).
     pub(super) fn drain(&mut self) -> usize {
         let q = &self.fr.queue;
         let mut n = 0;
-        let mut held = self.reader.take();
+        // (The states taken from a staged block but not expanded: their
+        // block archives them if it moves whole, else they are archived one
+        // by one below.)
+        let batch = std::mem::take(&mut self.batch);
+        let moved = self.moving;
+        // (A staged block is this worker's too; the others may have taken
+        // some of its states.)
+        let mut held = self.reader.take().or_else(|| {
+            let mut slot = self.fr.staged[self.me].lock();
+            self.fr.staged_left[self.me].store(0, Ordering::Relaxed);
+            slot.take().map(|st| st.reader)
+        });
         // (Compressed blocks move whole below; other states are archived
         // one by one.)
         self.moving = false;
@@ -386,6 +596,12 @@ impl<S> Local<'_, '_, S> {
                 }
             }
             for t in tasks.drain(..) {
+                self.retire(t);
+            }
+        }
+        for t in batch {
+            n += 1;
+            if !moved {
                 self.retire(t);
             }
         }
@@ -466,6 +682,257 @@ mod tests {
             }
             assert_eq!(l.drain(), i as usize - expand);
             assert_eq!(archived(&fr, &mut l), (0..i).collect::<Vec<_>>(), "{kinds:?} {expand}");
+        }
+    }
+
+    /// One level of `n` states of depth 1, written by worker 0, current.
+    fn level(a: &mut Local<'_, '_, Vec<u64>>, n: u64) {
+        for i in 0..n {
+            a.push_new(Task { state: vec![i, i / 2, 7], log: i, depth: 1 });
+        }
+        a.advance();
+    }
+
+    /// Near the end of a level the block a worker claims is staged: a worker
+    /// that finds nothing more to claim expands the states the first one has
+    /// not, one at a time, so that the level ends without it (a descheduled
+    /// worker would otherwise hold up the barrier with the rest of its
+    /// block).
+    #[test]
+    fn idle_workers_steal_a_stalled_workers_block() {
+        for compressed in [false, true] {
+            let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 4096, compress_above: 1 << 30 };
+            let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(4096, false), &Spill::default());
+            fr.squeeze(compressed);
+            let mut a = fr.local(0, false);
+            let mut b = fr.local(1, false);
+            level(&mut a, BLOCK as u64);
+            // Worker 0 claims the block (whole if compressed, else its last
+            // part), expands one state, and is descheduled.
+            let first = a.pop().unwrap().log;
+            let staged = fr.staged[0].lock().as_ref().map(|st| st.reader.left());
+            assert!(staged.is_some_and(|left| left > 0), "a staged block: {compressed}");
+            assert_eq!(fr.queued(), BLOCK as u64 - 1, "the staged states are queued: {compressed}");
+            // Worker 1 claims the rest of the level, then steals the states
+            // worker 0 has not expanded.
+            let mut seen = vec![0u8; BLOCK];
+            seen[first as usize] += 1;
+            while let Some(t) = b.pop() {
+                seen[t.log as usize] += 1;
+            }
+            // Worker 1 took the states of worker 0's block (the block is
+            // read, and dropped by its own worker): the queue counts only the
+            // batch worker 0 had taken, not the states a thief consumed.
+            assert_eq!(fr.staged[0].lock().as_ref().map(|st| st.reader.left()), Some(0), "compressed={compressed}");
+            assert_eq!(fr.queued(), (STAGED_BATCH - 1) as u64, "compressed={compressed}");
+            // Worker 0 expands the batch it held, and has nothing left.
+            while let Some(t) = a.pop() {
+                seen[t.log as usize] += 1;
+            }
+            assert!(seen.iter().all(|&c| c == 1), "compressed={compressed}");
+            assert_eq!(fr.queued(), 0, "compressed={compressed}");
+            assert!(fr.staged[0].lock().is_none());
+            assert!(a.take_io_error().is_none() && b.take_io_error().is_none());
+            fr.queue_mem().clear_pool();
+            assert_eq!(fr.queue_mem().bytes(), 0);
+        }
+    }
+
+    /// A worker that keeps a block early in a level goes on reading it after
+    /// the level's end has been reached (the blocks claimed after it are
+    /// staged): none of its states is lost. A block of a level expanded alone
+    /// is never staged.
+    #[test]
+    fn a_kept_block_is_read_after_the_end_of_the_level() {
+        let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 4096, compress_above: 1 << 30 };
+        let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(4096, false), &Spill::default());
+        let mut a = fr.local(0, false);
+        let mut b = fr.local(1, false);
+        // (Wide enough that the first claim keeps its block.)
+        let n = staging_below(2) + BLOCK as u64;
+        level(&mut a, n);
+        let mut seen = vec![0u8; n as usize];
+        // Worker 0 expands the level alone (as a narrow level is): its blocks
+        // are not staged for stealing.
+        a.share(false);
+        let t = a.pop().unwrap();
+        seen[t.log as usize] += 1;
+        assert!(fr.staged[0].lock().is_none(), "a block of a level expanded alone is kept");
+        while let Some(t) = b.pop() {
+            seen[t.log as usize] += 1;
+        }
+        // Worker 0 goes on with the block it kept.
+        while let Some(t) = a.pop() {
+            seen[t.log as usize] += 1;
+        }
+        assert!(seen.iter().all(|&c| c == 1), "{seen:?}");
+        assert_eq!(fr.queued(), 0);
+    }
+
+    /// States of `n` words, the first their log.
+    struct Wide(usize);
+
+    impl StateCodec<Vec<u64>> for Wide {
+        fn words(&self) -> usize {
+            self.0
+        }
+        fn encode(&self, s: &Vec<u64>, out: &mut [u64]) -> u64 {
+            out.copy_from_slice(s);
+            s[0].wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        fn decode(&self, w: &[u64], _depth: u32, _fp: u64) -> Vec<u64> {
+            w.to_vec()
+        }
+    }
+
+    thread_local! {
+        /// A gate a unit test sets to interleave another worker's claims
+        /// with the private claim of the worker that takes it.
+        pub(super) static CLAIM_GATE: std::cell::RefCell<Option<Arc<std::sync::Barrier>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// An exhausted kept reader is taken when it is read dry, so it cannot
+    /// outlive its block: with the other worker left holding a staged
+    /// compressed block, this worker steals a batch (which sets `moving`)
+    /// and the stale reader would be moved to the encoded archive — an empty
+    /// block that makes a checkpoint skip the worker's archive whole.
+    #[test]
+    fn interleaved_private_claim_leaves_an_encoded_archive() {
+        // (Auto: the first block is of objects, the rest are compressed.)
+        let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 1 << 20, compress_above: 1 << 30 };
+        let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(1 << 20, false), &Spill::default());
+        let mut a = fr.local(0, true);
+        let mut b = fr.local(1, true);
+        for i in 0..6 * BLOCK as u64 {
+            fr.squeeze(i >= BLOCK as u64);
+            a.push_new(Task { state: vec![i, i / 2, 7], log: i, depth: 1 });
+        }
+        a.advance();
+        for _ in 0..BLOCK {
+            let t = a.pop().unwrap();
+            a.retire(t);
+        }
+        assert_eq!(fr.queue.unclaimed(), 5 * BLOCK as u64);
+        // (Worker 0 selects the private claim path; worker 1 claims the rest
+        // of the level meanwhile, leaving its last compressed block staged.)
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        CLAIM_GATE.set(Some(gate.clone()));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                gate.wait();
+                while fr.queue.unclaimed() > 0 {
+                    let t = b.pop().unwrap();
+                    b.retire(t);
+                }
+                assert!(fr.staged_left[1].load(Ordering::Relaxed) > 0, "a staged block is left");
+                gate.wait();
+            });
+            while let Some(t) = a.pop() {
+                a.retire(t);
+            }
+        });
+        while let Some(t) = b.pop() {
+            b.retire(t);
+        }
+        let blocks = a.archived().unwrap();
+        assert!(blocks.iter().all(|b| b.encoded()), "an exhausted kept block reached the archive");
+    }
+
+    /// A batch is bounded by its decoded bytes as well as by its states: a
+    /// wide state is taken alone (its batch is empty), so the workers of a
+    /// memory-tight search do not each hold 32 decoded wide states.
+    #[test]
+    fn a_batch_is_bounded_by_decoded_bytes() {
+        let words = STAGED_BATCH_BYTES / 8;
+        let codec = Wide(words);
+        let cfg = Config { kinds: BlockKinds::Xor, seg_bytes: 1 << 20, compress_above: 0 };
+        let fr = Frontier::new(2, Some(&codec as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(1 << 20, false), &Spill::default());
+        let mut a = fr.local(0, false);
+        let mut b = fr.local(1, false);
+        for i in 0..BLOCK as u64 {
+            let mut state = vec![i; words];
+            state[1] = i / 2;
+            a.push_new(Task { state, log: i, depth: 1 });
+        }
+        a.advance();
+        // (The wide XOR block is claimed whole and staged.)
+        assert!(a.pop().is_some());
+        assert!(fr.staged[0].lock().as_ref().is_some_and(|st| st.reader.left() > 0), "a staged block");
+        assert_eq!(fr.held[0].0.load(Ordering::Relaxed), 0, "one state of {words} words per batch: no batch is held");
+        assert_eq!(fr.queued(), BLOCK as u64 - 1, "every state not yet expanded is still queued");
+        // (The other worker can steal the rest: every state is expanded once.)
+        let mut n = 1;
+        while let Some(t) = b.pop() {
+            assert_eq!(t.state.len(), words);
+            n += 1;
+        }
+        while let Some(t) = a.pop() {
+            assert_eq!(t.state.len(), words);
+            n += 1;
+        }
+        assert_eq!(n, BLOCK);
+        assert_eq!(fr.queued(), 0);
+    }
+
+    /// A narrow level expanded by one worker (the others wait at the
+    /// barrier) keeps its blocks private: nothing is staged, nothing is
+    /// stolen, and every state is still expanded exactly once.
+    #[test]
+    fn a_level_expanded_alone_stages_nothing() {
+        for compressed in [false, true] {
+            let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 4096, compress_above: 1 << 30 };
+            let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(4096, false), &Spill::default());
+            fr.squeeze(compressed);
+            let mut a = fr.local(0, false);
+            let mut b = fr.local(1, false);
+            level(&mut a, BLOCK as u64);
+            a.share(false);
+            let mut seen = vec![0u8; BLOCK];
+            let mut n = 0;
+            while let Some(t) = a.pop() {
+                seen[t.log as usize] += 1;
+                n += 1;
+                assert!(fr.staged[0].lock().is_none(), "staged in a level expanded alone: {compressed}");
+            }
+            assert_eq!(n, BLOCK, "compressed={compressed}");
+            assert!(seen.iter().all(|&c| c == 1), "compressed={compressed}");
+            assert!(b.pop().is_none());
+            assert_eq!(fr.queued(), 0, "compressed={compressed}");
+        }
+    }
+
+    /// Stealing loses and repeats no archived state: a compressed block moves
+    /// to the archive of the worker that claimed it whole (also when the
+    /// others stole its states), and the states of a block of objects are
+    /// archived one by one, by whoever expands them.
+    #[test]
+    fn stealing_keeps_the_archive_exact() {
+        for compressed in [false, true] {
+            let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 4096, compress_above: 1 << 30 };
+            let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(4096, false), &Spill::default());
+            fr.squeeze(compressed);
+            let mut a = fr.local(0, true);
+            let mut b = fr.local(1, true);
+            let n = 2 * BLOCK as u64;
+            level(&mut a, n);
+            // Worker 0 expands a few states, then stalls; worker 1 ends the
+            // level (and steals what worker 0 has left).
+            for _ in 0..3 {
+                let t = a.pop().unwrap();
+                a.retire(t);
+            }
+            while let Some(t) = b.pop() {
+                b.retire(t);
+            }
+            // (The batch worker 0 was taking when the level ended: it
+            // expanded three of its `STAGED_BATCH` states.)
+            assert_eq!(a.drain(), STAGED_BATCH - 3, "compressed={compressed}");
+            assert_eq!(b.drain(), 0, "compressed={compressed}");
+            let mut logs = archived(&fr, &mut a);
+            logs.extend(archived(&fr, &mut b));
+            logs.sort_unstable();
+            assert_eq!(logs, (0..n).collect::<Vec<_>>(), "compressed={compressed}");
         }
     }
 }

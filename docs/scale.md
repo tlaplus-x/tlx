@@ -329,10 +329,32 @@ A level is a set of per-worker block lists. A worker claims blocks (atomic curso
 list (cache locality), then from others in order; this replaces the work-stealing deque (equivalent under
 level synchronization, cheaper, order-preserving). At the end of a level, with several workers, a claim
 takes only the tail of a block (about remaining/(2 x workers) records, guided self-scheduling); XOR blocks
-are claimed whole. With one worker there is one list and the order is exactly FIFO. Segment buffers are
-pooled (at most 64) to avoid page-fault and `madvise` costs. Their retained capacity stays charged to
-the frontier budget until reused or freed; memory pressure drains the idle pool before spilling.
-`LiveStats::queue` is unexpanded states of the current level plus the next level.
+are claimed whole. With one worker there is one list and the order is exactly FIFO.
+
+**Stealing the states of a staged block.** A block claimed while at most `2 x workers x BLOCK` states are
+left to claim is *staged*: it moves to a per-worker slot (`Frontier::staged`, a mutex) and its worker reads
+its states from there like any other worker would. A worker that finds nothing more to claim takes the
+states of the staged blocks of the others in batches before it waits at the barrier (`Local::steal`): a
+descheduled worker then costs at most one batch of work at the barrier instead of the block it holds, up to
+256 states of an XOR block (which cannot be split: its records are coded against the previous one). A batch
+is at most 32 states, never more than half of what is left, and at most 64 KiB of decoded states, so the
+rest of a staged block stays stealable and a wide state (a few KiB to tens of KiB) is taken alone, into
+the buffer a worker recycles after each expansion: a batch is not charged to the queue's memory, and the
+block is charged for its encoded records. A batch takes the slot's lock once, and a slot with nothing left
+is recognised by the states counted at it, without a lock. A block claimed earlier in a level stays private, which keeps the steady
+state free of locking, and a narrow level expanded by one worker alone (its peers wait at the barrier,
+`levels.rs`) stages nothing at all. The states are decoded lazily: an object block stays charged while
+staged, and a compressed block is moved to the archive of the worker that claimed it, whole, once its
+records are read (before that worker arrives at the barrier); whoever expands one of its states, its worker
+or a thief, does not archive the state one by one (`Local::retire`). A block claimed at the moment another
+worker gives up (its claim is in flight, not yet staged) can stay with its worker: that costs one block of
+work at the barrier, as before.
+
+Segment buffers are pooled (at most 64) to avoid page-fault and `madvise` costs. Their retained capacity
+stays charged to the frontier budget until reused or freed; memory pressure drains the idle pool before
+spilling. `LiveStats::queue` is unexpanded states of the current level plus the next level; the states left in
+a staged block are counted at its slot, by whoever takes them, so a worker that steals them keeps the count
+exact (and publishing a worker's own count takes no lock).
 
 ### 5.3 Spilling and read-ahead
 
