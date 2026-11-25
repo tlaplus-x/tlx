@@ -2537,6 +2537,233 @@ theorem Val.selectSeq_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNa
       · exact ih
       · simp only [↓reduceIte, List.map_cons, ih]
 
+-- Sequence fold and commutative-associative mapped-set fold operations on Val
+theorem Val.cup_comm {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b : Val sizes A) :
+    Val.cup a b = Val.cup b a := by
+  induction a using Quotient.ind with
+  | _ ar =>
+    induction b using Quotient.ind with
+    | _ br =>
+      cases ar <;> cases br
+      all_goals try rfl
+      case set.set xs ys =>
+        change Val.set (xs.map mkVal ++ ys.map mkVal) = Val.set (ys.map mkVal ++ xs.map mkVal)
+        rw [Val.set_eq_iff]
+        intro v
+        simp only [List.mem_append]
+        exact Or.comm
+
+theorem Val.cup_assoc {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b c : Val sizes A) :
+    Val.cup (Val.cup a b) c = Val.cup a (Val.cup b c) := by
+  induction a using Quotient.ind with
+  | _ ar =>
+    induction b using Quotient.ind with
+    | _ br =>
+      induction c using Quotient.ind with
+      | _ cr =>
+        cases ar <;> cases br <;> cases cr
+        all_goals try rfl
+        case set.set.set xs ys zs =>
+          change Val.cup (Val.set (xs.map mkVal ++ ys.map mkVal)) (mkVal (.set zs)) =
+            Val.cup (mkVal (.set xs)) (Val.set (ys.map mkVal ++ zs.map mkVal))
+          unfold Val.set
+          change Val.set ((((xs.map mkVal ++ ys.map mkVal).map valOut).map mkVal) ++ zs.map mkVal) =
+            Val.set (xs.map mkVal ++ (((ys.map mkVal ++ zs.map mkVal).map valOut).map mkVal))
+          rw [Val.set_eq_iff]
+          intro v
+          simp only [List.mem_append, List.map_map, Function.comp_def, valOut_eq, List.map_id']
+          exact or_assoc
+
+private theorem Val.cap_mk_set {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (xs ys : List (RawVal (Key sizes) A)) :
+    Val.cap (mkVal (.set xs)) (mkVal (.set ys)) =
+      Val.set ((xs.map mkVal).filter (fun v => @decide (Val.mem v (mkVal (.set ys))) (Classical.propDecidable _))) := by
+  classical
+  unfold Val.cap
+  have hb : Val.isSet (mkVal (.set ys) : Val sizes A) := trivial
+  simp only [hb, ↓reduceIte]
+  rfl
+
+private theorem Val.cap_not_set_left {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    {a : Val sizes A} (ha : ¬ Val.isSet a) (b : Val sizes A) :
+    Val.cap a b = Val.err := by
+  classical
+  unfold Val.cap
+  split
+  · induction a using Quotient.ind with
+    | _ ar =>
+      cases ar with
+      | set _ => exact absurd trivial ha
+      | _ => rfl
+  · rfl
+
+private theorem Val.cap_not_set_right {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (a : Val sizes A) {b : Val sizes A} (hb : ¬ Val.isSet b) :
+    Val.cap a b = Val.err := by
+  classical
+  unfold Val.cap
+  simp only [hb, ↓reduceIte]
+
+theorem Val.cap_comm {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b : Val sizes A) :
+    Val.cap a b = Val.cap b a := by
+  classical
+  by_cases ha : Val.isSet a
+  · by_cases hb : Val.isSet b
+    · induction a using Quotient.ind with
+      | _ ar =>
+        induction b using Quotient.ind with
+        | _ br =>
+          cases ar <;> try exact absurd ha (by intro h; exact h)
+          cases br <;> try exact absurd hb (by intro h; exact h)
+          case set.set xs ys =>
+            change Val.cap (mkVal (.set xs)) (mkVal (.set ys)) = Val.cap (mkVal (.set ys)) (mkVal (.set xs))
+            rw [Val.cap_mk_set, Val.cap_mk_set, Val.set_eq_iff]
+            intro v
+            simp only [List.mem_filter, List.mem_map, decide_eq_true_eq]
+            constructor
+            · rintro ⟨⟨x, hx, rfl⟩, ⟨y, hy, hyx⟩⟩
+              exact ⟨⟨y, hy, hyx⟩, ⟨x, hx, rfl⟩⟩
+            · rintro ⟨⟨y, hy, rfl⟩, ⟨x, hx, hxy⟩⟩
+              exact ⟨⟨x, hx, hxy⟩, ⟨y, hy, rfl⟩⟩
+    · rw [Val.cap_not_set_right a hb, Val.cap_not_set_left hb a]
+  · rw [Val.cap_not_set_left ha b, Val.cap_not_set_right b ha]
+
+theorem Val.cap_assoc {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b c : Val sizes A) :
+    Val.cap (Val.cap a b) c = Val.cap a (Val.cap b c) := by
+  classical
+  by_cases ha : Val.isSet a
+  · by_cases hb : Val.isSet b
+    · by_cases hc : Val.isSet c
+      · induction a using Quotient.ind with
+        | _ ar =>
+          induction b using Quotient.ind with
+          | _ br =>
+            induction c using Quotient.ind with
+            | _ cr =>
+              cases ar <;> try exact absurd ha (by intro h; exact h)
+              cases br <;> try exact absurd hb (by intro h; exact h)
+              cases cr <;> try exact absurd hc (by intro h; exact h)
+              case set.set.set xs ys zs =>
+                change Val.cap (Val.cap (mkVal (.set xs)) (mkVal (.set ys))) (mkVal (.set zs)) =
+                  Val.cap (mkVal (.set xs)) (Val.cap (mkVal (.set ys)) (mkVal (.set zs)))
+                rw [Val.cap_mk_set, Val.cap_mk_set]
+                unfold Val.set
+                rw [Val.cap_mk_set, Val.cap_mk_set, Val.set_eq_iff]
+                intro v
+                simp only [List.mem_filter, List.map_map, Function.comp_def, valOut_eq, List.map_id', decide_eq_true_eq]
+                constructor
+                · rintro ⟨⟨hx, hy⟩, hz⟩
+                  refine ⟨hx, ?_⟩
+                  change ∃ r ∈ ((ys.map mkVal).filter (fun w => @decide (Val.mem w (mkVal (.set zs))) (Classical.propDecidable _))).map valOut, mkVal r = v
+                  rcases hy with ⟨y, hy', rfl⟩
+                  refine ⟨valOut (mkVal y), List.mem_map_of_mem ?_, valOut_eq _⟩
+                  simp only [List.mem_filter, decide_eq_true_eq]
+                  exact ⟨List.mem_map_of_mem hy', hz⟩
+                · rintro ⟨hx, hyz⟩
+                  rcases hyz with ⟨r, hr, rfl⟩
+                  rcases List.mem_map.mp hr with ⟨w, hw, rfl⟩
+                  rw [valOut_eq] at *
+                  simp only [List.mem_filter, List.mem_map, decide_eq_true_eq] at hw
+                  rcases hw with ⟨⟨y, hy', rfl⟩, hz⟩
+                  exact ⟨⟨hx, ⟨y, hy', rfl⟩⟩, hz⟩
+      · have hbc : ¬ Val.isSet (Val.cap b c) := by rw [Val.cap_not_set_right b hc]; exact fun h => h
+        rw [Val.cap_not_set_right _ hc, Val.cap_not_set_right a hbc]
+    · have hab : ¬ Val.isSet (Val.cap a b) := by rw [Val.cap_not_set_right a hb]; exact fun h => h
+      have hbc : ¬ Val.isSet (Val.cap b c) := by rw [Val.cap_not_set_left hb c]; exact fun h => h
+      rw [Val.cap_not_set_left hab c, Val.cap_not_set_right a hbc]
+  · have hab : ¬ Val.isSet (Val.cap a b) := by rw [Val.cap_not_set_left ha b]; exact fun h => h
+    rw [Val.cap_not_set_left hab c, Val.cap_not_set_left ha _]
+
+inductive ACOp where
+  | intAdd
+  | intMul
+  | setCup
+  | setCap
+  | boolAnd
+  | boolOr
+
+def seqIndicesAux {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Nat → Nat → List (Val sizes A)
+  | _, 0 => []
+  | i, n + 1 => Val.atom (HasNatAtom.natAtom i) :: seqIndicesAux (i + 1) n
+
+def seqIndices {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (n : Nat) : List (Val sizes A) :=
+  seqIndicesAux 1 n
+
+private theorem seqIndicesAux_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) : ∀ (i n : Nat),
+      (seqIndicesAux (sizes := sizes) (A := A) i n).map (renameVal p) = seqIndicesAux i n
+  | _, 0 => rfl
+  | i, n + 1 => by
+    simp only [seqIndicesAux, List.map_cons, Val.rename_atom, seqIndicesAux_rename p (i + 1) n]
+
+theorem seqIndices_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (n : Nat) :
+    (seqIndices (sizes := sizes) (A := A) n).map (renameVal p) = seqIndices n :=
+  seqIndicesAux_rename p 1 n
+
+def Val.foldSeq {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (right onDomain : Bool) (s base : Val sizes A)
+    (step : Val sizes A → Val sizes A → Val sizes A) : Val sizes A :=
+  match Val.seqElems s with
+  | some xs =>
+    let items := if onDomain then seqIndices xs.length else xs
+    if right then items.foldr step base
+    else items.foldl (fun acc x => step x acc) base
+  | none => Val.err
+
+private theorem foldl_map_equiv {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (step step' : Val sizes A → Val sizes A → Val sizes A)
+    (hstep : ∀ x acc, step' (renameVal p x) (renameVal p acc) = renameVal p (step x acc)) :
+    ∀ (xs : List (Val sizes A)) (base : Val sizes A),
+      (xs.map (renameVal p)).foldl (fun acc x => step' x acc) (renameVal p base) =
+        renameVal p (xs.foldl (fun acc x => step x acc) base)
+  | [], _ => rfl
+  | x :: xs, base => by
+    simp only [List.map_cons, List.foldl_cons, hstep x base]
+    exact foldl_map_equiv p step step' hstep xs (step x base)
+
+private theorem foldr_map_equiv {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (step step' : Val sizes A → Val sizes A → Val sizes A)
+    (hstep : ∀ x acc, step' (renameVal p x) (renameVal p acc) = renameVal p (step x acc)) :
+    ∀ (xs : List (Val sizes A)) (base : Val sizes A),
+      (xs.map (renameVal p)).foldr step' (renameVal p base) =
+        renameVal p (xs.foldr step base)
+  | [], _ => rfl
+  | x :: xs, base => by
+    simp only [List.map_cons, List.foldr_cons, foldr_map_equiv p step step' hstep xs base, hstep x _]
+
+theorem Val.foldSeq_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (right onDomain : Bool) (s base : Val sizes A)
+    (step step' : Val sizes A → Val sizes A → Val sizes A)
+    (hstep : ∀ x acc, step' (renameVal p x) (renameVal p acc) = renameVal p (step x acc)) :
+    Val.foldSeq right onDomain (renameVal p s) (renameVal p base) step' =
+      renameVal p (Val.foldSeq right onDomain s base step) := by
+  unfold Val.foldSeq
+  rw [Val.seqElems_rename]
+  cases Val.seqElems s with
+  | none => rfl
+  | some xs =>
+    simp only [Option.map_some, List.length_map]
+    cases onDomain
+    · cases right
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        exact foldl_map_equiv p step step' hstep xs base
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        exact foldr_map_equiv p step step' hstep xs base
+    · have hind := seqIndices_rename (sizes := sizes) (A := A) p xs.length
+      cases right
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        simpa only [hind] using foldl_map_equiv p step step' hstep (seqIndices xs.length) base
+      · simp only [↓reduceIte]
+        simpa only [hind] using foldr_map_equiv p step step' hstep (seqIndices xs.length) base
+
+theorem Val.foldSeq_order {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (a b base : Val sizes A) (step : Val sizes A → Val sizes A → Val sizes A) :
+    Val.foldSeq false false (Val.seq [a, b]) base step = step b (step a base) ∧
+    Val.foldSeq true false (Val.seq [a, b]) base step = step a (step b base) := by
+  simp only [Val.foldSeq, Val.seqElems_seq, Bool.false_eq_true, ↓reduceIte,
+    List.foldl_cons, List.foldl_nil, List.foldr_cons, List.foldr_nil, and_self]
+
 -- Atom-only operations (key-free leaves)
 def collectAtoms {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : List (Val sizes A) → Option (List A)
   | [] => some []
@@ -2611,6 +2838,8 @@ inductive Expr (d : Nat) (V : Type) where
   | concat (a b : Expr d V)
   | subseq (s lo hi : Expr d V)
   | selectSeq (s : Expr d V) (pred : Form d V)
+  | foldSeq (right onDomain : Bool) (seq base step : Expr d V)
+  | foldSetAC (op : ACOp) (dom base elem : Expr d V)
   | ite (cond : Form d V) (yes no : Expr d V)
   | letBind (val body : Expr d V)
   | ofForm (f : Form d V)
@@ -2692,6 +2921,7 @@ theorem renameState_inverse {V : Type} {d : Nat} {sizes : Fin d → Nat} {A : Ty
 structure AtomOps (A : Type) where
   atomVal : Nat → A
   boolAtom : Bool → A
+  intAtom : Int → A
   isTrue : A → Prop
   intOf : A → Option Int
   atomOp : Nat → List A → A
@@ -2700,6 +2930,187 @@ structure AtomOps (A : Type) where
   chooseAtom : (A → Prop) → A
   atomRel : Nat → List A → Prop
   atomPred : Nat → A → Prop
+
+def valInt {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (v : Val sizes A) : Option Int :=
+  (Val.asAtom v).bind ops.intOf
+
+theorem valInt_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (v : Val sizes A) :
+    valInt ops (renameVal p v) = valInt ops v := by
+  simp only [valInt, Val.asAtom_rename]
+
+def valBool {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (v : Val sizes A) : Option Bool :=
+  (Val.asAtom v).map (fun a => @decide (ops.isTrue a) (Classical.propDecidable _))
+
+theorem valBool_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (v : Val sizes A) :
+    valBool ops (renameVal p v) = valBool ops v := by
+  simp only [valBool, Val.asAtom_rename]
+
+def foldScalarAC {d : Nat} {sizes : Fin d → Nat} {A α : Type} [HasNatAtom A]
+    (decode : Val sizes A → Option α) (encode : α → A) (combine : α → α → α)
+    (base : Val sizes A) (vals : List (Val sizes A)) : Val sizes A :=
+  match vals.foldl (fun acc v => match acc, decode v with | some a, some x => some (combine a x) | _, _ => none) (decode base) with
+  | some r => Val.atom (encode r)
+  | none => Val.err
+
+private theorem foldScalarAC_perm {d : Nat} {sizes : Fin d → Nat} {A α : Type} [HasNatAtom A]
+    (decode : Val sizes A → Option α) (encode : α → A) (combine : α → α → α)
+    (hcomm : ∀ acc x y, combine (combine acc x) y = combine (combine acc y) x)
+    (base : Val sizes A) {l1 l2 : List (Val sizes A)} (hp : l1.Perm l2) :
+    foldScalarAC decode encode combine base l1 = foldScalarAC decode encode combine base l2 := by
+  unfold foldScalarAC
+  have hswap : ∀ x ∈ l1, ∀ y ∈ l1, ∀ acc : Option α,
+      (match (match acc, decode x with | some a, some b => some (combine a b) | _, _ => none), decode y with
+       | some a, some b => some (combine a b) | _, _ => none) =
+      (match (match acc, decode y with | some a, some b => some (combine a b) | _, _ => none), decode x with
+       | some a, some b => some (combine a b) | _, _ => none) := by
+    intro x _ y _ acc
+    cases acc <;> cases decode x <;> cases decode y <;> simp [hcomm]
+  rw [hp.foldl_eq' hswap (decode base)]
+
+private theorem foldScalarAC_rename {d : Nat} {sizes : Fin d → Nat} {A α : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (decode : Val sizes A → Option α) (encode : α → A) (combine : α → α → α)
+    (hdec : ∀ v, decode (renameVal p v) = decode v)
+    (base : Val sizes A) (vals : List (Val sizes A)) :
+    foldScalarAC decode encode combine (renameVal p base) (vals.map (renameVal p)) =
+      renameVal p (foldScalarAC decode encode combine base vals) := by
+  unfold foldScalarAC
+  have hfold : ∀ (xs : List (Val sizes A)) (acc : Option α),
+      (xs.map (renameVal p)).foldl (fun a v => match a, decode v with | some a, some x => some (combine a x) | _, _ => none) acc =
+        xs.foldl (fun a v => match a, decode v with | some a, some x => some (combine a x) | _, _ => none) acc := by
+    intro xs
+    induction xs with
+    | nil => intro _; rfl
+    | cons x t ih =>
+      intro acc
+      simp only [List.map_cons, List.foldl_cons, hdec x]
+      exact ih _
+  rw [hdec base, hfold vals (decode base)]
+  cases vals.foldl (fun a v => match a, decode v with | some a, some x => some (combine a x) | _, _ => none) (decode base) <;> rfl
+
+def foldSetACList {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (op : ACOp) (base : Val sizes A) (vals : List (Val sizes A)) : Val sizes A :=
+  match op with
+  | .intAdd => foldScalarAC (valInt ops) ops.intAtom (· + ·) base vals
+  | .intMul => foldScalarAC (valInt ops) ops.intAtom (· * ·) base vals
+  | .boolAnd => foldScalarAC (valBool ops) ops.boolAtom (· && ·) base vals
+  | .boolOr => foldScalarAC (valBool ops) ops.boolAtom (· || ·) base vals
+  | .setCup => vals.foldl (fun acc x => Val.cup x acc) base
+  | .setCap => vals.foldl (fun acc x => Val.cap x acc) base
+
+private theorem foldSetACList_perm {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (op : ACOp) (base : Val sizes A)
+    {l1 l2 : List (Val sizes A)} (hp : l1.Perm l2) :
+    foldSetACList ops op base l1 = foldSetACList ops op base l2 := by
+  cases op with
+  | intAdd =>
+    exact foldScalarAC_perm (valInt ops) ops.intAtom (· + ·) (fun acc x y => by omega) base hp
+  | intMul =>
+    exact foldScalarAC_perm (valInt ops) ops.intAtom (· * ·) (fun acc x y => by rw [Int.mul_assoc, Int.mul_comm x y, ← Int.mul_assoc]) base hp
+  | boolAnd =>
+    exact foldScalarAC_perm (valBool ops) ops.boolAtom (· && ·) (fun acc x y => by cases acc <;> cases x <;> cases y <;> rfl) base hp
+  | boolOr =>
+    exact foldScalarAC_perm (valBool ops) ops.boolAtom (· || ·) (fun acc x y => by cases acc <;> cases x <;> cases y <;> rfl) base hp
+  | setCup =>
+    exact hp.foldl_eq' (fun x _ y _ acc => by rw [← Val.cup_assoc, Val.cup_comm y x, Val.cup_assoc]) base
+  | setCap =>
+    exact hp.foldl_eq' (fun x _ y _ acc => by rw [← Val.cap_assoc, Val.cap_comm y x, Val.cap_assoc]) base
+
+private theorem foldSetACList_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (base : Val sizes A) (vals : List (Val sizes A)) :
+    foldSetACList ops op (renameVal p base) (vals.map (renameVal p)) =
+      renameVal p (foldSetACList ops op base vals) := by
+  cases op with
+  | intAdd => exact foldScalarAC_rename p (valInt ops) ops.intAtom (· + ·) (valInt_rename p ops) base vals
+  | intMul => exact foldScalarAC_rename p (valInt ops) ops.intAtom (· * ·) (valInt_rename p ops) base vals
+  | boolAnd => exact foldScalarAC_rename p (valBool ops) ops.boolAtom (· && ·) (valBool_rename p ops) base vals
+  | boolOr => exact foldScalarAC_rename p (valBool ops) ops.boolAtom (· || ·) (valBool_rename p ops) base vals
+  | setCup => exact foldl_map_equiv p Val.cup Val.cup (Val.cup_rename p) vals base
+  | setCap => exact foldl_map_equiv p Val.cap Val.cap (Val.cap_rename p) vals base
+
+def Val.foldSetAC {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (op : ACOp) (s base : Val sizes A) (f : Val sizes A → Val sizes A) : Val sizes A := by
+  classical
+  exact Quotient.liftOn s (fun sr => match sr with
+    | .set xs => foldSetACList ops op base ((dedupList (xs.map mkVal)).map f)
+    | _ => Val.err) (by
+    intro s1 s2 h
+    cases s1 <;> cases s2
+    all_goals try exact False.elim h
+    all_goals try rfl
+    case set.set xs ys =>
+      dsimp only
+      have hperm : (dedupList (xs.map mkVal)).Perm (dedupList (ys.map mkVal)) :=
+        (List.perm_ext_iff_of_nodup (nodup_dedupList _) (nodup_dedupList _)).mpr (fun v => by
+          simp only [mem_dedupList, List.mem_map]
+          rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
+          constructor
+          · rintro ⟨a, ha, rfl⟩
+            rcases h1 a ha with ⟨b, hb, hab⟩
+            exact ⟨b, hb, (Quotient.sound hab).symm⟩
+          · rintro ⟨b, hb, rfl⟩
+            rcases h2 b hb with ⟨a, ha, hab⟩
+            exact ⟨a, ha, Quotient.sound hab⟩)
+      exact foldSetACList_perm ops op base (hperm.map f))
+
+theorem Val.foldSetAC_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (s base : Val sizes A)
+    (f f' : Val sizes A → Val sizes A)
+    (hf : ∀ v, f' (renameVal p v) = renameVal p (f v)) :
+    Val.foldSetAC ops op (renameVal p s) (renameVal p base) f' =
+      renameVal p (Val.foldSetAC ops op s base f) := by
+  classical
+  induction s using Quotient.ind with
+  | _ sr =>
+    cases sr with
+    | set xs =>
+      change foldSetACList ops op (renameVal p base) ((dedupList ((renameRawList p xs).map mkVal)).map f') =
+        renameVal p (foldSetACList ops op base ((dedupList (xs.map mkVal)).map f))
+      have hnd1 := nodup_dedupList ((renameRawList p xs).map mkVal)
+      have hnd2 := nodup_map_inj (fun _ _ h => (renameVal_injective p).mp h) (nodup_dedupList (xs.map mkVal))
+      have hperm : (dedupList ((renameRawList p xs).map mkVal)).Perm ((dedupList (xs.map mkVal)).map (renameVal p)) :=
+        (List.perm_ext_iff_of_nodup hnd1 hnd2).mpr (fun w => by
+          simp only [mem_dedupList, renameRawList_eq_map, List.mem_map]
+          constructor
+          · rintro ⟨y', ⟨y, hy, rfl⟩, rfl⟩
+            exact ⟨mkVal y, ⟨y, hy, rfl⟩, rfl⟩
+          · rintro ⟨v, ⟨y, hy, rfl⟩, rfl⟩
+            exact ⟨renameRaw p y, ⟨y, hy, rfl⟩, rfl⟩)
+      rw [foldSetACList_perm ops op (renameVal p base) (hperm.map f')]
+      have hmap : ((dedupList (xs.map mkVal)).map (renameVal p)).map f' =
+          ((dedupList (xs.map mkVal)).map f).map (renameVal p) := by
+        rw [List.map_map, List.map_map]
+        apply List.map_congr_left
+        intro v _
+        exact hf v
+      rw [hmap]
+      exact foldSetACList_rename p ops op base ((dedupList (xs.map mkVal)).map f)
+    | _ => rfl
+
+theorem Val.foldSetAC_intAdd_dup_mapped {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (h0 : ops.intOf (ops.intAtom 0) = some 0) (h1 : ops.intOf (ops.intAtom 1) = some 1) :
+    Val.foldSetAC ops .intAdd
+      (Val.set (sizes := sizes) [Val.atom (HasNatAtom.natAtom 0), Val.atom (HasNatAtom.natAtom 1)])
+      (Val.atom (ops.intAtom 0))
+      (fun _ => Val.atom (ops.intAtom 1)) =
+    Val.atom (ops.intAtom 2) := by
+  classical
+  have hne : Val.atom (sizes := sizes) (HasNatAtom.natAtom (A := A) 0) ≠
+      Val.atom (HasNatAtom.natAtom (A := A) 1) := by
+    intro h
+    have h01 : (0 : Nat) = 1 := HasNatAtom.natAtom_inj 0 1 (Val.atom_inj h)
+    cases h01
+  change foldSetACList ops .intAdd (Val.atom (ops.intAtom 0))
+    ((dedupList ((List.map valOut [Val.atom (HasNatAtom.natAtom 0), Val.atom (HasNatAtom.natAtom 1)]).map mkVal)).map
+      (fun _ => Val.atom (ops.intAtom 1))) = Val.atom (ops.intAtom 2)
+  have hv0 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 0)) = some 0 := h0
+  have hv1 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 1)) = some 1 := h1
+  simp only [List.map_cons, List.map_nil, valOut_eq, dedupList, List.mem_singleton, hne, ↓reduceIte,
+    List.not_mem_nil, foldSetACList, foldScalarAC, hv0, hv1, List.foldl_cons, List.foldl_nil]
+  rfl
 
 mutual
 def evalExpr {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops : AtomOps A)
@@ -2752,6 +3163,12 @@ def evalExpr {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops 
       Val.subseq ops.intOf (evalExpr ops s t env x) (evalExpr ops s t env lo) (evalExpr ops s t env hi)
   | .selectSeq x pred =>
       Val.selectSeq (evalExpr ops s t env x) (fun v => evalForm ops s t (push env v) pred)
+  | .foldSeq right onDomain seq base step =>
+      Val.foldSeq right onDomain (evalExpr ops s t env seq) (evalExpr ops s t env base)
+        (fun x acc => evalExpr ops s t (push (push env acc) x) step)
+  | .foldSetAC op dom base elem =>
+      Val.foldSetAC ops op (evalExpr ops s t env dom) (evalExpr ops s t env base)
+        (fun v => evalExpr ops s t (push env v) elem)
   | .ite cond yes no =>
       @ite _ (evalForm ops s t env cond) (Classical.propDecidable _)
         (evalExpr ops s t env yes) (evalExpr ops s t env no)
@@ -2951,6 +3368,16 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
     simp only [evalExpr, evalExpr_equivariant p ops s t env x]
     exact Val.selectSeq_rename p _ _ _ (fun v => by
       rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) pred)
+  | .foldSeq right onDomain seq base step => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env seq, evalExpr_equivariant p ops s t env base]
+    exact Val.foldSeq_rename p right onDomain _ _ _ _ (fun x acc => by
+      rw [← renameEnv_push, ← renameEnv_push]
+      exact evalExpr_equivariant p ops s t (push (push env acc) x) step)
+  | .foldSetAC op dom base elem => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env dom, evalExpr_equivariant p ops s t env base]
+    exact Val.foldSetAC_rename p ops op _ _ _ _ (fun v => by
+      rw [← renameEnv_push]
+      exact evalExpr_equivariant p ops s t (push env v) elem)
   | .ite cond yes no => by
     simp only [evalExpr]
     rw [propext (evalForm_equivariant p ops s t env cond)]

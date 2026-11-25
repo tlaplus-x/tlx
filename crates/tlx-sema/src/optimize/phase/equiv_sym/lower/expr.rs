@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tlx_front::cfg::CfgValue;
 
 use super::{AtomKey, AtomKind, GroupMask, LowerCtx, Shape, Slot};
+use crate::optimize::phase::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
 use crate::{builtins::Builtin as B, hir::*};
 
 impl LowerCtx<'_> {
@@ -281,6 +282,60 @@ impl LowerCtx<'_> {
                     let pred = pred?;
                     self.charge(format!("(Expr.selectSeq {es} {pred})"))
                 }
+                (B::FoldSet, [op_lam, base, set]) => {
+                    let ac = classify_ac_op(op_lam)?;
+                    let es = self.lower_expr_rec(set, allow_prime, in_prime)?;
+                    let eb = self.lower_expr_rec(base, allow_prime, in_prime)?;
+                    self.charge(format!("(Expr.foldSetAC {} {es} {eb} (Expr.localVar 0))", ac.lean_ctor()))
+                }
+                (B::FoldFunction, [op_lam, base, fun]) => self.lower_fold_function(op_lam, base, fun, allow_prime, in_prime),
+                (B::FoldFunctionOnSet, [op_lam, base, fun, indices]) => {
+                    let ac = classify_ac_op(op_lam)?;
+                    let efun = self.lower_expr_rec(fun, allow_prime, in_prime)?;
+                    self.locals.push(Slot::Temp);
+                    let eidx = self.lower_expr_rec(indices, allow_prime, in_prime);
+                    let eb = self.lower_expr_rec(base, allow_prime, in_prime);
+                    self.locals.pop();
+                    let (eidx, eb) = (eidx?, eb?);
+                    self.charge(format!(
+                        "(Expr.letBind {efun} (Expr.foldSetAC {} {eidx} {eb} (Expr.fnApp (Expr.localVar 1) (Expr.localVar 0))))",
+                        ac.lean_ctor()
+                    ))
+                }
+                (B::MapThenFoldSet, [op_lam, base, f_lam, choose_lam, set, ..]) if args.len() == 5 || args.len() == 6 => {
+                    let ac = classify_ac_op(op_lam)?;
+                    if !is_chooses_first_lambda(choose_lam) {
+                        return None;
+                    }
+                    let ExprKind::Lambda { params, body } = &*f_lam.kind else { return None };
+                    let [p] = params.as_slice() else { return None };
+                    let es = self.lower_expr_rec(set, allow_prime, in_prime)?;
+                    let eb = self.lower_expr_rec(base, allow_prime, in_prime)?;
+                    let ak = self.elem_atom_kind(set);
+                    let (elem_shape, dom_origin) = self.totality.bound_elem_info(set, in_prime, &self.check_env);
+                    self.locals.push(Slot::Local(*p, ak));
+                    self.check_env.bind_local(*p, elem_shape, dom_origin);
+                    let ef = self.lower_expr_rec(body, allow_prime, in_prime);
+                    self.locals.pop();
+                    self.check_env.unbind_local(*p);
+                    let ef = ef?;
+                    self.charge(format!("(Expr.foldSetAC {} {es} {eb} {ef})", ac.lean_ctor()))
+                }
+                (B::FoldSeq, [op_lam, base, seq]) => {
+                    if self.totality.is_definitely_seq(seq, in_prime, &self.check_env) {
+                        self.lower_seq_fold(false, false, false, op_lam, base, seq, allow_prime, in_prime)
+                    } else {
+                        self.lower_fold_function(op_lam, base, seq, allow_prime, in_prime)
+                    }
+                }
+                (B::FoldLeft, [op_lam, base, seq]) => self.lower_seq_fold(false, false, true, op_lam, base, seq, allow_prime, in_prime),
+                (B::FoldRight, [op_lam, seq, base]) => self.lower_seq_fold(true, false, false, op_lam, base, seq, allow_prime, in_prime),
+                (B::FoldLeftDomain, [op_lam, base, seq]) => {
+                    self.lower_seq_fold(false, true, true, op_lam, base, seq, allow_prime, in_prime)
+                }
+                (B::FoldRightDomain, [op_lam, seq, base]) => {
+                    self.lower_seq_fold(true, true, false, op_lam, base, seq, allow_prime, in_prime)
+                }
                 (B::Plus | B::Minus | B::Mul | B::Div | B::Mod | B::Pow | B::Gcd, [a, b]) => {
                     let ea = self.lower_expr_rec(a, allow_prime, in_prime)?;
                     let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
@@ -328,6 +383,57 @@ impl LowerCtx<'_> {
             },
             _ => None,
         }
+    }
+
+    fn lower_fold_function(&mut self, op_lam: &Expr, base: &Expr, fun: &Expr, allow_prime: bool, in_prime: bool) -> Option<String> {
+        let ac = classify_ac_op(op_lam)?;
+        let efun = self.lower_expr_rec(fun, allow_prime, in_prime)?;
+        self.locals.push(Slot::Temp);
+        let eb = self.lower_expr_rec(base, allow_prime, in_prime);
+        self.locals.pop();
+        let eb = eb?;
+        self.charge(format!(
+            "(Expr.letBind {efun} (Expr.foldSetAC {} (Expr.domain (Expr.localVar 0)) {eb} (Expr.fnApp (Expr.localVar 1) (Expr.localVar 0))))",
+            ac.lean_ctor()
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_seq_fold(
+        &mut self,
+        right: bool,
+        on_domain: bool,
+        acc_first: bool,
+        op_lam: &Expr,
+        base: &Expr,
+        seq: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+    ) -> Option<String> {
+        if !self.totality.is_definitely_seq(seq, in_prime, &self.check_env) {
+            return None;
+        }
+        let ExprKind::Lambda { params, body } = &*op_lam.kind else { return None };
+        let [p0, p1] = params.as_slice() else { return None };
+        let eseq = self.lower_expr_rec(seq, allow_prime, in_prime)?;
+        let ebase = self.lower_expr_rec(base, allow_prime, in_prime)?;
+        let (acc_param, item_param) = if acc_first { (*p0, *p1) } else { (*p1, *p0) };
+        let (acc_shape, item_shape) =
+            self.totality.seq_fold_body_shapes(op_lam, base, seq, on_domain, acc_first, in_prime, &self.check_env);
+        let dom_origin = on_domain.then(|| (seq.clone(), in_prime));
+        let item_ak = if on_domain { AtomKind::Atom } else { AtomKind::Unknown };
+        // Push `acc` first (`localVar 1`) and `x` second (`localVar 0`), matching `push (push env acc) x`.
+        self.locals.push(Slot::Local(acc_param, AtomKind::Unknown));
+        self.check_env.bind_local(acc_param, acc_shape, None);
+        self.locals.push(Slot::Local(item_param, item_ak));
+        self.check_env.bind_local(item_param, item_shape, dom_origin);
+        let estep = self.lower_expr_rec(body, allow_prime, in_prime);
+        self.locals.pop();
+        self.check_env.unbind_local(item_param);
+        self.locals.pop();
+        self.check_env.unbind_local(acc_param);
+        let estep = estep?;
+        self.charge(format!("(Expr.foldSeq {right} {on_domain} {eseq} {ebase} {estep})"))
     }
 
     fn lower_except_seq(&mut self, base: String, updates: &[(Vec<ExceptKey>, Expr)], allow_prime: bool, in_prime: bool) -> Option<String> {
@@ -710,6 +816,10 @@ impl LowerCtx<'_> {
                 | B::IsFiniteSet
                 | B::IsInjective => true,
                 B::TLCEval => args.first().is_some_and(|a| self.is_definitely_atom(a)),
+                B::FoldSet | B::FoldFunction | B::FoldFunctionOnSet | B::MapThenFoldSet => args
+                    .first()
+                    .and_then(classify_ac_op)
+                    .is_some_and(|ac| matches!(ac, AcOpKind::IntAdd | AcOpKind::IntMul | AcOpKind::BoolAnd | AcOpKind::BoolOr)),
                 _ => false,
             },
             ExprKind::If { then, els, .. } => self.is_definitely_atom(then) && self.is_definitely_atom(els),

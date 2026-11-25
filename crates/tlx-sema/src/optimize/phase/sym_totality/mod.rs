@@ -18,6 +18,7 @@ use super::sym_norm::SymNormalizer;
 use crate::{builtins::Builtin as B, hir::*, Program};
 
 mod check;
+mod folds;
 mod infer;
 mod shape;
 
@@ -127,7 +128,7 @@ pub(crate) struct CheckEnv {
     locals: HashMap<LocalId, Shape>,
     local_dom: HashMap<LocalId, (Expr, bool)>,
     var_overrides: HashMap<(VarId, bool), Shape>,
-    fn_app_overrides: HashMap<(VarId, bool, PlaceKey), Shape>,
+    fn_app_overrides: HashMap<(VarId, bool, Vec<PlaceKey>), Shape>,
     at_shape: Option<Shape>,
     /// Definitely-bound variables along the current action/init path:
     /// `Some((false, set))` during `Init`, `Some((true, set))` during `Next`, `None` otherwise.
@@ -177,7 +178,7 @@ impl CheckEnv {
     pub(crate) fn unbind_local(&mut self, id: LocalId) {
         self.locals.remove(&id);
         self.local_dom.remove(&id);
-        self.fn_app_overrides.retain(|&(_, _, k), _| k != PlaceKey::Local(id));
+        self.fn_app_overrides.retain(|(_, _, ks), _| !ks.contains(&PlaceKey::Local(id)));
     }
 
     fn bind_var_override(&mut self, v: VarId, primed: bool, shape: Shape) {
@@ -817,6 +818,38 @@ impl<'a> TotalityChecker<'a> {
         let mut steps = MAX_STEPS;
         let s = self.infer_expr(e, in_prime, &self.var_shapes, env, &mut steps);
         is_seq_shape(&s)
+    }
+
+    /// Infer the accumulator and item shapes for a sequence fold body during lowering.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seq_fold_body_shapes(
+        &self,
+        op_lam: &Expr,
+        base: &Expr,
+        seq: &Expr,
+        on_domain: bool,
+        acc_first: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+    ) -> (Shape, Shape) {
+        let mut steps = MAX_STEPS;
+        let seq_shape = self.infer_expr(seq, in_prime, &self.var_shapes, env, &mut steps);
+        let item_shape = if on_domain {
+            match seq_elem_bounds(&seq_shape) {
+                Some((_, _, Some(hi))) if hi <= MAX_I32_U32 => {
+                    if hi == 0 {
+                        Shape::Bottom
+                    } else {
+                        Shape::Int(Some((1, hi as i32)))
+                    }
+                }
+                _ => Shape::Int(None),
+            }
+        } else {
+            seq_elem_bounds(&seq_shape).map_or(Shape::Top, |(e, _, _)| e)
+        };
+        let acc_shape = self.infer_seq_fold_shape(op_lam, base, seq, on_domain, acc_first, in_prime, &self.var_shapes, env, &mut steps);
+        (acc_shape, item_shape)
     }
 
     pub(crate) fn apply_positive_fact(&self, cond: &Expr, in_prime: bool, env: &mut CheckEnv) {

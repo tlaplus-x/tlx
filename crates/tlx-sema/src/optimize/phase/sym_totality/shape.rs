@@ -102,29 +102,61 @@ pub(super) fn place_key_of(e: &Expr, in_prime: bool) -> Option<PlaceKey> {
     }
 }
 
-pub(super) fn fn_app_place(func: &Expr, args: &[Expr], in_prime: bool) -> Option<(VarId, bool, PlaceKey)> {
+pub(super) fn fn_app_place(func: &Expr, args: &[Expr], in_prime: bool) -> Option<(VarId, bool, Vec<PlaceKey>)> {
     if args.len() != 1 {
         return None;
     }
-    let key = place_key_of(&args[0], in_prime)?;
-    match &*func.kind {
-        ExprKind::Var(v) => Some((*v, in_prime, key)),
-        ExprKind::Builtin { op: B::Prime, args: pa } if !in_prime && pa.len() == 1 => match &*pa[0].kind {
-            ExprKind::Var(v) => Some((*v, true, key)),
-            _ => None,
-        },
-        _ => None,
+    let last_key = place_key_of(&args[0], in_prime)?;
+    let mut keys = vec![last_key];
+    let mut cur = func;
+    for _ in 0..8 {
+        match &*cur.kind {
+            ExprKind::Var(v) => {
+                keys.reverse();
+                return Some((*v, in_prime, keys));
+            }
+            ExprKind::Builtin { op: B::Prime, args: pa } if !in_prime && pa.len() == 1 => match &*pa[0].kind {
+                ExprKind::Var(v) => {
+                    keys.reverse();
+                    return Some((*v, true, keys));
+                }
+                _ => return None,
+            },
+            ExprKind::FnApp { func: inner, args: iargs } if iargs.len() == 1 => {
+                keys.push(place_key_of(&iargs[0], in_prime)?);
+                cur = inner;
+            }
+            _ => return None,
+        }
     }
+    None
 }
 
 /// Resolve the `@` shape for an `EXCEPT` update, consulting `env.fn_app_overrides` when the base
 /// variable has not yet been modified by an earlier update in the same `EXCEPT`.
 pub(super) fn except_old_at_shape(base: &Expr, cur: &Shape, path: &[ExceptKey], in_prime: bool, env: &CheckEnv, unmodified: bool) -> Shape {
     if unmodified {
-        if let Some(ExceptKey::Index(ixs)) = path.first() {
-            if let Some(key) = fn_app_place(base, ixs, in_prime) {
-                if let Some(ov) = env.fn_app_overrides.get(&key) {
-                    return lookup_except_path(ov, &path[1..]);
+        let base_var = match &*base.kind {
+            ExprKind::Var(v) => Some((*v, in_prime)),
+            ExprKind::Builtin { op: B::Prime, args: pa } if !in_prime && pa.len() == 1 => match &*pa[0].kind {
+                ExprKind::Var(v) => Some((*v, true)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((v, primed)) = base_var {
+            let mut prefix_keys = Vec::new();
+            for step in path {
+                let ExceptKey::Index(ixs) = step else { break };
+                if ixs.len() != 1 {
+                    break;
+                }
+                let Some(pk) = place_key_of(&ixs[0], in_prime) else { break };
+                prefix_keys.push(pk);
+            }
+            for len in (1..=prefix_keys.len()).rev() {
+                if let Some(ov) = env.fn_app_overrides.get(&(v, primed, prefix_keys[..len].to_vec())) {
+                    return lookup_except_path(ov, &path[len..]);
                 }
             }
         }

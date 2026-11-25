@@ -31,6 +31,7 @@ use crate::{
     visit, Program,
 };
 
+pub(in crate::optimize::phase) use folds::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
 pub(in crate::optimize::phase) use helpers::{
     block_non_target, block_unchanged_tuple, exact_tuple_arity, lookup_resolved_root, mentions_local,
 };
@@ -469,7 +470,7 @@ impl<'a> SymNormalizer<'a> {
                 ExprKind::Case { arms: expanded_arms, other: None }
             }
             ExprKind::FnApp { func, args } => {
-                if self.mode == NormMode::Choose {
+                if matches!(self.mode, NormMode::Choose | NormMode::Equiv) {
                     if let [target_raw] = args.as_slice() {
                         if let ExprKind::Apply { op: OpRef::Def(sum_id), args: fargs } = &*func.kind {
                             if fargs.is_empty() {
@@ -647,10 +648,42 @@ impl<'a> SymNormalizer<'a> {
         if op.metadata().effect != Effect::Pure {
             return None;
         }
-        if self.mode == NormMode::Equiv && op == B::SelectSeq && args.len() == 2 {
-            let seq = self.expand(&args[0], env, op_env, cur_except, lex_at, depth + 1)?;
-            let pred_lam = self.expand_pred_arg(&args[1], env, op_env, cur_except, lex_at, span, depth + 1)?;
-            return Some(Expr::new(ExprKind::Builtin { op, args: vec![seq, pred_lam] }, span));
+        if self.mode == NormMode::Equiv {
+            match (op, args) {
+                (B::SelectSeq, [seq, pred]) => {
+                    let seq = self.expand(seq, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let pred_lam = self.expand_op_arg_arity(pred, 1, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![seq, pred_lam] }, span));
+                }
+                (B::FoldSet | B::FoldFunction | B::FoldSeq | B::FoldLeft | B::FoldLeftDomain, [op_arg, base, coll]) => {
+                    let op_lam = self.expand_op_arg_arity(op_arg, 2, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let base = self.expand(base, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let coll = self.expand(coll, env, op_env, cur_except, lex_at, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![op_lam, base, coll] }, span));
+                }
+                (B::FoldRight | B::FoldRightDomain, [op_arg, seq, base]) => {
+                    let op_lam = self.expand_op_arg_arity(op_arg, 2, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let seq = self.expand(seq, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let base = self.expand(base, env, op_env, cur_except, lex_at, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![op_lam, seq, base] }, span));
+                }
+                (B::FoldFunctionOnSet, [op_arg, base, fun, indices]) => {
+                    let op_lam = self.expand_op_arg_arity(op_arg, 2, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let base = self.expand(base, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let fun = self.expand(fun, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let indices = self.expand(indices, env, op_env, cur_except, lex_at, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![op_lam, base, fun, indices] }, span));
+                }
+                (B::MapThenFoldSet, [op_arg, base, f_arg, choose_arg, set]) => {
+                    let op_lam = self.expand_op_arg_arity(op_arg, 2, false, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let base = self.expand(base, env, op_env, cur_except, lex_at, depth + 1)?;
+                    let f_lam = self.expand_op_arg_arity(f_arg, 1, false, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let choose_lam = self.expand_op_arg_arity(choose_arg, 1, false, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let set = self.expand(set, env, op_env, cur_except, lex_at, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![op_lam, base, f_lam, choose_lam, set] }, span));
+                }
+                _ => {}
+            }
         }
         let prev = self.in_enabled;
         if op == B::Enabled {
@@ -662,9 +695,11 @@ impl<'a> SymNormalizer<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn expand_pred_arg(
+    fn expand_op_arg_arity(
         &mut self,
         e: &Expr,
+        arity: usize,
+        reject_native_lit: bool,
         env: &EnvMap,
         op_env: &HashMap<LocalId, OpBinding>,
         cur_except: Option<usize>,
@@ -673,21 +708,41 @@ impl<'a> SymNormalizer<'a> {
         depth: usize,
     ) -> Option<Expr> {
         let ov = self.eval_op_arg(e, env, op_env, lex_at)?;
+        let is_lit = |b: &Expr| matches!(&*b.kind, ExprKind::Num(_) | ExprKind::Str(_));
         match ov {
-            OpBinding::Lambda { params, body, env: mut cap_env, op_env: cap_op_env, lex_at: lam_at } if params.len() == 1 => {
-                if self.program.locals[params[0].idx()].arity != 0 {
+            OpBinding::Lambda { params, body, env: mut cap_env, op_env: cap_op_env, lex_at: lam_at } if params.len() == arity => {
+                if reject_native_lit && is_lit(&body) {
                     return None;
                 }
-                let id = self.alloc_local();
-                cap_env.insert(params[0], (Expr::new(ExprKind::Local(id), span), cur_except));
+                let mut fresh = Vec::with_capacity(arity);
+                for &p in &params {
+                    if self.program.locals[p.idx()].arity != 0 {
+                        return None;
+                    }
+                    let id = self.alloc_local();
+                    cap_env.insert(p, (Expr::new(ExprKind::Local(id), span), cur_except));
+                    fresh.push(id);
+                }
                 let body = self.expand(&body, &cap_env, &cap_op_env, cur_except, lam_at, depth + 1)?;
-                Some(Expr::new(ExprKind::Lambda { params: vec![id], body }, span))
+                Some(Expr::new(ExprKind::Lambda { params: fresh, body }, span))
             }
             OpBinding::Ref(op) => {
-                let id = self.alloc_local();
-                let arg = Expr::new(ExprKind::Local(id), span);
-                let body = self.expand_apply(op, &[arg], env, op_env, cur_except, lex_at, span, depth + 1)?;
-                Some(Expr::new(ExprKind::Lambda { params: vec![id], body }, span))
+                if reject_native_lit {
+                    if let OpRef::Def(d) = op {
+                        let def = &self.program.defs[d.idx()];
+                        if def.builtin.is_none() {
+                            if let DefKind::Op(raw_body) = &def.kind {
+                                if is_lit(raw_body) {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+                let fresh: Vec<LocalId> = (0..arity).map(|_| self.alloc_local()).collect();
+                let args: Vec<Expr> = fresh.iter().map(|&id| Expr::new(ExprKind::Local(id), span)).collect();
+                let body = self.expand_apply(op, &args, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                Some(Expr::new(ExprKind::Lambda { params: fresh, body }, span))
             }
             _ => None,
         }
@@ -705,7 +760,7 @@ impl<'a> SymNormalizer<'a> {
         span: Span,
         depth: usize,
     ) -> Option<Expr> {
-        if self.mode == NormMode::Choose && args.is_empty() {
+        if matches!(self.mode, NormMode::Choose | NormMode::Equiv) && args.is_empty() {
             if let Some(val) = self.let_vals.get(&id) {
                 return Some(val.clone());
             }
@@ -720,13 +775,12 @@ impl<'a> SymNormalizer<'a> {
         if self.program.is_strict_call_def(id) && !super::normalize::strict_call_preserves_args(self.program, d) {
             return None;
         }
-        if self.mode == NormMode::Choose && !args.is_empty() {
+        if matches!(self.mode, NormMode::Choose | NormMode::Equiv) && !args.is_empty() {
+            let sum_only = self.mode == NormMode::Choose;
             if let DefKind::Op(body) = &d.kind {
                 for (k, &s_local) in d.params.iter().enumerate() {
-                    if let Some((choose_def, raw_term)) = folds::match_sum_fold_body(self.program, id, s_local, Some((&d.params, k)), body)
-                    {
-                        return self
-                            .expand_op_fold(id, k, s_local, choose_def, &raw_term, args, env, op_env, cur_except, lex_at, span, depth);
+                    if let Some(matched) = folds::match_rec_fold_body(self.program, id, s_local, Some((&d.params, k)), body, sum_only) {
+                        return self.expand_op_fold(id, k, s_local, &matched, args, env, op_env, cur_except, lex_at, span, depth);
                     }
                 }
             }

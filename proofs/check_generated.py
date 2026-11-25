@@ -267,6 +267,9 @@ def verify(lean, path, negative, lean_pool=None):
                 ("| .set xs => .set (renameRawList p xs)", "| .set xs => .set xs", "failed to rename set elements"),
                 ("| .fn ps => .fn (renameRawPairs p ps)", "| .fn ps => .fn ps", "failed to rename function entries"),
                 ("| .set xs => some (dedupList (xs.map mkVal)).length", "| .set xs => some xs.length", "replaced set cardinality with non-extensional list length"),
+                ("| .set xs => foldSetACList ops op base ((dedupList (xs.map mkVal)).map f)", "| .set xs => foldSetACList ops op base ((xs.map mkVal).map f)", "dropped key-set dedupList in AC fold"),
+                ("| .set xs => foldSetACList ops op base ((dedupList (xs.map mkVal)).map f)", "| .set xs => foldSetACList ops op base (dedupList ((xs.map mkVal).map f))", "deduplicated mapped AC fold outputs instead of source set"),
+                ("if right then items.foldr step base", "if right then items.foldl (fun acc x => step x acc) base", "swapped sequence foldRight direction to foldLeft"),
                 ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
             ] if namespace in {"GeneratedEquivSymmetry", "GeneratedErasedEquivSymmetry"} else [
