@@ -173,6 +173,10 @@ pub struct RegionEnv<'a> {
     pub cache: &'a mut StateCache,
 }
 
+// Retain small buffers for reuse without pinning a rare call/state peak per worker.
+const RETAINED_ARENA_SLOTS: usize = 2048;
+const RETAINED_CACHE_WORDS: usize = 2048;
+
 /// The decoding of the most recent current state. A hit compares all the
 /// state's words (cheap next to decoding; buffers are reused and
 /// fingerprints may collide).
@@ -203,6 +207,9 @@ impl StateCache {
 
     pub fn clear(&mut self) {
         self.words.clear();
+        if self.words.capacity() > RETAINED_CACHE_WORDS {
+            self.words.shrink_to(RETAINED_CACHE_WORDS);
+        }
         self.vals = None;
     }
 }
@@ -245,6 +252,9 @@ impl Arena {
     /// Free all values (end of a call).
     fn reset(&mut self) {
         self.slots.clear();
+        if self.slots.capacity() > RETAINED_ARENA_SLOTS {
+            self.slots.shrink_to(RETAINED_ARENA_SLOTS);
+        }
         self.epoch = self.epoch.wrapping_add(1);
     }
 }
@@ -337,6 +347,79 @@ mod tests {
         assert!(r.is_err(), "a handle of an ended call must be refused");
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.get(0).clone()));
         assert!(r.is_err(), "handle 0 is invalid");
+    }
+
+    #[test]
+    fn end_call_bounds_arena_capacity_and_invalidates_handles() {
+        let mut cx = MixedCx::new();
+        let stale = cx.push(Value::Int(7));
+        for _ in 0..RETAINED_ARENA_SLOTS * 16 {
+            cx.push(Value::Int(1));
+        }
+        assert!(cx.arena.slots.capacity() > RETAINED_ARENA_SLOTS);
+        cx.end_call();
+        assert_eq!(cx.live_values(), 0);
+        assert_eq!(cx.arena.slots.capacity(), RETAINED_ARENA_SLOTS);
+
+        let fresh = cx.push(Value::Int(9));
+        assert_eq!(fresh as u32, stale as u32, "index reused");
+        assert_eq!(cx.arena.get(fresh), &Value::Int(9));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cx.arena.get(stale).clone()));
+        assert!(r.is_err(), "shrinking must not revive a stale handle");
+    }
+
+    #[test]
+    fn small_calls_reuse_arena_buffer() {
+        let mut cx = MixedCx::new();
+        cx.end_call();
+        assert_eq!(cx.arena.slots.capacity(), 0);
+        for _ in 0..32 {
+            cx.push(Value::Int(1));
+        }
+        let capacity = cx.arena.slots.capacity();
+        let ptr = cx.arena.slots.as_ptr();
+        for _ in 0..3 {
+            cx.end_call();
+            for _ in 0..32 {
+                cx.push(Value::Int(2));
+            }
+            assert_eq!(cx.arena.slots.capacity(), capacity);
+            assert_eq!(cx.arena.slots.as_ptr(), ptr);
+        }
+    }
+
+    #[test]
+    fn clear_bounds_cache_capacity_and_forces_decode() {
+        let mut c = StateCache::default();
+        c.clear();
+        assert_eq!(c.words.capacity(), 0);
+        let words = vec![1; RETAINED_CACHE_WORDS * 16];
+        let old = c.get(&words, |_| vec![Value::Int(1)]);
+        assert!(c.words.capacity() > RETAINED_CACHE_WORDS);
+        c.clear();
+        assert!(c.words.is_empty());
+        assert!(c.vals.is_none());
+        assert_eq!(c.words.capacity(), RETAINED_CACHE_WORDS);
+        assert_eq!(&*old, &[Value::Int(1)]);
+
+        let fresh = c.get(&[], |_| vec![Value::Int(2)]);
+        assert_eq!(&*fresh, &[Value::Int(2)]);
+        assert_eq!(c.decodes, 2);
+        let hit = c.get(&[], |_| panic!("cached state must not decode again"));
+        assert!(Arc::ptr_eq(&fresh, &hit));
+    }
+
+    #[test]
+    fn clear_reuses_small_cache_buffer() {
+        let mut c = StateCache::default();
+        c.get(&[1, 2], |_| vec![Value::Int(1)]);
+        let capacity = c.words.capacity();
+        let ptr = c.words.as_ptr();
+        c.clear();
+        c.get(&[1, 2], |_| vec![Value::Int(2)]);
+        assert_eq!(c.words.capacity(), capacity);
+        assert_eq!(c.words.as_ptr(), ptr);
+        assert_eq!(c.decodes, 2);
     }
 
     #[test]
