@@ -127,4 +127,25 @@ impl AtomBits<EState> for EncModel {
         self.check_state_model(t);
         self.live_tableau_bits(t)
     }
+    fn has_action_atoms(&self) -> bool {
+        !self.base.live.action_atoms.is_empty()
+    }
+    fn stage_state(&self, t: &EState) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        self.check_state_model(t);
+        self.value_store().is_some().then(|| Box::new(self.values(t)) as Box<dyn std::any::Any + Send + Sync>)
+    }
+    fn action_staged(&self, s: &EState, staged: &(dyn std::any::Any + Send + Sync)) -> Result<Vec<u64>, ModelError> {
+        self.check_state_model(s);
+        let vt = staged.downcast_ref::<Arc<[Value]>>().expect("staged EncModel state");
+        let live = &self.base.live;
+        let vs = self.cached_values(&s.words, true);
+        live_bits(live.action_atoms.len(), |k| {
+            if live.next_steps.get(k).is_some_and(|&b| b) {
+                if let Some(holds) = live.step_atom(&self.base.ip, k, &vs, vt, s.level) {
+                    return Ok(holds);
+                }
+            }
+            live.eval_action_atom(&self.base.ip, k, &vs, vt, s.level).map_err(|e| self.base.error(e))
+        })
+    }
 }

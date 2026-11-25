@@ -9,7 +9,7 @@
 //! releases the barrier and the safepoints (`Shared::abort`) and the
 //! monitors stop before the panic propagates.
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -24,8 +24,8 @@ use super::safepoint::Safepoint;
 use super::tracelog::TraceLog;
 use super::worker::{run_worker, Slot, WorkerOut};
 use super::{
-    abort_on_panic, budget_monitor, coverage, fp_set, init_phase, join_all, progress_monitor, InitResult, Options, Outcome, PathTable,
-    SearchObserver, Shared, Start, Stats, NO_PARENT,
+    abort_on_panic, budget_monitor, coverage, fp_set, init_phase, join_all, progress_monitor, InitResult, Options, Outcome, ParkedRoots,
+    PathTable, SearchObserver, Shared, Start, Stats, NO_PARENT,
 };
 use crate::cache_mem;
 use crate::io::SpillMode;
@@ -54,6 +54,8 @@ pub(super) struct Run<'m, M: Model> {
     /// `Model::extra_generated` before the search: the states the model
     /// generated outside `successors` during it are the difference.
     pub(super) extra_at_start: u64,
+    /// RAII guard marking the model's value store as GC-managed for this run.
+    pub(super) _store_gc_guard: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// The first phase: read `opts` into the search's shared state and the
@@ -119,6 +121,8 @@ pub(super) fn prepare<'m, M: Model>(
     };
     // (Checkpoints need a way to write the states.)
     let ckpt = opts.checkpoint.clone().filter(|_| model.caps().format.is_some()).map(|c| CkptRun::new(c, nworkers, extra_at_start));
+    let store_gc = model.caps().gc;
+    let store_gc_guard = store_gc.map(|gc| gc.enter_scope());
     let shared = Shared {
         model,
         opts,
@@ -149,6 +153,11 @@ pub(super) fn prepare<'m, M: Model>(
         history: Mutex::new(History::new()),
         cov_base,
         paths: model.uses_trace().then(|| Mutex::new(PathTable::default())),
+        store_gc,
+        gc_roots: (0..nworkers).map(|_| Mutex::new(ParkedRoots::default())).collect(),
+        mid_task_parked: AtomicUsize::new(0),
+        store_gc_epoch: AtomicU64::new(0),
+        store_gc_drop_archive: AtomicBool::new(false),
     }
     .with_meters();
 
@@ -171,7 +180,7 @@ pub(super) fn prepare<'m, M: Model>(
         shared.relieve();
     }
     let archiving = shared.retention.on && !shared.retention.off();
-    Run { shared, stats: Stats::default(), levels0, archiving, resumed, extra_at_start }
+    Run { shared, stats: Stats::default(), levels0, archiving, resumed, extra_at_start, _store_gc_guard: store_gc_guard }
 }
 
 /// The second phase: the initial states (checked and queued in `seed`), or

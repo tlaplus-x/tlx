@@ -297,7 +297,8 @@ impl Src {
                 let Slot::W(off, _) = bind else { return bind_mismatch() };
                 let at = set.at(fx)?;
                 let h = fx.word(at, 0);
-                let Some(es) = store.set_elems(h) else {
+                let pin = store.pin();
+                let Some(es) = pin.set_elems(h) else {
                     return Err(EvalError::new("value store iteration over a non-set (the interpreter decides)"));
                 };
                 for &e in es {

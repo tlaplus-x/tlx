@@ -47,9 +47,11 @@ pub fn violation_message(names: &[String]) -> String {
 /// (a safety trace, a lasso): the state through the ALIAS if there is one,
 /// else as the model renders it.
 type Text<'a, S> = dyn Fn(usize, &S, Option<&S>) -> String + 'a;
+type ValText<'a> = dyn Fn(usize, &Arc<[Value]>, Option<&Arc<[Value]>>) -> String + 'a;
 
 pub struct TraceView<'a, S> {
     text: Box<Text<'a, S>>,
+    val_text: Box<ValText<'a>>,
     /// The values of the variables of a state (`-dumpTrace`).
     pub values: Box<dyn Fn(&S) -> Arc<[Value]> + Sync + 'a>,
     /// The label of the initial state.
@@ -71,8 +73,13 @@ impl<'a, S> TraceView<'a, S> {
             let next = next.map(|n| t.values(n));
             base.render_alias(&t.values(s), next.as_deref(), i as u32 + 1).unwrap_or_else(|| t.render(s))
         };
+        let val_text = move |i: usize, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>| {
+            base.render_alias(vals, next.map(|n| n.as_ref()), i as u32 + 1)
+                .unwrap_or_else(|| tlx_runtime::Model::render(base, &tlx_eval::model::State::new(vals.clone(), i as u32 + 1, 0)))
+        };
         TraceView {
             text: Box::new(text),
+            val_text: Box::new(val_text),
             values: Box::new(move |s| t.values(s)),
             init,
             action: Box::new(move |a| base.action_label(a as usize)),
@@ -97,6 +104,22 @@ impl<'a, S> TraceView<'a, S> {
         with_path(Some(CurrentPath::Known(node)), || (self.text)(i, s, next))
     }
 
+    /// Like `show`, rendering pre-decoded owned variable values so traces
+    /// survive value-store GC during a secondary liveness recheck search.
+    pub fn show_values(&self, i: usize, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>, into: Option<u32>) -> String {
+        use tlx_runtime::live::{with_path, CurrentPath, PathNode};
+        let Some(path) = &self.path else { return (self.val_text)(i, vals, next) };
+        let node = {
+            let mut p = path.borrow_mut();
+            p.truncate(i);
+            let parent = p.last().cloned();
+            let node = Arc::new(PathNode { values: vals.clone(), action: into, parent });
+            p.push(node.clone());
+            node
+        };
+        with_path(Some(CurrentPath::Known(node)), || (self.val_text)(i, vals, next))
+    }
+
     /// The label of a step: `<Initial predicate>` or `<Action ...>`, by the
     /// action into the state (None for an initial state).
     pub fn label(&self, into: Option<u32>) -> String {
@@ -109,6 +132,11 @@ impl<'a, S> TraceView<'a, S> {
     /// The printed state `i + 1` of a trace (reached by `into`) under `label`.
     pub fn step(&self, i: usize, label: &str, s: &S, next: Option<&S>, into: Option<u32>) -> String {
         crate::out::state(i + 1, label, &self.show(i, s, next, into))
+    }
+
+    /// Like `step`, rendering pre-decoded owned variable values.
+    pub fn step_values(&self, i: usize, label: &str, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>, into: Option<u32>) -> String {
+        crate::out::state(i + 1, label, &self.show_values(i, vals, next, into))
     }
 }
 
@@ -286,10 +314,8 @@ pub fn find_error<T: Tier>(
     crate::report::record_search_stats(base, &found.report);
     let outcome = match rendered(base, fired.result(&input), view, false) {
         Liveness::Violated(properties, counterexample) => tlx_runtime::Outcome::TemporalViolated { properties, counterexample },
-        // (By the message only, as the other errors of the checks.)
-        Liveness::Error(tlx_runtime::ModelError { message, .. }) | Liveness::OutOfMemory(message) => {
-            tlx_runtime::Outcome::Error(tlx_runtime::ModelError::new(message))
-        }
+        Liveness::Error(e) => tlx_runtime::Outcome::Error(e),
+        Liveness::OutOfMemory(message) => tlx_runtime::Outcome::Error(tlx_runtime::ModelError::new(message)),
         Liveness::Holds => unreachable!("a violation"),
     };
     Some(tlx_runtime::Report { outcome, trace: Vec::new(), ..found.report })

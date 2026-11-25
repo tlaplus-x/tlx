@@ -82,17 +82,16 @@ pub trait Regions {
     fn eval(&self, rid: u32, args: &Args<'_>, env: &mut RegionEnv<'_>) -> Result<Out, RegionError>;
 }
 
-/// The value store operations a library calls (`host->ref_op` and
-/// `host->ref_elems`, ABI v5), implemented by the compiled tier for one
-/// model: the table the code was generated for (its size and hash are
-/// checked when the library is loaded).
-pub trait RefOps: Send + Sync {
+/// A pinned execution scope for one native call into a [`RefOps`] table.
+/// Holding the scope pins the underlying value store for the duration of
+/// the native call so `run` and `elems` need no per-operation locking and
+/// element slices returned by `elems` stay live until the call returns.
+pub trait RefOpsScope {
     /// Number of operations (ids are `0..len`).
     fn len(&self) -> u32;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn hash(&self) -> u64;
     /// Run operation `op`; false: an error (the interpreter decides).
     ///
     /// # Safety
@@ -110,7 +109,23 @@ pub trait RefOps: Send + Sync {
     /// spans, and all storage must remain live for the call.
     unsafe fn run(&self, op: u32, args: *const u64, out: *mut u64) -> bool;
     /// The handles of the elements of stored set `set` (None: not a set).
+    /// The slice remains valid for the lifetime of this pinned scope.
     fn elems(&self, set: u64) -> Option<&[u64]>;
+}
+
+/// The value store operations a library calls (`host->ref_op` and
+/// `host->ref_elems`, ABI v5), implemented by the compiled tier for one
+/// model: the table the code was generated for (its size and hash are
+/// checked when the library is loaded).
+pub trait RefOps: Send + Sync {
+    /// Number of operations (ids are `0..len`).
+    fn len(&self) -> u32;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn hash(&self) -> u64;
+    /// Pin the underlying value store once for the duration of `f`.
+    fn with_scope(&self, f: &mut dyn FnMut(&dyn RefOpsScope));
 }
 
 /// `tlx_arg` in tlx_abi.h.

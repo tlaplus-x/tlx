@@ -3,18 +3,21 @@
 use super::diagnostic::{error_report, fp_set_full};
 use super::*;
 
+pub(super) type SavedTrace = [(Arc<[tlx_value::Value]>, Option<u32>)];
+
 /// Print the result TLC-style and return TLC's exit code.
 /// `view` shows the states and labels the steps of a trace.
 pub(super) fn report<T: Tier>(
     r: Report<T::State>,
+    saved_trace: Option<&SavedTrace>,
     live: Option<(live::Liveness, Duration)>,
     post: Option<(u32, String)>,
     view: &live::TraceView<T::State>,
     run: &Run,
     dump: &dyn Fn(),
 ) -> ExitCode {
-    let (code, success, post_failed) = outcome::<T>(&r, &live, &post, view, run);
-    let incomplete = trace::<T>(&r, view);
+    let (code, success, post_failed) = outcome::<T>(&r, saved_trace, &live, &post, view, run);
+    let incomplete = trace::<T>(&r, saved_trace, view);
     // (TLC's -dumpTrace postconditions, before the statistics.)
     dump();
     // (A simulation reports the POSTCONDITION after the statistics.)
@@ -28,6 +31,7 @@ pub(super) fn report<T: Tier>(
 /// Keep every outcome explicit: names, messages and exit codes belong together.
 fn outcome<T: Tier>(
     r: &Report<T::State>,
+    saved_trace: Option<&SavedTrace>,
     live: &Option<(live::Liveness, Duration)>,
     post: &Option<(u32, String)>,
     view: &live::TraceView<T::State>,
@@ -93,7 +97,10 @@ fn outcome<T: Tier>(
             }
         }
         Outcome::InvariantViolated(name) if r.in_init => {
-            let state = r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default();
+            let state = match saved_trace {
+                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None)).unwrap_or_default(),
+                None => r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default(),
+            };
             out::error(code::TLC_INVARIANT_VIOLATED_INITIAL, &format!("Invariant {name} is violated by the initial state:\n{state}\n"));
             EXIT_INVARIANT
         }
@@ -117,7 +124,10 @@ fn outcome<T: Tier>(
         }
         Outcome::InitPropertyViolated(label) => {
             // TLC shows just the state (no behavior).
-            let state = r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default();
+            let state = match saved_trace {
+                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None)).unwrap_or_default(),
+                None => r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default(),
+            };
             out::error(code::TLC_PROPERTY_VIOLATED_INITIAL, &format!("Property {label} is violated by the initial state:\n{state}\n"));
             EXIT_LIVENESS
         }
@@ -160,7 +170,11 @@ fn outcome<T: Tier>(
 
 /// Print a behavior, preserving any note that limits its completeness.
 /// Return an incomplete successor for the statistics suppression rules.
-fn trace<'a, T: Tier>(r: &'a Report<T::State>, view: &live::TraceView<T::State>) -> Option<(Option<u32>, &'a String)> {
+fn trace<'a, T: Tier>(
+    r: &'a Report<T::State>,
+    saved_trace: Option<&SavedTrace>,
+    view: &live::TraceView<T::State>,
+) -> Option<(Option<u32>, &'a String)> {
     let incomplete = match &r.outcome {
         Outcome::Error(ModelError { context: ErrorContext::IncompleteState { action, state, .. }, .. }) => Some((*action, state)),
         _ => None,
@@ -171,16 +185,24 @@ fn trace<'a, T: Tier>(r: &'a Report<T::State>, view: &live::TraceView<T::State>)
     if let Some(note) = &r.trace_note {
         println!("{note}");
     }
-    if !r.trace.is_empty() && !state_only {
+    let trace_len = saved_trace.map_or(r.trace.len(), |s| s.len());
+    if trace_len > 0 && !state_only {
         out::error(code::TLC_BEHAVIOR_UP_TO_THIS_POINT, "The behavior up to this point is:");
         let mut text = String::new();
-        for (i, step) in r.trace.iter().enumerate() {
-            let next = r.trace.get(i + 1).map(|t| &t.state);
-            text += &view.step(i, &view.label(step.action), &step.state, next, step.action);
+        if let Some(saved) = saved_trace {
+            for (i, (vals, action)) in saved.iter().enumerate() {
+                let next = saved.get(i + 1).map(|(v, _)| v);
+                text += &view.step_values(i, &view.label(*action), vals, next, *action);
+            }
+        } else {
+            for (i, step) in r.trace.iter().enumerate() {
+                let next = r.trace.get(i + 1).map(|t| &t.state);
+                text += &view.step(i, &view.label(step.action), &step.state, next, step.action);
+            }
         }
         // The incomplete successor ends the behavior.
         if let (None, Some((Some(a), state))) = (&r.trace_note, incomplete) {
-            text += &out::state(r.trace.len() + 1, &view.label(Some(a)), state);
+            text += &out::state(trace_len + 1, &view.label(Some(a)), state);
         }
         print!("{text}");
     }

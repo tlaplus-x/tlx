@@ -248,7 +248,7 @@ pub fn stuttering(num: usize) -> String {
 /// kind its message shows. (A layout miss, which is not an error of the
 /// spec, is a general error.)
 pub fn error_kind(e: &ModelError) -> ErrorKind {
-    if !matches!(e.kind, ErrorKind::General | ErrorKind::LayoutMiss | ErrorKind::FunctionDomain) {
+    if !matches!(e.kind, ErrorKind::General | ErrorKind::LayoutMiss | ErrorKind::StoreFull | ErrorKind::FunctionDomain) {
         return e.kind;
     }
     let msg = &e.message;
@@ -272,7 +272,9 @@ pub fn error_kind(e: &ModelError) -> ErrorKind {
 /// The message code TLC reports an error of kind `kind` with.
 pub fn kind_code(kind: ErrorKind) -> u32 {
     match kind {
-        ErrorKind::General | ErrorKind::Unsupported | ErrorKind::LayoutMiss | ErrorKind::FunctionDomain => code::GENERAL,
+        ErrorKind::General | ErrorKind::Unsupported | ErrorKind::LayoutMiss | ErrorKind::StoreFull | ErrorKind::FunctionDomain => {
+            code::GENERAL
+        }
         ErrorKind::AssertFailed => code::TLC_VALUE_ASSERT_FAILED,
         ErrorKind::DivisionByZero => code::TLC_MODULE_DIVISION_BY_ZERO,
         ErrorKind::ArgumentError => code::TLC_MODULE_ARGUMENT_ERROR,

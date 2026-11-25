@@ -233,6 +233,57 @@ impl<'m, S> Frontier<'m, S> {
     pub(super) fn for_each_queued_in<E>(&self, l: usize, f: impl FnMut(&Block<S>) -> Result<(), E>) -> Result<(), E> {
         self.queue.for_each_unclaimed_in(l, f)
     }
+
+    /// A scratch `XorPrev` sized for this frontier's encoded states.
+    pub(super) fn scratch(&self) -> XorPrev {
+        self.queue.scratch()
+    }
+
+    /// Visit every state held in the shared frontier queue (unclaimed current
+    /// level + submitted next level) at a safepoint.
+    pub(super) fn visit_queued(
+        &self,
+        cache: &mut crate::queue::SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(crate::queue::StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        self.queue.visit_states(cache, prev, visit)
+    }
+
+    /// Visit states held in per-worker staged blocks (`Frontier::staged`) at a
+    /// safepoint. When `include_archive` is true and the owning worker is still
+    /// archiving (`owner_archiving(i)`), a compressed staged block (`st.moving`)
+    /// keeps its consumed records rooted until the owner moves the whole block
+    /// to its archive; otherwise only the unread suffix is visited so consumed
+    /// records can be reclaimed immediately.
+    pub(super) fn visit_staged(
+        &self,
+        include_archive: bool,
+        owner_archiving: impl Fn(usize) -> bool,
+        cache: &mut crate::queue::SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(crate::queue::StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        for (i, slot) in self.staged.iter().enumerate() {
+            let arch = include_archive && owner_archiving(i);
+            if let Some(st) = &*slot.lock() {
+                let keep_consumed = arch && st.moving;
+                st.reader.visit_states(keep_consumed, cache, prev, visit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear `moving` on every staged block once the search drops its
+    /// layout-miss archive at a safepoint, so neither `read_own` nor
+    /// subsequent thieves treat staged compressed blocks as archived.
+    pub(super) fn clear_staged_archiving(&self) {
+        for slot in self.staged.iter() {
+            if let Some(st) = &mut *slot.lock() {
+                st.moving = false;
+            }
+        }
+    }
 }
 
 /// The states left to claim below which a claimed block is staged for
@@ -469,6 +520,62 @@ impl<S> Local<'_, '_, S> {
     pub(super) fn stop_archiving(&mut self) {
         self.archive = None;
         self.moving = false;
+        if let Some(st) = &mut *self.fr.staged[self.me].lock() {
+            st.moving = false;
+        }
+    }
+
+    /// Temporarily move this worker's frontier containers out for safepoint GC
+    /// root enumeration (restored by `restore_gc_parts`).
+    pub(super) fn take_gc_parts(&mut self) -> (Option<Reader<S>>, Vec<Task<S>>, Writer<S>, Option<Writer<S>>) {
+        self.spare = None;
+        let reader = self.reader.take();
+        let batch = std::mem::take(&mut self.batch);
+        let writer = std::mem::replace(&mut self.writer, self.fr.queue.writer());
+        let archive = self.archive.take();
+        (reader, batch, writer, archive)
+    }
+
+    /// Restore the frontier containers moved out by `take_gc_parts`.
+    pub(super) fn restore_gc_parts(
+        &mut self,
+        reader: Option<Reader<S>>,
+        batch: Vec<Task<S>>,
+        writer: Writer<S>,
+        archive: Option<Writer<S>>,
+    ) {
+        self.reader = reader;
+        self.batch = batch;
+        self.writer = writer;
+        self.archive = archive;
+        if self.archive.is_none() {
+            self.moving = false;
+        }
+    }
+
+    /// Visit every state held directly by this `Local` (reader, batch, writer,
+    /// and optionally archive), used for single-threaded init-phase GC.
+    pub(super) fn visit_local(
+        &self,
+        include_archive: bool,
+        cache: &mut crate::queue::SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(crate::queue::StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        if let Some(r) = &self.reader {
+            let keep_consumed = include_archive && self.archive.is_some() && r.compressed();
+            r.visit_states(keep_consumed, cache, prev, visit)?;
+        }
+        for t in &self.batch {
+            visit(crate::queue::StateRef::Obj(&t.state));
+        }
+        self.writer.visit_states(cache, prev, visit)?;
+        if include_archive {
+            if let Some(a) = &self.archive {
+                a.visit_states(cache, prev, visit)?;
+            }
+        }
+        Ok(())
     }
 
     /// Add `blocks` (of states done with) to this worker's part of the archive.
@@ -933,6 +1040,90 @@ mod tests {
             logs.extend(archived(&fr, &mut b));
             logs.sort_unstable();
             assert_eq!(logs, (0..n).collect::<Vec<_>>(), "compressed={compressed}");
+        }
+    }
+
+    /// Safepoint GC root scanning covers staged blocks and stolen per-worker
+    /// batches (both object and compressed blocks), keeping consumed records
+    /// rooted only while a compressed staged block is still destined for a
+    /// retained archive.
+    #[test]
+    fn staged_and_stolen_batches_are_visited_for_gc() {
+        for compressed in [false, true] {
+            let cfg = Config { kinds: BlockKinds::Auto, seg_bytes: 4096, compress_above: 1 << 30 };
+            let fr = Frontier::new(2, Some(&Words as &dyn StateCodec<Vec<u64>>), cfg, Mem::new(4096, false), &Spill::default());
+            fr.squeeze(compressed);
+            let mut a = fr.local(0, true);
+            let mut b = fr.local(1, true);
+            let n = 64u64;
+            level(&mut a, n);
+            // Worker 0 claims and stages the block, expands 2 states, and holds
+            // the rest of its batch. Worker 1 steals a batch and expands 1 state.
+            let t0 = a.pop().unwrap();
+            a.retire(t0);
+            let t1 = a.pop().unwrap();
+            a.retire(t1);
+            let s0 = b.pop().unwrap();
+            b.retire(s0);
+
+            let (ra, ba, wa, aa) = a.take_gc_parts();
+            let (rb, bb, wb, ab) = b.take_gc_parts();
+            assert!(!ba.is_empty(), "worker 0 batch should be non-empty: compressed={compressed}");
+            assert!(!bb.is_empty(), "worker 1 batch should be non-empty: compressed={compressed}");
+
+            let scan = |include_archive: bool, owner_archiving: bool| {
+                let mut cache = crate::queue::SegCache::default();
+                let mut prev = fr.scratch();
+                let mut seen = Vec::new();
+                let mut visit = |sr: crate::queue::StateRef<'_, Vec<u64>>| match sr {
+                    crate::queue::StateRef::Obj(st) => seen.push(st[0]),
+                    crate::queue::StateRef::Words(w) => seen.push(w[0]),
+                };
+                fr.visit_queued(&mut cache, &mut prev, &mut visit).unwrap();
+                fr.visit_staged(include_archive, |i| i == 0 && owner_archiving, &mut cache, &mut prev, &mut visit).unwrap();
+                for t in ba.iter().chain(bb.iter()) {
+                    visit(crate::queue::StateRef::Obj(&t.state));
+                }
+                if include_archive {
+                    if let Some(arch) = &aa {
+                        arch.visit_states(&mut cache, &mut prev, &mut visit).unwrap();
+                    }
+                    if let Some(arch) = &ab {
+                        arch.visit_states(&mut cache, &mut prev, &mut visit).unwrap();
+                    }
+                }
+                seen.sort_unstable();
+                seen.dedup();
+                seen
+            };
+
+            // With archive retained, all 64 states remain reachable.
+            assert_eq!(scan(true, true), (0..n).collect::<Vec<_>>(), "retained compressed={compressed}");
+
+            // Once the archive is dropped, only the 61 unexpanded states stay
+            // rooted (the 3 retired states are released immediately).
+            let without_archive = scan(false, true);
+            assert_eq!(without_archive.len(), (n - 3) as usize, "dropped compressed={compressed}");
+
+            // After `clear_staged_archiving`, a compressed staged block drops
+            // its consumed prefix even if `include_archive` & `owner_archiving`
+            // are true (whereas uncompressed blocks archived retired states in
+            // `aa`/`ab` directly).
+            fr.clear_staged_archiving();
+            let after_clear = scan(true, true);
+            let want_after_clear = if compressed { n - 3 } else { n };
+            assert_eq!(after_clear.len(), want_after_clear as usize, "cleared compressed={compressed}");
+
+            a.restore_gc_parts(ra, ba, wa, aa);
+            b.restore_gc_parts(rb, bb, wb, ab);
+            let mut rest = 3u64;
+            while a.pop().is_some() {
+                rest += 1;
+            }
+            while b.pop().is_some() {
+                rest += 1;
+            }
+            assert_eq!(rest, n, "restored batches must preserve every state: compressed={compressed}");
         }
     }
 }

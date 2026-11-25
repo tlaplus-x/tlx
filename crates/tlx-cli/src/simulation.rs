@@ -56,6 +56,7 @@ pub(crate) fn run(a: &Args, model: InterpModel, traces: u64, seed: u64, check_de
             fp_mem: a.fp_mem(),
             opts: None,
             coverage: None,
+            checkpoint: None,
         };
         return finish(&m, r, &run);
     }
@@ -68,6 +69,7 @@ pub(crate) fn run(a: &Args, model: InterpModel, traces: u64, seed: u64, check_de
         fp_mem: a.fp_mem(),
         opts: None,
         coverage: None,
+        checkpoint: None,
     };
     finish(&model, r, &run)
 }

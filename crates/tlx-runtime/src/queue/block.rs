@@ -15,6 +15,13 @@ use super::seg::{self, Seg};
 use crate::io::IoError;
 use crate::mem::{Gauge, Meter};
 
+/// A borrowed state yielded during safepoint root scanning: either an object
+/// state or its decoded encoding words.
+pub(crate) enum StateRef<'a, S> {
+    Obj(&'a S),
+    Words(&'a [u64]),
+}
+
 /// A queued state: the state, its trace-log entry and its depth.
 pub(crate) struct Task<S> {
     pub(crate) state: S,
@@ -277,6 +284,80 @@ impl<S> Block<S> {
             }
         }
         Ok(Ok(()))
+    }
+
+    /// Visit every state in this block (as an object for `Block::Objects`, or
+    /// as decoded words for `Block::Encoded`) for safepoint root scanning.
+    pub(crate) fn visit_states(
+        &self,
+        cache: &mut SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        self.visit_suffix(self.len(), cache, prev, visit)
+    }
+
+    /// Visit only the last `left` unread states in this block (for `Reader`
+    /// safepoint scanning when consumed records are no longer retained for
+    /// whole-block archival). For `Block::Objects`, consumed states were
+    /// already popped so all remaining tasks are visited; for `Kind::Raw`
+    /// encoded blocks the consumed prefix is skipped directly; for `Kind::Xor`
+    /// encoded blocks the consumed prefix is decoded into `prev` scratch
+    /// without invoking `visit` so the XOR state is reconstructed for the
+    /// unread suffix.
+    pub(crate) fn visit_suffix(
+        &self,
+        left: usize,
+        cache: &mut SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        if left == 0 {
+            return Ok(());
+        }
+        match self {
+            Block::Objects { tasks, .. } => {
+                for t in tasks {
+                    visit(StateRef::Obj(&t.state));
+                }
+                Ok(())
+            }
+            Block::Encoded { seg, start, n, kind, .. } => {
+                let total = *n as usize;
+                let skip = total.saturating_sub(left);
+                if !cache.seg.as_ref().is_some_and(|c| Arc::ptr_eq(c, seg)) {
+                    cache.bytes = None;
+                    cache.bytes = Some(seg.bytes()?);
+                    cache.seg = Some(seg.clone());
+                }
+                let data = match cache.bytes.as_ref().expect("cached segment") {
+                    seg::Bytes::Shared(s) => &s.data[..],
+                    seg::Bytes::Owned(v) => &v[..],
+                };
+                match kind {
+                    Kind::Raw => {
+                        let size = codec::raw_size(prev.words.len());
+                        let mut pos = *start as usize + skip * size;
+                        for _ in skip..total {
+                            let _ = codec::get_raw(&data[pos..pos + size], &mut prev.words);
+                            pos += size;
+                            visit(StateRef::Words(&prev.words));
+                        }
+                    }
+                    Kind::Xor => {
+                        let mut pos = *start as usize;
+                        prev.reset();
+                        for i in 0..total {
+                            let _ = codec::get_xor(data, &mut pos, prev);
+                            if i >= skip {
+                                visit(StateRef::Words(&prev.words));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The segment of an encoded block.

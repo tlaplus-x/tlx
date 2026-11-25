@@ -277,7 +277,13 @@ impl<M: Model> WorkerState<'_, '_, M> {
         self.local.share(stealing);
         self.order_level();
         let mut n = 0;
-        while self.proceed() {
+        loop {
+            if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                shared.control().request(super::SP_STORE_GC);
+            }
+            if !self.proceed() {
+                break;
+            }
             if shared.model.stop_requested() {
                 shared.control().stop();
                 break;
@@ -326,9 +332,16 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
                 // Choosing the representatives in BFS order: once every
                 // worker has offered its candidates (see `order`).
                 w.leave_safepoints();
-                barrier_wait(shared, w.me);
+                barrier_wait_then(shared, w.me, || {
+                    if shared.store_gc.is_some() {
+                        shared.safepoint.join_all(shared.slots.len());
+                    }
+                });
                 if levels.barrier.is_broken() {
                     return;
+                }
+                if shared.store_gc.is_some() {
+                    w.joined_safepoints();
                 }
                 w.resolve();
             }
@@ -396,12 +409,18 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             levels.done.store(done, Ordering::SeqCst);
             // (A checkpoint: the workers write their parts below, and join
             // the safepoints after it.)
-            if !done && !shared.checkpoint_due() {
-                // Every worker is active again before any expands a task of
-                // the level, so that a safepoint requested meanwhile is
-                // served by all of them. (The others are waiting here: they
-                // hold no reference into what a safepoint changes.)
-                shared.safepoint.join_all(shared.slots.len());
+            if !done {
+                if shared.checkpoint_due() {
+                    if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                        shared.gc_store();
+                    }
+                } else {
+                    // Every worker is active again before any expands a task of
+                    // the level, so that a safepoint requested meanwhile is
+                    // served by all of them. (The others are waiting here: they
+                    // hold no reference into what a safepoint changes.)
+                    shared.safepoint.join_all(shared.slots.len());
+                }
             }
         });
         if levels.done.load(Ordering::SeqCst) || levels.barrier.is_broken() {
@@ -411,6 +430,7 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             // A checkpoint between the levels: every worker writes its
             // part, then the last to finish writes the rest and commits
             // before any goes on (all still out of the safepoints).
+            w.take_roots();
             w.publish_history();
             barrier_wait(shared, me);
             if levels.barrier.is_broken() {

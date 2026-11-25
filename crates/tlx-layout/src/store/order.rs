@@ -12,7 +12,7 @@ use tlx_value::plan::{ComparisonKind, FunctionComparison};
 use tlx_value::Sym;
 
 use super::ops::RefOpError;
-use super::{int_handle, is_immediate, str_handle, tag, Body, Store, TAG_BOOL, TAG_INT, TAG_MODEL_VALUE, TAG_STR};
+use super::{int_handle, is_immediate, str_handle, tag, Body, Store, StorePin, TAG_BOOL, TAG_INT, TAG_MODEL_VALUE, TAG_STR};
 use crate::scalar;
 
 type R<T> = Result<T, RefOpError>;
@@ -59,7 +59,7 @@ enum View<'a> {
     Fn(Fn<'a>),
 }
 
-fn view(s: &Store, h: u64) -> View<'_> {
+fn view<'a>(s: &'a StorePin<'_>, h: u64) -> View<'a> {
     if is_immediate(h) {
         return View::Imm(h);
     }
@@ -79,18 +79,18 @@ fn view(s: &Store, h: u64) -> View<'_> {
 }
 
 /// The function view of a handle (None: not a function).
-pub(crate) fn fn_view(s: &Store, h: u64) -> Option<Fn<'_>> {
+pub(crate) fn fn_view<'a>(s: &'a StorePin<'_>, h: u64) -> Option<Fn<'a>> {
     match view(s, h) {
         View::Fn(f) => Some(f),
         _ => None,
     }
 }
 
-fn delegate_eq(s: &Store, a: u64, b: u64) -> R<bool> {
+fn delegate_eq(s: &StorePin<'_>, a: u64, b: u64) -> R<bool> {
     tlx_value::order::eq_tlc(&s.thaw(a), &s.thaw(b)).map_err(|_| RefOpError::Eval)
 }
 
-fn delegate_cmp(s: &Store, a: u64, b: u64) -> R<Ordering> {
+fn delegate_cmp(s: &StorePin<'_>, a: u64, b: u64) -> R<Ordering> {
     tlx_value::order::cmp_tlc(&s.thaw(a), &s.thaw(b)).map_err(|_| RefOpError::Eval)
 }
 
@@ -104,9 +104,9 @@ fn interval_len(lo: i64, hi: i64) -> usize {
 
 /// Compare a stored handle `h` against a 64-bit integer `v` without allocating
 /// or populating `Node::elems`; `h_left` selects TLC's left/right operand order.
-fn eq_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<bool> {
+fn eq_with_int(s: &StorePin<'_>, h: u64, v: i64, h_left: bool) -> R<bool> {
     if let Some(vh) = int_handle(v) {
-        return if h_left { eq_tlc(s, h, vh) } else { eq_tlc(s, vh, h) };
+        return if h_left { eq_tlc_pin(s, h, vh) } else { eq_tlc_pin(s, vh, h) };
     }
     if tag(h) == TAG_INT {
         return Ok(false);
@@ -120,9 +120,9 @@ fn eq_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<bool> {
     r.map_err(|_| RefOpError::Eval)
 }
 
-fn cmp_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<Ordering> {
+fn cmp_with_int(s: &StorePin<'_>, h: u64, v: i64, h_left: bool) -> R<Ordering> {
     if let Some(vh) = int_handle(v) {
-        return if h_left { cmp_tlc(s, h, vh) } else { cmp_tlc(s, vh, h) };
+        return if h_left { cmp_tlc_pin(s, h, vh) } else { cmp_tlc_pin(s, vh, h) };
     }
     if tag(h) == TAG_INT {
         let x = (h as i64) >> scalar::TAG_BITS;
@@ -137,7 +137,7 @@ fn cmp_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<Ordering> {
     r.map_err(|_| RefOpError::Eval)
 }
 
-fn eq_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<bool> {
+fn eq_set_interval(s: &StorePin<'_>, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<bool> {
     if es.len() != interval_len(lo, hi) {
         return Ok(false);
     }
@@ -149,7 +149,7 @@ fn eq_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R
     Ok(true)
 }
 
-fn cmp_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<Ordering> {
+fn cmp_set_interval(s: &StorePin<'_>, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<Ordering> {
     let n = interval_len(lo, hi);
     let c = if set_left { es.len().cmp(&n) } else { n.cmp(&es.len()) };
     if c != Ordering::Equal {
@@ -166,6 +166,11 @@ fn cmp_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> 
 
 /// TLC `a.equals(b)` on handles (`order::eq_tlc`).
 pub fn eq_tlc(s: &Store, a: u64, b: u64) -> R<bool> {
+    eq_tlc_pin(&s.pin(), a, b)
+}
+
+/// TLC `a.equals(b)` on handles using an already-pinned store.
+pub fn eq_tlc_pin(s: &StorePin<'_>, a: u64, b: u64) -> R<bool> {
     if !s.is_valid(a) || !s.is_valid(b) {
         return Err(RefOpError::Eval);
     }
@@ -220,9 +225,9 @@ fn sym_of(h: u64) -> Sym {
     super::symbol(h).expect("invalid symbol handle")
 }
 
-fn eq_seq(s: &Store, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>) -> R<bool> {
+fn eq_seq(s: &StorePin<'_>, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>) -> R<bool> {
     for (x, y) in a.zip(b) {
-        if !eq_tlc(s, x, y)? {
+        if !eq_tlc_pin(s, x, y)? {
             return Ok(false);
         }
     }
@@ -230,7 +235,7 @@ fn eq_seq(s: &Store, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>)
 }
 
 fn record_eq(
-    s: &Store,
+    s: &StorePin<'_>,
     r: impl Iterator<Item = (Sym, u64)> + Clone,
     q: impl Iterator<Item = (Sym, u64)> + Clone,
     n: usize,
@@ -243,7 +248,7 @@ fn record_eq(
 }
 
 /// `this.equals(fcn)` with both sides as FcnRcdValues (`order::fcn_eq`).
-fn fcn_eq(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<bool> {
+fn fcn_eq(s: &StorePin<'_>, x: Fn<'_>, y: Fn<'_>) -> R<bool> {
     let plan = FunctionComparison::new(x.len(), y.len(), matches!(x, Fn::Tuple(_)), matches!(y, Fn::Tuple(_)));
     if plan.length_order != Ordering::Equal {
         return Ok(false);
@@ -254,7 +259,7 @@ fn fcn_eq(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<bool> {
         }
     }
     for i in plan.values {
-        if !eq_tlc(s, x.val(i), y.val(i))? {
+        if !eq_tlc_pin(s, x.val(i), y.val(i))? {
             return Ok(false);
         }
     }
@@ -263,6 +268,11 @@ fn fcn_eq(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<bool> {
 
 /// TLC `a.compareTo(b)` on handles (`order::cmp_tlc`).
 pub fn cmp_tlc(s: &Store, a: u64, b: u64) -> R<Ordering> {
+    cmp_tlc_pin(&s.pin(), a, b)
+}
+
+/// TLC `a.compareTo(b)` on handles using an already-pinned store.
+pub fn cmp_tlc_pin(s: &StorePin<'_>, a: u64, b: u64) -> R<Ordering> {
     if !s.is_valid(a) || !s.is_valid(b) {
         return Err(RefOpError::Eval);
     }
@@ -321,9 +331,9 @@ pub fn cmp_tlc(s: &Store, a: u64, b: u64) -> R<Ordering> {
     }
 }
 
-fn cmp_seq(s: &Store, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>) -> R<Ordering> {
+fn cmp_seq(s: &StorePin<'_>, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>) -> R<Ordering> {
     for (x, y) in a.zip(b) {
-        let c = cmp_tlc(s, x, y)?;
+        let c = cmp_tlc_pin(s, x, y)?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -332,7 +342,7 @@ fn cmp_seq(s: &Store, a: impl Iterator<Item = u64>, b: impl Iterator<Item = u64>
 }
 
 fn record_cmp(
-    s: &Store,
+    s: &StorePin<'_>,
     r: impl Iterator<Item = (Sym, u64)> + Clone,
     q: impl Iterator<Item = (Sym, u64)> + Clone,
     n: usize,
@@ -352,7 +362,7 @@ fn record_cmp(
 }
 
 /// `order::fcn_cmp`.
-fn fcn_cmp(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<Ordering> {
+fn fcn_cmp(s: &StorePin<'_>, x: Fn<'_>, y: Fn<'_>) -> R<Ordering> {
     let plan = FunctionComparison::new(x.len(), y.len(), matches!(x, Fn::Tuple(_)), matches!(y, Fn::Tuple(_)));
     if plan.length_order != Ordering::Equal {
         return Ok(plan.length_order);
@@ -364,7 +374,7 @@ fn fcn_cmp(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<Ordering> {
         }
     }
     for i in plan.values {
-        let c = cmp_tlc(s, x.val(i), y.val(i))?;
+        let c = cmp_tlc_pin(s, x.val(i), y.val(i))?;
         if c != Ordering::Equal {
             return Ok(c);
         }
@@ -375,16 +385,16 @@ fn fcn_cmp(s: &Store, x: Fn<'_>, y: Fn<'_>) -> R<Ordering> {
 /// D-31: unlike mapped values, unequal domain-key kinds have a total order.
 /// Keep the allocation-free comparison for ordinary domains. Frozen values
 /// contain no lazy values, so structural comparison cannot fail here.
-fn domain_cmp(s: &Store, a: u64, b: u64) -> Ordering {
+fn domain_cmp(s: &StorePin<'_>, a: u64, b: u64) -> Ordering {
     let (ka, kb) = (comparison_kind(s, a), comparison_kind(s, b));
     if ka != kb {
         return ka.cmp(&kb);
     }
-    cmp_tlc(s, a, b).unwrap_or_else(|_| s.thaw(a).cmp(&s.thaw(b)))
+    cmp_tlc_pin(s, a, b).unwrap_or_else(|_| s.thaw(a).cmp(&s.thaw(b)))
 }
 
 /// Decode the representation; the kind order itself belongs to tlx-value.
-fn comparison_kind(s: &Store, h: u64) -> ComparisonKind {
+fn comparison_kind(s: &StorePin<'_>, h: u64) -> ComparisonKind {
     match view(s, h) {
         View::Imm(h) => match tag(h) {
             TAG_MODEL_VALUE => ComparisonKind::ModelValue,

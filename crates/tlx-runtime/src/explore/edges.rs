@@ -56,6 +56,21 @@ pub trait AtomBits<S> {
     fn action_only(&self, s: &S, t: &S, _mask: &[u64]) -> Result<Vec<u64>, ModelError> {
         self.action(s, t)
     }
+    /// Whether this model has any action atoms that must be evaluated on
+    /// outgoing (including constraint-rejected) steps.
+    fn has_action_atoms(&self) -> bool {
+        true
+    }
+    /// Optional store-free staging of `t` so constraint-rejected candidates
+    /// can release their value-store handles while preserving `action_staged`
+    /// evaluation under final `TLCGet("stats")` statistics.
+    fn stage_state(&self, _t: &S) -> Option<Box<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    /// Action-atom bits of `s -> staged` where `staged` came from `stage_state`.
+    fn action_staged(&self, _s: &S, _staged: &(dyn std::any::Any + Send + Sync)) -> Result<Vec<u64>, ModelError> {
+        unreachable!("action_staged called without stage_state")
+    }
 }
 
 /// The action atoms decided by the action that generates a step: atoms
@@ -208,7 +223,7 @@ impl<'m, S> EdgeRec<'m, S> {
         }
     }
 
-    fn fail(&mut self, e: ModelError) -> Result<(), ModelError> {
+    pub(super) fn fail(&mut self, e: ModelError) -> Result<(), ModelError> {
         self.failed = true;
         self.error = Some(e.clone());
         let b = self.fps.block_len() * 8;
@@ -244,6 +259,7 @@ impl<'m, S> EdgeRec<'m, S> {
         };
         let b = match b {
             Ok(b) => b,
+            Err(e) if e.is_store_full() => return Err(e),
             Err(e) => return self.fail(e),
         };
         let p = self.actions.intern(b);
@@ -331,6 +347,7 @@ impl<'m, S> EdgeRec<'m, S> {
         }
         match self.atoms.tableau(t) {
             Ok(()) => Ok(()),
+            Err(e) if e.is_store_full() => Err(e),
             Err(e) => self.fail(e),
         }
     }
@@ -345,6 +362,7 @@ impl<'m, S> EdgeRec<'m, S> {
         self.share_decided();
         let stutter = match self.atoms.action(s, s) {
             Ok(b) => self.actions.intern(b),
+            Err(e) if e.is_store_full() => return Err(e),
             Err(e) => return self.fail(e),
         };
         let pats = &self.actions.pats;
@@ -352,6 +370,7 @@ impl<'m, S> EdgeRec<'m, S> {
             self.cur_pats.iter().chain(std::iter::once(&stutter)).chain(&self.cur_cut).map(|&p| &*pats[p as usize]).collect();
         let b = match self.atoms.state(s, &outs) {
             Ok(b) => b,
+            Err(e) if e.is_store_full() => return Err(e),
             Err(e) => return self.fail(e),
         };
         let sp = self.states.intern(b);
@@ -504,6 +523,7 @@ fn kind_code(k: ErrorKind) -> u8 {
         ErrorKind::IntegerTooBig => 8,
         ErrorKind::LayoutMiss => 9,
         ErrorKind::FunctionDomain => 10,
+        ErrorKind::StoreFull => 11,
     }
 }
 
@@ -512,7 +532,7 @@ fn kind_of_code(c: u8) -> Option<ErrorKind> {
 }
 
 /// Append only: the codes are in checkpoints (must match `kind_code`).
-const KINDS: [ErrorKind; 11] = [
+const KINDS: [ErrorKind; 12] = [
     ErrorKind::General,
     ErrorKind::Unsupported,
     ErrorKind::AssertFailed,
@@ -524,6 +544,7 @@ const KINDS: [ErrorKind; 11] = [
     ErrorKind::IntegerTooBig,
     ErrorKind::LayoutMiss,
     ErrorKind::FunctionDomain,
+    ErrorKind::StoreFull,
 ];
 
 /// The memory `build` allocates for the graph of the records `recs`

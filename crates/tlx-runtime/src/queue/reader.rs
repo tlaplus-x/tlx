@@ -66,6 +66,25 @@ impl<S> Reader<S> {
         self.block
     }
 
+    /// Non-destructively visit states held by this reader for safepoint root
+    /// scanning. When `include_consumed` is true (a compressed block destined
+    /// for a retained whole-block archive), visits the entire block; otherwise
+    /// visits only the last `self.left` unread records so already-consumed
+    /// frontier states can be reclaimed immediately.
+    pub(crate) fn visit_states(
+        &self,
+        include_consumed: bool,
+        cache: &mut super::SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(super::StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        if include_consumed {
+            self.block.visit_states(cache, prev, visit)
+        } else {
+            self.block.visit_suffix(self.left, cache, prev, visit)
+        }
+    }
+
     /// The next state, decoded with `codec` (with `prev` the scratch of
     /// this reader, reusing `spare` if given).
     #[inline]

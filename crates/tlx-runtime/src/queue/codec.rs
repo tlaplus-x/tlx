@@ -63,6 +63,7 @@ pub(crate) fn get_raw(rec: &[u8], words: &mut [u64]) -> (u64, u64) {
 }
 
 /// The previous record of an XOR-varint block (zeros before the first).
+#[derive(Clone)]
 pub(crate) struct XorPrev {
     pub(crate) log: u64,
     pub(crate) words: Vec<u64>,

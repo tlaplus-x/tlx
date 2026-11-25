@@ -33,17 +33,25 @@ use crate::shape::{
 use tlx_value::{FcnDom, Value};
 
 /// A value does not fit the layout (speculation failed); the host widens the
-/// shape and recompiles.
+/// shape and recompiles. When `store_full` is set, encoding failed because a
+/// `Shape::Ref` value store hit its byte budget rather than because the value
+/// did not fit the shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Miss {
     /// Path from the variable to the offending sub-value, for diagnostics.
     pub path: String,
     pub value: Value,
+    /// True when the miss was caused by `StoreError::Full` on a `Shape::Ref` slot.
+    pub store_full: bool,
 }
 
 impl Miss {
     pub(crate) fn new(v: &Value) -> Miss {
-        Miss { path: String::new(), value: v.clone() }
+        Miss { path: String::new(), value: v.clone(), store_full: false }
+    }
+
+    pub(crate) fn store_full(v: &Value) -> Miss {
+        Miss { path: String::new(), value: v.clone(), store_full: true }
     }
 
     /// Prepend a path segment (the error travels from the leaf upwards).
@@ -327,8 +335,11 @@ fn enc<const SEMANTIC: bool>(s: &Shape, v: &Value, out: &mut [u64]) -> Result<()
     }
     if let Shape::Ref(store) = s {
         // (A value the store cannot hold, or a full store, is a miss of
-        // this slot; the compiled tier reports a full store as such.)
-        out[0] = store.freeze(v).map_err(|_| Miss::new(v))?;
+        // this slot; the compiled tier distinguishes `store_full` for GC/retry.)
+        out[0] = store.freeze(v).map_err(|e| match e {
+            crate::store::StoreError::Full => Miss::store_full(v),
+            _ => Miss::new(v),
+        })?;
         return Ok(());
     }
     let Some(v) = force(v) else { return Err(Miss::new(v)) };

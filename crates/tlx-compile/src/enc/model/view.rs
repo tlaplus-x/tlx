@@ -70,7 +70,8 @@ impl ProjectionOrbit {
 
     pub(super) fn fingerprint(&self, words: &[u64]) -> u64 {
         assert_eq!(words.len(), self.layout.words);
-        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout, words, None)
+        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout, words, None, None)
+            .expect("orbit fingerprint without value-store digests cannot fail")
     }
 }
 

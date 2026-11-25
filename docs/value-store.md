@@ -33,8 +33,14 @@ store. The immediate schema is declared once in `crates/tlx-layout/src/scalar.rs
 store, so the store, the `Dyn` interner and the C and JIT backends derive their tags from one owner
 (ARCH-07). A node handle carries the store's 16-bit id and the node's index; store ids are allocated
 from a process-global counter and are never reused, so a handle of another store is refused by the
-checked lookups rather than read as this store's node. Nodes live in a page table of `OnceLock`s
-(16384 nodes per page, 65536 pages).
+checked lookups rather than read as this store's node. Nodes live in a two-level radix page table
+(256 nodes per page, 4,096 pages per directory with an inline first directory covering the first
+1,048,576 nodes, and 16,384 directories — up to 2^34 handles) behind a readers-writer lock
+(`StorePin<'_>` via re-entrant read locks during normal execution, exclusive write lock only during
+safepoint reclamation). Sealed pages with at most half their slots live compact to sparse sorted
+arrays (`Page::Sparse`), and sealed overflow directories with at most 1/8 of their pages live
+compact to `Dir::Sparse`, keeping retained backing storage proportional to survivors and charged
+against the byte budget.
 
 ## 2. Identity: interning, witnesses and the digest
 
@@ -51,9 +57,10 @@ interpreter does, not as the fixed encodings do.
 and returns the existing handle when a structurally equal body is there; only if not does it append a
 node and publish it. Hash collisions are settled by the structural comparison, never by the hash.
 
-Interning takes a short lock on one shard. Nodes are published once and never change or move, so
-readers take no lock at all; a node slot written twice is an assertion failure rather than a silent
-replacement.
+Interning takes a short lock on one shard under a shared `StorePin<'_>`. Published nodes never
+change or move while live, so concurrent readers share the pin with no per-node locking; a node
+slot written twice is an assertion failure rather than a silent replacement. Only safepoint
+reclamation (section 6) takes the exclusive write lock to sweep dead slots and drop empty pages.
 
 ### 2.2 The semantic digest
 
@@ -142,36 +149,87 @@ payload bytes, index estimate, budget and the operation counts per executor.
 
 The store belongs to a run. It is created when the encoding is built, with the run's full memory
 budget (`-maxmem`, or `mem::default_budget()` when `-maxmem` is not set; unlimited when the run has
-no memory budget, `Settings::value_store_bytes` in `crates/tlx-compile/src/settings.rs`). A handle
-stays valid for as long as that run's store lives — nothing else keeps it alive, and nothing
-reclaims it.
+no memory budget, `Settings::value_store_bytes` in `crates/tlx-compile/src/settings.rs`).
 
 The store is not a process-wide interner, so two runs in one process have two stores even when they
 share one cached native library: the library calls back into the store of its per-call context, not
 into one of its own (`tlx-compile/tests/value_store_runs.rs`).
 
-There is **no reclamation**. The budget is the run's own memory budget
-(`Settings::value_store_bytes`), never a fraction of it: the store replaces the process-wide `Dyn`
-interner for its slots, and that interner had no limit of its own, so a budget below the run's would
-end a run the run's memory guard lets finish. Insertion charges the node word plus its payload bytes
-against the budget (the index is counted separately, for the report). Exceeding the budget — or
-exhausting the page table — marks the store full and ends the run with an error naming the budget
-and the way out (`raise -maxmem or turn the store off (TLX_VALUE_STORE=0)`,
-`enc/driver.rs::check_store`); values the store refused were neither stored nor fingerprinted, so
-this is a hard stop and not a degraded mode. When a run has no memory budget (`usize::MAX`, such as
-simulation or unbudgeted library `Options`), the page table is the store's only limit, as the
-interner's growth was (section 10, gap 1).
+### 6.1 Safepoint live-root reclamation
+
+The store reclaims unreachable nodes via **stop-the-world safepoint mark-and-sweep**
+(`Store::collect_with` in `crates/tlx-layout/src/store/mod.rs`, `StoreGc` in
+`crates/tlx-runtime/src/model.rs`, and `SP_STORE_GC` in `crates/tlx-runtime/src/explore/`):
+
+- **Budget & triggers.** Insertion charges the node struct plus payload bytes (and retained page and
+  overflow directory backing storage after sweep/restore) against the budget (the index is counted
+  separately for reporting). Crossing the **soft limit** (75% of budget) sets `gc_requested`, which
+  the pressure monitor (`relieve`) and level boundaries observe to request a proactive `SP_STORE_GC`
+  safepoint. Hitting the hard budget returns `StoreError::Full` (`ErrorKind::StoreFull`), which
+  parks workers at a mid-level `SP_STORE_GC` safepoint and retries cleanly. Successors are finished
+  and delivered one at a time in order via `Model::action_successors_gc` / `Model::init_states_gc`,
+  holding captured `PrintT` output until fingerprinting succeeds so GC retries never duplicate
+  printed lines or interpreter effects (`Print`, `TLCSet`, files) and never change first-failure
+  order. If a single compiled action, predicate, or `VIEW` expression still overflows an
+  archive-free store due to discarded transient intermediates, the retry falls back to the
+  interpreter (which evaluates intermediates without interning discarded values).
+- **Root enumeration.** At `SP_STORE_GC`, all active workers are parked with their local queue
+  readers/writers, archives, VIEW/SYMMETRY candidate stores, in-flight states, and pending emit
+  handles deposited into `Shared::gc_roots`. The safepoint executor enumerates every live root:
+  current and next frontier queues (in-memory and spilled segments), worker local buffers,
+  VIEW/SYMMETRY candidate stores, the layout-miss resume archive (phase 1), in-flight/pending
+  states, and compile-time constant `Ref` handles pinned in `EncModel::pinned_handles`.
+- **Two-phase archive policy.** Both initialization and worker safepoints share one archive-drop
+  decision: proactive collections keep the layout-miss resume archive rooted up to 3/4 of budget so
+  layout-miss resume remains available whenever live frontier + archive fit; persistent hard
+  allocation retries force an archive-free collection before latching exhaustion, even when
+  post-sweep occupancy fell below 3/4.
+- **Sweep, page compaction & caches.** Mark traversal runs an iterative DFS over child handles using
+  per-page bitmaps. Sweep removes unmarked entries from the 64 intern shards (shrinking excess
+  shard capacity), clears dead slots, frees empty pages and overflow directories, compacts sealed
+  sparse pages/directories, charges exact retained backing storage against the budget, resets
+  derived `domain`/`elems` caches on surviving nodes, and increments `Store::gc_gen`. Thread-local
+  memo tables (`exec/memo.rs`), decoded/mixed value caches (`enc/model.rs`), and symmetry
+  permutation memos (`permute.rs`) key on `gc_gen` and drop stale entries automatically.
+- **Liveness edges, concrete liveness & counterexample replay.** Recoverable `StoreFull` errors
+  during liveness atom evaluation (`EdgeRec`) return to a unified worker retry path without clearing
+  the recorded graph; only exhausted retries fail the recorder and stop the search. Multi-predicate
+  checks (`check_invariants_gc`, `constraint_gc`, `action_constraint_gc`, `check_transition_gc`)
+  retry only the failing predicate so earlier predicates' committed side effects (`TLCSet`, `PrintT`)
+  are preserved. Pre-resume edge reconstruction (`resume.rs::record_archived`), liveness lasso
+  counterexample replay (`liveness/recorded.rs`), concrete liveness BFS and counterexample rebuilding
+  under `VIEW`/`SYMMETRY` (`liveness/concrete.rs`), early temporal checking inside `find_error`
+  (`liveness/search.rs`), and safety/terminal-error trace reconstruction (`tracelog.rs`, whenever
+  `Effects::resumes` declines a `ResumePoint`) all run with `StoreGc` reclamation so deep traces and
+  temporal checks stay within `-maxmem`. Constraint-rejected candidates release their store handles
+  immediately (staging store-free `Arc<[Value]>` snapshots via `AtomBits::stage_state` only when the
+  spec has action atoms), and `Early` reuses the worker's filtered successor batch and safepoint GC
+  hook rather than re-expanding actions outside GC. Before running a secondary liveness-error search
+  (`find_error`) or `-dump` search on the same model, the CLI decodes any retained safety/error trace
+  into owned values so collections in the secondary search cannot sweep handles still needed for
+  rendering.
+  Optional layout-miss archive migration (`enc/driver.rs::migrate`) runs inside a GC scope so a
+  transient budget hit falls back to a fresh restart after sweeping dead nodes instead of latching
+  permanent store exhaustion.
+- **Hard stop when live roots exceed `-maxmem`.** If live reachable roots genuinely exceed the
+  budget even after collection (and archive drop), the search stops cleanly with an error naming
+  the budget and the way out (`raise -maxmem or turn the store off (TLX_VALUE_STORE=0)`,
+  `enc/driver.rs::check_store`), and `Checkpointed::keep_checkpoint` preserves the last committed
+  checkpoint on disk for `-recover` with a larger `-maxmem`. `-stats` reports `gc_cycles`,
+  `reclaimed_nodes`, and `reclaimed_bytes` alongside live node counts and payload bytes.
 
 ## 7. Checkpoint and recovery
 
 Stored runs support both TLC's default 30-minute checkpoint interval and explicit `-checkpoint` /
 `-recover` (`crates/tlx-layout/src/store/ser.rs`, `crates/tlx-compile/src/enc/driver.rs`).
 
-- **`model-store`:** `Checkpointed::files` writes a framed `model-store` file alongside
-  `model-strings`, `model-shapes`, and `model-dyn`. It serializes the store's published nodes in
-  index order (`0..n`), preserving every `Body` kind and `FcnDom` witness while encoding node
-  references as 0-based indices (`< i`, acyclic by construction) and symbols by `Sym` id (resolved
-  after `model-strings` restore).
+- **`model-store` (format v2, sparse ascending delta):** `Checkpointed::files` writes a framed
+  `model-store` file alongside `model-strings`, `model-shapes`, and `model-dyn`. Because safepoint
+  reclamation leaves swept holes in the monotonic handle space, format v2 persists the store's
+  `next` high-water mark, `live_count`, and only live nodes as `(delta, kind, body)` records in
+  ascending index order, preserving every `Body` kind and `FcnDom` witness while encoding node
+  references as 0-based indices (`< idx`, acyclic by construction) and symbols by `Sym` id
+  (resolved after `model-strings` restore).
 - **Store-id-neutral queue and archive words:** on checkpoint write, `StateCodec::checkpoint_words`
   strips the 16-bit `store_id` bits (`-> 0`) of `TAG_NODE` handles in `Ref` slots without adding
   overhead to in-run `StateCodec::encode`. Keeping on-disk state words store-id-neutral preserves
@@ -180,13 +238,15 @@ Stored runs support both TLC's default 30-minute checkpoint interval and explici
   (`TLX_VALUE_STORE=0` / `1` / `all`), and recovery refuses mode mismatches (including recovering a
   stored checkpoint under `TLX_VALUE_STORE=0` or `TLX_ESCAPE=1`, or vice versa) before loading
   tables. `Store::read_snapshot` always allocates a fresh process-unique `uid` from `NEXT_UID`,
-  recomputes semantic digests, rebuilds the shard intern index, enforces `-maxmem`, and rejects
-  corrupt/truncated payloads, forward/cyclic/out-of-range node references, malformed or duplicate
-  bodies, and unpublished `Sym` ids (`Sym::try_from_id`). `StateCodec::recover_words` then rewrites
-  `store_id = 0 -> store.id` in recovered `queue` and `archive` state words and validates every slot
-  canonically before any words enter trusted execution paths. If the store exhausts its `-maxmem`
-  budget during a run (including after a recovery), `Checkpointed::keep_checkpoint` preserves the
-  last committed checkpoint on disk so the user can retry `-recover` with a larger `-maxmem`.
+  recomputes semantic digests, rebuilds the shard intern index at the exact original sparse indices
+  (compacting finished sealed pages and overflow directories as restore progresses), restores
+  `next`, enforces `-maxmem` against retained backing storage, and rejects corrupt/truncated
+  payloads, forward/cyclic/out-of-range/swept-hole node references, malformed or duplicate bodies,
+  and unpublished `Sym` ids (`Sym::try_from_id`). `StateCodec::recover_words` then rewrites `store_id = 0 -> store.id` in
+  recovered `queue` and `archive` state words and validates every slot canonically (including
+  rejecting swept holes) before any words enter trusted execution paths. If live roots exhaust
+  `-maxmem` during a run (including after a recovery), `Checkpointed::keep_checkpoint` preserves
+  the last committed checkpoint on disk so the user can retry `-recover` with a larger `-maxmem`.
 
 ## 8. Limits and known deviations
 
@@ -214,7 +274,9 @@ Stored runs support both TLC's default 30-minute checkpoint interval and explici
   fallbacks), digests against value equality, comparisons against the interpreter, tiny-hash
   collisions, growth across 31/32/33 and 255/256/257 keys, failed operations that publish nothing,
   the byte budget as a hard limit, handles of another store, store ids that never wrap, store
-  identity, concurrent interning, and `model-store` snapshot round-trip and corruption rejection.
+  identity, concurrent interning, safepoint mark-and-sweep reclamation (page freeing, sparse
+  page/directory compaction, backing-storage accounting, and derived cache reset), and sparse v2
+  `model-store` snapshot round-trip and corruption/hole rejection.
 - `crates/tlx-layout/src/store/order.rs` — comparison and equality of mixed stored function kinds against
   their boxed consumers; `crates/tlx-layout/src/permute.rs` — permutation of stored handles.
 - `crates/tlx-compile/src/exec/refops.rs` — the native callbacks accept an uninitialized output and
@@ -223,18 +285,26 @@ Stored runs support both TLC's default 30-minute checkpoint interval and explici
   and of two models in one process, sequential and concurrent.
 - `crates/tlx-compile/tests/value_store_switch.rs` — the switch on: a `Dyn` slot is a `Ref` slot and
   the run's counts equal the interpreter's; a run whose shapes are all fixed takes no store path; the
-  store's budget is the run's `-maxmem` (a value set that fits it finishes, half of what it needs ends
-  the run with the error that names the way out); default and explicit checkpoints persist `model-store`
-  and recover repeatedly in-process with fresh store ids; budget overflow and corrupt `model-store` are
+  store's budget is the run's `-maxmem`; safepoint reclamation completes `>= 5x` single-worker and
+  multi-worker churn (both multi-level frontier churn and mid-level transient churn) inside a tight
+  budget while genuine live-frontier exhaustion stops cleanly with the error naming the way out;
+  default and explicit checkpoints persist sparse v2 `model-store` across multiple GC cycles and
+  recover repeatedly in-process with fresh store ids; budget overflow and corrupt `model-store` are
   rejected cleanly. The switch's own values (`0`, `1`, `all`, unset, and its coexistence with
   `TLX_ESCAPE`) are parsed in `tlx-compile/src/settings.rs`, tested there: one test binary runs one
   environment.
 - `crates/tlx-native/tests/native.rs` — an operation-table count or hash mismatch is refused, and the
   ABI header matches the Rust descriptor field by field.
-- `crates/tlx-cli/tests/value_store.rs` — the budget error, checkpoint and `-recover` across workers,
-  `TLX_VALUE_STORE=all`, counterexample traces, `VIEW`/`SYMMETRY`, layout-miss restarts after recovery,
-  store-mode mismatch refusals (`TLX_VALUE_STORE=0`/`all`, `TLX_ESCAPE=1`), and corrupt `model-store`
-  rejection.
+- `crates/tlx-cli/tests/value_store.rs` — `>= 5x` churn reclamation across closure, C, and JIT
+  backends (single- and multi-worker, mid-level and multi-level, including `TLX_PARANOID=1`),
+  retry-boundary regressions (first-failure `VIEW` ordering, GC-backed counterexample replay,
+  recoverable liveness atom `StoreFull`, hard-retry archive drop below 75%, single-action transient
+  overflow fallback, and once-only `PrintT` across forced `VIEW` `StoreFull` retries),
+  genuine live-frontier budget errors preserving the last checkpoint for larger-budget recovery,
+  checkpoint and `-recover` across multiple GC cycles and workers (`VIEW`, `SYMMETRY`, `DOMAIN` /
+  interval iteration caches, incremental `archive-*` hard-linking), `TLX_VALUE_STORE=all`,
+  counterexample traces, layout-miss restarts after recovery, store-mode mismatch refusals
+  (`TLX_VALUE_STORE=0`/`all`, `TLX_ESCAPE=1`), and corrupt `model-store` rejection.
 - `crates/tlx-cli/tests/repr_litmus.rs` — the value-contract litmus specs
   (`tests/specs/Repr*.tla`: aliases, empty function, missing EXCEPT path, CHOOSE order, lazy union,
   EXCEPT side effects and errors) on the interpreter and the closure, C and JIT executors, with the
@@ -243,14 +313,14 @@ Stored runs support both TLC's default 30-minute checkpoint interval and explici
 
 ## 10. Gaps of the experiment
 
-`TLX_VALUE_STORE=1` is what a run sets to use the store, and the switch stays off by default until
-gap 1 below is closed (gap 2 is resolved). This section is the record of what turning it on costs a
-user today, what the way out is, and what closing each gap takes; a gap here is not a defect of
-the store's operation set (section 4) but a property of the experiment it still is.
+`TLX_VALUE_STORE=1` is what a run sets to use the store (both gaps 1 and 2 below are now resolved;
+the switch remains opt-in while gaps 4 and 5 are evaluated). This section is the record of what
+turning it on costs a user today, what the way out is, and what closing each gap takes; a gap here
+is not a defect of the store's operation set (section 4) but a property of the experiment it still is.
 
 | # | Gap | What a run with the store on sees | Way out today | Fix | Cost |
 |---|---|---|---|---|---|
-| 1 | **No reclamation** (section 6) | A `Dyn` variable's values accumulate for the whole run; past the run's `-maxmem` the run *stops with an error*, where the `Dyn` interner it replaced grew until the machine ran out of memory. Long runs on bag-like state are the ones that reach it. The budget is the run's own `-maxmem`, not a fraction of it | raise `-maxmem`, or `TLX_VALUE_STORE=0` | reclamation (reference counting, or mark-and-sweep rooted in the live states) plus a budget policy that matches the other representations — the "stable state root slots" step of the design record | a full batch: it needs the set of live state roots (queue, archive, spill, memo) to be enumerable, which is a change to the search, not to the store |
+| 1 | **No reclamation** *(resolved, section 6)* | Safepoint live-root mark-and-sweep reclamation (`SP_STORE_GC`) frees unreachable nodes, empty pages, and stale generation-keyed caches at level boundaries and mid-level budget pressure, with two-phase archive drop when live bytes exceed 3/4 of budget. Only workloads whose live reachable frontier genuinely exceeds `-maxmem` stop with the budget error (preserving the last checkpoint) | raise `-maxmem`, or `TLX_VALUE_STORE=0` if live roots exceed `-maxmem` | implemented (`crates/tlx-layout/src/store/mod.rs`, `crates/tlx-runtime/src/explore/`, `crates/tlx-compile/src/enc/model.rs`) | done |
 | 2 | **Checkpoint format** *(resolved, section 7)* | Default 30-minute checkpoints and explicit `-checkpoint` / `-recover` work with `TLX_VALUE_STORE=1` and `all` via framed `model-store` snapshots, fresh `NEXT_UID` allocation on restore, store-id-neutral checkpoint handles, and mode-mismatch validation | none needed | implemented (`crates/tlx-layout/src/store/ser.rs`, `crates/tlx-compile/src/enc/driver.rs`) | done |
 | 3 | **Not combined with `TLX_ESCAPE`** | With both `TLX_ESCAPE=1` and `TLX_VALUE_STORE=1`, the driver runs with the store off (logged) rather than refusing the pair | none needed | escape wins when both switches are set | none |
 | 4 | **Crude slot selection** | A slot that merely *contains* a `Dyn` part becomes one handle, so its other, already-encoded components (a bitset field of a tuple, say) stop using their encodings; and a materialized definition with a `Dyn` part stays unmaterialized (`enc/driver.rs`). Only models with a `Dyn` slot are affected. | `TLX_VALUE_STORE=0` | promote per component, or choose per slot by measured benefit | half a batch: it needs a per-slot read/write and representation analysis, and the recorded regressions of the earlier broader promotion policy are the evidence that guessing is worse than not promoting |

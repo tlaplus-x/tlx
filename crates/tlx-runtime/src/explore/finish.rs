@@ -16,7 +16,7 @@ use super::edges::{self, liveness_memory_error, AtomBits, LiveGraph};
 use super::history::History;
 use super::resume::{record_archived, resume_point, Pre};
 use super::run::Run;
-use super::tracelog::{rebuild_trace, TraceLog, NO_PARENT};
+use super::tracelog::{rebuild_trace, TraceBuild, TraceLog, NO_PARENT};
 use super::worker::WorkerOut;
 use super::{Failure, Options, Outcome, OutdegreeHist, Report, ResumePoint, Shared, Stats, TraceStep};
 use crate::cache_mem;
@@ -34,7 +34,7 @@ pub(super) fn finalize<'m, M: Model>(
     mut outs: Vec<WorkerOut<'m, M::State>>,
     in_init: bool,
 ) -> (Report<M::State>, Option<ResumePoint<M::State>>) {
-    let Run { shared, mut stats, levels0, resumed, extra_at_start, .. } = run;
+    let Run { shared, mut stats, levels0, resumed, extra_at_start, _store_gc_guard, .. } = run;
     let start = shared.start;
     let model = shared.model;
     let opts = shared.opts;
@@ -93,7 +93,7 @@ pub(super) fn finalize<'m, M: Model>(
     // the levels before the resume point were expanded by an earlier search
     // without recording their liveness atoms.)
     let live_atoms_ok = live_atoms.is_some() && !resumed && pre.is_empty() && !in_init && all_edges && edges.iter().all(|e| !e.failed());
-    let resumable = matches!(failure, Some((Outcome::Error(_), _)))
+    let resumable = matches!(failure, Some((Outcome::Error(ref e), _)) if model.caps().resumes(e))
         && !in_init
         && shared.retention.on
         && !shared.retention.off()
@@ -103,20 +103,26 @@ pub(super) fn finalize<'m, M: Model>(
     let meters = shared.budget.meters();
     let frontier_peak = shared.frontier.peak_bytes().0;
     let mem = search_memory(&shared, levels0, &logs, &outs);
-    let (outcome, trace, trace_note) = failure_report(model, &shared, &logs, failure, results);
+    let (outcome, trace, mut trace_note, trace_store_full) = failure_report(model, &shared, &logs, failure, results, resumable);
     let resume = resumable.then(|| keep_resume(&shared, &stats, &base_outdegree, opts, logs, outs));
     report_memory(&shared, meters, mem, resume.is_some(), logs_spilled);
     // The search ended (it was not killed): its checkpoint goes, unless the
-    // model stopped on a recoverable resource limit (e.g. value-store budget)
-    // or is restarting after a layout miss (later attempts may replace it or
-    // stop on a resource limit).
+    // model stopped on a recoverable resource limit (e.g. value-store budget),
+    // trace reconstruction exhausted the store, the search is restarting after
+    // a layout miss, or the caller deferred cleanup until post-search liveness
+    // checking and replay complete.
     let interrupted = matches!(&outcome, Outcome::Error(e) if model.caps().interrupts(e));
     if let Some(c) = &opts.checkpoint {
-        let keep = model.caps().keep_checkpoint();
+        let keep = model.caps().keep_checkpoint() || trace_store_full;
         if keep {
-            c.keep_last();
+            let kept = c.keep_last();
+            if trace_store_full && kept {
+                if let Some(note) = &mut trace_note {
+                    note.push_str(", recovering the last checkpoint, which is kept");
+                }
+            }
         }
-        if keep || !interrupted {
+        if !c.finish_deferred() && (keep || !interrupted) {
             c.finish();
         }
     }
@@ -135,6 +141,7 @@ pub(super) fn finalize<'m, M: Model>(
     } else {
         drop((edges, pre));
     }
+    drop(_store_gc_guard);
     if matches!(outcome, Outcome::Ok) && live_error.is_none() {
         // Wait for any background spill I/O holding run-owned stores to finish
         // releasing them, then surface any cleanup I/O failure (e.g. failed unlink).
@@ -150,6 +157,7 @@ pub(super) fn finalize<'m, M: Model>(
             outcome,
             trace,
             trace_note,
+            trace_store_full,
             elapsed: start.elapsed(),
             in_init,
             live_graph,
@@ -172,25 +180,31 @@ fn failure_report<'m, M: Model>(
     logs: &[TraceLog],
     failure: Option<Failure>,
     results: bool,
-) -> (Outcome, Vec<TraceStep<M::State>>, Option<String>) {
+    resumable: bool,
+) -> (Outcome, Vec<TraceStep<M::State>>, Option<String>, bool) {
     match failure {
-        None => (Outcome::Ok, Vec::new(), None),
+        None => (Outcome::Ok, Vec::new(), None, false),
         Some((o, at)) => {
-            let interrupted = matches!(&o, Outcome::Error(e) if model.caps().interrupts(e));
-            let rebuilt = if interrupted || !results {
-                Ok(None)
+            let no_trace = matches!(&o, Outcome::Error(e) if e.is_store_full() || model.caps().interrupts(e));
+            // When the search is not retaining a `ResumePoint`, the frontier and
+            // archives are dead; trace reconstruction can sweep leftover search
+            // nodes and reclaim transient replay allocations under `store_gc`.
+            let replay_gc = (!resumable).then_some(shared.store_gc).flatten();
+            let rebuilt = if no_trace || !results {
+                Ok(TraceBuild::Unavailable)
             } else if model.coarse_fingerprint() {
                 let snapshot = live::Source::snapshot(shared);
-                live::with_source(&snapshot, || rebuild_trace(model, logs, at, &o))
+                live::with_source(&snapshot, || rebuild_trace(model, logs, at, &o, replay_gc))
             } else {
-                rebuild_trace(model, logs, at, &o)
+                rebuild_trace(model, logs, at, &o, replay_gc)
             };
             match rebuilt {
-                Ok(Some(rebuilt)) => {
-                    (o, rebuilt.trace, (!rebuilt.complete).then(|| model.trace_replay_limit().map(str::to_owned)).flatten())
+                Ok(TraceBuild::Rebuilt(rebuilt)) => {
+                    (o, rebuilt.trace, (!rebuilt.complete).then(|| model.trace_replay_limit().map(str::to_owned)).flatten(), false)
                 }
-                Ok(None) => (o, Vec::new(), None),
-                Err(e) => (Outcome::Io(format!("{e} (while rebuilding the trace of: {o:?})")), Vec::new(), None),
+                Ok(TraceBuild::Unavailable) => (o, Vec::new(), None, false),
+                Ok(TraceBuild::StoreFull(e)) => (o, Vec::new(), Some(format!("trace cannot be reconstructed: {}", e.message)), true),
+                Err(e) => (Outcome::Io(format!("{e} (while rebuilding the trace of: {o:?})")), Vec::new(), None, false),
             }
         }
     }
@@ -309,6 +323,7 @@ pub(super) fn in_init_failed<'m, M: Model>(run: &Run<'m, M>, e: ModelError) -> R
         outcome: Outcome::Error(e),
         trace: Vec::new(),
         trace_note: None,
+        trace_store_full: false,
         elapsed: shared.start.elapsed(),
         in_init: true,
         live_graph: None,

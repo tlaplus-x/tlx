@@ -186,7 +186,12 @@ barrier is one such moment but a level can take minutes, so there are mid-level 
   to absorb the inserts workers finish for their current task.
 - **Narrow levels**: when one worker expands a narrow level alone (design.md §7.3), it performs safepoint
   work itself, with the same-sized crew of temporary threads for large rehashes.
-- **Preference**: non-urgent work (checkpoints, preventive growth, run merges) waits for a level barrier.
+- **Preference**: non-urgent work (checkpoints, preventive growth, run merges, proactive value-store
+  reclamation above its 75% soft limit) waits for a level barrier or runs via the monitor;
+  hard value-store pressure (`SP_STORE_GC`) parks workers mid-level with their local queue, archive,
+  candidate, and in-flight state roots deposited into `Shared::gc_roots`, runs live-root mark-and-sweep
+  (dropping the layout-miss archive in a second pass if live bytes remain above 3/4 of budget,
+  [value-store.md](value-store.md) §6), and retries the allocation cleanly.
   `Options::safepoint_every` requests no-op safepoints periodically for tests.
 
 ## 4. Fingerprint set (`fpset/`)
@@ -526,7 +531,7 @@ second barrier the last arriving worker writes the model files and the manifest 
 | `queue-<l>` | unclaimed blocks of list `l` in claim order: XOR records for encoded models, `Persist` bytes otherwise; with VIEW/SYMMETRY and several workers each carries its BFS position |
 | `trace-<id>.<n>`, `edges-<id>-fps.<n>`, `edges-<id>-meta.<n>`, `edges-<id>` | history shards by stable ID, independent of worker count; append-only stream segments (`.<n>` = new part of the n-th checkpoint) and the edge-log header |
 | `archive-<w>.<n>` | each current worker's archive, as append-only stream segments |
-| `model-strings`, `model-shapes`, `model-dyn`, `model-store` | string intern table; compiled mode's shapes, store mode, and speculation state (per variable and materialized definition: shape, miss counts, fallbacks, attempt); Dyn interner snapshot; value store node table (present when `TLX_VALUE_STORE` is active) |
+| `model-strings`, `model-shapes`, `model-dyn`, `model-store` | string intern table; compiled mode's shapes, store mode, and speculation state (per variable and materialized definition: shape, miss counts, fallbacks, attempt); Dyn interner snapshot; sparse v2 value store node table (present when `TLX_VALUE_STORE` is active) |
 
 Every file is framed (magic, format version, file kind, build id, per-block checksums, end marker) and the
 manifest records every file's size, checked when opened. Runs of the live spill directory are not

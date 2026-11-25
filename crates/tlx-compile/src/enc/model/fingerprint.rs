@@ -12,7 +12,7 @@ use tlx_runtime::stats::{self, C, T};
 use tlx_runtime::{Model, ModelError};
 use tlx_value::Value;
 
-use super::symmetry::orbit_fp;
+use super::symmetry::{orbit_fp, RefDigests};
 use super::{EState, EncModel, View};
 use crate::paranoid::{mismatch, state_list};
 
@@ -67,8 +67,11 @@ impl SemFp {
         out.clear();
         out.extend_from_slice(words);
         if let Some(store) = &self.store {
-            for &i in &self.state {
-                out[i] = store.digest(out[i]);
+            if !self.state.is_empty() {
+                let pin = store.pin();
+                for &i in &self.state {
+                    out[i] = pin.digest(out[i]);
+                }
             }
         }
         if layout.has_dynamic_witness {
@@ -82,8 +85,11 @@ impl SemFp {
         out.clear();
         out.extend_from_slice(words);
         if let Some(store) = &self.store {
-            for &i in &self.view {
-                out[i] = store.digest(out[i]);
+            if !self.view.is_empty() {
+                let pin = store.pin();
+                for &i in &self.view {
+                    out[i] = pin.digest(out[i]);
+                }
             }
         }
         if node.has_dynamic_witness() {
@@ -180,10 +186,28 @@ impl EncModel {
         match &self.fp {
             Fingerprint::View(v) => self.view_fp(v, words, level),
             Fingerprint::Symmetry { group, order } => {
+                let has_store = self.value_store().is_some();
+                if has_store {
+                    tlx_layout::store::clear_full_hit();
+                }
+                if has_store && self.store_pressure() {
+                    return self.symmetry_fp_values(group, order, words);
+                }
                 if self.paranoid {
                     self.check_permutations(group, words);
+                    if has_store && tlx_layout::store::take_full_hit() {
+                        return self.symmetry_fp_values(group, order, words);
+                    }
                 }
-                Ok(orbit_fp(group, order, &self.layout, words, self.sem.as_ref()))
+                let fp = orbit_fp(group, order, &self.layout, words, self.sem.as_ref(), None)?;
+                if has_store && tlx_layout::store::take_full_hit() {
+                    // The failed insertion requested a collection: subsequent
+                    // fingerprints take the digest path until it runs. Finish
+                    // this one from decoded values instead of rematerializing
+                    // the image on a retry.
+                    return self.symmetry_fp_values(group, order, words);
+                }
+                Ok(fp)
             }
             Fingerprint::SymView { group, visit, order, view } => self.sym_view_fp(group, visit, order, view, words, level),
             Fingerprint::Words | Fingerprint::Values => Ok(match &self.sem {
@@ -234,9 +258,21 @@ impl EncModel {
         }
     }
 
+    /// Apply SYMMETRY element `p` to decoded values the way the interpreter
+    /// does: `permute_shared` keeps a value that the permutation does not
+    /// change, including its function-domain representation (an interval
+    /// domain stays an interval, not a rebuilt enumerated function). Rebuilding
+    /// unchanged functions changes what `EXCEPT`/application do with
+    /// non-integer keys.
     fn escape_permute(&self, vals: &[Value], p: usize) -> Result<Vec<Value>, ModelError> {
         let m = &self.base.symmetry_maps()[p];
-        vals.iter().map(|v| tlx_value::ops::permute(v, &|s| m.get(&s).cloned()).map_err(|x| self.base.error(x.into()))).collect()
+        vals.iter()
+            .map(|v| {
+                tlx_value::ops::permute_shared(v, &|s| m.get(&s).cloned())
+                    .map(|image| image.unwrap_or_else(|| v.clone()))
+                    .map_err(|x| self.base.error(x.into()))
+            })
+            .collect()
     }
 
     fn escape_view_fp(&self, v: &View, vals: &[Value], level: u32) -> Result<u64, ModelError> {
@@ -277,13 +313,38 @@ impl EncModel {
         words: &[u64],
         level: u32,
     ) -> Result<u64, ModelError> {
+        let has_store = self.value_store().is_some();
+        if has_store && self.store_pressure() {
+            // Completing the winning permutation interns a permuted copy of
+            // every `Ref` variable. When the live store is already close to
+            // the budget, that allocation cannot fit after reclamation and
+            // every retry rematerializes it; choose and evaluate the
+            // representative on decoded values and fingerprint only the VIEW
+            // result instead.
+            return self.sym_view_fp_values(v, words, level);
+        }
+        if has_store {
+            tlx_layout::store::clear_full_hit();
+        }
         if self.paranoid {
             self.check_permutations(group, words);
+            if has_store && tlx_layout::store::take_full_hit() {
+                return self.sym_view_fp_values(v, words, level);
+            }
         }
+        let mut store_full = false;
         let word_res = PERM_BUF.with(|b| {
             let mut b = b.borrow_mut();
             let (best_buf, cand_buf) = &mut *b;
             let least = self.least_perm_words(group, visit, order, words, best_buf, cand_buf)?;
+            // Completing the chosen representative permutes its remaining
+            // variables, which may intern value-store images. A full store
+            // keeps the old handle in the encoding, so retry after reclamation
+            // instead of fingerprinting a partially permuted state.
+            if has_store && tlx_layout::store::take_full_hit() {
+                store_full = true;
+                return None;
+            }
             if self.paranoid {
                 self.check_sym_view_least(group, words, least, best_buf);
             }
@@ -292,6 +353,12 @@ impl EncModel {
                 Some(_) => self.view_fp(v, best_buf, level),
             })
         });
+        if store_full {
+            // The failed insertion requested a collection; subsequent
+            // fingerprints take the value path until it runs. Finish this one
+            // on decoded values instead of rematerializing the permutation.
+            return self.sym_view_fp_values(v, words, level);
+        }
         if let Some(fp) = word_res {
             return fp;
         }
@@ -315,8 +382,78 @@ impl EncModel {
                 // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
                 unsafe { plan.apply_unchecked(&words[r.clone()], &mut buf[r]) };
             }
+            if has_store && tlx_layout::store::take_full_hit() {
+                return self.sym_view_fp_values(v, words, level);
+            }
             self.view_fp(v, buf, level)
         })
+    }
+
+    /// `Fingerprint::Symmetry` under persistent value-store pressure (or
+    /// after an interning attempt failed): compare and hash the same canonical
+    /// words, but take each permuted top-level `Ref` variable's digest from its
+    /// decoded value instead of interning the image.
+    fn symmetry_fp_values(&self, group: &[Vec<PermPlan>], order: &[usize], words: &[u64]) -> Result<u64, ModelError> {
+        let digests = RefDigests::new(&self.layout, words, self.base.symmetry_maps());
+        orbit_fp(group, order, &self.layout, words, self.sem.as_ref(), Some(&digests))
+    }
+
+    /// `SymView` fingerprint under persistent value-store pressure: select the
+    /// least state of the SYMMETRY orbit on decoded values (the interpreter's
+    /// selection), evaluate the VIEW there, and fingerprint only the VIEW's
+    /// encoding. The encoded-word path would intern a permuted copy of every
+    /// `Ref` variable before the VIEW is even evaluated.
+    fn sym_view_fp_values(&self, v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
+        // SAFETY: the matching encoder/program produced these words.
+        // Active Dyn handles were published before this call.
+        let mut vals = unsafe { self.layout.decode_state_unchecked(words) };
+        let least = {
+            let mut state = StateVals::Given(&vals);
+            self.base.least_perm(&mut state)?
+        };
+        if let Some(p) = least {
+            vals = self.escape_permute(&vals, p)?;
+        }
+        self.view_values_fp(v, &vals, level)
+    }
+
+    /// The VIEW fingerprint of decoded values. A VIEW result with `Ref`
+    /// positions is encoded with their semantic digests instead of interning
+    /// the permuted values, producing exactly the canonical words
+    /// `SemFp::fp_view` would hash for the handle encoding.
+    fn view_values_fp(&self, v: &View, vals: &[Value], level: u32) -> Result<u64, ModelError> {
+        let digest_refs = self.sem.as_ref().is_some_and(|s| !s.view.is_empty()) && v.orbit.is_none();
+        if !digest_refs {
+            return match self.view_encoded(v, vals, level)? {
+                ViewEncoded::Words(w) => Ok(self.hash_view_words(v, &w)),
+                ViewEncoded::Digest(d) => Ok(fp_words(&[u64::MAX, d])),
+            };
+        }
+        let val = self.view_value(vals, level)?;
+        let node = v.result_node();
+        let mut out = vec![0u64; node.words()];
+        if node.encode_ref_digested(&val, &mut out).is_err() {
+            // The value does not fit its inferred shape (or escape mode is
+            // active): fall back to the ordinary encoder and its conventions.
+            return match self.view_encoded(v, vals, level)? {
+                ViewEncoded::Words(w) => Ok(self.hash_view_words(v, &w)),
+                ViewEncoded::Digest(d) => Ok(fp_words(&[u64::MAX, d])),
+            };
+        }
+        // The `Ref` positions already hold their semantic digests; only the
+        // trailing dynamic witness words remain to be canonicalized.
+        if node.has_dynamic_witness() {
+            node.canonicalize_words(&mut out);
+        }
+        Ok(fp_words(&out))
+    }
+
+    /// Whether an interning attempt already failed and the store is waiting
+    /// for its next collection (or a retry escalated to the transient
+    /// fallback). Fingerprints then avoid rematerializing permutation images
+    /// until the store has been reclaimed.
+    fn store_pressure(&self) -> bool {
+        Self::transient_fallback() || self.value_store().is_some_and(|s| s.needs_gc())
     }
 
     /// Select the TLC-least orbit representative directly on encoded words,
@@ -496,6 +633,7 @@ impl EncModel {
     /// Paranoid: each permutation plan applied to `words` gives the
     /// encoding of the permuted values.
     fn check_permutations(&self, group: &[Vec<PermPlan>], words: &[u64]) {
+        let has_store = self.value_store().is_some();
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
         let vals = unsafe { self.layout.decode_state_unchecked(words) };
@@ -506,6 +644,9 @@ impl EncModel {
 
                 // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
                 unsafe { p.apply_unchecked(&words[r.clone()], &mut buf[r.clone()]) };
+            }
+            if has_store && tlx_layout::store::peek_full_hit() {
+                return;
             }
             // SAFETY: the matching encoder/program produced these words.
             // Active Dyn handles were published before this call.
@@ -526,6 +667,8 @@ impl EncModel {
     /// IR executor, else in the interpreter (all produce the canonical
     /// encoding of the VIEW's value).
     fn view_fp(&self, v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
+        let has_store = self.value_store().is_some();
+        let skip_compiled = has_store && Self::transient_fallback();
         VIEW_BUF.with(|b| {
             let mut b = b.borrow_mut();
             let (ext, out) = &mut *b;
@@ -533,7 +676,10 @@ impl EncModel {
             ext.extend_from_slice(words);
             ext.resize(v.typing.layout.words, 0);
             out.clear();
-            if v.compiled(&self.base, ext, level, out) {
+            if has_store {
+                tlx_layout::store::clear_full_hit();
+            }
+            if !skip_compiled && v.compiled(&self.base, ext, level, out) {
                 if self.paranoid {
                     match self.view_interpreted(v, words, level)? {
                         ViewEncoded::Words(want) if *out == want => {}
@@ -550,6 +696,9 @@ impl EncModel {
                     }
                 }
             } else {
+                if !skip_compiled && has_store && tlx_layout::store::take_full_hit() {
+                    return Err(self.store_full_error());
+                }
                 match self.view_interpreted(v, words, level)? {
                     ViewEncoded::Words(w) => *out = w,
                     ViewEncoded::Digest(d) => return Ok(fp_words(&[u64::MAX, d])),
@@ -566,16 +715,28 @@ impl EncModel {
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
         let vals = unsafe { self.layout.decode_state_unchecked(words) };
+        self.view_encoded(v, &vals, level)
+    }
+
+    /// Evaluate the VIEW expression on decoded state `vals`.
+    fn view_value(&self, vals: &[Value], level: u32) -> Result<Value, ModelError> {
         let e = self.base.view_expr().expect("VIEW");
-        let val = self.base.ip.eval(e, &Env::default(), &Ctx::state(&vals, level)).and_then(|x| Ok(x.normalize()?)).map_err(|e| {
+        self.base.ip.eval(e, &Env::default(), &Ctx::state(vals, level)).and_then(|x| Ok(x.normalize()?)).map_err(|e| {
             // (A state whose VIEW fails counts as generated.)
             self.base.count_generated();
             self.base.error(e)
-        })?;
+        })
+    }
+
+    /// The VIEW of the decoded state `vals`, encoded in the VIEW's shape.
+    /// Shared by `view_interpreted` and the pressure path of `sym_view_fp`.
+    fn view_encoded(&self, v: &View, vals: &[Value], level: u32) -> Result<ViewEncoded, ModelError> {
+        let val = self.view_value(vals, level)?;
         let node = v.result_node();
         let mut out = vec![0u64; node.words()];
         match node.encode(&val, &mut out) {
             Ok(()) => Ok(ViewEncoded::Words(out)),
+            Err(m) if m.store_full => Err(self.store_full_error()),
             Err(_) if self.escape.is_some() => {
                 if node.encode_semantic(&val, &mut out).is_ok() {
                     Ok(ViewEncoded::Words(out))

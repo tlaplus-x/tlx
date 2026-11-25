@@ -386,7 +386,7 @@ impl LayoutNode {
     /// untouched), as `layout::encode`.
     pub fn encode(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
         out[..self.words].fill(0);
-        self.enc_impl::<false>(v, out)
+        self.enc_impl::<false, false>(v, out)
     }
 
     /// Encode `v` into `out[..self.words()]` ignoring function-domain
@@ -394,21 +394,41 @@ impl LayoutNode {
     /// witness words are written as 0).
     pub fn encode_semantic(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
         out[..self.words].fill(0);
-        self.enc_impl::<true>(v, out)
+        self.enc_impl::<true, false>(v, out)
+    }
+
+    /// Encode `v` writing the semantic digest at every `Ref` position instead
+    /// of interning the value there. The digest word is the same one a
+    /// canonical fingerprint gets from `Store::digest` of the interned image,
+    /// so the canonical fingerprint words are unchanged; this only avoids
+    /// allocating the image under value-store pressure.
+    pub fn encode_ref_digested(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
+        out[..self.words].fill(0);
+        self.enc_impl::<false, true>(v, out)
     }
 
     /// `encode` into an already zeroed `out`.
     pub(crate) fn enc(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
-        self.enc_impl::<false>(v, out)
+        self.enc_impl::<false, false>(v, out)
     }
 
-    fn enc_impl<const SEMANTIC: bool>(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
+    fn enc_impl<const SEMANTIC: bool, const DIGEST_REF: bool>(&self, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
         if let Kind::Dyn = self.kind {
             out[0] = if SEMANTIC { dynval::intern(v) } else { dynval::intern_exact(v) };
             return Ok(());
         }
         if let Kind::Ref(store) = &self.kind {
-            out[0] = store.freeze(v).map_err(|_| Miss::new(v))?;
+            out[0] = if DIGEST_REF {
+                crate::store::digest_of_value(v).map_err(|e| match e {
+                    crate::store::StoreError::Full => Miss::store_full(v),
+                    _ => Miss::new(v),
+                })?
+            } else {
+                store.freeze(v).map_err(|e| match e {
+                    crate::store::StoreError::Full => Miss::store_full(v),
+                    _ => Miss::new(v),
+                })?
+            };
             return Ok(());
         }
         let Some(v) = force(v) else { return Err(Miss::new(v)) };
@@ -446,7 +466,7 @@ impl LayoutNode {
                     }
                     let mut buf = vec![0u64; es.len() * ew];
                     for (i, e) in es.iter().enumerate() {
-                        elem.enc_impl::<SEMANTIC>(e, &mut buf[i * ew..]).map_err(|m| m.under("{}"))?;
+                        elem.enc_impl::<SEMANTIC, DIGEST_REF>(e, &mut buf[i * ew..]).map_err(|m| m.under("{}"))?;
                     }
                     crate::layout::sort_word_chunks(&buf, ew, &mut out[1..]);
                 }
@@ -468,7 +488,7 @@ impl LayoutNode {
                     return Err(Miss::new(v));
                 }
                 for (i, (k, x)) in ps.iter().enumerate() {
-                    range.enc_loc::<SEMANTIC>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
+                    range.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
                 }
                 if *witness == FcnWitness::Dynamic {
                     out[payload_words] = u64::from(!SEMANTIC && *d == FcnDom::Enumerated);
@@ -480,7 +500,7 @@ impl LayoutNode {
                 }
                 let payload_words = slot.array_words(dom.len());
                 for (i, x) in vs.iter().enumerate() {
-                    range.enc_loc::<SEMANTIC>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                    range.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
                 }
                 out[payload_words] = 0;
             }
@@ -490,7 +510,7 @@ impl LayoutNode {
                 }
                 let payload_words = slot.array_words(dom.len());
                 for (i, (k, x)) in fs.iter().enumerate() {
-                    range.enc_loc::<SEMANTIC>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!(".{}", k.as_str())))?;
+                    range.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!(".{}", k.as_str())))?;
                 }
                 out[payload_words] = 0;
             }
@@ -501,7 +521,7 @@ impl LayoutNode {
                 for_each_pair(v, |k, x| {
                     let r = key.rank_finite_impl::<SEMANTIC>(k).map_err(|m| m.under("DOMAIN"))?;
                     out[(r / 64) as usize] |= 1u64 << (r % 64);
-                    range.enc_loc::<SEMANTIC>(x, out, dims.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))
+                    range.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, dims.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))
                 })?;
                 if *witness == FcnWitness::Dynamic {
                     out[dims.words()] = u64::from(!SEMANTIC && matches!(v, Value::Fcn(_, FcnDom::Enumerated)));
@@ -512,7 +532,7 @@ impl LayoutNode {
                     return Err(Miss::new(v));
                 }
                 for (f, x) in fs.iter().zip(vs.iter()) {
-                    f.1.enc_loc::<SEMANTIC>(&x.1, out, f.2).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
+                    f.1.enc_loc::<SEMANTIC, DIGEST_REF>(&x.1, out, f.2).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
                 }
             }
             (Kind::Tuple { elems: ss, .. }, Value::Tuple(vs)) => {
@@ -520,7 +540,7 @@ impl LayoutNode {
                     return Err(Miss::new(v));
                 }
                 for (i, (s, x)) in ss.iter().zip(vs.iter()).enumerate() {
-                    s.0.enc_loc::<SEMANTIC>(x, out, s.1).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                    s.0.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, s.1).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
                 }
             }
             (Kind::Seq { elem, max_len, slot, .. }, Value::Tuple(vs)) => {
@@ -529,7 +549,7 @@ impl LayoutNode {
                 }
                 out[0] = vs.len() as u64;
                 for (i, x) in vs.iter().enumerate() {
-                    elem.enc_loc::<SEMANTIC>(x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                    elem.enc_loc::<SEMANTIC, DIGEST_REF>(x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
                 }
             }
             (Kind::Union { arms, .. }, _) => {
@@ -537,7 +557,7 @@ impl LayoutNode {
                 match arm {
                     Some(i) => {
                         out[0] = i as u64;
-                        arms[i].enc_impl::<SEMANTIC>(v, &mut out[1..])?;
+                        arms[i].enc_impl::<SEMANTIC, DIGEST_REF>(v, &mut out[1..])?;
                     }
                     None => return Err(Miss::new(v)),
                 }
@@ -548,12 +568,12 @@ impl LayoutNode {
     }
 
     #[inline]
-    fn enc_loc<const SEMANTIC: bool>(&self, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
+    fn enc_loc<const SEMANTIC: bool, const DIGEST_REF: bool>(&self, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
         match loc {
-            FieldLoc::Words(w) => self.enc_impl::<SEMANTIC>(v, &mut out[w..]),
+            FieldLoc::Words(w) => self.enc_impl::<SEMANTIC, DIGEST_REF>(v, &mut out[w..]),
             FieldLoc::Bits(pos) => {
                 let mut tmp = [0u64];
-                self.enc_impl::<SEMANTIC>(v, &mut tmp)?;
+                self.enc_impl::<SEMANTIC, DIGEST_REF>(v, &mut tmp)?;
                 pos.set_zeroed(out, tmp[0]);
                 Ok(())
             }

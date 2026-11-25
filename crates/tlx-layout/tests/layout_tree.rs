@@ -745,3 +745,33 @@ fn cmp_tlc_words_edge_cases() {
     assert_eq!(LayoutNode::new(&Shape::Never).cmp_tlc_words(&[], &[]), None);
     assert_eq!(LayoutNode::new(&Shape::Bool).cmp_tlc_words(&[0], &[1]), Some(Ordering::Less));
 }
+
+/// `LayoutNode::encode_ref_digested` writes the same words as `encode` outside
+/// `Ref` positions and the semantic digest of the interned image at each `Ref`
+/// position: exactly the canonical words a fingerprint builds from a handle
+/// encoding, without interning the value.
+#[test]
+fn encode_ref_digested_matches_handle_digests() {
+    use tlx_layout::store::StoreRef;
+
+    let store = StoreRef::new(usize::MAX);
+    let bag = Value::set_from(vec![Value::Int(1), Value::Int(4)]).unwrap();
+    let shape = Shape::Tuple(Arc::from(vec![Shape::Int { lo: 0, hi: 10 }, Shape::Ref(store.clone())]));
+    let node = LayoutNode::new(&shape);
+    let value = Value::tuple(vec![Value::Int(3), bag.clone()]);
+    let mut encoded = vec![0u64; node.words()];
+    node.encode(&value, &mut encoded).unwrap();
+    let mut digested = vec![0u64; node.words()];
+    node.encode_ref_digested(&value, &mut digested).unwrap();
+    assert_eq!(digested[0], encoded[0]);
+    assert_eq!(digested[1], store.digest(encoded[1]));
+    assert_eq!(digested[1], tlx_layout::store::digest_of_value(&bag).unwrap());
+    // Long pressure-mode searches digest one Ref value per state/permutation:
+    // more operations than the process-wide 16-bit store-id space must not
+    // create (or exhaust) any store.
+    let ref_node = LayoutNode::new(&Shape::Ref(StoreRef::new(usize::MAX)));
+    let mut ref_words = [0u64];
+    for i in 0..70_000 {
+        ref_node.encode_ref_digested(&Value::Int(i), &mut ref_words).unwrap();
+    }
+}

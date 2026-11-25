@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tlx_live::{Fairness, Ltl};
 use tlx_runtime::liveness::{self, LiveInput, LiveResult};
 use tlx_runtime::mem::RssGuard;
-use tlx_runtime::{admits, explore, AtomBits, Caps, Model, ModelError, Options, Outcome};
+use tlx_runtime::{admits, explore, AtomBits, Caps, ErrorKind, GcResult, Model, ModelError, Options, Outcome, StoreGc};
 
 struct TrackingAlloc;
 
@@ -117,7 +117,7 @@ impl Model for Ring {
         format!("/\\ x = {s}")
     }
     fn caps(&self) -> Caps<'_, u32> {
-        Caps { format: None, live_atoms: Some(self), effects: None, checkpoint: None }
+        Caps { format: None, live_atoms: Some(self), effects: None, checkpoint: None, gc: None }
     }
 }
 
@@ -315,7 +315,7 @@ impl Model for WideRing {
         format!("/\\ x = {s}")
     }
     fn caps(&self) -> Caps<'_, u32> {
-        Caps { format: None, live_atoms: Some(self), effects: None, checkpoint: None }
+        Caps { format: None, live_atoms: Some(self), effects: None, checkpoint: None, gc: None }
     }
 }
 
@@ -411,4 +411,219 @@ fn csr_topology_is_released_before_replay() {
     assert!(matches!(res, LiveResult::Violated(_)));
     assert!(m.saw_tgt_freed.load(Ordering::Relaxed), "CSR `tgt` buffer was still allocated at replay entry");
     assert!(m.saw_fps_freed.load(Ordering::Relaxed), "fingerprint vector `fps` was still allocated at replay entry");
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayFailAt {
+    None,
+    InitConstraint,
+    SuccAdmits,
+    SuccEmit,
+}
+
+/// Toy model with a `StoreGc` capability where state `0` branches to `1`
+/// (ordinal 0) and `2` (ordinal 1), so exhausting the store during recorded
+/// counterexample replay exercises both `constraint_gc` and `admits_gc`
+/// (including the ordinal-shift hazard when successor 0 fails before edge 1).
+struct ReplayFullModel {
+    fail_at: std::sync::atomic::AtomicU8,
+    marked_full: AtomicBool,
+    admits_seen: AtomicU32,
+    inv: Vec<String>,
+    acts: Vec<String>,
+}
+
+impl ReplayFullModel {
+    fn new() -> Self {
+        Self {
+            fail_at: std::sync::atomic::AtomicU8::new(ReplayFailAt::None as u8),
+            marked_full: AtomicBool::new(false),
+            admits_seen: AtomicU32::new(0),
+            inv: Vec::new(),
+            acts: vec!["Next".into()],
+        }
+    }
+
+    fn mode(&self) -> ReplayFailAt {
+        match self.fail_at.load(Ordering::Relaxed) {
+            1 => ReplayFailAt::InitConstraint,
+            2 => ReplayFailAt::SuccAdmits,
+            3 => ReplayFailAt::SuccEmit,
+            _ => ReplayFailAt::None,
+        }
+    }
+
+    fn set_mode(&self, m: ReplayFailAt) {
+        self.fail_at.store(m as u8, Ordering::Relaxed);
+        self.marked_full.store(false, Ordering::Relaxed);
+        self.admits_seen.store(0, Ordering::Relaxed);
+    }
+
+    fn store_full() -> ModelError {
+        ModelError::of_kind(ErrorKind::StoreFull, "value store budget exhausted during replay")
+    }
+}
+
+impl StoreGc<u32> for ReplayFullModel {
+    fn enter_scope(&self) -> Box<dyn std::any::Any + Send + Sync> {
+        Box::new(())
+    }
+    fn needs_gc(&self) -> bool {
+        false
+    }
+    fn mark_full(&self) {
+        self.marked_full.store(true, Ordering::Relaxed);
+    }
+    fn mark_state(&self, _s: &u32, _mark: &mut dyn FnMut(u64)) {}
+    fn mark_words(&self, _words: &[u64], _mark: &mut dyn FnMut(u64)) {}
+    fn collect(&self, visit_roots: &mut dyn FnMut(&mut dyn FnMut(u64)) -> Result<(), String>) -> Result<GcResult, String> {
+        visit_roots(&mut |_| {})?;
+        Ok(GcResult::default())
+    }
+}
+
+impl Model for ReplayFullModel {
+    type State = u32;
+    fn coarse_fingerprint(&self) -> bool {
+        false
+    }
+    fn check_init_property(&self, _s: &u32) -> Result<Option<String>, ModelError> {
+        Ok(None)
+    }
+    fn constraint(&self, _s: &u32) -> Result<bool, ModelError> {
+        Ok(true)
+    }
+    fn constraint_gc(&self, s: &u32, _collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        if self.mode() == ReplayFailAt::InitConstraint && *s == 0 {
+            return Err(Self::store_full());
+        }
+        Ok(true)
+    }
+    fn action_constraint(&self, _s: &u32, _t: &u32) -> Result<bool, ModelError> {
+        Ok(true)
+    }
+    fn action_constraint_gc(&self, s: &u32, t: &u32, _collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        if self.mode() == ReplayFailAt::SuccAdmits && *s == 0 {
+            self.admits_seen.fetch_add(1, Ordering::Relaxed);
+            if *t == 1 {
+                return Err(Self::store_full());
+            }
+        }
+        Ok(true)
+    }
+    fn check_transition(&self, _s: &u32, _t: &u32) -> Result<Option<usize>, ModelError> {
+        Ok(None)
+    }
+    fn action_property_names(&self) -> &[String] {
+        &self.inv
+    }
+    fn extra_generated(&self) -> u64 {
+        0
+    }
+    fn stop_requested(&self) -> bool {
+        false
+    }
+    fn init_states(&self, out: &mut dyn FnMut(u32)) -> Result<(), ModelError> {
+        out(0);
+        Ok(())
+    }
+    fn successors(&self, s: &u32, out: &mut dyn FnMut(u32, u32) -> bool) -> Result<(), ModelError> {
+        if self.mode() == ReplayFailAt::SuccEmit && *s == 0 {
+            return Err(Self::store_full());
+        }
+        match *s {
+            // Ordinal 0 -> state 1 (returns to 0); ordinal 1 -> state 2 (loops on 2, violating []<>(x = 0)).
+            0 => {
+                if out(1, 0) {
+                    let _ = out(2, 0);
+                }
+            }
+            1 => {
+                let _ = out(0, 0);
+            }
+            _ => {
+                let _ = out(2, 0);
+            }
+        }
+        Ok(())
+    }
+    fn fingerprint(&self, s: &u32) -> u64 {
+        (*s as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+    fn check_invariants(&self, _s: &u32) -> Result<Option<usize>, ModelError> {
+        Ok(None)
+    }
+    fn invariant_names(&self) -> &[String] {
+        &self.inv
+    }
+    fn action_names(&self) -> &[String] {
+        &self.acts
+    }
+    fn render(&self, s: &u32) -> String {
+        format!("/\\ x = {s}")
+    }
+    fn caps(&self) -> Caps<'_, u32> {
+        Caps { format: None, live_atoms: Some(self), effects: None, checkpoint: None, gc: Some(self) }
+    }
+}
+
+impl AtomBits<u32> for ReplayFullModel {
+    fn state(&self, s: &u32, _out: &[&[u64]]) -> Result<Vec<u64>, ModelError> {
+        Ok(vec![u64::from(*s == 0)])
+    }
+    fn action(&self, s: &u32, t: &u32) -> Result<Vec<u64>, ModelError> {
+        Ok(vec![u64::from(s != t)])
+    }
+}
+
+#[test]
+fn recorded_replay_propagates_store_full_errors() {
+    let m = ReplayFullModel::new();
+    let props = infinitely_often_zero();
+    let alone: Vec<Ltl> = props.iter().map(|(_, f)| f.clone()).collect();
+    let input = LiveInput { props: &props, alone: &alone, fairness: Vec::new(), concrete: false };
+
+    let run = |mode: ReplayFailAt| -> LiveResult<u32> {
+        m.set_mode(ReplayFailAt::None);
+        let r = explore(&m, &Options { workers: 1, check_deadlock: false, ..Default::default() });
+        assert_eq!(r.outcome, Outcome::Ok);
+        let recorded = r.live_graph.expect("recorded graph");
+        m.set_mode(mode);
+        liveness::check(&m, &input, &m, 1, usize::MAX, Some(recorded), RssGuard::new(usize::MAX, 0))
+    };
+
+    // Baseline: counterexample replays cleanly when the store has budget.
+    assert!(matches!(run(ReplayFailAt::None), LiveResult::Violated(_)));
+
+    // Exhaustion in initial-state constraint_gc propagates StoreFull (not "cannot be replayed").
+    match run(ReplayFailAt::InitConstraint) {
+        LiveResult::Error(e) => assert!(e.is_store_full(), "expected StoreFull, got: {e}"),
+        LiveResult::Holds => panic!("expected StoreFull on init constraint, got Holds"),
+        LiveResult::Violated(_) => panic!("expected StoreFull on init constraint, got Violated"),
+        LiveResult::OutOfMemory(m) => panic!("expected StoreFull on init constraint, got OutOfMemory({m})"),
+    }
+    assert!(m.marked_full.load(Ordering::Relaxed), "expected gc.mark_full() on init constraint StoreFull");
+
+    // Exhaustion in successor admits_gc on ordinal 0 stops immediately without shifting ordinals.
+    match run(ReplayFailAt::SuccAdmits) {
+        LiveResult::Error(e) => assert!(e.is_store_full(), "expected StoreFull, got: {e}"),
+        LiveResult::Holds => panic!("expected StoreFull on successor admits, got Holds"),
+        LiveResult::Violated(_) => panic!("expected StoreFull on successor admits, got Violated"),
+        LiveResult::OutOfMemory(m) => panic!("expected StoreFull on successor admits, got OutOfMemory({m})"),
+    }
+    assert!(m.marked_full.load(Ordering::Relaxed), "expected gc.mark_full() on successor admits StoreFull");
+    assert_eq!(
+        m.admits_seen.load(Ordering::Relaxed),
+        1,
+        "replay must stop at the first StoreFull successor rather than skipping and shifting ordinals"
+    );
+
+    // Exhaustion in action_successors_gc also latches mark_full and propagates StoreFull.
+    match run(ReplayFailAt::SuccEmit) {
+        LiveResult::Error(e) => assert!(e.is_store_full(), "expected StoreFull, got: {e}"),
+        LiveResult::Holds => panic!("expected StoreFull on action_successors_gc, got Holds"),
+        LiveResult::Violated(_) => panic!("expected StoreFull on action_successors_gc, got Violated"),
+        LiveResult::OutOfMemory(m) => panic!("expected StoreFull on action_successors_gc, got OutOfMemory({m})"),
+    }
+    assert!(m.marked_full.load(Ordering::Relaxed), "expected gc.mark_full() on action_successors_gc StoreFull");
 }

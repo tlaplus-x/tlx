@@ -130,6 +130,7 @@ impl Model for Layers {
             live_atoms: self.live.then_some(self as _),
             effects: None,
             checkpoint: Some(self),
+            gc: None,
         }
     }
 }

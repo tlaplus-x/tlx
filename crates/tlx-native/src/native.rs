@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use libloading::Library;
 
-use crate::mixed::{Arg, Args, Kind, MixedCx, Out, RefOps, RegionEnv, Regions};
+use crate::mixed::{Arg, Args, Kind, MixedCx, Out, RefOps, RefOpsScope, RegionEnv, Regions};
 
 /// Host callbacks (`tlx_host` in tlx_abi.h).
 #[repr(C)]
@@ -474,7 +474,10 @@ impl NativeLib {
                 self.regions_hash
             );
         }
-        let mut cx = CallCtx { words: self.words, out, error: None, miss: None, mx, regions, refops: self.refops.as_deref(), level };
+        if let Some(ops) = self.refops.as_deref() {
+            return self.call_mixed_pinned(ops, regions, mx, out, level, f);
+        }
+        let mut cx = CallCtx { words: self.words, out, error: None, miss: None, mx, regions, refops: None, level };
         let rc = f(&HOST, &mut cx as *mut CallCtx as *mut c_void);
         let (error, miss) = (cx.error, cx.miss);
         cx.mx.end_call();
@@ -482,6 +485,39 @@ impl NativeLib {
             std::panic::resume_unwind(p);
         }
         Call { rc, error, miss }
+    }
+
+    #[inline(never)]
+    fn call_mixed_pinned<F>(
+        &self,
+        ops: &dyn RefOps,
+        regions: Option<&dyn Regions>,
+        mx: &mut MixedCx,
+        out: &mut dyn FnMut(Box<[u64]>, u32) -> bool,
+        level: u32,
+        f: F,
+    ) -> Call
+    where
+        F: FnOnce(*const Host, *mut c_void) -> i32,
+    {
+        let mut f = Some(f);
+        let mut out = Some(out);
+        let mut mx = Some(mx);
+        let mut result = None;
+        ops.with_scope(&mut |scope| {
+            let f = f.take().expect("RefOps::with_scope invoked callback more than once");
+            let out = out.take().unwrap();
+            let mx = mx.take().unwrap();
+            let mut cx = CallCtx { words: self.words, out, error: None, miss: None, mx, regions, refops: Some(scope), level };
+            let rc = f(&HOST, &mut cx as *mut CallCtx as *mut c_void);
+            let (error, miss) = (cx.error, cx.miss);
+            cx.mx.end_call();
+            if let Some(p) = cx.mx.panic.take() {
+                std::panic::resume_unwind(p);
+            }
+            result = Some(Call { rc, error, miss });
+        });
+        result.expect("RefOps::with_scope did not invoke callback")
     }
 
     /// Run Init, appending initial states to `out` (ABI return code).
@@ -638,7 +674,7 @@ struct CallCtx<'a> {
     /// the call returns).
     mx: &'a mut MixedCx,
     regions: Option<&'a dyn Regions>,
-    refops: Option<&'a dyn RefOps>,
+    refops: Option<&'a dyn RefOpsScope>,
     level: u32,
 }
 
@@ -805,7 +841,7 @@ unsafe extern "C" fn ref_elems_cb(cx: *mut c_void, set: u64, first: *mut *const 
         match ops.elems(set) {
             Some(es) => {
                 // SAFETY: the generated code passes pointers to two variables;
-                // the elements stay in the store for the run.
+                // `RefOpsScope` pins the value store for the entire native call.
                 unsafe {
                     *first = es.as_ptr();
                     *n = es.len() as u64;

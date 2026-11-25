@@ -17,12 +17,15 @@ pub mod stats;
 pub use dump::{DumpObserver, DumpOptions};
 pub use explore::{
     explore, explore_from, explore_observed, explore_resumable, ActionMasks, AfterCommit, AtomBits, CheckpointConfig, CheckpointEvent,
-    Checkpointer, Coverage, CoverageReport, LiveGraph, Options, Outcome, Outdegree, Progress, Recovery, Report, ResumePoint,
+    Checkpointer, Coverage, CoverageReport, ExpandedBatch, LiveGraph, Options, Outcome, Outdegree, Progress, Recovery, Report, ResumePoint,
     SearchObserver, Start, Stats, TraceStep, TranscodeError,
 };
 pub use fpset::FpConfig;
 pub use live::{CurrentAction, LiveStats};
 pub use mem::MemBudget;
-pub use model::{admits, Caps, Checkpointed, Effects, ErrorContext, ErrorKind, Model, ModelError, Persist, StateFormat};
+pub use model::{
+    admits, Caps, Checkpointed, Effects, ErrorContext, ErrorKind, GcEvent, GcResult, Model, ModelError, Persist, StateFormat, StoreGc,
+    StoreGcRetry,
+};
 pub use queue::StateCodec;
 pub use simulate::{simulate, SimOptions, SimPhase, SimProgress};

@@ -88,7 +88,7 @@ impl Model for Grid {
         format!("/\\ x = {}\n/\\ y = {}", s.0, s.1)
     }
     fn caps(&self) -> Caps<'_, S> {
-        Caps { format: None, live_atoms: Some(self), effects: Some(self), checkpoint: None }
+        Caps { format: None, live_atoms: Some(self), effects: Some(self), checkpoint: None, gc: None }
     }
 }
 

@@ -140,6 +140,7 @@ mod tests {
                 TraceStep { state: 2, action: Some(1) },
             ],
             trace_note: None,
+            trace_store_full: false,
             elapsed: r.elapsed,
             in_init: false,
             live_graph: r.live_graph,

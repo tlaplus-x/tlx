@@ -31,8 +31,10 @@ static NEXT_DYN_PLAN: AtomicU64 = AtomicU64::new(1);
 const DYN_MEMO_BITS: u32 = 12;
 
 thread_local! {
-    /// Images of `Dyn` handles, direct-mapped: (plan number, handle, image).
-    static DYN_MEMO: RefCell<Vec<(u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
+    /// Images of `Dyn` / `Ref` handles, direct-mapped: (plan number, gc generation, handle, image).
+    /// `Dyn` uses generation 0; `Ref` keys on `store.gc_gen()` so entries whose
+    /// output handle was swept are never returned after a GC cycle.
+    static DYN_MEMO: RefCell<Vec<(u64, u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A permutation of atoms (identity on everything but model values).
@@ -350,21 +352,23 @@ impl PermPlan {
                 PermPlan::Dyn(perm, id) | PermPlan::Ref(perm, _, id) => {
                     // Handles are never reused for other values, and the states
                     // of a search share most of their values: the image of a
-                    // handle under this plan is looked up first.
+                    // handle under this plan is looked up first (keyed by
+                    // `gc_gen` for `Ref` so swept nodes are never returned).
+                    let store = match self {
+                        PermPlan::Ref(_, store, _) => Some(store),
+                        _ => None,
+                    };
+                    let gen = store.map_or(0, |s| s.gc_gen());
                     let slot =
                         (src[0] ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0xff51_afd7_ed55_8ccd) >> (64 - DYN_MEMO_BITS);
                     let hit = DYN_MEMO.with(|m| {
                         let m = m.borrow();
-                        m.get(slot as usize).filter(|e| e.0 == *id && e.1 == src[0]).map(|e| e.2)
+                        m.get(slot as usize).filter(|e| e.0 == *id && e.1 == gen && e.2 == src[0]).map(|e| e.3)
                     });
                     if let Some(h) = hit {
                         dst[0] = h;
                         return;
                     }
-                    let store = match self {
-                        PermPlan::Ref(_, store, _) => Some(store),
-                        _ => None,
-                    };
                     let v = match store {
                         Some(s) if TRUSTED => s.thaw(src[0]),
                         Some(s) => s.try_thaw(src[0]).expect("valid value store handle"),
@@ -378,21 +382,31 @@ impl PermPlan {
                         let y = perm(&x);
                         (y != x).then_some(y)
                     };
+                    let mut cacheable = true;
                     dst[0] = match tlx_value::ops::permute_shared(&v, &image) {
-                        // (A full store keeps the handle: the run stops on it.)
+                        // (A full store keeps the handle and records STORE_FULL_HIT;
+                        // do not memoize it so a retry after GC computes the image.)
                         Ok(Some(p)) => match store {
-                            Some(s) => s.freeze(&p).unwrap_or(src[0]),
+                            Some(s) => match s.freeze(&p) {
+                                Ok(h) => h,
+                                Err(_) => {
+                                    cacheable = false;
+                                    src[0]
+                                }
+                            },
                             None => dynval::intern_exact(&p),
                         },
                         _ => src[0],
                     };
-                    DYN_MEMO.with(|m| {
-                        let mut m = m.borrow_mut();
-                        if m.is_empty() {
-                            m.resize(1 << DYN_MEMO_BITS, (0, 0, 0));
-                        }
-                        m[slot as usize] = (*id, src[0], dst[0]);
-                    });
+                    if cacheable {
+                        DYN_MEMO.with(|m| {
+                            let mut m = m.borrow_mut();
+                            if m.is_empty() {
+                                m.resize(1 << DYN_MEMO_BITS, (0, 0, 0, 0));
+                            }
+                            m[slot as usize] = (*id, gen, src[0], dst[0]);
+                        });
+                    }
                 }
             }
         }

@@ -317,7 +317,9 @@ EXTENDS Naturals, Sequences, TLC
 VARIABLES bag, n
 K(i) == [id |-> i, log |-> <<i>>]
 Init == bag = (K(0) :> 0) /\ n = 0
-Next == n < 1000 /\ bag' = bag @@ (K(n + 1) :> n) /\ n' = n + 1
+Next == /\ n < 1000
+        /\ \E j \in 1..(IF n = 999 THEN 1000 ELSE 1) : bag' = bag @@ (K(n + j) :> n)
+        /\ n' = n + 1
 ====
 "#;
     let dir = spec_dir("store-budget", src);

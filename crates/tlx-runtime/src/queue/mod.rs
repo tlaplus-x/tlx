@@ -43,7 +43,7 @@ mod reader;
 mod seg;
 mod writer;
 
-pub(crate) use self::block::{Block, Charge, Mem, SegCache, Segment, Task, BLOCK};
+pub(crate) use self::block::{Block, Charge, Mem, SegCache, Segment, StateRef, Task, BLOCK};
 pub(crate) use self::reader::Reader;
 pub(crate) use self::writer::Writer;
 
@@ -529,6 +529,32 @@ impl<'c, S> Queue<'c, S> {
         for slot in list.blocks.iter().skip(start) {
             if let Some(b) = &*slot.lock() {
                 f(b)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit every state queued in this queue (unclaimed blocks of the current
+    /// level plus submitted blocks of the next level) at a safepoint.
+    pub(crate) fn visit_states(
+        &self,
+        cache: &mut SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        let lists = self.level.read();
+        for list in lists.iter() {
+            let start = list.cursor.load(Ordering::Acquire);
+            for slot in list.blocks.iter().skip(start) {
+                if let Some(b) = &*slot.lock() {
+                    b.visit_states(cache, prev, visit)?;
+                }
+            }
+        }
+        drop(lists);
+        for (_, blocks) in self.submitted.lock().iter() {
+            for b in blocks {
+                b.visit_states(cache, prev, visit)?;
             }
         }
         Ok(())

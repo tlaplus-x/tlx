@@ -117,6 +117,7 @@ impl Model for Bulges {
             live_atoms: self.live.then_some(self as _),
             effects: Some(self),
             checkpoint: None,
+            gc: None,
         }
     }
 }

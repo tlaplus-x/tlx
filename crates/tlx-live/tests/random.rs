@@ -105,6 +105,7 @@ fn tlc_algorithm_agrees_without_view() {
     use tlx_live::{check_concrete, Conc, Event, Expand, Expansion, Lasso, Succ};
     struct Ex<'a>(&'a Graph);
     impl Expand for Ex<'_> {
+        type Error = String;
         fn expand(&mut self, from: u32, idx: u32) -> Result<Expansion, String> {
             Ok(expansion(self.0, self.0.edges[from as usize][idx as usize].0))
         }

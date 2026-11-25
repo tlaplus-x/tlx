@@ -160,6 +160,7 @@ impl Model for InterpModel {
             live_atoms: self.records_live_edges().then_some(self as _),
             effects: None,
             checkpoint: Some(self),
+            gc: None,
         }
     }
 

@@ -2,14 +2,16 @@
 //! them during its search, to find where TLC reports their errors (and the
 //! violations it detects during its search).
 
+use std::any::Any;
 use std::sync::Mutex;
 
 use tlx_base::hash::IdMap;
 
-use super::concrete::{at_point, violation, Concrete, NO_STATE};
-use super::{expand_concrete, LiveInput, LiveResult};
+use super::concrete::{at_point, violation, Concrete, GcHook, NO_STATE};
+use super::expand::{concrete_bits, ConcreteSuccessors};
+use super::{LiveInput, LiveResult};
 use crate::live::LiveStats;
-use crate::{AtomBits, ErrorContext, Model, ModelError, Options, Outcome, Report, SearchObserver};
+use crate::{AtomBits, ErrorContext, ExpandedBatch, Model, ModelError, Options, Outcome, Report, SearchObserver};
 
 /// The liveness predicates of a spec evaluated on the states of a search as
 /// TLC evaluates them during its search (Worker.doNextCheckLiveness,
@@ -48,7 +50,7 @@ struct LiveErrors<'a, M: Model> {
 /// TLC's products during the search (see `LiveErrors`).
 struct Early<'a, M: Model> {
     cx: Concrete<'a, M>,
-    checker: tlx_live::ConcreteChecker,
+    checker: tlx_live::ConcreteChecker<ModelError>,
     /// The state id of each state found and not yet expanded, by fingerprint.
     pending: IdMap<u32>,
     /// The products could not be built (an atom failed; the error is
@@ -81,13 +83,46 @@ impl<M: Model> Early<'_, M> {
         self.checker.event(&tlx_live::Event::Init { node, conc, bits: tlx_live::Bits::from_words(&b) }, &mut self.cx);
     }
 
-    /// The search expanded `s`: whether that completes a violation.
-    fn next(&mut self, s: &M::State) -> bool {
+    /// GC-backed `init` routing retries and any on-demand expansion through `park`.
+    fn init_gc(&mut self, s: &M::State, k: u32, park: &mut dyn FnMut(&[&M::State], bool) -> bool) {
+        if self.off {
+            return;
+        }
+        let (m, bits) = (self.cx.m, self.cx.bits);
+        let fp = m.fingerprint(s);
+        self.cx.find(fp);
+        let mut hook = GcHook::Park(park);
+        let Ok(b) = self.cx.retry_with(|| bits.tableau_bits(s), |hook, force_drop| self.cx.collect_with(hook, force_drop, &[s]), &mut hook)
+        else {
+            self.off = true;
+            return;
+        };
+        let conc = self.cx.state_id((NO_STATE, k));
+        self.pending.insert(fp, conc);
+        let node = self.cx.node(fp);
+        self.cx.init_event_with(&mut self.checker, node, conc, &b, &mut hook);
+    }
+
+    /// The search expanded `s` with the transitions already generated in `all`:
+    /// whether that completes a violation.
+    fn next_all(&mut self, s: &M::State, all: &[(M::State, u32)]) -> bool {
         if self.off {
             return false;
         }
         let (m, bits) = (self.cx.m, self.cx.bits);
-        let (Some(conc), Ok(e)) = (self.pending.remove(&m.fingerprint(s)), expand_concrete(m, bits, s)) else {
+        let Some(conc) = self.pending.remove(&m.fingerprint(s)) else {
+            self.off = true;
+            return false;
+        };
+        let mut out = Vec::with_capacity(all.len());
+        for (t, a) in all {
+            let Ok(ok) = crate::admits(m, s, t) else {
+                self.off = true;
+                return false;
+            };
+            out.push((t.clone(), *a, m.fingerprint(t), ok));
+        }
+        let Ok(e) = concrete_bits(m, bits, s, ConcreteSuccessors { all: out }) else {
             self.off = true;
             return false;
         };
@@ -98,14 +133,50 @@ impl<M: Model> Early<'_, M> {
         self.fired = self.checker.fired();
         self.fired.is_some()
     }
+
+    /// GC-backed `next` reusing the worker's filtered successor batch `batch`
+    /// and routing atom retries and on-demand expansion through `park`.
+    fn next_batch(&mut self, s: &M::State, batch: &ExpandedBatch<'_, M::State>, park: &mut dyn FnMut(&[&M::State], bool) -> bool) -> bool {
+        if self.off {
+            return false;
+        }
+        let m = self.cx.m;
+        let Some(conc) = self.pending.remove(&m.fingerprint(s)) else {
+            self.off = true;
+            return false;
+        };
+        let mut hook = GcHook::Park(park);
+        let Ok(e) = self.cx.concrete_bits_with(s, batch.admitted.to_vec(), batch.rejected_staged, Vec::new(), &[], &mut hook) else {
+            self.off = true;
+            return false;
+        };
+        let pending = &mut self.pending;
+        self.cx.next_event_with(&mut self.checker, conc, e, None, &mut hook, &mut |id, _, fp| {
+            pending.insert(fp, id);
+        });
+        self.fired = self.checker.fired();
+        self.fired.is_some()
+    }
 }
 
 impl<M: Model> LiveErrors<'_, M> {
     /// The products of `early` after the search expanded `s`: the error
     /// stopping the search if that completes a violation.
-    fn check_early(&self, s: &M::State) -> Result<(), ModelError> {
+    fn check_early(&self, s: &M::State, all: &[(M::State, u32)]) -> Result<(), ModelError> {
         match &self.early {
-            Some(e) if e.lock().unwrap().next(s) => Err(ModelError::new(FIRED).within(ErrorContext::Liveness)),
+            Some(e) if e.lock().unwrap().next_all(s, all) => Err(ModelError::new(FIRED).within(ErrorContext::Liveness)),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_early_gc(
+        &self,
+        s: &M::State,
+        batch: &ExpandedBatch<'_, M::State>,
+        park: &mut dyn FnMut(&[&M::State], bool) -> bool,
+    ) -> Result<(), ModelError> {
+        match &self.early {
+            Some(e) if e.lock().unwrap().next_batch(s, batch, park) => Err(ModelError::new(FIRED).within(ErrorContext::Liveness)),
             _ => Ok(()),
         }
     }
@@ -125,11 +196,31 @@ impl<M: Model> SearchObserver<M::State> for LiveErrors<'_, M> {
         true
     }
 
+    fn filters_rejected(&self) -> bool {
+        true
+    }
+
+    fn wants_rejected_staged(&self) -> bool {
+        self.early.as_ref().is_some_and(|e| e.lock().unwrap().cx.bits.has_action_atoms())
+    }
+
+    fn stage_rejected(&self, t: &M::State) -> Option<Box<dyn Any + Send + Sync>> {
+        self.early.as_ref().and_then(|e| e.lock().unwrap().cx.bits.stage_state(t))
+    }
+
     // TLC checks a new initial state before its invariants.
     fn on_init(&self, s: &M::State, k: u64) -> Result<(), ModelError> {
         self.atoms.init(s).map_err(|e| e.within(ErrorContext::Liveness))?;
         if let Some(e) = &self.early {
             e.lock().unwrap().init(s, k as u32);
+        }
+        Ok(())
+    }
+
+    fn on_init_gc(&self, s: &M::State, k: u64, park: &mut dyn FnMut(&[&M::State], bool) -> bool) -> Result<(), ModelError> {
+        self.atoms.init(s).map_err(|e| e.within(ErrorContext::Liveness))?;
+        if let Some(e) = &self.early {
+            e.lock().unwrap().init_gc(s, k as u32, park);
         }
         Ok(())
     }
@@ -143,7 +234,7 @@ impl<M: Model> SearchObserver<M::State> for LiveErrors<'_, M> {
         let check = || {
             let live = if deadlock { Ok(()) } else { self.atoms.expanded(s, &succ).map_err(|e| e.within(ErrorContext::Liveness)) };
             if live.is_ok() && complete && !deadlock {
-                self.check_early(s)
+                self.check_early(s, all)
             } else {
                 live
             }
@@ -155,6 +246,34 @@ impl<M: Model> SearchObserver<M::State> for LiveErrors<'_, M> {
             Some((e, p)) => {
                 let new = e.lock().unwrap().cx.count_new(succ.iter().map(|t| self.m.fingerprint(t)));
                 let p = LiveStats { generated: p.generated + all.len() as u64, distinct: p.distinct + new, queue: p.queue + new, ..p };
+                at_point(p, check)
+            }
+            None => check(),
+        }
+    }
+
+    fn on_expanded_gc(
+        &self,
+        s: &M::State,
+        batch: &ExpandedBatch<'_, M::State>,
+        park: &mut dyn FnMut(&[&M::State], bool) -> bool,
+    ) -> Result<(), ModelError> {
+        let succ: Vec<M::State> = batch.admitted.iter().map(|(t, ..)| t.clone()).collect();
+        let deadlock = batch.complete && batch.total_generated == 0 && self.check_deadlock;
+        let mut check = || {
+            let live = if deadlock { Ok(()) } else { self.atoms.expanded(s, &succ).map_err(|e| e.within(ErrorContext::Liveness)) };
+            if live.is_ok() && batch.complete && !deadlock {
+                self.check_early_gc(s, batch, park)
+            } else {
+                live
+            }
+        };
+        match self.early.as_ref().and_then(|e| crate::live::current().map(|p| (e, p))) {
+            Some((_, p)) => {
+                // `generated`, `distinct`, and `diameter` are already published
+                // as each successor is checked in generation order; add any
+                // multi-worker deferred queue pushes to `queue`.
+                let p = LiveStats { queue: p.queue + batch.deferred_queued, ..p };
                 at_point(p, check)
             }
             None => check(),
@@ -181,6 +300,10 @@ impl<M: Model> Fired<'_, M> {
     /// The violation, its counterexample's states rebuilt by re-executing
     /// the model.
     pub fn result(&self, input: &LiveInput) -> LiveResult<M::State> {
+        let _gc_guard = self.cx.m.caps().gc.map(|gc| gc.enter_scope());
+        if let Some(gc) = self.cx.m.caps().gc {
+            let _ = gc.collect(&mut |_| Ok(()));
+        }
         violation(input, self.prop, &self.lasso, &self.cx)
     }
 }
@@ -221,7 +344,8 @@ pub fn find_error<'a, M: Model>(
         return None;
     }
     let fired = lm.early.and_then(|e| {
-        let Early { cx, fired, .. } = e.into_inner().unwrap();
+        let Early { mut cx, fired, .. } = e.into_inner().unwrap();
+        cx.enable_gc();
         fired.map(|(prop, lasso)| Fired { cx, prop, lasso })
     });
     Some(Found { report: r, fired })

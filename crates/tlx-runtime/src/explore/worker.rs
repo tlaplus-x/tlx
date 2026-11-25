@@ -78,6 +78,35 @@ pub(super) struct WorkerState<'s, 'm, M: Model> {
     checked_outside: Vec<u64>,
     /// The path to the state being expanded (`TLCExt!Trace`), if known.
     pub(super) path: Option<std::sync::Arc<live::PathNode>>,
+    /// Whether this worker's frontier/order containers are currently deposited
+    /// in `shared.gc_roots[self.me]`.
+    roots_deposited: bool,
+    /// Pending buffered observer states in `observed_successors` (kept on
+    /// `WorkerState` so mid-action GC can mark them).
+    obs_pending: Vec<(M::State, u32)>,
+    /// Admitted buffered observer states when `SearchObserver::filters_rejected`
+    /// is enabled under value-store GC.
+    obs_admitted: Vec<(M::State, u32, u64)>,
+}
+
+/// Deferred queue push/offer for multi-worker filtered observed searches so
+/// other workers cannot steal admitted states before `on_expanded_gc` runs.
+enum DeferredEnqueue {
+    None,
+    Push { log: LogRef, depth: u32, action: u32 },
+    Offer { fp: u64, action: u32, idx: u64 },
+}
+
+/// Per-expansion state for `observed_successors_filtered` passed into
+/// `add_successor` so both admitted and rejected candidates share one
+/// generation-ordered stats/check path while rejected handles drop immediately.
+struct FilteredObs<'a, S> {
+    o: &'a dyn super::SearchObserver<S>,
+    wants_staged: bool,
+    rejected_staged: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    deferred: Vec<DeferredEnqueue>,
+    deferred_queued: u64,
+    defer_enqueue: bool,
 }
 
 /// Slots of a worker's cache of checked states outside the constraints.
@@ -101,16 +130,89 @@ pub(super) struct WorkerOut<'m, S> {
 }
 
 impl<'m, M: Model> WorkerState<'_, 'm, M> {
+    /// Deposit this worker's frontier, candidate store, in-flight states, and
+    /// thread-local emit roots into `shared.gc_roots[self.me]` before parking
+    /// or leaving safepoints (no-op when the model has no value store GC).
+    pub(super) fn deposit_roots(&mut self, in_flight: &[&M::State]) {
+        let Some(gc) = self.shared.store_gc else { return };
+        if self.roots_deposited {
+            return;
+        }
+        let mut roots = self.shared.gc_roots[self.me].lock();
+        let (reader, batch, writer, archive) = self.local.take_gc_parts();
+        roots.reader = reader;
+        roots.batch = batch;
+        roots.writer = Some(writer);
+        roots.archive = archive;
+        if let Some(o) = &mut self.order {
+            roots.cands = Some(o.take_store());
+        }
+        roots.in_flight.clear();
+        for &s in in_flight {
+            roots.in_flight.push(s.clone());
+        }
+        for (s, _) in &self.obs_pending {
+            roots.in_flight.push(s.clone());
+        }
+        for (s, ..) in &self.obs_admitted {
+            roots.in_flight.push(s.clone());
+        }
+        roots.extra_handles.clear();
+        gc.take_thread_roots(&mut roots.extra_handles);
+        self.roots_deposited = true;
+    }
+
+    /// Take back this worker's deposited containers after waking from a
+    /// safepoint or level barrier (idempotent; no-op without value store GC).
+    pub(super) fn take_roots(&mut self) {
+        if self.shared.store_gc.is_none() || !self.roots_deposited {
+            return;
+        }
+        let mut roots = self.shared.gc_roots[self.me].lock();
+        let writer = roots.writer.take().expect("deposited gc writer");
+        let reader = roots.reader.take();
+        let batch = std::mem::take(&mut roots.batch);
+        let archive = roots.archive.take();
+        self.local.restore_gc_parts(reader, batch, writer, archive);
+        if let (Some(o), Some(cs)) = (&mut self.order, roots.cands.take()) {
+            o.restore_store(cs);
+        }
+        roots.in_flight.clear();
+        roots.extra_handles.clear();
+        self.roots_deposited = false;
+    }
+
+    /// Request a value-store GC safepoint and wait until at least one
+    /// collection has completed (or the search stops), keeping `in_flight`
+    /// states and any pending thread-local emit buffers rooted. When
+    /// `force_drop_archive` is set, forces the collector to release the
+    /// layout-miss archive before retrying a hard allocation failure.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn park_for_store_gc(&mut self, in_flight: &[&M::State], force_drop_archive: bool) {
+        let shared = self.shared;
+        if force_drop_archive {
+            shared.store_gc_drop_archive.store(true, Ordering::Release);
+        }
+        let epoch_before = shared.store_gc_epoch.load(Ordering::Acquire);
+        self.deposit_roots(in_flight);
+        while !shared.control().stopped() && shared.store_gc_epoch.load(Ordering::Acquire) == epoch_before {
+            shared.control().request(super::SP_STORE_GC);
+            shared.safepoint.park(|req, crew| shared.serve_safepoint(req, crew));
+        }
+        self.take_roots();
+    }
+
     /// Called between tasks: whether to go on (false once the search
     /// stops). Parks at a safepoint if one is requested.
     #[inline]
-    pub(super) fn proceed(&self) -> bool {
+    pub(super) fn proceed(&mut self) -> bool {
         self.shared.control().get() == 0 || self.proceed_slow()
     }
 
     #[cold]
     #[inline(never)]
-    fn proceed_slow(&self) -> bool {
+    fn proceed_slow(&mut self) -> bool {
         let shared = self.shared;
         loop {
             let c = shared.control().get();
@@ -120,7 +222,9 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
             if c & STOP != 0 {
                 return false;
             }
+            self.deposit_roots(&[]);
             shared.safepoint.park(|req, crew| shared.serve_safepoint(req, crew));
+            self.take_roots();
         }
     }
 
@@ -128,6 +232,7 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
     /// or at the end).
     pub(super) fn leave_safepoints(&mut self) {
         if self.active {
+            self.deposit_roots(&[]);
             self.active = false;
             let shared = self.shared;
             shared.safepoint.leave(|req, crew| shared.serve_safepoint(req, crew));
@@ -138,6 +243,7 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
     /// behalf (`Safepoint::join_all`).
     pub(super) fn joined_safepoints(&mut self) {
         debug_assert!(!self.active, "joined while active");
+        self.take_roots();
         self.active = true;
     }
 
@@ -294,6 +400,8 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         }
         let res = if OBS {
             self.observed_successors::<STATS, ORDERED, COV>(task, &mut count, &mut failure)
+        } else if self.shared.store_gc.is_some() {
+            self.expand_with_store_gc::<STATS, ORDERED, COV>(task, &mut count, &mut failure)
         } else {
             model.successors(&task.state, &mut |t, a| self.successor::<STATS, ORDERED, COV, false>(task, t, a, &mut count, &mut failure, 0))
         };
@@ -311,11 +419,135 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         if count == 0 && self.shared.opts.check_deadlock {
             return Err((Outcome::Deadlock, task.log));
         }
-        if let Some(e) = &mut self.shard.edges {
-            let r = e.end(&task.state, model.fingerprint(&task.state), (task.depth == 1).then_some(task.log));
+        if let Some(edges) = &mut self.shard.edges {
+            let fp = model.fingerprint(&task.state);
+            let init_log = (task.depth == 1).then_some(task.log);
+            let r = match edges.end(&task.state, fp, init_log) {
+                Err(e) if e.is_store_full() => self.retry_edge(&[&task.state], e, |edges| edges.end(&task.state, fp, init_log)),
+                other => other,
+            };
             edge_error(model, r, task.log)?;
         }
         Ok(())
+    }
+
+    #[inline(never)]
+    fn expand_with_store_gc<const STATS: bool, const ORDERED: bool, const COV: bool>(
+        &mut self,
+        task: &Task<M::State>,
+        count: &mut u64,
+        failure: &mut Option<Failure>,
+    ) -> Result<(), ModelError> {
+        let model = self.shared.model;
+        let gc = self.shared.store_gc.expect("store_gc");
+        for a in 0..model.action_names().len() as u32 {
+            let go = model.action_successors_gc(&task.state, a, &mut |ev| match ev {
+                crate::model::GcEvent::Emit(t, act) => self.successor::<STATS, ORDERED, COV, false>(task, t, act, count, failure, 0),
+                crate::model::GcEvent::Collect { force_drop_archive } => {
+                    self.park_for_store_gc(&[&task.state], force_drop_archive);
+                    !self.shared.control().stopped()
+                }
+            });
+            match go {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    if e.is_store_full() {
+                        gc.mark_full();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unified cold retry path for liveness edge recorder operations (`end`,
+    /// `successor`, `found`, and ordered `resolve::found`). `EdgeRec` returns
+    /// `StoreFull` without setting `failed` or clearing its logs, so retries
+    /// preserve the full behavior graph; only exhausted retries fail the
+    /// recorder, latch `gc.mark_full()`, and propagate via `edge_error`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn retry_edge<F>(&mut self, in_flight: &[&M::State], first_err: ModelError, mut op: F) -> Result<(), ModelError>
+    where
+        F: FnMut(&mut super::edges::EdgeRec<'m, M::State>) -> Result<(), ModelError>,
+    {
+        let Some(gc) = self.shared.store_gc else {
+            if let Some(edges) = self.shard.edges.as_mut() {
+                let _ = edges.fail(first_err.clone());
+            }
+            return Err(first_err);
+        };
+        let mut last = first_err;
+        for stage in crate::model::StoreGcRetry::STAGES {
+            self.park_for_store_gc(in_flight, stage.force_drop_archive);
+            let _fb = stage.transient_fallback.then(|| super::TransientFallbackGuard::enter(gc));
+            let Some(edges) = self.shard.edges.as_mut() else {
+                return Ok(());
+            };
+            match op(edges) {
+                Err(e) if e.is_store_full() => last = e,
+                other => return other,
+            }
+        }
+        gc.mark_full();
+        if let Some(edges) = self.shard.edges.as_mut() {
+            return edges.fail(last);
+        }
+        Err(last)
+    }
+
+    #[inline(never)]
+    fn admits_with_store_gc(&mut self, task: &Task<M::State>, t: &M::State) -> Result<bool, ModelError> {
+        let model = self.shared.model;
+        let gc = self.shared.store_gc.expect("store_gc");
+        let mut stopped = false;
+        let r = crate::model::admits_gc(model, &task.state, t, &mut |force_drop| {
+            self.park_for_store_gc(&[&task.state, t], force_drop);
+            stopped = self.shared.control().stopped();
+            !stopped
+        });
+        if let Err(ref e) = r {
+            if e.is_store_full() && !stopped {
+                gc.mark_full();
+            }
+        }
+        r
+    }
+
+    #[inline(never)]
+    fn invariant_with_store_gc(&mut self, task: &Task<M::State>, t: &M::State, r: LogRef) -> Option<Failure> {
+        let model = self.shared.model;
+        let gc = self.shared.store_gc.expect("store_gc");
+        let mut stopped = false;
+        let f = super::invariant_failure_gc(model, t, r, &mut |force_drop| {
+            self.park_for_store_gc(&[&task.state, t], force_drop);
+            stopped = self.shared.control().stopped();
+            !stopped
+        });
+        if matches!(&f, Some((Outcome::Error(e), _)) if e.is_store_full()) && !stopped {
+            gc.mark_full();
+        }
+        f
+    }
+
+    #[inline(never)]
+    fn transition_with_store_gc(&mut self, task: &Task<M::State>, t: &M::State) -> Result<Option<usize>, ModelError> {
+        let model = self.shared.model;
+        let gc = self.shared.store_gc.expect("store_gc");
+        let mut stopped = false;
+        let r = model.check_transition_gc(&task.state, t, &mut |force_drop| {
+            self.park_for_store_gc(&[&task.state, t], force_drop);
+            stopped = self.shared.control().stopped();
+            !stopped
+        });
+        if let Err(ref e) = r {
+            if e.is_store_full() && !stopped {
+                gc.mark_full();
+            }
+        }
+        r
     }
 
     /// Process successor `t` of `task` by action `a` as it is generated
@@ -330,6 +562,21 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         count: &mut u64,
         failure: &mut Option<Failure>,
         from: u64,
+    ) -> bool {
+        self.successor_checked::<STATS, ORDERED, COV, OBS>(task, t, a, count, failure, from, None)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn successor_checked<const STATS: bool, const ORDERED: bool, const COV: bool, const OBS: bool>(
+        &mut self,
+        task: &Task<M::State>,
+        t: M::State,
+        a: u32,
+        count: &mut u64,
+        failure: &mut Option<Failure>,
+        from: u64,
+        filter: Option<&mut FilteredObs<'m, M::State>>,
     ) -> bool {
         if OBS {
             if let Some(o) = self.shared.observer {
@@ -348,7 +595,7 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         self.generated += 1;
         self.slot.generated.store(self.generated, Ordering::Relaxed);
         let span = if STATS { stats::span() } else { stats::Span::Off };
-        let r = self.add_successor::<STATS, ORDERED, COV, OBS>(task, t, a, *count, from);
+        let r = self.add_successor::<STATS, ORDERED, COV, OBS>(task, t, a, *count, from, filter);
         span.end(T::Successor);
         match r {
             // (The observer may stop the search after each successor.)
@@ -376,18 +623,177 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         let o = self.shared.observer.expect("an observed search");
         let from = model.fingerprint(&task.state);
         if !o.buffers() {
+            if let Some(gc) = self.shared.store_gc {
+                for a in 0..model.action_names().len() as u32 {
+                    let go = model.action_successors_gc(&task.state, a, &mut |ev| match ev {
+                        crate::model::GcEvent::Emit(t, act) => {
+                            self.successor::<STATS, ORDERED, COV, true>(task, t, act, count, failure, from)
+                        }
+                        crate::model::GcEvent::Collect { force_drop_archive } => {
+                            self.park_for_store_gc(&[&task.state], force_drop_archive);
+                            !self.shared.control().stopped()
+                        }
+                    });
+                    match go {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            if e.is_store_full() {
+                                gc.mark_full();
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                return Ok(());
+            }
             return model
                 .successors(&task.state, &mut |t, a| self.successor::<STATS, ORDERED, COV, true>(task, t, a, count, failure, from));
         }
-        let mut all = Vec::new();
-        let res = model.successors(&task.state, &mut |t, a| {
-            all.push((t, a));
-            true
-        });
-        let observed = o.on_expanded(&task.state, &all, res.is_ok());
-        for (t, a) in all {
+        if let Some(gc) = self.shared.store_gc {
+            if o.filters_rejected() {
+                return self.observed_successors_filtered::<STATS, ORDERED, COV>(task, count, failure, from, o, gc);
+            }
+        }
+        self.obs_pending.clear();
+        let res = if let Some(gc) = self.shared.store_gc {
+            let mut action_res = Ok(());
+            for a in 0..model.action_names().len() as u32 {
+                let r = model.action_successors_gc(&task.state, a, &mut |ev| match ev {
+                    crate::model::GcEvent::Emit(t, act) => {
+                        self.obs_pending.push((t, act));
+                        true
+                    }
+                    crate::model::GcEvent::Collect { force_drop_archive } => {
+                        self.park_for_store_gc(&[&task.state], force_drop_archive);
+                        !self.shared.control().stopped()
+                    }
+                });
+                if let Err(e) = r {
+                    if e.is_store_full() {
+                        gc.mark_full();
+                    }
+                    action_res = Err(e);
+                    break;
+                }
+            }
+            action_res
+        } else {
+            model.successors(&task.state, &mut |t, a| {
+                self.obs_pending.push((t, a));
+                true
+            })
+        };
+        let observed = o.on_expanded(&task.state, &self.obs_pending, res.is_ok());
+        // Reverse so `pop()` visits in original order while keeping remaining
+        // states rooted in `self.obs_pending` if `successor` parks for GC.
+        self.obs_pending.reverse();
+        while let Some((t, a)) = self.obs_pending.pop() {
             if !self.successor::<STATS, ORDERED, COV, true>(task, t, a, count, failure, from) {
+                self.obs_pending.clear();
                 break;
+            }
+        }
+        observed.and(res)
+    }
+
+    /// Buffering observed expansion under value-store GC for observers that
+    /// filter rejected candidates (`LiveErrors`): processes every admitted and
+    /// rejected candidate through `successor_checked` in exact generation order
+    /// (publishing per-successor `generated`/`distinct`/`queue` statistics and
+    /// preserving invariant/register side effects), drops rejected handles
+    /// immediately (staging store-free snapshots only when action atoms exist),
+    /// and invokes `on_expanded_gc` before publishing any multi-worker deferred
+    /// queue entries.
+    #[inline(never)]
+    fn observed_successors_filtered<const STATS: bool, const ORDERED: bool, const COV: bool>(
+        &mut self,
+        task: &Task<M::State>,
+        count: &mut u64,
+        failure: &mut Option<Failure>,
+        from: u64,
+        o: &'m dyn super::SearchObserver<M::State>,
+        gc: &'m dyn crate::model::StoreGc<M::State>,
+    ) -> Result<(), ModelError> {
+        let model = self.shared.model;
+        self.obs_admitted.clear();
+        let mut filter = FilteredObs {
+            o,
+            wants_staged: o.wants_rejected_staged(),
+            rejected_staged: Vec::new(),
+            deferred: Vec::new(),
+            deferred_queued: 0,
+            defer_enqueue: self.shared.slots.len() > 1,
+        };
+        let mut res = Ok(());
+        for a in 0..model.action_names().len() as u32 {
+            let go = model.action_successors_gc(&task.state, a, &mut |ev| match ev {
+                crate::model::GcEvent::Emit(t, act) => {
+                    self.successor_checked::<STATS, ORDERED, COV, true>(task, t, act, count, failure, from, Some(&mut filter))
+                }
+                crate::model::GcEvent::Collect { force_drop_archive } => {
+                    self.park_for_store_gc(&[&task.state], force_drop_archive);
+                    !self.shared.control().stopped()
+                }
+            });
+            match go {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    if e.is_store_full() {
+                        gc.mark_full();
+                    }
+                    res = Err(e);
+                    break;
+                }
+            }
+        }
+        if failure.is_some() {
+            self.obs_admitted.clear();
+            return res;
+        }
+        let admitted = std::mem::take(&mut self.obs_admitted);
+        let observed = {
+            let batch = super::ExpandedBatch {
+                admitted: &admitted,
+                total_generated: *count,
+                deferred_queued: filter.deferred_queued,
+                rejected_staged: &filter.rejected_staged,
+                complete: res.is_ok(),
+            };
+            let mut park = |extra: &[&M::State], force_drop: bool| {
+                let mut in_flight = Vec::with_capacity(1 + admitted.len() + extra.len());
+                in_flight.push(&task.state);
+                for (s, ..) in &admitted {
+                    in_flight.push(s);
+                }
+                in_flight.extend_from_slice(extra);
+                self.park_for_store_gc(&in_flight, force_drop);
+                !self.shared.control().stopped()
+            };
+            o.on_expanded_gc(&task.state, &batch, &mut park)
+        };
+        drop(filter.rejected_staged);
+        if filter.defer_enqueue {
+            let mut deferred = filter.deferred;
+            self.obs_admitted = admitted;
+            self.obs_admitted.reverse();
+            deferred.reverse();
+            while let Some((t, _, _)) = self.obs_admitted.pop() {
+                match deferred.pop().expect("deferred enqueue") {
+                    DeferredEnqueue::None => {}
+                    DeferredEnqueue::Push { log, depth, action } => {
+                        self.shared.note_path(log, depth, &t, Some(action), self.path.clone());
+                        self.local.push_new(Task { state: t, log, depth });
+                    }
+                    DeferredEnqueue::Offer { fp, action, idx } => {
+                        if let Err(f) = self.offer::<STATS>(task, t, fp, action, idx) {
+                            *failure = Some(f);
+                            self.obs_admitted.clear();
+                            break;
+                        }
+                    }
+                }
             }
         }
         observed.and(res)
@@ -407,7 +813,9 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
                 return Err(fp_set_full(seen));
             }
             shared.control().request(SP_GROW);
+            shared.mid_task_parked.fetch_add(1, Ordering::AcqRel);
             shared.safepoint.park(|req, crew| shared.serve_safepoint(req, crew));
+            shared.mid_task_parked.fetch_sub(1, Ordering::AcqRel);
             match seen.insert(fp, &mut 0, || shared.control().request(SP_GROW)) {
                 Ok(b) => return Ok(b),
                 // (A broken safepoint serves nothing: the search stops.)
@@ -429,21 +837,28 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         action: u32,
         idx: u64,
         from: u64,
+        filter: Option<&mut FilteredObs<'m, M::State>>,
     ) -> Result<(), Failure> {
         let model = self.shared.model;
-        let s = &task.state;
         let span = if STATS { stats::span() } else { stats::Span::Off };
         // (TLC's trace of an error in a constraint or an action property
         // ends with the successor.)
-        let in_model = crate::model::admits(model, s, &t);
+        let in_model =
+            if self.shared.store_gc.is_some() { self.admits_with_store_gc(task, &t) } else { crate::model::admits(model, &task.state, &t) };
         span.end(T::Constraint);
         let in_model = match in_model {
             Ok(b) => b,
             Err(e) => return Err((Outcome::Error(e), self.append_log(task.log, model.fingerprint(&t)))),
         };
         let fp = model.fingerprint(&t);
-        if let Some(e) = &mut self.shard.edges {
-            edge_error(model, e.successor(s, &t, fp, action, in_model), task.log)?;
+        if let Some(edges) = &mut self.shard.edges {
+            let r = match edges.successor(&task.state, &t, fp, action, in_model) {
+                Err(e) if e.is_store_full() => {
+                    self.retry_edge(&[&task.state, &t], e, |edges| edges.successor(&task.state, &t, fp, action, in_model))
+                }
+                other => other,
+            };
+            edge_error(model, r, task.log)?;
         }
         // States outside the model are not added to the seen set, but are
         // checked against the invariants every time they are generated.
@@ -477,8 +892,12 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
                 if COV {
                     bump(&self.slot.cov, generated_at(action) + 1);
                 }
-                if let Some(e) = &mut self.shard.edges {
-                    edge_error(model, e.found(&t), task.log)?;
+                if let Some(edges) = &mut self.shard.edges {
+                    let er = match edges.found(&t) {
+                        Err(e) if e.is_store_full() => self.retry_edge(&[&task.state, &t], e, |edges| edges.found(&t)),
+                        other => other,
+                    };
+                    edge_error(model, er, task.log)?;
                 }
                 // Counted before the checks: TLC reports the depth of a
                 // violating state.
@@ -488,7 +907,8 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
                 }
             }
             let span = if STATS { stats::span() } else { stats::Span::Off };
-            let f = invariant_failure(model, &t, r);
+            let f =
+                if self.shared.store_gc.is_some() { self.invariant_with_store_gc(task, &t, r) } else { invariant_failure(model, &t, r) };
             span.end(T::Invariants);
             if let Some(f) = f {
                 return Err(f);
@@ -502,7 +922,8 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
         }
         // Action properties are checked on every transition (TLC: implied actions).
         let span = if STATS { stats::span() } else { stats::Span::Off };
-        let transition = model.check_transition(s, &t);
+        let transition =
+            if self.shared.store_gc.is_some() { self.transition_with_store_gc(task, &t) } else { model.check_transition(&task.state, &t) };
         span.end(T::Transition);
         match transition {
             Ok(None) => {}
@@ -511,6 +932,38 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
                 return Err((Outcome::ActionPropertyViolated(model.action_property_names()[i].clone()), r));
             }
             Err(e) => return Err((Outcome::Error(e), lr.unwrap_or_else(|| self.append_log(task.log, fp)))),
+        }
+        if let Some(f) = filter {
+            if in_model {
+                if f.defer_enqueue {
+                    self.obs_admitted.push((t, action, fp));
+                    if ordered {
+                        f.deferred.push(DeferredEnqueue::Offer { fp, action, idx });
+                    } else if let Some(log) = lr {
+                        f.deferred.push(DeferredEnqueue::Push { log, depth, action });
+                        f.deferred_queued += 1;
+                    } else {
+                        f.deferred.push(DeferredEnqueue::None);
+                    }
+                } else {
+                    self.obs_admitted.push((t.clone(), action, fp));
+                    if let Some(log) = lr {
+                        self.shared.note_path(log, depth, &t, Some(action), self.path.clone());
+                        self.local.push_new(Task { state: t, log, depth });
+                    }
+                }
+            } else {
+                if f.wants_staged {
+                    if let Some(tok) = f.o.stage_rejected(&t) {
+                        f.rejected_staged.push(tok);
+                    }
+                }
+                drop(t);
+                if self.shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                    self.park_for_store_gc(&[&task.state], false);
+                }
+            }
+            return Ok(());
         }
         if ordered {
             self.offer::<STATS>(task, t, fp, action, idx)?;
@@ -530,7 +983,7 @@ impl<'m, M: Model> WorkerState<'_, 'm, M> {
 #[inline]
 pub(super) fn edge_error<M: Model>(model: &M, r: Result<(), ModelError>, at: LogRef) -> Result<(), Failure> {
     match r {
-        Err(e) if model.caps().interrupts(&e) => Err((Outcome::Error(e), at)),
+        Err(e) if e.is_store_full() || model.caps().interrupts(&e) => Err((Outcome::Error(e), at)),
         _ => Ok(()),
     }
 }
@@ -577,6 +1030,9 @@ fn run_worker_in<'s, 'm, M: Model>(
         order: shared.order.as_ref().map(|o| OrderLocal::new(o, shared.model.caps().codec(), shared.opts.queue.seg_bytes)),
         checked_outside: Vec::new(),
         path: None,
+        roots_deposited: false,
+        obs_pending: Vec::new(),
+        obs_admitted: Vec::new(),
     };
     if shared.slots.len() > 1 {
         run_levels(&mut w);
@@ -589,6 +1045,9 @@ fn run_worker_in<'s, 'm, M: Model>(
             }
             w.local.advance();
             if shared.checkpoint_due() {
+                if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                    w.park_for_store_gc(&[], false);
+                }
                 w.publish_history();
                 w.checkpoint_part();
                 shared.commit_checkpoint();
@@ -597,6 +1056,7 @@ fn run_worker_in<'s, 'm, M: Model>(
         }
     }
     w.leave_safepoints();
+    w.take_roots();
     w.spill_logs(true);
     let left = w.retain_left();
     let archive = w.local.take_archive();

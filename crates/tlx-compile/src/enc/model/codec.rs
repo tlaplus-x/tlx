@@ -21,6 +21,24 @@ impl EncModel {
         self.sem.as_ref().and_then(|s| s.store.as_ref())
     }
 
+    /// Current GC generation of this model's value store (0 when unused).
+    #[inline]
+    pub(super) fn store_gc_gen(&self) -> u64 {
+        self.value_store().map_or(0, |s| s.gc_gen())
+    }
+
+    /// The `ErrorKind::StoreFull` error returned when the value store hits its
+    /// byte budget (triggers safepoint GC + retry, or stops the run if full).
+    pub(super) fn store_full_error(&self) -> ModelError {
+        let mb = self.value_store().map_or(0, |s| s.budget() >> 20);
+        ModelError::of_kind(
+            ErrorKind::StoreFull,
+            format!(
+                "the value store (TLX_VALUE_STORE) exceeded its budget of {mb} MiB (-maxmem): raise -maxmem or turn the store off (TLX_VALUE_STORE=0)"
+            ),
+        )
+    }
+
     /// The variable values of an encoded state.
     pub fn values(&self, s: &EState) -> Arc<[Value]> {
         self.check_state_model(s);
@@ -32,9 +50,10 @@ impl EncModel {
     /// being expanded (all its actions and the action properties of its
     /// steps read it); otherwise it replaces the last other state decoded.
     pub(super) fn cached_values(&self, words: &[u64], current: bool) -> Arc<[Value]> {
+        let gc_gen = self.store_gc_gen();
         let hit = DECODED.with(|c| {
             let c = c.borrow();
-            if c.model != self.id {
+            if c.model != self.id || c.gc_gen != gc_gen {
                 return None;
             }
             c.slots.iter().find(|(w, v)| v.is_some() && **w == *words).and_then(|(_, v)| v.clone())
@@ -53,8 +72,9 @@ impl EncModel {
         span.end(T::Decode);
         DECODED.with(|c| {
             let mut c = c.borrow_mut();
-            if c.model != self.id {
+            if c.model != self.id || c.gc_gen != gc_gen {
                 c.model = self.id;
+                c.gc_gen = gc_gen;
                 c.slots.iter_mut().for_each(|s| s.1 = None);
             }
             let (w, v) = &mut c.slots[if current { 0 } else { 1 }];
@@ -113,6 +133,7 @@ impl EncModel {
                     model: self.id,
                 })
             }
+            Err(m) if m.store_full => Err(self.store_full_error()),
             Err(m) => {
                 let var = m.var_index().unwrap_or(0);
                 Err(Self::record_miss(&self.miss, var, v.vals[var].clone()))
@@ -177,13 +198,25 @@ impl EncModel {
 
     /// A state produced by compiled code (already encoded).
     pub(super) fn finish(&self, words: Box<[u64]>, level: u32) -> Result<EState, ModelError> {
+        self.finish_or_return(words, level).map_err(|(_, e)| e)
+    }
+
+    /// Like `finish`, returning the untouched `words` buffer on error so the
+    /// caller can re-root its store handles across a safepoint GC and retry.
+    pub(super) fn finish_or_return(&self, words: Box<[u64]>, level: u32) -> Result<EState, (Box<[u64]>, ModelError)> {
         let fp = if matches!(self.fp, Fingerprint::Values) {
             // SAFETY: the matching encoder/program produced these words.
             // Active Dyn handles were published before this call.
             let vals: Vec<Option<Value>> = unsafe { self.layout.decode_state_unchecked(&words) }.into_iter().map(Some).collect();
-            self.base.make_state_counted(&vals, level, "state").map_err(|e| self.base.error(e))?.fp
+            match self.base.make_state_counted(&vals, level, "state") {
+                Ok(s) => s.fp,
+                Err(e) => return Err((words, self.base.error(e))),
+            }
         } else {
-            self.words_fp(&words, level)?
+            match self.words_fp(&words, level) {
+                Ok(fp) => fp,
+                Err(e) => return Err((words, e)),
+            }
         };
         Ok(EState {
             words,
@@ -197,7 +230,8 @@ impl EncModel {
 
 thread_local! {
     /// Decoded states of `EncModel::cached_values` (per worker thread).
-    static DECODED: RefCell<DecodeCache> = const { RefCell::new(DecodeCache { model: 0, slots: [(Vec::new(), None), (Vec::new(), None)] }) };
+    static DECODED: RefCell<DecodeCache> =
+        const { RefCell::new(DecodeCache { model: 0, gc_gen: 0, slots: [(Vec::new(), None), (Vec::new(), None)] }) };
 }
 
 /// The last decoded states of one worker: the state being expanded (slot
@@ -206,7 +240,65 @@ thread_local! {
 struct DecodeCache {
     /// Id of the `EncModel` whose layout decoded them.
     model: u64,
+    /// Value-store GC generation when these entries were cached.
+    gc_gen: u64,
     slots: [(Vec<u64>, Option<Arc<[Value]>>); 2],
+}
+
+impl tlx_runtime::StoreGc<EState> for EncModel {
+    fn enter_scope(&self) -> Box<dyn std::any::Any + Send + Sync> {
+        let store = self.value_store().expect("StoreGc requires a value store");
+        Box::new(store.0.enter_gc_scope())
+    }
+
+    fn needs_gc(&self) -> bool {
+        self.value_store().is_some_and(|s| s.needs_gc())
+    }
+
+    fn mark_full(&self) {
+        if let Some(s) = self.value_store() {
+            s.mark_full();
+        }
+    }
+
+    fn mark_state(&self, s: &EState, mark: &mut dyn FnMut(u64)) {
+        self.mark_words(&s.words, mark);
+    }
+
+    fn mark_words(&self, words: &[u64], mark: &mut dyn FnMut(u64)) {
+        if let Some(sem) = &self.sem {
+            for &off in &sem.state {
+                if let Some(&h) = words.get(off) {
+                    mark(h);
+                }
+            }
+        }
+    }
+
+    fn take_thread_roots(&self, out: &mut Vec<u64>) {
+        self.take_pending_emit_roots(out);
+    }
+
+    fn collect(&self, visit_roots: &mut dyn FnMut(&mut dyn FnMut(u64)) -> Result<(), String>) -> Result<tlx_runtime::GcResult, String> {
+        let store = self.value_store().expect("StoreGc requires a value store");
+        let res = store.try_collect_with(|mark| {
+            for &h in &self.pinned_handles {
+                mark(h);
+            }
+            visit_roots(mark)
+        })?;
+        crate::exec::memo::invalidate_for_store_gc();
+        Ok(tlx_runtime::GcResult {
+            live_bytes: res.live_bytes as usize,
+            budget: store.budget(),
+            reclaimed_bytes: res.reclaimed_bytes,
+            full: res.live_bytes as usize >= store.budget(),
+        })
+    }
+
+    fn set_transient_fallback(&self, on: bool) {
+        EncModel::set_transient_fallback(on);
+    }
 }
 
 /// Checkpoints: the string table, the shapes (the layout and the

@@ -31,6 +31,43 @@ Next == n < 1000 /\ bag' = bag @@ (K(n + 1) :> n) /\ n' = n + 1
 ====
 "#;
 
+/// A bag spec whose level-251 frontier holds 1,500 distinct 251-key bags
+/// simultaneously: even after live-root GC drops the archive, the live
+/// frontier alone exceeds a tight budget, verifying that genuine live-root
+/// exhaustion still stops cleanly with the budget error.
+const WIDE_BAG: &str = r#"---- MODULE WideBag ----
+EXTENDS Naturals, Sequences, TLC
+VARIABLES bag, n, branch
+K(i) == [id |-> i, log |-> <<i, i + 1>>]
+Init == bag = (K(0) :> 0) /\ n = 0 /\ branch = 0
+Next == \/ n < 250 /\ bag' = bag @@ (K(n + 1) :> n) /\ n' = n + 1 /\ branch' = 0
+        \/ n = 250 /\ branch = 0 /\ \E b \in 1..1500 :
+             bag' = bag @@ (K(1000 + b) :> b) /\ n' = 251 /\ branch' = b
+====
+"#;
+
+/// A multi-worker mid-level transient churn spec: steps 0..120 build a
+/// 121-key bag, step 120 fans out to 64 parallel tasks at level 121, step 121
+/// performs 6,400 `bag' = bag @@ (K(...) :> j)` merges inside ONE single level
+/// (~14.5 MiB of transient `Store` nodes, ~227 KiB per task) filtered by
+/// `CONSTRAINT Bound` down to 4 live states, and step 122 reuses `ConstBag`.
+const MID_LEVEL_CHURN: &str = r#"---- MODULE MidLevelChurn ----
+EXTENDS Naturals, Sequences, TLC
+VARIABLES bag, w, step, tag
+K(i) == [id |-> i, log |-> <<i, i + 1, i + 2>>]
+ConstBag == (K(999999) :> 42)
+Init == bag = ConstBag /\ w = 0 /\ step = 0 /\ tag = 0
+Next == \/ step < 120 /\ bag' = bag @@ (K(step + 1) :> step) /\ w' = 0 /\ step' = step + 1 /\ tag' = 0
+        \/ step = 120 /\ \E id \in 1..64 :
+             bag' = bag @@ (K(1000 + id) :> id) /\ w' = id /\ step' = 121 /\ tag' = 0
+        \/ step = 121 /\ \E j \in 1..100 :
+             bag' = bag @@ (K(w * 100000 + j) :> j) /\ w' = w /\ step' = 122 /\ tag' = j
+        \/ step = 122 /\ bag' = ConstBag /\ w' = w /\ step' = 123 /\ tag' = tag
+Bound == step < 122 \/ (tag = 1 /\ w <= 4)
+====
+"#;
+const MID_LEVEL_CFG: &str = "INIT Init\nNEXT Next\nCONSTRAINT Bound\nCHECK_DEADLOCK FALSE\n";
+
 /// Every slot of this run has a fixed shape (an integer): nothing of it
 /// is a handle.
 const FIXED: &str = r#"---- MODULE Fixed ----
@@ -57,21 +94,31 @@ fn store_on_environment() {
     });
 }
 
-/// The compiled run of `src` under `opts`: its model and its counts.
-fn compiled(src: &str, opts: &Options) -> Result<(tlx_compile::enc::EncModel, (u64, u64, u32)), String> {
+/// The compiled run of `src` under `cfg` and `opts`: its model and its counts.
+fn compiled_cfg(src: &str, cfg: &str, opts: &Options) -> Result<(tlx_compile::enc::EncModel, (u64, u64, u32)), String> {
     store_on_environment();
-    let model = load(src, CFG);
+    let model = load(src, cfg);
     model.ip.set_run_config(opts.workers, opts.check_deadlock);
     let (m, r) = tlx_compile::enc::check(Arc::new(model), opts, 16)?;
     assert!(matches!(r.outcome, Outcome::Ok), "{:?}", r.outcome);
     Ok((m, (r.stats.generated, r.stats.distinct, r.stats.depth)))
 }
 
+/// The compiled run of `src` under `CFG` and `opts`: its model and its counts.
+fn compiled(src: &str, opts: &Options) -> Result<(tlx_compile::enc::EncModel, (u64, u64, u32)), String> {
+    compiled_cfg(src, CFG, opts)
+}
+
 /// The interpreter's counts, the semantic reference (compat.md §0).
-fn interpreted(src: &str) -> (u64, u64, u32) {
-    let s = run_mode(src, CFG, Mode::Interp);
+fn interpreted_cfg(src: &str, cfg: &str) -> (u64, u64, u32) {
+    let s = run_mode(src, cfg, Mode::Interp);
     assert_eq!(s.outcome, "Ok");
     (s.generated, s.distinct, s.depth)
+}
+
+/// The interpreter's counts under `CFG`.
+fn interpreted(src: &str) -> (u64, u64, u32) {
+    interpreted_cfg(src, CFG)
 }
 
 fn options() -> Options {
@@ -132,14 +179,101 @@ fn the_budget_is_the_runs_own_budget_not_a_fraction_of_it() {
 
 #[test]
 fn a_full_store_is_a_hard_error_naming_the_way_out() {
-    // Half of what the values need: the store refuses and the run ends.
-    let opts = Options { maxmem: bag_bytes() / 2, ..options() };
-    let err = match compiled(BAG, &opts) {
+    // Measure WIDE_BAG's full uncollected store size, then run with a budget
+    // well below its live level-251 frontier (~6 MiB): even after live-root
+    // GC reclaims dead nodes and drops the archive, the live frontier itself
+    // exceeds the budget and the run ends cleanly with the budget error.
+    let (m_full, _) = compiled(WIDE_BAG, &options()).unwrap();
+    let full_bytes = m_full.value_store().expect("wide bag store").stats().node_bytes as usize;
+    let budget = (full_bytes / 4).max(128 * 1024);
+    let opts = Options { maxmem: budget, ..options() };
+    let err = match compiled(WIDE_BAG, &opts) {
         Err(e) => e,
-        Ok(_) => panic!("a full value store must end the run"),
+        Ok(_) => panic!("a live frontier exceeding budget ({budget}) must end the run"),
     };
     assert!(err.contains("the value store (TLX_VALUE_STORE) exceeded its budget of"), "{err}");
     assert!(err.contains("turn the store off (TLX_VALUE_STORE=0)"), "the error does not name the way out: {err}");
+}
+
+#[test]
+fn safepoint_reclamation_handles_five_x_churn_single_and_multi_worker() {
+    // 1. Multi-level frontier churn (BAG): cumulative bytes (~10+ MiB) exceed
+    //    the budget by >= 5x while the live frontier is a single state.
+    let full_bytes = bag_bytes();
+    let budget = (full_bytes / 7).max(256 * 1024);
+    assert!(full_bytes >= 5 * budget, "test setup requires >= 5x churn: full={full_bytes}, budget={budget}");
+    let want = interpreted(BAG);
+    let opts = Options { maxmem: budget, ..options() };
+    let (m, got) = compiled(BAG, &opts).unwrap();
+    assert_eq!(got, want);
+    assert_eq!(m.bailouts.get(), 0, "GC churn fell back to interpreter");
+    let st = m.value_store().expect("bag store").stats();
+    assert!(st.gc_cycles >= 3, "expected multiple GC cycles, got {}", st.gc_cycles);
+    assert!(
+        st.reclaimed_bytes + st.node_bytes >= 5 * budget as u64,
+        "expected >= 5x budget cumulative bytes processed: reclaimed={}, live={}, budget={}",
+        st.reclaimed_bytes,
+        st.node_bytes,
+        budget
+    );
+    assert!(st.node_bytes <= budget as u64, "final live bytes {} exceeded budget {}", st.node_bytes, budget);
+
+    // 2. Mid-level transient churn with both 1 and 4 workers: a single level
+    //    generates >= 5x budget of transient bags filtered by CONSTRAINT.
+    let want_mid = interpreted_cfg(MID_LEVEL_CHURN, MID_LEVEL_CFG);
+    let (m_mid_full, _) = compiled_cfg(MID_LEVEL_CHURN, MID_LEVEL_CFG, &options()).unwrap();
+    let mid_full_bytes = m_mid_full.value_store().expect("mid churn store").stats().node_bytes as usize;
+    let mid_budget = (mid_full_bytes / 7).max(256 * 1024);
+    assert!(mid_full_bytes >= 5 * mid_budget, "mid-level test setup requires >= 5x churn: full={mid_full_bytes}, budget={mid_budget}");
+    for workers in [1, 4] {
+        let opts = Options { workers, maxmem: mid_budget, ..options() };
+        let (m, got) = compiled_cfg(MID_LEVEL_CHURN, MID_LEVEL_CFG, &opts).unwrap();
+        assert_eq!(got, want_mid, "workers={workers}");
+        assert_eq!(m.bailouts.get(), 0, "workers={workers} fell back to interpreter");
+        let st = m.value_store().expect("mid churn store").stats();
+        assert!(st.gc_cycles >= 2, "workers={workers}: expected mid-level GC cycles, got {}", st.gc_cycles);
+        assert!(
+            st.reclaimed_bytes + st.node_bytes >= 5 * mid_budget as u64,
+            "workers={workers}: cumulative {} < 5x budget {}",
+            st.reclaimed_bytes + st.node_bytes,
+            mid_budget
+        );
+    }
+}
+
+#[test]
+fn checkpoint_and_recovery_work_across_multiple_gc_cycles() {
+    store_on_environment();
+    let want = interpreted(BAG);
+    let full_bytes = bag_bytes();
+    let budget = (full_bytes / 6).max(256 * 1024);
+    let md = TempDir::new("value-store-gc-recover");
+    let spill = |reused: bool| Spill::new(SpillConfig { dir: Some(md.path().to_path_buf()), reused, ..Default::default() });
+
+    // Run 1: force GC before checkpointing at 550 states.
+    let ck1 = checkpointer(true, Some(550), AfterCommit::Stop(1));
+    let opts1 = Options { maxmem: budget, checkpoint: Some(ck1.clone()), spill: spill(false), ..options() };
+    let model1 = load(BAG, CFG);
+    model1.ip.set_run_config(1, false);
+    let Checked::Compiled(m1, _) = check_from(Arc::new(model1), &opts1, 16, None).unwrap() else {
+        panic!("expected compiled run 1");
+    };
+    assert_eq!(ck1.count(), 1);
+    assert!(m1.value_store().expect("store 1").stats().gc_cycles >= 1, "expected GC before checkpoint 1");
+
+    // Run 2: recover sparse v2 model-store under the same tight budget and finish.
+    let rec = Recovery::open(md.path()).unwrap();
+    let ck2 = checkpointer(true, None, AfterCommit::Continue);
+    let opts2 = Options { maxmem: budget, checkpoint: Some(ck2), spill: spill(true), ..options() };
+    let model2 = load(BAG, CFG);
+    model2.ip.set_run_config(1, false);
+    let Checked::Compiled(m2, r2) = check_from(Arc::new(model2), &opts2, 16, Some(&rec)).unwrap() else {
+        panic!("expected compiled recovery");
+    };
+    assert!(matches!(r2.outcome, Outcome::Ok), "{:?}", r2.outcome);
+    assert_eq!((r2.stats.generated, r2.stats.distinct, r2.stats.depth), want);
+    assert_eq!(m2.bailouts.get(), 0);
+    assert!(m2.value_store().expect("store 2").stats().gc_cycles >= 1, "expected GC after recovery");
 }
 
 #[test]
