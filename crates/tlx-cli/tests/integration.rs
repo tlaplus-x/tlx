@@ -26,6 +26,7 @@ mod constrained_reductions;
 mod coverage;
 mod diagnostics;
 mod dump_trace;
+mod equiv_bags;
 mod equiv_folds;
 mod equiv_soundness;
 mod escape;
@@ -82,6 +83,7 @@ fn all_test_files_registered() {
         "coverage",
         "diagnostics",
         "dump_trace",
+        "equiv_bags",
         "equiv_folds",
         "equiv_soundness",
         "escape",

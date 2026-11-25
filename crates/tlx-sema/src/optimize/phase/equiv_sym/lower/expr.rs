@@ -336,6 +336,58 @@ impl LowerCtx<'_> {
                 (B::FoldRightDomain, [op_lam, seq, base]) => {
                     self.lower_seq_fold(true, true, false, op_lam, base, seq, allow_prime, in_prime)
                 }
+                (B::EmptyBag, []) => Some("(Expr.recLit [])".to_string()),
+                (B::SetToBag, [s]) => {
+                    let es = self.lower_expr_rec(s, allow_prime, in_prime)?;
+                    let one = self.int_expr(1);
+                    Some(format!("(Expr.fnConstruct {es} {one})"))
+                }
+                (B::BagToSet, [b]) => {
+                    let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
+                    Some(format!("(Expr.domain {eb})"))
+                }
+                (B::CopiesIn, [elem, b]) => {
+                    let ee = self.lower_expr_rec(elem, allow_prime, in_prime)?;
+                    let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
+                    Some(format!("(Expr.copiesIn {ee} {eb})"))
+                }
+                (B::BagCup, [b1, b2]) => {
+                    let e1 = self.lower_expr_rec(b1, allow_prime, in_prime)?;
+                    let e2 = self.lower_expr_rec(b2, allow_prime, in_prime)?;
+                    Some(format!("(Expr.bagCup {e1} {e2})"))
+                }
+                (B::BagDiff, [b1, b2]) => {
+                    let e1 = self.lower_expr_rec(b1, allow_prime, in_prime)?;
+                    let e2 = self.lower_expr_rec(b2, allow_prime, in_prime)?;
+                    Some(format!("(Expr.bagDiff {e1} {e2})"))
+                }
+                (B::BagUnion, [s]) => {
+                    let es = self.lower_expr_rec(s, allow_prime, in_prime)?;
+                    Some(format!("(Expr.bagUnion {es})"))
+                }
+                (B::BagCardinality, [b]) => {
+                    let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
+                    Some(format!("(Expr.bagCard {eb})"))
+                }
+                (B::BagOfAll, [f_lam, bag]) => {
+                    let ExprKind::Lambda { params, body } = &*f_lam.kind else { return None };
+                    let [p] = params.as_slice() else { return None };
+                    let eb = self.lower_expr_rec(bag, allow_prime, in_prime)?;
+                    let dom_shape = self.totality.bag_dom_shape(bag, in_prime, &self.check_env);
+                    self.locals.push(Slot::Local(*p, AtomKind::Unknown));
+                    self.check_env.bind_local(*p, dom_shape, Some((bag.clone(), in_prime)));
+                    let ef = self.lower_expr_rec(body, allow_prime, in_prime);
+                    self.locals.pop();
+                    self.check_env.unbind_local(*p);
+                    let ef = ef?;
+                    self.charge(format!("(Expr.bagOfAll {eb} {ef})"))
+                }
+                (B::FoldBag, [op_lam, base, bag]) => {
+                    let ac = classify_ac_op(op_lam)?;
+                    let eb = self.lower_expr_rec(bag, allow_prime, in_prime)?;
+                    let ebase = self.lower_expr_rec(base, allow_prime, in_prime)?;
+                    self.charge(format!("(Expr.foldBag {} {eb} {ebase})", ac.lean_ctor()))
+                }
                 (B::Plus | B::Minus | B::Mul | B::Div | B::Mod | B::Pow | B::Gcd, [a, b]) => {
                     let ea = self.lower_expr_rec(a, allow_prime, in_prime)?;
                     let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
@@ -373,7 +425,10 @@ impl LowerCtx<'_> {
                     | B::Gt
                     | B::Ge
                     | B::IsFiniteSet
-                    | B::IsInjective,
+                    | B::IsInjective
+                    | B::IsABag
+                    | B::BagIn
+                    | B::SqSubseteq,
                     _,
                 ) => {
                     let f = self.lower_form_rec(e, allow_prime, in_prime, false)?;
@@ -814,9 +869,14 @@ impl LowerCtx<'_> {
                 | B::Gt
                 | B::Ge
                 | B::IsFiniteSet
-                | B::IsInjective => true,
+                | B::IsInjective
+                | B::IsABag
+                | B::BagIn
+                | B::SqSubseteq
+                | B::CopiesIn
+                | B::BagCardinality => true,
                 B::TLCEval => args.first().is_some_and(|a| self.is_definitely_atom(a)),
-                B::FoldSet | B::FoldFunction | B::FoldFunctionOnSet | B::MapThenFoldSet => args
+                B::FoldSet | B::FoldFunction | B::FoldFunctionOnSet | B::MapThenFoldSet | B::FoldBag => args
                     .first()
                     .and_then(classify_ac_op)
                     .is_some_and(|ac| matches!(ac, AcOpKind::IntAdd | AcOpKind::IntMul | AcOpKind::BoolAnd | AcOpKind::BoolOr)),

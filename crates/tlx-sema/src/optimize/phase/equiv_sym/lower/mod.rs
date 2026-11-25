@@ -420,6 +420,20 @@ impl<'a> LowerCtx<'a> {
                     let es = self.lower_expr_rec(s, allow_prime, in_prime)?;
                     self.charge(format!("(Form.isFiniteSet {es})"))
                 }
+                (B::IsABag, [b]) => {
+                    let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
+                    self.charge(format!("(Form.isABag {eb})"))
+                }
+                (B::BagIn, [elem, b]) => {
+                    let ee = self.lower_expr_rec(elem, allow_prime, in_prime)?;
+                    let eb = self.lower_expr_rec(b, allow_prime, in_prime)?;
+                    self.charge(format!("(Form.bagIn {ee} {eb})"))
+                }
+                (B::SqSubseteq, [b1, b2]) => {
+                    let e1 = self.lower_expr_rec(b1, allow_prime, in_prime)?;
+                    let e2 = self.lower_expr_rec(b2, allow_prime, in_prime)?;
+                    self.charge(format!("(Form.sqSubseteq {e1} {e2})"))
+                }
                 (B::IsInjective, [f]) => {
                     let ef = self.lower_expr_rec(f, allow_prime, in_prime)?;
                     Some(format!(

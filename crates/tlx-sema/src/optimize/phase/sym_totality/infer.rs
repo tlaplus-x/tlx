@@ -8,7 +8,7 @@ use tlx_front::cfg::CfgValue;
 
 use super::super::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
 use super::shape::*;
-use super::{CheckEnv, ConstInfo, MvType, Shape, TotalityChecker, MAX_I32_U32, MAX_STEPS, MAX_STR_SET, MAX_UNMOVED_SET};
+use super::{CheckEnv, ConstInfo, MvType, PlaceKey, Shape, TotalityChecker, MAX_I32_U32, MAX_STEPS, MAX_STR_SET, MAX_UNMOVED_SET};
 use crate::{builtins::Builtin as B, hir::*};
 
 impl<'a> TotalityChecker<'a> {
@@ -585,6 +585,7 @@ impl<'a> TotalityChecker<'a> {
                 }
             }
             (B::Len, [s]) => match self.infer_expr(s, in_prime, vars, env, steps) {
+                Shape::Bottom => Shape::Bottom,
                 Shape::Tuple(ts) => i32::try_from(ts.len()).map_or(Shape::Int(None), |n| Shape::Int(Some((n, n)))),
                 Shape::Seq { min_len, max_len: Some(hi), .. } if hi <= MAX_I32_U32 => {
                     Shape::Int(Some((min_len.min(MAX_I32_U32) as i32, hi as i32)))
@@ -758,11 +759,11 @@ impl<'a> TotalityChecker<'a> {
             (B::FoldRightDomain, [op_lam, seq, base]) => {
                 self.infer_seq_fold_shape(op_lam, base, seq, true, false, in_prime, vars, env, steps)
             }
-            _ => Shape::Top,
+            _ => self.infer_bag_builtin(op, args, in_prime, vars, env, steps).unwrap_or(Shape::Top),
         }
     }
 
-    fn infer_ac_fold_shape(&self, ac: AcOpKind, base: &Shape, elem: &Shape, max_card: Option<u32>) -> Shape {
+    pub(super) fn infer_ac_fold_shape(&self, ac: AcOpKind, base: &Shape, elem: &Shape, max_card: Option<u32>) -> Shape {
         if matches!(base, Shape::Bottom) {
             return Shape::Bottom;
         }
@@ -862,7 +863,14 @@ impl<'a> TotalityChecker<'a> {
         acc
     }
 
-    fn infer_set_info(&self, set: &Expr, in_prime: bool, vars: &[Shape], env: &CheckEnv, steps: &mut usize) -> (Shape, bool, Option<u32>) {
+    pub(super) fn infer_set_info(
+        &self,
+        set: &Expr,
+        in_prime: bool,
+        vars: &[Shape],
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> (Shape, bool, Option<u32>) {
         match self.infer_expr(set, in_prime, vars, env, steps) {
             Shape::Set { elem, finite, max_card } => {
                 let bound = if finite { max_card.or_else(|| shape_universe_size(&elem, self.groups)) } else { None };
@@ -1099,12 +1107,27 @@ impl<'a> TotalityChecker<'a> {
                 let mut steps = 2000;
                 let elem = self.infer_set_elem(&args[1], in_prime, vars, env, &mut steps);
                 let origin = match &*args[1].kind {
-                    ExprKind::Builtin { op: B::Domain, args: da } if da.len() == 1 => Some((da[0].clone(), in_prime)),
+                    ExprKind::Builtin { op: B::Domain | B::BagToSet, args: da } if da.len() == 1 => {
+                        env.proven_in_dom.push((args[0].clone(), da[0].clone(), in_prime));
+                        Some((da[0].clone(), in_prime))
+                    }
                     _ => None,
                 };
                 if let Some(cur) = self.read_place(&args[0], in_prime, vars, env) {
                     let narrowed = narrow_shape(&cur, &elem);
                     self.write_place(&args[0], in_prime, vars, narrowed, origin, env);
+                }
+            }
+            ExprKind::Builtin { op: B::BagIn, args } if positive && args.len() == 2 => {
+                let mut steps = 2000;
+                let sb = self.infer_expr(&args[1], in_prime, vars, env, &mut steps);
+                env.proven_in_dom.push((args[0].clone(), args[1].clone(), in_prime));
+                let origin = Some((args[1].clone(), in_prime));
+                if let Some((dom, _, _)) = super::bags::bag_fn_info(&sb) {
+                    if let Some(cur) = self.read_place(&args[0], in_prime, vars, env) {
+                        let narrowed = narrow_shape(&cur, &dom);
+                        self.write_place(&args[0], in_prime, vars, narrowed, origin, env);
+                    }
                 }
             }
             ExprKind::Builtin { op: op @ (B::Lt | B::Le | B::Gt | B::Ge), args } if args.len() == 2 => {
@@ -1167,12 +1190,41 @@ impl<'a> TotalityChecker<'a> {
         let mut steps = 2000;
         let other_s = self.infer_expr(other, in_prime, vars, env, &mut steps);
         if eq {
+            if let ExprKind::Local(l) = &*place.kind {
+                if let Some(ok) = place_key_of(other, in_prime) {
+                    let lk = PlaceKey::Local(*l);
+                    let extra: Vec<_> = env
+                        .fn_app_overrides
+                        .iter()
+                        .filter(|((_, _, ks), _)| ks.contains(&ok))
+                        .map(|((v, pr, ks), sh)| {
+                            let mapped: Vec<_> = ks.iter().map(|&k| if k == ok { lk } else { k }).collect();
+                            ((*v, *pr, mapped), sh.clone())
+                        })
+                        .collect();
+                    for (k, sh) in extra {
+                        env.fn_app_overrides.insert(k, sh);
+                    }
+                }
+            }
             if !matches!(other_s, Shape::Top | Shape::Bottom) {
                 self.write_place(place, in_prime, vars, narrow_shape(&cur, &other_s), None, env);
             }
         } else {
-            // `seq # <<>>` proves `min_len >= 1`:
+            // `l \in DOMAIN f \cup {excl} /\ l # excl ==> l \in DOMAIN f` (used by `BagsExt!BagAdd`).
+            if let ExprKind::Local(l) = &*place.kind {
+                if let Some((func, fp, excl)) = env.local_dom_except.get(l).cloned() {
+                    if expr_struct_eq(other, in_prime, &excl, fp) {
+                        env.local_dom.insert(*l, (func, fp));
+                    }
+                }
+            }
+            // `seq # <<>>` proves `min_len >= 1` (and makes an empty tuple unreachable):
             if matches!(&other_s, Shape::Tuple(ts) if ts.is_empty()) {
+                if matches!(&cur, Shape::Tuple(ts) if ts.is_empty()) {
+                    self.write_place(place, in_prime, vars, Shape::Bottom, None, env);
+                    return;
+                }
                 if let Shape::Seq { elem, min_len, max_len } = &cur {
                     self.write_place(
                         place,
@@ -1196,6 +1248,18 @@ impl<'a> TotalityChecker<'a> {
         if let ExprKind::Builtin { op: B::Len, args } = &*place.kind {
             if args.len() == 1 {
                 self.narrow_seq_len(&args[0], op, k, in_prime, vars, env);
+            }
+            return;
+        }
+        if let ExprKind::Builtin { op: B::BagCardinality, args } = &*place.kind {
+            if args.len() == 1 {
+                self.narrow_bag_card(&args[0], op, k, in_prime, vars, env);
+            }
+            return;
+        }
+        if let ExprKind::Builtin { op: B::CopiesIn, args } = &*place.kind {
+            if let [elem, bag] = args.as_slice() {
+                self.narrow_copies_in((elem, bag), op, k, in_prime, vars, env);
             }
             return;
         }
@@ -1260,6 +1324,69 @@ impl<'a> TotalityChecker<'a> {
         }
         if hi.is_none_or(|h| lo <= h) {
             self.write_place(place, in_prime, vars, Shape::Seq { elem, min_len: lo, max_len: hi }, None, env);
+        }
+    }
+
+    fn narrow_bag_card(&self, bag: &Expr, op: B, k: i32, in_prime: bool, vars: &[Shape], env: &mut CheckEnv) {
+        let max_total = match op {
+            B::Lt => k.checked_sub(1),
+            B::Le => Some(k),
+            _ => None,
+        };
+        let Some(max_total) = max_total else { return };
+        let Some(Shape::Func { dom, exact_dom, range, max_dom }) = self.read_place(bag, in_prime, vars, env) else {
+            return;
+        };
+        // Only narrow an already-proved bag (`lo >= 1`) or empty bag; never fabricate positivity.
+        if max_total < 0 {
+            return;
+        }
+        if max_total == 0 {
+            if matches!(*range, Shape::Bottom) || matches!(*range, Shape::Int(Some((lo, _))) if lo >= 1) {
+                self.write_place(bag, in_prime, vars, super::bags::empty_bag_shape(), None, env);
+            }
+            return;
+        }
+        let Shape::Int(Some((lo, hi))) = *range else { return };
+        if lo < 1 {
+            return;
+        }
+        let new_hi = hi.min(max_total);
+        let new_max_dom = Some(max_dom.map_or(max_total as u32, |m| m.min(max_total as u32)));
+        if lo <= new_hi {
+            self.write_place(
+                bag,
+                in_prime,
+                vars,
+                Shape::Func { dom, exact_dom, range: Box::new(Shape::Int(Some((lo, new_hi)))), max_dom: new_max_dom },
+                None,
+                env,
+            );
+        }
+    }
+
+    fn narrow_copies_in(&self, (elem, bag): (&Expr, &Expr), op: B, k: i32, in_prime: bool, vars: &[Shape], env: &mut CheckEnv) {
+        let Some(key) = fn_app_place(bag, std::slice::from_ref(elem), in_prime) else { return };
+        let cur = if let Some(ov) = env.fn_app_overrides.get(&key) {
+            ov.clone()
+        } else {
+            let Some(fs) = self.read_place(bag, in_prime, vars, env) else { return };
+            fn_app_range(&fs)
+        };
+        let Shape::Int(bounds) = cur else { return };
+        let (lo, hi) = bounds.unwrap_or((i32::MIN, i32::MAX));
+        let (nlo, nhi, implies_in_dom) = match op {
+            B::Lt => (lo, hi.min(k.saturating_sub(1)), false),
+            B::Le => (lo, hi.min(k), false),
+            B::Gt => (lo.max(k.saturating_add(1)), hi, k >= 0),
+            B::Ge => (lo.max(k), hi, k >= 1),
+            _ => return,
+        };
+        if implies_in_dom {
+            env.proven_in_dom.push((elem.clone(), bag.clone(), in_prime));
+        }
+        if nlo <= nhi {
+            env.fn_app_overrides.insert(key, Shape::Int(Some((nlo, nhi))));
         }
     }
 

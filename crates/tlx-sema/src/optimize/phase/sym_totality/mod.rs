@@ -17,6 +17,7 @@ use super::equiv_sym::{GroupInfo, GroupMask};
 use super::sym_norm::SymNormalizer;
 use crate::{builtins::Builtin as B, hir::*, Program};
 
+mod bags;
 mod check;
 mod folds;
 mod infer;
@@ -127,6 +128,11 @@ pub(crate) enum IntBoundHint {
 pub(crate) struct CheckEnv {
     locals: HashMap<LocalId, Shape>,
     local_dom: HashMap<LocalId, (Expr, bool)>,
+    /// `local_dom_except[l] = (f, in_prime, excl)` means `l \in DOMAIN f \cup {excl}`,
+    /// so `l # excl` promotes `l` into `local_dom` for `f`.
+    local_dom_except: HashMap<LocalId, (Expr, bool, Expr)>,
+    /// Proven `key \in DOMAIN f` facts for arbitrary expressions (not just `Local`).
+    proven_in_dom: Vec<(Expr, Expr, bool)>,
     var_overrides: HashMap<(VarId, bool), Shape>,
     fn_app_overrides: HashMap<(VarId, bool, Vec<PlaceKey>), Shape>,
     at_shape: Option<Shape>,
@@ -162,11 +168,16 @@ impl CheckEnv {
     }
     pub(crate) fn bind_local(&mut self, id: LocalId, shape: Shape, dom_origin: Option<(Expr, bool)>) {
         self.locals.insert(id, shape);
+        self.local_dom_except.remove(&id);
         if let Some(d) = dom_origin {
             self.local_dom.insert(id, d);
         } else {
             self.local_dom.remove(&id);
         }
+    }
+
+    pub(super) fn bind_local_dom_except(&mut self, id: LocalId, func: Expr, in_prime: bool, excl: Expr) {
+        self.local_dom_except.insert(id, (func, in_prime, excl));
     }
 
     pub(crate) fn with_local(&self, id: LocalId, shape: Shape) -> Self {
@@ -178,6 +189,7 @@ impl CheckEnv {
     pub(crate) fn unbind_local(&mut self, id: LocalId) {
         self.locals.remove(&id);
         self.local_dom.remove(&id);
+        self.local_dom_except.remove(&id);
         self.fn_app_overrides.retain(|(_, _, ks), _| !ks.contains(&PlaceKey::Local(id)));
     }
 
@@ -861,8 +873,21 @@ impl<'a> TotalityChecker<'a> {
     }
 
     pub(crate) fn bound_elem_info(&self, set: &Expr, in_prime: bool, env: &CheckEnv) -> (Shape, Option<(Expr, bool)>) {
-        let origin = match &*set.kind {
-            ExprKind::Builtin { op: B::Domain, args } if args.len() == 1 => Some((args[0].clone(), in_prime)),
+        let origin = self.dom_origin_of_set(set, in_prime, env);
+        let mut steps = MAX_STEPS;
+        let elem = self.set_elem_shape(set, in_prime, env, &mut steps);
+        (elem, origin)
+    }
+
+    fn dom_origin_of_set(&self, set: &Expr, in_prime: bool, env: &CheckEnv) -> Option<(Expr, bool)> {
+        match &*set.kind {
+            ExprKind::Builtin { op: B::Domain | B::BagToSet, args } if args.len() == 1 => Some((args[0].clone(), in_prime)),
+            ExprKind::Builtin { op: B::SetMinus, args } if args.len() == 2 => self.dom_origin_of_set(&args[0], in_prime, env),
+            ExprKind::Builtin { op: B::Cap, args } if args.len() == 2 => {
+                self.dom_origin_of_set(&args[0], in_prime, env).or_else(|| self.dom_origin_of_set(&args[1], in_prime, env))
+            }
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.dom_origin_of_set(&args[0], in_prime, env),
+            ExprKind::SetFilter { bound, .. } => self.dom_origin_of_set(&bound.set, in_prime, env),
             ExprKind::Builtin { op: B::DotDot, args } if args.len() == 2 && matches!(&*args[0].kind, ExprKind::Num(1)) => {
                 if let ExprKind::Builtin { op: B::Len, args: la } = &*args[1].kind {
                     if la.len() == 1 && self.is_definitely_seq(&la[0], in_prime, env) {
@@ -875,10 +900,13 @@ impl<'a> TotalityChecker<'a> {
                 }
             }
             _ => None,
-        };
+        }
+    }
+
+    pub(crate) fn bag_dom_shape(&self, bag: &Expr, in_prime: bool, env: &CheckEnv) -> Shape {
         let mut steps = MAX_STEPS;
-        let elem = self.set_elem_shape(set, in_prime, env, &mut steps);
-        (elem, origin)
+        let sb = self.infer_expr(bag, in_prime, &self.var_shapes, env, &mut steps);
+        bags::bag_fn_info(&sb).map_or(Shape::Top, |(dom, _, _)| dom)
     }
 
     pub(crate) fn prove_tuple_set_arity(&self, set: &Expr, arity: usize, in_prime: bool, env: &CheckEnv) -> Option<Vec<Shape>> {

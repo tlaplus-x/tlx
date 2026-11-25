@@ -188,7 +188,7 @@ impl<'a> TotalityChecker<'a> {
         self.check_ac_fold(ac, &base_s, &mapped_s, max_card)
     }
 
-    fn check_ac_fold(&self, ac: AcOpKind, base: &Shape, elem: &Shape, max_card: u32) -> Option<Shape> {
+    pub(super) fn check_ac_fold(&self, ac: AcOpKind, base: &Shape, elem: &Shape, max_card: u32) -> Option<Shape> {
         let empty = max_card == 0 || matches!(elem, Shape::Bottom);
         match ac {
             AcOpKind::IntAdd | AcOpKind::IntMul => {

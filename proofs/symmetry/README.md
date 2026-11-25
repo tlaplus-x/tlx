@@ -18,11 +18,13 @@ connected Lean certificate emitters:
 2. **`EquivSymCertificate.lean` (`phase/equiv_sym/`):** closed recursive finite
    values and formulas when `KeyedCertificate` declines (key-valued and nested
    maps, multi-key records, bounded sequences/tuples, set comprehensions,
-   `KSubset`, `IsInjective`, commutative-associative finite folds
-   `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet` and recursive
+   `KSubset`, `IsInjective`, standard `Bags` multisets
+   `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll`
+   plus pure `BagsExt` helpers, commutative-associative finite folds
+   `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag` and recursive
    `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds
-   `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`; `FoldBag`
-   and non-CA/overflowing folds fail closed).
+   `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`;
+   non-bag/overflowing multiset operations and non-CA/overflowing folds fail closed).
 3. **`ChooseSymCertificate.lean` (`phase/choose_sym/`):** choice-irrelevant
    `CHOOSE` specifications (unique-witness key `CHOOSE` including `ChooseOne` and
    inductively proved at-most-one active key, projected uniform/constant-value

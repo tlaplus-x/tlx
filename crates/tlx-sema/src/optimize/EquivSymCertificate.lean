@@ -2840,6 +2840,13 @@ inductive Expr (d : Nat) (V : Type) where
   | selectSeq (s : Expr d V) (pred : Form d V)
   | foldSeq (right onDomain : Bool) (seq base step : Expr d V)
   | foldSetAC (op : ACOp) (dom base elem : Expr d V)
+  | copiesIn (elem bag : Expr d V)
+  | bagCup (b1 b2 : Expr d V)
+  | bagDiff (b1 b2 : Expr d V)
+  | bagUnion (s : Expr d V)
+  | bagCard (b : Expr d V)
+  | bagOfAll (bag f : Expr d V)
+  | foldBag (op : ACOp) (bag base : Expr d V)
   | ite (cond : Form d V) (yes no : Expr d V)
   | letBind (val body : Expr d V)
   | ofForm (f : Form d V)
@@ -2855,6 +2862,9 @@ inductive Form (d : Nat) (V : Type) where
   | mem (elem : Expr d V) (set : SetPred d V)
   | subsetEq (sub : Expr d V) (sup : SetPred d V)
   | isFiniteSet (e : Expr d V)
+  | isABag (b : Expr d V)
+  | bagIn (elem bag : Expr d V)
+  | sqSubseteq (b1 b2 : Expr d V)
   | conj (a b : Form d V)
   | disj (a b : Form d V)
   | neg (a : Form d V)
@@ -3112,6 +3122,446 @@ theorem Val.foldSetAC_intAdd_dup_mapped {d : Nat} {sizes : Fin d → Nat} {A : T
     List.not_mem_nil, foldSetACList, foldScalarAC, hv0, hv1, List.foldl_cons, List.foldl_nil]
   rfl
 
+-- Multiset (Bags / BagsExt) operations on Val
+def Val.isABag {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (v : Val sizes A) : Prop :=
+  Val.isFn v ∧ ∀ k w, Val.mapsTo v k w → ∃ n : Int, valInt ops w = some n ∧ n > 0
+
+theorem Val.isABag_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (v : Val sizes A) :
+    Val.isABag ops (renameVal p v) ↔ Val.isABag ops v := by
+  unfold Val.isABag
+  apply and_congr (Val.isFn_rename p v)
+  constructor
+  · intro h k w hkw
+    have h' := h (renameVal p k) (renameVal p w) ((Val.mapsTo_rename p v k w).mpr hkw)
+    rwa [valInt_rename] at h'
+  · intro h k w hkw
+    have hkw' : Val.mapsTo v (renameVal p.inverse k) (renameVal p.inverse w) := by
+      have := (Val.mapsTo_rename p v (renameVal p.inverse k) (renameVal p.inverse w)).mp
+      rw [renameVal_right, renameVal_right] at this
+      exact this hkw
+    have h' := h _ _ hkw'
+    rwa [valInt_rename] at h'
+
+def Val.bagCountOpt {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (b k : Val sizes A) : Option Int :=
+  match Val.fnLookup b k with
+  | some w => valInt ops w
+  | none => some 0
+
+theorem Val.bagCountOpt_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (b k : Val sizes A) :
+    Val.bagCountOpt ops (renameVal p b) (renameVal p k) = Val.bagCountOpt ops b k := by
+  unfold Val.bagCountOpt
+  rw [Val.fnLookup_rename]
+  cases Val.fnLookup b k with
+  | none => rfl
+  | some w => simp only [Option.map_some, valInt_rename]
+
+def Val.bagIn {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (e b : Val sizes A) : Prop :=
+  Val.isFn b ∧ ∃ n : Int, (Val.fnLookup b e).bind (valInt ops) = some n ∧ n > 0
+
+theorem Val.bagIn_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (e b : Val sizes A) :
+    Val.bagIn ops (renameVal p e) (renameVal p b) ↔ Val.bagIn ops e b := by
+  unfold Val.bagIn
+  rw [Val.isFn_rename, Val.fnLookup_rename]
+  cases Val.fnLookup b e with
+  | none => rfl
+  | some w => simp only [Option.map_some, Option.bind_some, valInt_rename]
+
+def Val.copiesIn {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (e b : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isFn b) (Classical.propDecidable _)
+    (match Val.bagCountOpt ops b e with
+     | some n => Val.atom (ops.intAtom n)
+     | none => Val.err)
+    Val.err
+
+theorem Val.copiesIn_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (e b : Val sizes A) :
+    Val.copiesIn ops (renameVal p e) (renameVal p b) = renameVal p (Val.copiesIn ops e b) := by
+  unfold Val.copiesIn
+  rw [propext (Val.isFn_rename p b), Val.bagCountOpt_rename]
+  split
+  · cases Val.bagCountOpt ops b e <;> rfl
+  · rfl
+
+def Val.sqSubseteq {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (b1 b2 : Val sizes A) : Prop :=
+  Val.isFn b1 ∧ Val.isFn b2 ∧
+  ∀ k w1, Val.mapsTo b1 k w1 →
+    ∃ c1 c2 : Int, valInt ops w1 = some c1 ∧ Val.bagCountOpt ops b2 k = some c2 ∧ c1 ≤ c2
+
+theorem Val.sqSubseteq_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (b1 b2 : Val sizes A) :
+    Val.sqSubseteq ops (renameVal p b1) (renameVal p b2) ↔ Val.sqSubseteq ops b1 b2 := by
+  unfold Val.sqSubseteq
+  apply and_congr (Val.isFn_rename p b1)
+  apply and_congr (Val.isFn_rename p b2)
+  constructor
+  · intro h k w1 hkw
+    have h' := h (renameVal p k) (renameVal p w1) ((Val.mapsTo_rename p b1 k w1).mpr hkw)
+    rwa [valInt_rename, Val.bagCountOpt_rename] at h'
+  · intro h k w1 hkw
+    have hkw' : Val.mapsTo b1 (renameVal p.inverse k) (renameVal p.inverse w1) := by
+      have := (Val.mapsTo_rename p b1 (renameVal p.inverse k) (renameVal p.inverse w1)).mp
+      rw [renameVal_right, renameVal_right] at this
+      exact this hkw
+    have h' := h _ _ hkw'
+    have hbc : Val.bagCountOpt ops (renameVal p b2) k = Val.bagCountOpt ops b2 (renameVal p.inverse k) := by
+      have := Val.bagCountOpt_rename p ops b2 (renameVal p.inverse k)
+      rwa [renameVal_right] at this
+    rwa [valInt_rename, ← hbc] at h'
+
+def Val.bagCup {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (b1 b2 : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isABag ops b1 ∧ Val.isABag ops b2) (Classical.propDecidable _)
+    (Val.fnConstruct (Val.cup (Val.domain b1) (Val.domain b2)) (fun k =>
+      match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with
+      | some c1, some c2 => Val.atom (ops.intAtom (c1 + c2))
+      | _, _ => Val.err))
+    Val.err
+
+theorem Val.bagCup_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (b1 b2 : Val sizes A) :
+    Val.bagCup ops (renameVal p b1) (renameVal p b2) = renameVal p (Val.bagCup ops b1 b2) := by
+  unfold Val.bagCup
+  rw [propext (and_congr (Val.isABag_rename p ops b1) (Val.isABag_rename p ops b2))]
+  split
+  · rw [Val.domain_rename, Val.domain_rename, Val.cup_rename]
+    exact Val.fnConstruct_rename p _ _ _ (fun k => by
+      rw [Val.bagCountOpt_rename, Val.bagCountOpt_rename]
+      cases Val.bagCountOpt ops b1 k <;> cases Val.bagCountOpt ops b2 k <;> rfl)
+  · rfl
+
+def Val.bagDiff {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (b1 b2 : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isFn b1 ∧ Val.isFn b2) (Classical.propDecidable _)
+    (Val.fnConstruct
+      (Val.setFilter (Val.domain b1) (fun k =>
+        match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with
+        | some c1, some c2 => c1 - c2 > 0
+        | _, _ => False))
+      (fun k =>
+        match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with
+        | some c1, some c2 => Val.atom (ops.intAtom (c1 - c2))
+        | _, _ => Val.err))
+    Val.err
+
+theorem Val.bagDiff_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (b1 b2 : Val sizes A) :
+    Val.bagDiff ops (renameVal p b1) (renameVal p b2) = renameVal p (Val.bagDiff ops b1 b2) := by
+  unfold Val.bagDiff
+  rw [propext (and_congr (Val.isFn_rename p b1) (Val.isFn_rename p b2))]
+  split
+  · rw [Val.domain_rename]
+    have hfilt := Val.setFilter_rename p (Val.domain b1)
+      (fun k => match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with | some c1, some c2 => c1 - c2 > 0 | _, _ => False)
+      (fun k => match Val.bagCountOpt ops (renameVal p b1) k, Val.bagCountOpt ops (renameVal p b2) k with | some c1, some c2 => c1 - c2 > 0 | _, _ => False)
+      (fun k => by rw [Val.bagCountOpt_rename, Val.bagCountOpt_rename])
+    rw [hfilt]
+    exact Val.fnConstruct_rename p _ _ _ (fun k => by
+      rw [Val.bagCountOpt_rename, Val.bagCountOpt_rename]
+      cases Val.bagCountOpt ops b1 k <;> cases Val.bagCountOpt ops b2 k <;> rfl)
+  · rfl
+
+def Val.bagCard {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (b : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isABag ops b) (Classical.propDecidable _)
+    (Val.foldSetAC ops .intAdd (Val.domain b) (Val.atom (ops.intAtom 0)) (fun k => Val.apply b k))
+    Val.err
+
+theorem Val.bagCard_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (b : Val sizes A) :
+    Val.bagCard ops (renameVal p b) = renameVal p (Val.bagCard ops b) := by
+  unfold Val.bagCard
+  rw [propext (Val.isABag_rename p ops b)]
+  split
+  · rw [Val.domain_rename]
+    exact Val.foldSetAC_rename p ops .intAdd (Val.domain b) (Val.atom (ops.intAtom 0))
+      (fun k => Val.apply b k) (fun k => Val.apply (renameVal p b) k)
+      (fun k => Val.apply_rename p b k)
+  · rfl
+
+def Val.bagUnion {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (s : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isSet s ∧ ∀ b, Val.mem b s → Val.isABag ops b) (Classical.propDecidable _)
+    (Val.fnConstruct (Val.union (Val.setMap s Val.domain)) (fun k =>
+      Val.foldSetAC ops .intAdd s (Val.atom (ops.intAtom 0)) (fun b => Val.copiesIn ops k b)))
+    Val.err
+
+theorem Val.bagUnion_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (s : Val sizes A) :
+    Val.bagUnion ops (renameVal p s) = renameVal p (Val.bagUnion ops s) := by
+  unfold Val.bagUnion
+  have hcond : (Val.isSet (renameVal p s) ∧ ∀ b, Val.mem b (renameVal p s) → Val.isABag ops b) ↔
+      (Val.isSet s ∧ ∀ b, Val.mem b s → Val.isABag ops b) := by
+    apply and_congr (Val.isSet_rename p s)
+    constructor
+    · intro h b hb
+      exact (Val.isABag_rename p ops b).mp (h (renameVal p b) ((Val.mem_rename p b s).mpr hb))
+    · intro h b hb
+      have hb' : Val.mem (renameVal p.inverse b) s := by
+        have := (Val.mem_rename p (renameVal p.inverse b) s).mp
+        rw [renameVal_right] at this
+        exact this hb
+      have := (Val.isABag_rename p ops (renameVal p.inverse b)).mpr (h _ hb')
+      rwa [renameVal_right] at this
+  rw [propext hcond]
+  split
+  · have hdom : Val.union (Val.setMap (renameVal p s) Val.domain) = renameVal p (Val.union (Val.setMap s Val.domain)) := by
+      rw [Val.setMap_rename p s Val.domain Val.domain (Val.domain_rename p), Val.union_rename]
+    rw [hdom]
+    exact Val.fnConstruct_rename p _ _ _ (fun k =>
+      Val.foldSetAC_rename p ops .intAdd s (Val.atom (ops.intAtom 0))
+        (fun b => Val.copiesIn ops k b)
+        (fun b => Val.copiesIn ops (renameVal p k) b)
+        (fun b => Val.copiesIn_rename p ops k b))
+  · rfl
+
+def Val.bagOfAll {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (f : Val sizes A → Val sizes A) (b : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isABag ops b) (Classical.propDecidable _)
+    (Val.fnConstruct (Val.setMap (Val.domain b) f) (fun y =>
+      Val.foldSetAC ops .intAdd (Val.setFilter (Val.domain b) (fun k => f k = y))
+        (Val.atom (ops.intAtom 0)) (fun k => Val.apply b k)))
+    Val.err
+
+theorem Val.bagOfAll_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (f f' : Val sizes A → Val sizes A)
+    (hf : ∀ v, f' (renameVal p v) = renameVal p (f v)) (b : Val sizes A) :
+    Val.bagOfAll ops f' (renameVal p b) = renameVal p (Val.bagOfAll ops f b) := by
+  unfold Val.bagOfAll
+  rw [propext (Val.isABag_rename p ops b)]
+  split
+  · rw [Val.domain_rename, Val.setMap_rename p (Val.domain b) f f' hf]
+    exact Val.fnConstruct_rename p _ _ _ (fun y => by
+      have hfilt := Val.setFilter_rename p (Val.domain b)
+        (fun k => f k = y) (fun k => f' k = renameVal p y)
+        (fun k => by rw [hf k, renameVal_injective])
+      rw [hfilt]
+      exact Val.foldSetAC_rename p ops .intAdd _ (Val.atom (ops.intAtom 0))
+        (fun k => Val.apply b k) (fun k => Val.apply (renameVal p b) k)
+        (fun k => Val.apply_rename p b k))
+  · rfl
+
+private theorem perm_flatMap {α β : Type} (g : α → List β) {l1 l2 : List α} (hp : l1.Perm l2) :
+    (l1.flatMap g).Perm (l2.flatMap g) := by
+  induction hp with
+  | nil => exact List.Perm.nil
+  | cons x _ ih => exact List.Perm.append_left (g x) ih
+  | swap x y l =>
+    simp only [List.flatMap_cons, ← List.append_assoc]
+    exact List.Perm.append_right (l.flatMap g) List.perm_append_comm
+  | trans _ _ ih1 ih2 => exact ih1.trans ih2
+
+private def foldBagDom {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (op : ACOp) (b base dVal : Val sizes A) : Val sizes A := by
+  classical
+  exact Quotient.liftOn dVal (fun sr => match sr with
+    | .set xs =>
+      foldSetACList ops op base
+        ((dedupList (xs.map mkVal)).flatMap (fun k =>
+          match (Val.fnLookup b k).bind (valInt ops) with
+          | some n => List.replicate n.toNat k
+          | none => []))
+    | _ => Val.err) (by
+    intro s1 s2 h
+    cases s1 <;> cases s2
+    all_goals try exact False.elim h
+    all_goals try rfl
+    case set.set xs ys =>
+      dsimp only
+      have hperm : (dedupList (xs.map mkVal)).Perm (dedupList (ys.map mkVal)) :=
+        (List.perm_ext_iff_of_nodup (nodup_dedupList _) (nodup_dedupList _)).mpr (fun v => by
+          simp only [mem_dedupList, List.mem_map]
+          rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
+          constructor
+          · rintro ⟨a, ha, rfl⟩
+            rcases h1 a ha with ⟨c, hc, hac⟩
+            exact ⟨c, hc, (Quotient.sound hac).symm⟩
+          · rintro ⟨c, hc, rfl⟩
+            rcases h2 c hc with ⟨a, ha, hac⟩
+            exact ⟨a, ha, Quotient.sound hac⟩)
+      exact foldSetACList_perm ops op base (perm_flatMap _ hperm))
+
+private theorem foldBagDom_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (b base dVal : Val sizes A) :
+    foldBagDom ops op (renameVal p b) (renameVal p base) (renameVal p dVal) =
+      renameVal p (foldBagDom ops op b base dVal) := by
+  classical
+  induction dVal using Quotient.ind with
+  | _ sr =>
+    cases sr with
+    | set xs =>
+      change foldSetACList ops op (renameVal p base)
+        ((dedupList ((renameRawList p xs).map mkVal)).flatMap _) =
+        renameVal p (foldSetACList ops op base ((dedupList (xs.map mkVal)).flatMap _))
+      have hnd1 := nodup_dedupList ((renameRawList p xs).map mkVal)
+      have hnd2 := nodup_map_inj (fun _ _ h => (renameVal_injective p).mp h) (nodup_dedupList (xs.map mkVal))
+      have hperm : (dedupList ((renameRawList p xs).map mkVal)).Perm ((dedupList (xs.map mkVal)).map (renameVal p)) :=
+        (List.perm_ext_iff_of_nodup hnd1 hnd2).mpr (fun w => by
+          simp only [mem_dedupList, renameRawList_eq_map, List.mem_map]
+          constructor
+          · rintro ⟨y', ⟨y, hy, rfl⟩, rfl⟩; exact ⟨mkVal y, ⟨y, hy, rfl⟩, rfl⟩
+          · rintro ⟨v, ⟨y, hy, rfl⟩, rfl⟩; exact ⟨renameRaw p y, ⟨y, hy, rfl⟩, rfl⟩)
+      rw [foldSetACList_perm ops op (renameVal p base) (perm_flatMap _ hperm)]
+      have hfm : ((dedupList (xs.map mkVal)).map (renameVal p)).flatMap
+          (fun k => match (Val.fnLookup (renameVal p b) k).bind (valInt ops) with
+            | some n => List.replicate n.toNat k
+            | none => []) =
+          ((dedupList (xs.map mkVal)).flatMap (fun k =>
+            match (Val.fnLookup b k).bind (valInt ops) with
+            | some n => List.replicate n.toNat k
+            | none => [])).map (renameVal p) := by
+        rw [List.flatMap_map, List.map_flatMap]
+        congr 1
+        funext k
+        rw [Val.fnLookup_rename]
+        cases Val.fnLookup b k with
+        | none => rfl
+        | some w =>
+          simp only [Option.map_some, Option.bind_some, valInt_rename]
+          cases valInt ops w with
+          | none => rfl
+          | some n => rw [List.map_replicate]
+      rw [hfm]
+      exact foldSetACList_rename p ops op base _
+    | _ => rfl
+
+def Val.foldBag {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (op : ACOp) (b base : Val sizes A) : Val sizes A :=
+  @ite _ (Val.isABag ops b) (Classical.propDecidable _)
+    (foldBagDom ops op b base (Val.domain b))
+    Val.err
+
+theorem Val.foldBag_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (b base : Val sizes A) :
+    Val.foldBag ops op (renameVal p b) (renameVal p base) = renameVal p (Val.foldBag ops op b base) := by
+  unfold Val.foldBag
+  rw [propext (Val.isABag_rename p ops b)]
+  split
+  · rw [Val.domain_rename]
+    exact foldBagDom_rename p ops op b base (Val.domain b)
+  · rfl
+
+private theorem Val.fnLookup_singleton {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (k v : Val sizes A) :
+    Val.fnLookup (Val.fn [(k, v)]) k = some v := by
+  classical
+  have hm : Val.mapsTo (Val.fn [(k, v)]) k v := by
+    change ∃ kv ∈ [(valOut k, valOut v)], mkVal kv.1 = k ∧ mkVal kv.2 = v
+    exact ⟨(valOut k, valOut v), List.mem_cons_self, valOut_eq k, valOut_eq v⟩
+  have hu : ∀ w, Val.mapsTo (Val.fn [(k, v)]) k w → w = v := by
+    intro w hw
+    rcases hw with ⟨kv, hkv, _, h2⟩
+    rcases List.mem_singleton.mp hkv with rfl
+    exact h2.symm.trans (valOut_eq v)
+  have hex : ∃ x, Val.mapsTo (Val.fn [(k, v)]) k x ∧ ∀ w, Val.mapsTo (Val.fn [(k, v)]) k w → w = x := ⟨v, hm, hu⟩
+  unfold Val.fnLookup
+  simp only [hex, ↓reduceDIte]
+  congr 1
+  exact hu _ (Classical.choose_spec hex).1
+
+theorem Val.bagDiff_drops_zero {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (k : Val sizes A) (h1 : ops.intOf (ops.intAtom 1) = some 1) :
+    Val.bagDiff ops (Val.fn [(k, Val.atom (ops.intAtom 1))]) (Val.fn [(k, Val.atom (ops.intAtom 1))]) = Val.fn [] := by
+  classical
+  have hfn : Val.isFn (Val.fn [(k, Val.atom (ops.intAtom 1))]) := rfl
+  have hbc : Val.bagCountOpt ops (Val.fn [(k, Val.atom (ops.intAtom 1))]) k = some 1 := by
+    unfold Val.bagCountOpt
+    rw [Val.fnLookup_singleton]
+    exact h1
+  unfold Val.bagDiff
+  simp only [hfn, and_self, ↓reduceIte]
+  have hdom : Val.domain (Val.fn [(k, Val.atom (ops.intAtom 1))]) = Val.set [k] := by
+    change Val.set [mkVal (valOut k)] = Val.set [k]
+    rw [valOut_eq]
+  rw [hdom]
+  have hfilt : Val.setFilter (Val.set [k]) (fun x =>
+      match Val.bagCountOpt ops (Val.fn [(k, Val.atom (ops.intAtom 1))]) x,
+            Val.bagCountOpt ops (Val.fn [(k, Val.atom (ops.intAtom 1))]) x with
+      | some c1, some c2 => c1 - c2 > 0
+      | _, _ => False) = Val.set [] := by
+    change Val.set (([mkVal (valOut k)]).filter _) = Val.set []
+    rw [valOut_eq, List.filter_cons, List.filter_nil]
+    have h00 : ¬ ((0 : Int) > 0) := by omega
+    simp only [hbc, Int.sub_self, h00, decide_false, Bool.false_eq_true, ↓reduceIte]
+  rw [hfilt]
+  rfl
+
+theorem Val.bagCard_counts_copies {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (k : Val sizes A)
+    (h0 : ops.intOf (ops.intAtom 0) = some 0) (h2 : ops.intOf (ops.intAtom 2) = some 2) :
+    Val.bagCard ops (Val.fn [(k, Val.atom (ops.intAtom 2))]) = Val.atom (ops.intAtom 2) := by
+  classical
+  have hbag : Val.isABag ops (Val.fn [(k, Val.atom (ops.intAtom 2))]) := by
+    refine ⟨rfl, fun x w hxw => ?_⟩
+    rcases hxw with ⟨kv, hkv, _, hw⟩
+    rcases List.mem_singleton.mp hkv with rfl
+    rw [valOut_eq] at hw
+    rw [← hw]
+    exact ⟨2, h2, by omega⟩
+  have hdom : Val.domain (Val.fn [(k, Val.atom (ops.intAtom 2))]) = Val.set [k] := by
+    change Val.set [mkVal (valOut k)] = Val.set [k]
+    rw [valOut_eq]
+  have happ : Val.apply (Val.fn [(k, Val.atom (ops.intAtom 2))]) k = Val.atom (ops.intAtom 2) := by
+    unfold Val.apply
+    rw [Val.fnLookup_singleton]
+    rfl
+  unfold Val.bagCard
+  simp only [hbag, ↓reduceIte, hdom]
+  change foldSetACList ops .intAdd (Val.atom (ops.intAtom 0))
+    ((dedupList ((List.map valOut [k]).map mkVal)).map (fun x => Val.apply (Val.fn [(k, Val.atom (ops.intAtom 2))]) x)) =
+    Val.atom (ops.intAtom 2)
+  have hv0 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 0)) = some 0 := h0
+  have hv2 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 2)) = some 2 := h2
+  simp only [List.map_cons, List.map_nil, valOut_eq, dedupList, List.not_mem_nil, ↓reduceIte,
+    happ, foldSetACList, foldScalarAC, hv0, hv2, List.foldl_cons, List.foldl_nil]
+  rfl
+
+theorem Val.foldBag_counts_multiplicity {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (ops : AtomOps A)
+    (h0 : ops.intOf (ops.intAtom 0) = some 0)
+    (h1 : ops.intOf (ops.intAtom 1) = some 1)
+    (h2 : ops.intOf (ops.intAtom 2) = some 2) :
+    Val.foldBag (sizes := sizes) ops .intAdd
+      (Val.fn [(Val.atom (ops.intAtom 1), Val.atom (ops.intAtom 2))])
+      (Val.atom (ops.intAtom 0)) = Val.atom (ops.intAtom 2) := by
+  classical
+  have hbag : Val.isABag (sizes := sizes) ops (Val.fn [(Val.atom (ops.intAtom 1), Val.atom (ops.intAtom 2))]) := by
+    refine ⟨rfl, fun x w hxw => ?_⟩
+    rcases hxw with ⟨kv, hkv, _, hw⟩
+    rcases List.mem_singleton.mp hkv with rfl
+    rw [valOut_eq] at hw
+    rw [← hw]
+    exact ⟨2, h2, by omega⟩
+  have hdom : Val.domain (Val.fn (sizes := sizes) [(Val.atom (ops.intAtom 1), Val.atom (ops.intAtom 2))]) =
+      Val.set [Val.atom (ops.intAtom 1)] := by
+    change Val.set [mkVal (valOut (Val.atom (ops.intAtom 1)))] = Val.set [Val.atom (ops.intAtom 1)]
+    rw [valOut_eq]
+  have hlu : Val.fnLookup (Val.fn (sizes := sizes) [(Val.atom (ops.intAtom 1), Val.atom (ops.intAtom 2))])
+      (Val.atom (ops.intAtom 1)) = some (Val.atom (ops.intAtom 2)) := Val.fnLookup_singleton _ _
+  unfold Val.foldBag
+  simp only [hbag, ↓reduceIte, hdom]
+  change foldSetACList ops .intAdd (Val.atom (ops.intAtom 0))
+    ((dedupList ((List.map valOut [Val.atom (ops.intAtom 1)]).map mkVal)).flatMap (fun k =>
+      match (Val.fnLookup (Val.fn [(Val.atom (ops.intAtom 1), Val.atom (ops.intAtom 2))]) k).bind (valInt ops) with
+      | some n => List.replicate n.toNat k
+      | none => [])) = Val.atom (ops.intAtom 2)
+  have hv0 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 0)) = some 0 := h0
+  have hv1 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 1)) = some 1 := h1
+  have hv2 : valInt (sizes := sizes) ops (Val.atom (ops.intAtom 2)) = some 2 := h2
+  have ht2 : (2 : Int).toNat = 2 := rfl
+  simp only [List.map_cons, List.map_nil, valOut_eq, dedupList, List.not_mem_nil, ↓reduceIte,
+    List.flatMap_cons, List.flatMap_nil, List.append_nil, hlu, Option.bind_some, hv2, ht2,
+    List.replicate_succ, List.replicate_zero,
+    foldSetACList, foldScalarAC, hv0, hv1, List.foldl_cons, List.foldl_nil]
+  rfl
+
 mutual
 def evalExpr {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops : AtomOps A)
     (s t : State V sizes A) (env : Env sizes A) : Expr d V → Val sizes A
@@ -3169,6 +3619,20 @@ def evalExpr {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops 
   | .foldSetAC op dom base elem =>
       Val.foldSetAC ops op (evalExpr ops s t env dom) (evalExpr ops s t env base)
         (fun v => evalExpr ops s t (push env v) elem)
+  | .copiesIn elem bag =>
+      Val.copiesIn ops (evalExpr ops s t env elem) (evalExpr ops s t env bag)
+  | .bagCup b1 b2 =>
+      Val.bagCup ops (evalExpr ops s t env b1) (evalExpr ops s t env b2)
+  | .bagDiff b1 b2 =>
+      Val.bagDiff ops (evalExpr ops s t env b1) (evalExpr ops s t env b2)
+  | .bagUnion x =>
+      Val.bagUnion ops (evalExpr ops s t env x)
+  | .bagCard b =>
+      Val.bagCard ops (evalExpr ops s t env b)
+  | .bagOfAll bag f =>
+      Val.bagOfAll ops (fun v => evalExpr ops s t (push env v) f) (evalExpr ops s t env bag)
+  | .foldBag op bag base =>
+      Val.foldBag ops op (evalExpr ops s t env bag) (evalExpr ops s t env base)
   | .ite cond yes no =>
       @ite _ (evalForm ops s t env cond) (Classical.propDecidable _)
         (evalExpr ops s t env yes) (evalExpr ops s t env no)
@@ -3221,6 +3685,9 @@ def evalForm {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops 
       let sv := evalExpr ops s t env sub
       Val.isSet sv ∧ ∀ v, Val.mem v sv → evalSetPred ops s t env sup v
   | .isFiniteSet e => Val.isFinite (evalExpr ops s t env e)
+  | .isABag b => Val.isABag ops (evalExpr ops s t env b)
+  | .bagIn elem bag => Val.bagIn ops (evalExpr ops s t env elem) (evalExpr ops s t env bag)
+  | .sqSubseteq b1 b2 => Val.sqSubseteq ops (evalExpr ops s t env b1) (evalExpr ops s t env b2)
   | .conj a b => evalForm ops s t env a ∧ evalForm ops s t env b
   | .disj a b => evalForm ops s t env a ∨ evalForm ops s t env b
   | .neg a => ¬ evalForm ops s t env a
@@ -3378,6 +3845,23 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
     exact Val.foldSetAC_rename p ops op _ _ _ _ (fun v => by
       rw [← renameEnv_push]
       exact evalExpr_equivariant p ops s t (push env v) elem)
+  | .copiesIn elem bag => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env elem, evalExpr_equivariant p ops s t env bag, Val.copiesIn_rename]
+  | .bagCup b1 b2 => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.bagCup_rename]
+  | .bagDiff b1 b2 => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.bagDiff_rename]
+  | .bagUnion x => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.bagUnion_rename]
+  | .bagCard b => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env b, Val.bagCard_rename]
+  | .bagOfAll bag f => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env bag]
+    exact Val.bagOfAll_rename p ops _ _ (fun v => by
+      rw [← renameEnv_push]
+      exact evalExpr_equivariant p ops s t (push env v) f) _
+  | .foldBag op bag base => by
+    simp only [evalExpr, evalExpr_equivariant p ops s t env bag, evalExpr_equivariant p ops s t env base, Val.foldBag_rename]
   | .ite cond yes no => by
     simp only [evalExpr]
     rw [propext (evalForm_equivariant p ops s t env cond)]
@@ -3490,6 +3974,12 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       rwa [renameVal_right] at hsp
   | .isFiniteSet e => by
     simp only [evalForm, evalExpr_equivariant p ops s t env e, Val.isFinite_rename]
+  | .isABag b => by
+    simp only [evalForm, evalExpr_equivariant p ops s t env b, Val.isABag_rename]
+  | .bagIn elem bag => by
+    simp only [evalForm, evalExpr_equivariant p ops s t env elem, evalExpr_equivariant p ops s t env bag, Val.bagIn_rename]
+  | .sqSubseteq b1 b2 => by
+    simp only [evalForm, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.sqSubseteq_rename]
   | .conj a b => and_congr (evalForm_equivariant p ops s t env a) (evalForm_equivariant p ops s t env b)
   | .disj a b => or_congr (evalForm_equivariant p ops s t env a) (evalForm_equivariant p ops s t env b)
   | .neg a => not_congr (evalForm_equivariant p ops s t env a)
