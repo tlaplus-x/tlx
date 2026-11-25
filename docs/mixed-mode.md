@@ -128,6 +128,10 @@ current state (`StateCache`), a panic caught inside a callback, and region-evalu
   handle whose epoch does not match its slot panics (a bug in generated code, not a TLA+ error).
   Handles never escape into the next state: an `Assign` of a region result has the variable's
   `Enc` result type, and `Emit` copies encoded words.
+- **Idle capacity.** At call end, an oversized arena buffer is shrunk toward 2,048 slots.
+  Explicitly clearing the state decode cache similarly shrinks its word buffer toward 2,048
+  words. Smaller buffers retain their capacity for reuse; active calls and cached states may
+  still grow beyond these retention targets.
 - **Release in loops.** IR scopes are lexical, so a boxed value bound in a loop body does not
   outlive the iteration. C brackets loop bodies that contain region calls with `mark`/`release`,
   which bounds the arena by nesting depth times temporaries per level. The element handles of
