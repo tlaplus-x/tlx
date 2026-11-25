@@ -1,29 +1,49 @@
 //! Erasure transfers share the keyed branch; semantic leaves cannot read them.
-use super::{binding, Case, Emitter};
+use super::{
+    super::{erasure::branch_hidden_binding, erasure::HiddenBinding},
+    Case, Emitter,
+};
 use crate::{hir::*, optimize::lean::literal};
 use std::fmt::Write;
 
 impl Emitter<'_> {
     pub(super) fn hidden_updates(&mut self, b: &super::Branch) -> Option<Vec<String>> {
-        self.omitted.clone().iter().map(|v| self.hidden_value(&binding(b, *v, true)?)).collect()
+        self.omitted
+            .clone()
+            .iter()
+            .map(|&v| {
+                let bind = branch_hidden_binding(b, v, true)?;
+                self.hidden_value(&bind, v)
+            })
+            .collect()
     }
 
-    fn hidden_value(&mut self, e: &Expr) -> Option<String> {
-        Some(match &*e.kind {
-            ExprKind::Num(n) if i32::try_from(*n).is_ok() => format!("sem.number ({n})"),
-            ExprKind::Str(s) => format!("sem.string {}", literal(s)),
-            ExprKind::Bool(b) => format!("sem.boolean {b}"),
-            ExprKind::Var(v) => {
-                if let Some(i) = self.omitted.iter().position(|x| x == v) {
-                    format!("h ⟨{i}, by decide⟩")
-                } else {
-                    let id = self.atoms.len();
-                    self.atoms.push(format!("Hidden old retained-variable copy HIR: {e:#?}"));
-                    format!("sem.hiddenValue {id} s")
-                }
+    fn hidden_value(&mut self, bind: &HiddenBinding, v: VarId) -> Option<String> {
+        match bind {
+            HiddenBinding::Unchanged => {
+                let i = self.omitted.iter().position(|x| *x == v)?;
+                Some(format!("h ⟨{i}, by decide⟩"))
             }
-            _ => return None,
-        })
+            HiddenBinding::Assign { rhs, .. } => Some(match &*rhs.kind {
+                ExprKind::Num(n) if i32::try_from(*n).is_ok() => format!("sem.number ({n})"),
+                ExprKind::Str(s) => format!("sem.string {}", literal(s)),
+                ExprKind::Bool(b) => format!("sem.boolean {b}"),
+                ExprKind::Var(u) => {
+                    if let Some(i) = self.omitted.iter().position(|x| x == u) {
+                        format!("h ⟨{i}, by decide⟩")
+                    } else {
+                        let id = self.atoms.len();
+                        self.atoms.push(format!("Hidden old retained-variable copy HIR: {rhs:#?}"));
+                        format!("sem.hiddenValue {id} s")
+                    }
+                }
+                _ => {
+                    let id = self.atoms.len();
+                    self.atoms.push(format!("Hidden total update expr HIR: {rhs:#?}"));
+                    format!("sem.hiddenExpr {id} s w keys h")
+                }
+            }),
+        }
     }
 
     pub(super) fn erasure_semantics(&self, out: &mut String, constrained: bool) {
@@ -32,11 +52,11 @@ impl Emitter<'_> {
         if constrained {
             out.push_str("  actionObserve : Nat → C → C → List V → List (Option V) → List (Option A) → List Nat → Prop\n");
         }
-        out.push_str("  number : Int → H\n  string : String → H\n  boolean : Bool → H\n  hiddenValue : Nat → State C MapId SlotId (Key groupSizes) V A → H\n");
+        out.push_str("  number : Int → H\n  string : String → H\n  boolean : Bool → H\n  hiddenValue : Nat → State C MapId SlotId (Key groupSizes) V A → H\n  hiddenExpr : Nat → State C MapId SlotId (Key groupSizes) V A → W → Environment (Key groupSizes) → Hidden H → H\n");
     }
 
     pub(super) fn erasure_model(&self, mut out: String, cases: &[Case], constrained: bool) -> super::super::OpenCert {
-        out.push_str("variable {C V A W H : Type} (sem : Semantics C V A W H)\ndef hiddenUpdate {C V A W H : Type} (sem : Semantics C V A W H) (b : BranchId) (s : State C MapId SlotId (Key groupSizes) V A) (_w : W) (_keys : Environment (Key groupSizes)) (h : Hidden H) : Hidden H :=\n  match b.val with\n");
+        out.push_str("variable {C V A W H : Type} (sem : Semantics C V A W H)\ndef hiddenUpdate {C V A W H : Type} (sem : Semantics C V A W H) (b : BranchId) (s : State C MapId SlotId (Key groupSizes) V A) (w : W) (keys : Environment (Key groupSizes)) (h : Hidden H) : Hidden H :=\n  match b.val with\n");
         for (b, c) in cases.iter().enumerate() {
             writeln!(out, "  | {b} => fun i => match i.val with").unwrap();
             for (i, v) in c.hidden.iter().enumerate() {

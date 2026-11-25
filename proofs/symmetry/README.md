@@ -137,8 +137,27 @@ broken key/map/slot/cardinality renaming, missing quotient initialization/succes
 removed concrete hidden successors and changed reduced observations. Runtime tests
 retain concrete snapshot values in failing and deadlocking traces across execution tiers.
 
-The installed projection must be the exact retained-variable tuple. Unknown or
-partial hidden updates, reads of omitted variables, unsupported keyed shapes and
-other projection kinds refuse composition. Existing user VIEW/SYMMETRY declarations
-retain the TLC path. Source lowering, domain/totality inference, independent semantic
-leaves, group closure and runtime projection/canonicalization remain trusted.
+[ErasedMultiKey.tla](ErasedMultiKey.tla) ([ErasedMultiKey.cfg](ErasedMultiKey.cfg))
+exercises the fallback composition with `EquivSymCertificate` via
+`ErasedEquivCertificate.lean` (`GeneratedErasedEquivSymmetry`). Its retained state
+holds a set of two-key message records (`msgs`) and a bounded sequence of two-key
+records (`log`), while three unobserved structured variables (`audit`, `lastAction`,
+and `stats`) are updated with total set-union, record-literal, and function `EXCEPT`
+expressions. Compatibility mode explores 136 distinct states; standalone erasure
+(`GeneratedErasure`) reduces this to 100 distinct states; composed erasure +
+equivariant symmetry (`GeneratedErasedEquivSymmetry`) reduces it to 19 distinct
+states across all execution tiers while preserving concrete `audit`, `lastAction`,
+and `stats` values in counterexample and deadlock traces:
+
+```sh
+./target/release/tlx check proofs/symmetry/ErasedMultiKey.tla -tlc -interp
+./target/release/tlx check proofs/symmetry/ErasedMultiKey.tla -optimize -noautosymmetry -interp
+TLX_PARANOID=1 TLX_SYMMETRY_PARANOID=1 ./target/release/tlx check proofs/symmetry/ErasedMultiKey.tla -optimize -compile
+```
+
+The installed projection must be the exact retained-variable tuple. Unknown,
+partial, overflowing, primed-RHS, or multi-binding hidden updates, reads of omitted
+variables, unsupported symmetry shapes and other projection kinds refuse
+composition. Existing user VIEW/SYMMETRY declarations retain the TLC path. Source
+lowering, domain/totality inference (`sym_totality`), independent semantic leaves,
+group closure and runtime projection/canonicalization remain trusted.

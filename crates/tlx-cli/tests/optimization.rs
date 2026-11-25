@@ -244,7 +244,7 @@ fn projection_preserves_concrete_counterexamples_and_deadlocks() {
 #[test]
 fn observations_and_temporal_checks_keep_the_full_graph() {
     for (cfg, expected) in [
-        (CFG.replace("INVARIANT Inv", "INVARIANT TagInv"), 12),
+        (format!("{CFG}INVARIANT TagInv\n"), 12),
         (format!("{CFG}CONSTRAINT Bound\n"), 0),
         (format!("{CFG}ACTION_CONSTRAINT ActionBound\n"), 0),
         (format!("{CFG}VIEW Observed\n"), 0),
@@ -256,6 +256,12 @@ fn observations_and_temporal_checks_keep_the_full_graph() {
         assert_eq!(run.code, expected, "{}", run.text());
         assert!(!run.stdout.contains("unobserved-state-projection"), "{}", run.text());
     }
+    // Checking only `TagInv` observes `tag` while leaving `x` unobserved with total
+    // arithmetic update `x' = 1 - x`, so `x` is erased and `TagInv` still fails concretely.
+    let dir = tlx_testkit::TempDir::with_spec("projection-tag-only", PROJECTION_SPEC, &CFG.replace("INVARIANT Inv", "INVARIANT TagInv"));
+    let run = tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp", "-noautosymmetry"]).dir(&dir).run();
+    assert_eq!(run.code, 12, "{}", run.text());
+    assert!(run.stdout.contains("unobserved-state-projection (x;"), "{}", run.text());
 }
 
 #[test]

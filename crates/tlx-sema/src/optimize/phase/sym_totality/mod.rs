@@ -135,11 +135,11 @@ pub(crate) struct CheckEnv {
 }
 
 impl CheckEnv {
-    pub(super) fn with_var_tracking(primed: bool) -> Self {
+    pub(crate) fn with_var_tracking(primed: bool) -> Self {
         Self { bound_vars: Some((primed, BTreeSet::new())), ..Self::default() }
     }
 
-    pub(super) fn mark_var_bound(&mut self, v: VarId) {
+    pub(crate) fn mark_var_bound(&mut self, v: VarId) {
         if let Some((_, bv)) = &mut self.bound_vars {
             bv.insert(v);
         }
@@ -606,19 +606,6 @@ pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
     })
 }
 
-/// Verify totality of all newly added constrained observations (`init_props`,
-/// `constraints`, `action_constraints`, and `action_props`, including primed
-/// reads in action predicates) for non-symmetry emitters such as erasure.
-pub(crate) fn check_constrained_observations_total(
-    program: &Program,
-    cfg: &Config,
-    init: &Expr,
-    next: &Expr,
-    spec: super::CheckSpec<'_>,
-) -> bool {
-    check_observations_total_inner(program, cfg, init, next, spec, false, None)
-}
-
 /// Verify totality of constrained observations for state-projection emitters
 /// (`phase`, `sequence`, `history`, `ordered`). Permits reading `Len(seq)` and
 /// `1..Len(seq)` on unbounded sequences while requiring strict 32-bit safe
@@ -891,6 +878,26 @@ impl<'a> TotalityChecker<'a> {
             }
         }
         Shape::Model { groups: mask, mv_type: mv_type.unwrap_or(MvType::Unknown), unmoved: Some(BTreeSet::new()) }
+    }
+
+    pub(crate) fn bind_branch_bounds(&self, bounds: &[Bound], env: &mut CheckEnv) -> Option<()> {
+        for b in bounds {
+            let (elem, origin) = self.bound_elem_info(&b.set, false, env);
+            match &b.vars {
+                BoundVars::Many(ids) => {
+                    for &id in ids {
+                        env.bind_local(id, elem.clone(), origin.clone());
+                    }
+                }
+                BoundVars::Tuple(ids) => {
+                    let parts = extract_exact_tuple_arity(&elem, ids.len())?;
+                    for (&id, p) in ids.iter().zip(parts) {
+                        env.bind_local(id, p, None);
+                    }
+                }
+            }
+        }
+        Some(())
     }
 
     pub(crate) fn bind_step_bounds(&self, bounds: &[Bound], hints: &HashMap<LocalId, IntBoundHint>) -> Option<CheckEnv> {
