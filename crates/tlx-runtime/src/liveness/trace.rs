@@ -31,7 +31,12 @@ pub fn check_trace<M: Model>(
             let names = violated_names(
                 input,
                 &sh,
-                &mut |k| Ok(states.iter().find(|t| t.conc == conc[sh.shown[k].pos]).map_or_else(tlx_live::Bits::new, |t| t.bits.clone())),
+                &mut |k| {
+                    Ok(states
+                        .iter()
+                        .find(|t| t.conc == conc[sh.shown[k].pos])
+                        .map_or_else(|| std::borrow::Cow::Owned(tlx_live::Bits::new()), |t| std::borrow::Cow::Borrowed(&t.bits)))
+                },
                 &mut |k| step_bits(bits, seq[sh.shown[k].pos].1, seq[sh.shown[sh.next(k)].pos].1),
             );
             return violated(names, i, &seq, &sh);

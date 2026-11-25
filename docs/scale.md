@@ -157,7 +157,14 @@ failed on process baseline memory that has nothing to do with the graph. Edge-lo
 `u8`/`u16`/`u32` by the number of distinct patterns (`tlx_live::Ids`). The product is built and searched
 part by part (design.md §7.4): its memory is that of the largest part, or of the parts in progress together
 with several workers (over the budget together, they run one at a time); the nodes of waiting tableau states
-are not built, and only edges that can lie on an accepting cycle are stored.
+are not built, and only edges that can lie on an accepting cycle are stored. Inside each `Product`, per-node
+automaton state ids (`Ids::zeros(0, max)`) and the graph-edge index behind each retained product edge
+(`gedge`, widened on demand) also use `tlx_live::Ids` (`u8`/`u16`/`u32`), BFS depths are stored as monotone
+`(start_node, dist)` level spans rather than a `u32` per node, and the temporary `(graph node, tableau state)
+-> product node` hash map is dropped before `fair_cycle` allocates its Tarjan SCC stack so `Product::bytes`
+charges the larger of the two rather than their sum (`bcastFolklore/bcastFolklore`: 501,552 states and 10.2M
+graph edges take 58.3 MiB CSR, 76.2 MiB for the largest 655,360-node / 6.48M-edge product, and 239.7 MiB peak
+RSS).
 
 ## 3. Safepoints
 
@@ -393,9 +400,11 @@ violation, the log is discarded.
 
 Sources are numbered by worker order and log order; a fingerprint-to-id open-addressing table
 (`tlx_base::hash::FpMap`; `tlx_live::Csr`) translates targets; the CSR (`off`, `tgt`, edge pattern ids,
-actions, state pattern ids, id-to-fingerprint) replaces a stored graph of states. Counterexample states are
+actions, state pattern ids, id-to-fingerprint) replaces a stored graph of states, moving boxed bit-pattern
+words into `tlx_live::Bits` without copying (`Bits::from_boxed_words`). Counterexample states are
 recovered by re-executing from an initial state along the path, matching fingerprints
-(design.md §7.4). This costs about 170 B per state against about 1260 B for a graph that stored
+(design.md §7.4) after extracting the lasso step metadata and dropping both `Csr` and the
+id-to-fingerprint vector. This costs about 120-170 B per state against about 1260 B for a graph that stored
 states. Both passes over the edge log read blocks from disk if they spilled, with read-ahead; the second
 deletes blocks after reading.
 

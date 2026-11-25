@@ -258,6 +258,7 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-runtime/src/queue/codec.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/queue/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/queue/reader.rs` | reviewed | Trusted decoding of encoder-produced queue records, checked against the checksums retained for spilled segments (encoded-state contract below; rows 3-16). |
+| `crates/tlx-runtime/tests/liveness.rs` | reviewed | Test-only `GlobalAlloc` wrapper delegating directly to `std::alloc::System` to verify buffer deallocation and allocation byte bounds in liveness tests. |
 | `crates/tlx-testkit/src/cli.rs` | reviewed | Owned process groups and descriptor flags (row 33). |
 | `crates/tlx-testkit/src/diff.rs` | reviewed | Verified generated-code loader and trusted state fixture (rows 17-22). |
 | `crates/tlx-value/src/intern.rs` | reviewed | Append-only symbol publication (row 1). |

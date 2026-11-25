@@ -274,9 +274,7 @@ fn automaton(sol: &Solution) -> (Automaton, Vec<bool>) {
 /// condition on cycles and its tableau has an accepting sink. See
 /// [`ConcreteChecker::fired`].
 pub fn reports_early(prop: &Ltl, fairness: &[Fairness]) -> bool {
-    solutions(prop, fairness)
-        .iter()
-        .any(|sol| sol.tf.is_some() && sol.pems.iter().any(Pem::is_empty) && automaton(sol).1.iter().any(|&b| b))
+    fairness.is_empty() && has_pem_free_accepting_sink(prop)
 }
 
 mod formula;
@@ -284,7 +282,7 @@ mod product;
 mod tableau;
 
 pub use formula::{check_size, tableau_initial_checks, tableau_state_atoms};
-use formula::{solutions, Pem, Solution};
+use formula::{has_pem_free_accepting_sink, solutions, Pem, Solution};
 use product::{Pats, TProduct};
 use tableau::particle_tableau;
 
@@ -344,5 +342,131 @@ mod tests {
         assert!(!reports_early(&ev(st(0)), &[]));
         assert!(!reports_early(&al(ev(st(0))), &[]));
         assert!(!reports_early(&al(imp(st(0), ev(st(1)))), &[]));
+    }
+
+    #[test]
+    fn fast_metadata_agrees_with_solutions_on_small_formulas() {
+        let base = [Ltl::True, Ltl::False, st(0), st(1), Ltl::Action(0)];
+        let mut layer = base.to_vec();
+        let mut all = base.to_vec();
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for a in &layer {
+                next.push(Ltl::Not(Box::new(a.clone())));
+                next.push(Ltl::Always(Box::new(a.clone())));
+                next.push(Ltl::Eventually(Box::new(a.clone())));
+            }
+            for a in &layer {
+                for b in &layer {
+                    next.push(Ltl::And(vec![a.clone(), b.clone()]));
+                    next.push(Ltl::Or(vec![a.clone(), b.clone()]));
+                }
+            }
+            all.extend(next.iter().cloned());
+            layer = next;
+        }
+        let fair_cases: [&[Fairness]; 3] =
+            [&[], &[Fairness { strong: false, enabled: 1, taken: 0 }], &[Fairness { strong: true, enabled: 1, taken: 0 }]];
+        for f in &all {
+            for fair in fair_cases {
+                assert!(check_size(f, fair).is_ok());
+                let sols = solutions(f, fair);
+                let mut want_atoms = Vec::new();
+                let mut want_init = Vec::new();
+                for sol in &sols {
+                    if let Some(tf) = &sol.tf {
+                        fn collect(f: &F, out: &mut Vec<u32>) {
+                            match f {
+                                F::Bool(_) => {}
+                                F::Lit { action, atom, .. } => {
+                                    if !*action && !out.contains(atom) {
+                                        out.push(*atom);
+                                    }
+                                }
+                                F::And(xs) | F::Or(xs) => xs.iter().for_each(|x| collect(x, out)),
+                                F::All(x) | F::Even(x) => collect(x, out),
+                            }
+                        }
+                        collect(tf, &mut want_atoms);
+                        want_init.extend(tableau::initial_checks(tf));
+                    }
+                }
+                let got_atoms = tableau_state_atoms(f, fair);
+                assert_eq!(got_atoms, want_atoms, "tableau_state_atoms order of {f:?} under {fair:?}");
+                assert_eq!(tableau_initial_checks(f, fair), want_init, "tableau_initial_checks of {f:?} under {fair:?}");
+
+                let want_early =
+                    sols.iter().any(|sol| sol.tf.is_some() && sol.pems.iter().any(Pem::is_empty) && automaton(sol).1.iter().any(|&b| b));
+                assert_eq!(reports_early(f, fair), want_early, "reports_early of {f:?} under {fair:?}");
+            }
+        }
+        // Negated `(<>p0 \/ <>p1) /\ (<>p2 \/ <>p3)` distributes in TLC solution
+        // order `[0, 2, 3, 1]`, not syntactic AST order `[0, 1, 2, 3]`.
+        let cross = Ltl::Or(vec![
+            Ltl::And(vec![Ltl::Always(Box::new(Ltl::Not(Box::new(st(0))))), Ltl::Always(Box::new(Ltl::Not(Box::new(st(1)))))]),
+            Ltl::And(vec![Ltl::Always(Box::new(Ltl::Not(Box::new(st(2))))), Ltl::Always(Box::new(Ltl::Not(Box::new(st(3)))))]),
+        ]);
+        assert_eq!(tableau_state_atoms(&cross, &[]), vec![0, 2, 3, 1]);
+
+        // Deeper mixed PEM + non-PEM `[]<>[]` cases: stripping a PEM sibling
+        // from a conjunction (`([]<>[]p0 /\ <>[]p1) \/ <>p2` and
+        // `(<>[]p2 /\ []<>[]p0) \/ p1`) must not re-run `[]<>` disjunction
+        // merging and push `p0` past `p2` / `p1`.
+        let al = |x: Ltl| Ltl::Always(Box::new(x));
+        let ev = |x: Ltl| Ltl::Eventually(Box::new(x));
+        let nt = |x: Ltl| Ltl::Not(Box::new(x));
+        let mixed_cases = [
+            // Negation: `([]<>[]~p0 /\ <>[]~p1) \/ <>~p2` -> atoms `[0, 2]`.
+            Ltl::And(vec![Ltl::Or(vec![ev(al(ev(st(0)))), al(ev(st(1)))]), al(st(2))]),
+            // Negation: `(<>[]~p2 /\ []<>[]~p0) \/ ~p1` -> atoms `[0, 1]`.
+            Ltl::And(vec![Ltl::Or(vec![al(ev(st(2))), ev(al(ev(st(0))))]), st(1)]),
+            // Negation: `[]<>[]~p0 \/ (p1 /\ <>[]~p2) \/ []<>[]~p3` -> `[1, 0, 3]`.
+            Ltl::And(vec![ev(al(ev(st(0)))), Ltl::Or(vec![nt(st(1)), al(ev(st(2)))]), ev(al(ev(st(3))))]),
+            // Negation: `([]<>TRUE \/ []<>[]TRUE) /\ p0`. Merged `[]<>(TRUE \/ []TRUE)`
+            // stays in the tableau (not re-simplified to `[]<>TRUE`), so no accepting sink.
+            Ltl::Or(vec![Ltl::And(vec![ev(al(Ltl::False)), ev(al(ev(Ltl::False)))]), nt(st(0))]),
+        ];
+        for (idx, mf) in mixed_cases.iter().enumerate() {
+            for fair in fair_cases {
+                let sols = solutions(mf, fair);
+                let mut want_atoms = Vec::new();
+                let mut want_init = Vec::new();
+                for sol in &sols {
+                    if let Some(tf) = &sol.tf {
+                        fn collect(f: &F, out: &mut Vec<u32>) {
+                            match f {
+                                F::Bool(_) => {}
+                                F::Lit { action, atom, .. } => {
+                                    if !*action && !out.contains(atom) {
+                                        out.push(*atom);
+                                    }
+                                }
+                                F::And(xs) | F::Or(xs) => xs.iter().for_each(|x| collect(x, out)),
+                                F::All(x) | F::Even(x) => collect(x, out),
+                            }
+                        }
+                        collect(tf, &mut want_atoms);
+                        want_init.extend(tableau::initial_checks(tf));
+                    }
+                }
+                assert_eq!(tableau_state_atoms(mf, fair), want_atoms, "mixed case {idx} atoms under {fair:?}");
+                assert_eq!(tableau_initial_checks(mf, fair), want_init, "mixed case {idx} init checks under {fair:?}");
+                let want_early =
+                    sols.iter().any(|sol| sol.tf.is_some() && sol.pems.iter().any(Pem::is_empty) && automaton(sol).1.iter().any(|&b| b));
+                assert_eq!(reports_early(mf, fair), want_early, "mixed case {idx} reports_early under {fair:?}");
+            }
+        }
+        assert_eq!(tableau_state_atoms(&mixed_cases[0], &[]), vec![0, 2]);
+        assert_eq!(tableau_state_atoms(&mixed_cases[1], &[]), vec![0, 1]);
+        assert!(!reports_early(&mixed_cases[3], &[]));
+        // Wide flat disjunction (100,000 copies of `[]p0`, negated to one flat
+        // conjunction) must not overflow the call stack.
+        let wide = Ltl::Or(vec![al(st(0)); 100_000]);
+        assert!(check_size(&wide, &[]).is_ok());
+        assert_eq!(tableau_state_atoms(&wide, &[]), vec![0]);
+        assert_eq!(crate::branches([&wide]), 1);
+        // DNF overflow (> i32::MAX disjuncts) is still rejected without allocating.
+        let huge_sf: Vec<Fairness> = (0..32).map(|i| Fairness { strong: true, enabled: i, taken: i }).collect();
+        assert!(check_size(&Ltl::Eventually(Box::new(st(0))), &huge_sf).is_err());
     }
 }

@@ -150,9 +150,6 @@ pub fn check<T: Tier>(
         tlx_runtime::stats::set("liveness: fairness ENABLED from A's steps", tlx_runtime::stats::Metric::Count(from_steps as u64));
         tlx_runtime::stats::set("liveness: fairness conditions", tlx_runtime::stats::Metric::Count(live.fairness.len() as u64));
     }
-    if !base.has_view_or_symmetry() {
-        crate::stats::record_peak_rss("peak RSS before liveness");
-    }
     let r = tlx_runtime::liveness::check(m, &input(base), m, workers, expanded, recorded, guard);
     rendered(base, r, view, true)
 }

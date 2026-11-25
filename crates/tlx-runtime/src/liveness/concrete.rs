@@ -444,7 +444,11 @@ pub(super) fn violation<M: Model>(input: &LiveInput, prop: usize, l: &tlx_live::
     let names = violated_names(
         input,
         &sh,
-        &mut |k| expand_concrete(cx.m, cx.bits, seq[sh.shown[k].pos].1).map(|e| tlx_live::Bits::from_words(&e.bits)).map_err(|e| e.message),
+        &mut |k| {
+            expand_concrete(cx.m, cx.bits, seq[sh.shown[k].pos].1)
+                .map(|e| std::borrow::Cow::Owned(tlx_live::Bits::from_words(&e.bits)))
+                .map_err(|e| e.message)
+        },
         &mut |k| step_bits(cx.bits, seq[sh.shown[k].pos].1, seq[sh.shown[sh.next(k)].pos].1),
     );
     violated(names, prop, &seq, &sh)

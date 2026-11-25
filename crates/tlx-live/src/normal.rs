@@ -18,13 +18,12 @@ use crate::Ltl;
 /// disjunct of the negated property has a conjunct `[]<>P` or `<>[]P` (P
 /// without temporal operators), or a `<>` whose body has a `[]`.
 pub fn needs_cycle_conditions(prop: &Ltl) -> bool {
+    let neg = nnf(prop, true);
     let mut found = false;
-    let mut conj = Vec::new();
-    let mut visit = |c: &[Ltl]| -> bool {
+    each_cartesian_row(&neg, classify_ltl, &mut |c| {
         found = c.iter().any(|x| pem(x) || box_in_promise(x));
         !found
-    };
-    each_disjunct(&nnf(prop, true), &mut conj, &mut visit);
+    });
     found
 }
 
@@ -76,24 +75,57 @@ pub fn is_tautology<'a>(props: impl IntoIterator<Item = &'a Ltl>) -> bool {
 /// folds constant-level predicates to TRUE / FALSE first; here they are
 /// atoms, so e.g. `C => <>[]P` counts one branch too many.)
 pub fn branches<'a>(props: impl IntoIterator<Item = &'a Ltl>) -> usize {
-    let neg = Ltl::Or(props.into_iter().map(|p| nnf(p, true)).collect());
+    let neg = collapse_pem_only(Ltl::Or(props.into_iter().map(|p| nnf(p, true)).collect()));
     // The tableau key is the ordered conjuncts that take one; comparing the
     // conjuncts themselves keeps identity structural and preserves both the
     // order and the multiplicity TLC distinguishes (CODE-13).
-    let mut tableaux: Vec<Vec<Ltl>> = Vec::new();
-    let mut conj = Vec::new();
-    let mut visit = |c: &[Ltl]| -> bool {
+    let mut tableaux: std::collections::HashSet<Vec<&Ltl>> = std::collections::HashSet::new();
+    each_cartesian_row(&neg, classify_ltl, &mut |c| {
         if c.iter().any(|x| matches!(x, Ltl::False)) {
             return true;
         }
-        let key: Vec<Ltl> = c.iter().filter(|x| !pem(x) && !matches!(x, Ltl::True)).cloned().collect();
-        if !tableaux.contains(&key) {
-            tableaux.push(key);
-        }
+        let key: Vec<&Ltl> = c.iter().copied().filter(|x| !pem(x) && !matches!(x, Ltl::True)).collect();
+        tableaux.insert(key);
         true
-    };
-    each_disjunct(&neg, &mut conj, &mut visit);
+    });
     tableaux.len().max(1)
+}
+
+/// Fold pure-PEM boolean subtrees bottom-up in one linear pass: PEM leaves
+/// (`[]<>P` / `<>[]P`) become `TRUE` (an empty tableau contribution), and a
+/// junction whose transformed children are all `TRUE` / `FALSE` folds to a
+/// single constant (`TRUE` if satisfiable, `FALSE` otherwise), while mixed
+/// junctions preserve their exact structure and child order (including
+/// `TRUE \/ ordinary_atom`, which represents two distinct tableau keys).
+fn collapse_pem_only(f: Ltl) -> Ltl {
+    match f {
+        c if pem(&c) => Ltl::True,
+        Ltl::And(xs) => {
+            let ys: Vec<Ltl> = xs.into_iter().map(collapse_pem_only).collect();
+            if ys.iter().all(|y| matches!(y, Ltl::True | Ltl::False)) {
+                if ys.iter().all(|y| matches!(y, Ltl::True)) {
+                    Ltl::True
+                } else {
+                    Ltl::False
+                }
+            } else {
+                Ltl::And(ys)
+            }
+        }
+        Ltl::Or(xs) => {
+            let ys: Vec<Ltl> = xs.into_iter().map(collapse_pem_only).collect();
+            if ys.iter().all(|y| matches!(y, Ltl::True | Ltl::False)) {
+                if ys.iter().any(|y| matches!(y, Ltl::True)) {
+                    Ltl::True
+                } else {
+                    Ltl::False
+                }
+            } else {
+                Ltl::Or(ys)
+            }
+        }
+        other => other,
+    }
 }
 
 /// Negation normal form of `f`, negated if `neg`.
@@ -136,40 +168,91 @@ fn temporal(f: &Ltl) -> bool {
     }
 }
 
-/// Calls `visit` once per disjunct of the top-level DNF of `f`, in the order
-/// the eager DNF produced them; `conj` holds that disjunct's conjuncts while
-/// `visit` runs (it must not change them). `visit` returning `false` stops
-/// the traversal, which then returns `false` as well; otherwise the
-/// traversal completes and returns `true`. No disjunct list is ever built:
-/// only the formula and the one accumulator live, and the intermediate
-/// Cartesian rows the eager `dnf` kept are gone.
-fn each_disjunct(f: &Ltl, conj: &mut Vec<Ltl>, visit: &mut dyn FnMut(&[Ltl]) -> bool) -> bool {
-    walk(f, conj, &mut |conj| visit(conj.as_slice()))
+/// Formula node classification for [`each_cartesian_row`].
+pub(crate) enum Node<'a, T> {
+    And(&'a [T]),
+    Or(&'a [T]),
+    Leaf,
 }
 
-/// The traversal itself, with its continuation over the accumulator so a
-/// conjunction can keep extending the same disjunct after a nested one
-/// finished.
-fn walk(f: &Ltl, conj: &mut Vec<Ltl>, k: &mut dyn FnMut(&mut Vec<Ltl>) -> bool) -> bool {
+fn classify_ltl(f: &Ltl) -> Node<'_, Ltl> {
     match f {
-        Ltl::Or(xs) => xs.iter().all(|x| walk(x, conj, k)),
-        Ltl::And(xs) => walk_and(xs, conj, k),
-        _ => {
-            conj.push(f.clone());
-            let more = k(conj);
-            conj.pop();
-            more
-        }
+        Ltl::And(xs) => Node::And(xs),
+        Ltl::Or(xs) => Node::Or(xs),
+        _ => Node::Leaf,
     }
 }
 
-/// The cross product of the disjuncts of `xs` (the conjunction list of an
-/// `Ltl::And`), appending one disjunct of each element in order; the last
-/// element varies fastest, matching the order of the old `fold`.
-fn walk_and(xs: &[Ltl], conj: &mut Vec<Ltl>, k: &mut dyn FnMut(&mut Vec<Ltl>) -> bool) -> bool {
-    match xs.split_first() {
-        None => k(conj),
-        Some((head, tail)) => walk(head, conj, &mut |conj| walk_and(tail, conj, k)),
+/// Iteratively enumerate the top-level Cartesian DNF rows of `f` in TLC's
+/// `LNConj.toDNF` order (first `Or` varies slowest, last `Or` varies fastest;
+/// conjuncts within a row appear in `And` order), using an explicit heap work
+/// stack so wide flat conjunctions take `O(1)` call-stack depth. `visit`
+/// returning `false` stops early and returns `false`; otherwise returns `true`.
+pub(crate) fn each_cartesian_row<'a, T>(
+    f: &'a T,
+    classify: impl Fn(&'a T) -> Node<'a, T>,
+    visit: &mut dyn FnMut(&[&'a T]) -> bool,
+) -> bool {
+    struct Choice<'a, T> {
+        rest: &'a [T],
+        conj_len: usize,
+        todo: Vec<&'a [T]>,
+    }
+    let mut conj: Vec<&'a T> = Vec::new();
+    let mut todo: Vec<&'a [T]> = vec![std::slice::from_ref(f)];
+    let mut choices: Vec<Choice<'a, T>> = Vec::new();
+    loop {
+        while let Some(top) = todo.last_mut() {
+            let head = &top[0];
+            *top = &top[1..];
+            if top.is_empty() {
+                todo.pop();
+            }
+            match classify(head) {
+                Node::And(xs) => {
+                    if !xs.is_empty() {
+                        todo.push(xs);
+                    }
+                }
+                Node::Or(xs) => {
+                    if xs.is_empty() {
+                        todo.clear();
+                        if let Some(mut ch) = choices.pop() {
+                            conj.truncate(ch.conj_len);
+                            todo = ch.todo;
+                            let next = &ch.rest[0];
+                            if ch.rest.len() > 1 {
+                                ch.rest = &ch.rest[1..];
+                                choices.push(Choice { rest: ch.rest, conj_len: ch.conj_len, todo: todo.clone() });
+                            }
+                            todo.push(std::slice::from_ref(next));
+                        } else {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if xs.len() > 1 {
+                        choices.push(Choice { rest: &xs[1..], conj_len: conj.len(), todo: todo.clone() });
+                    }
+                    todo.push(std::slice::from_ref(&xs[0]));
+                }
+                Node::Leaf => conj.push(head),
+            }
+        }
+        if !visit(conj.as_slice()) {
+            return false;
+        }
+        let Some(mut ch) = choices.pop() else {
+            return true;
+        };
+        conj.truncate(ch.conj_len);
+        todo = ch.todo;
+        let next = &ch.rest[0];
+        if ch.rest.len() > 1 {
+            ch.rest = &ch.rest[1..];
+            choices.push(Choice { rest: ch.rest, conj_len: ch.conj_len, todo: todo.clone() });
+        }
+        todo.push(std::slice::from_ref(next));
     }
 }
 
@@ -234,12 +317,11 @@ mod tests {
 
     fn each_disjunct_collect(f: &Ltl) -> Vec<Vec<Ltl>> {
         let mut rows = Vec::new();
-        let mut conj = Vec::new();
-        let mut visit = |c: &[Ltl]| -> bool {
-            rows.push(c.to_vec());
+        let mut visit = |c: &[&Ltl]| -> bool {
+            rows.push(c.iter().copied().cloned().collect());
             true
         };
-        assert!(each_disjunct(f, &mut conj, &mut visit));
+        assert!(each_cartesian_row(f, classify_ltl, &mut visit));
         rows
     }
 
@@ -317,26 +399,24 @@ mod tests {
         for n in 12..=16usize {
             let f = product(n);
             let (mut visits, mut max_len, mut min_len) = (0usize, 0usize, usize::MAX);
-            let mut conj = Vec::new();
-            let mut visit = |c: &[Ltl]| -> bool {
+            let mut visit = |c: &[&Ltl]| -> bool {
                 visits += 1;
                 max_len = max_len.max(c.len());
                 min_len = min_len.min(c.len());
                 true
             };
-            assert!(each_disjunct(&f, &mut conj, &mut visit));
+            assert!(each_cartesian_row(&f, classify_ltl, &mut visit));
             assert_eq!(visits, 1 << n, "disjuncts of the {n}-way product");
             assert_eq!((min_len, max_len), (n, n), "each disjunct has exactly the {n} conjuncts");
-            assert!(conj.is_empty(), "the accumulator is empty again after the traversal");
 
             // A visit that returns false stops immediately, which is what
             // `needs_cycle_conditions` relies on to stop at the first witness.
             let mut early = 0usize;
-            let mut visit = |_: &[Ltl]| -> bool {
+            let mut visit = |_: &[&Ltl]| -> bool {
                 early += 1;
                 early < 3
             };
-            assert!(!each_disjunct(&f, &mut conj, &mut visit));
+            assert!(!each_cartesian_row(&f, classify_ltl, &mut visit));
             assert_eq!(early, 3);
 
             // The eager DNF the refactor removed materialized all 2^n rows,
@@ -366,6 +446,18 @@ mod tests {
         // /\ (¬p0 \/ ¬p1) x (¬p1 \/ ¬p0) stay distinct.
         let swapped = Ltl::Or(vec![Ltl::And(vec![p(0), p(1)]), Ltl::And(vec![p(1), p(0)])]);
         assert_eq!(branches([&swapped]), 4);
+        // Mixed `pem \/ ordinary_atom` keeps both the empty tableau key and
+        // the atom's tableau key, matching the eager oracle.
+        let mixed = Ltl::Or(vec![Ltl::And(vec![eventually(always(p(0))), p(1)]), eventually(p(2))]);
+        assert_eq!(branches([&mixed]), branches_one_eager(&mixed));
+        assert_eq!(branches([&mixed]), 2);
+        // Deep mixed chain with PEM siblings at every layer and one ordinary
+        // atom at the bottom runs in linear time without quadratic re-scans.
+        let mut chain = p(0);
+        for i in 0..2_000u32 {
+            chain = Ltl::Or(vec![eventually(always(p(i % 8))), chain]);
+        }
+        assert_eq!(branches([&chain]), 1);
         // No properties: the folded conjunction is TRUE, one branch.
         assert_eq!(branches([]), 1);
     }

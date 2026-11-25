@@ -834,19 +834,72 @@ public class %s extends ModelCheckerTestCase {
             f.write('@Ignore public class Susp extends PCalModelCheckerTestCase { public Susp() { super("P", "pcal", new String[] { "-wf" }); } }\n')
         with open(os.path.join(tmp, "test", "a", "Lit.java"), "w") as f:
             f.write('public class Lit extends ModelCheckerTestCase { public Lit() { super("L", new String[] { ARG, "-x" }); } }\n')
+        with open(os.path.join(tmp, "test", "a", "Sep.java"), "w") as f:
+            f.write('public class Sep extends ModelCheckerTestCase { public Sep() { super("S", new String[] { "-dumpTrace", "json", "states" + File.separator + "S.json" /* comment */ }); } }\n')
+        with open(os.path.join(tmp, "test", "a", "DynPath.java"), "w") as f:
+            f.write('public class DynPath extends ModelCheckerTestCase { public DynPath() { super("D", new String[] { "-dumptrace", "tlcaction", "states" + FileUtil.separator + DynPath.class.getCanonicalName() + ".tla" }); } }\n')
+        with open(os.path.join(tmp, "test", "a", "QuotedDelims.java"), "w") as f:
+            f.write('public class QuotedDelims extends ModelCheckerTestCase { public QuotedDelims() { super("Q", new String[] { /* skip */ "-config", "a/*literal*/b.cfg", "{x,y}", "p\\tq\\"r\\\\s" // end\n }, ExitStatus.VIOLATION_SAFETY); } }\n')
+        with open(os.path.join(tmp, "test", "a", "BadEsc.java"), "w") as f:
+            f.write('public class BadEsc extends ModelCheckerTestCase { public BadEsc() { super("B", new String[] { "\\u0041" }); } }\n')
+        with open(os.path.join(tmp, "test", "a", "SubSep.java"), "w") as f:
+            f.write('public class SubSep extends ModelCheckerTestCase { public SubSep() { super("Spec", "dir" + File.separator + "sub", new String[] {"-config", "X.cfg"}, ExitStatus.VIOLATION_SAFETY); } }\n')
+        with open(os.path.join(tmp, "test", "a", "BadExit.java"), "w") as f:
+            f.write('public class BadExit extends ModelCheckerTestCase { public BadExit() { super("Spec", "dir" + dyn(), new String[] {"-config", "X.cfg"}, computeExit()); } }\n')
+        with open(os.path.join(tmp, "test", "a", "CommentedSuper.java"), "w") as f:
+            f.write('/** Uses a different overload from super(). */\n// super("Old")\n/* super("Other") */\npublic class CommentedSuper extends ModelCheckerTestCase { static class Helper { Helper() { super(); } } static final String TB = """\n    super("Wrong", new String[] {"-simulate"})\n    """; public CommentedSuper() { String s = "super(\\"Quoted\\")"; super("Clock", new String[] { "-config", "Clock.cfg" }); } }\n')
+        with open(os.path.join(tmp, "test", "a", "UnicodeComment.java"), "w") as f:
+            f.write('public class UnicodeComment extends ModelCheckerTestCase { public UnicodeComment() { super("Clock", new String[] { "-config", // config \\u000a "Clock.cfg"\n }); } }\n')
         with open(os.path.join(tmp, "test", "a", "Test7.java"), "w") as f:
-            f.write('public class Test7 extends SuiteTestCase { public Test7() { super("10", "7", "0"); } }\n')
+            f.write('public class Test7 extends SuiteTestCase { /* super("99", "98", "97"); */ public Test7() { super("10", "7", "0"); } }\n')
+        with open(os.path.join(tmp, "test", "a", "Test17.java"), "w") as f:
+            f.write('public class Test17 extends SuiteTestCase { public Test17() { super("7", "2", "0", "1", "line 101: 0\\n" + "line 102: 0"); } }\n')
+        with open(os.path.join(tmp, "test", "a", "Test18.java"), "w") as f:
+            f.write('public class Test18 extends SuiteTestCase { public Test18() { super("14", "1", "0", "1"); } }\n')
+        with open(os.path.join(tmp, "test", "a", "TestDefault.java"), "w") as f:
+            f.write('public class TestDefault extends SuiteTestCase { }\n')
+        with open(os.path.join(tmp, "test", "a", "TestBadSuite.java"), "w") as f:
+            f.write('public class TestBadSuite extends SuiteTestCase { public TestBadSuite() { super(dyn(), "1", "0", "1"); } }\n')
+        with open(os.path.join(tmp, "test", "a", "ETestSim.java"), "w") as f:
+            f.write('public class ETestSim extends SuiteETestCase { public ETestSim() { super(new String[]{"-simulate"}, ExitStatus.ERROR /*comment*/); } }\n')
 
     def test_extract_cases(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.tree(tmp)
             cases = {c["cls"]: c for c in tlcsuite.extract_cases(tmp)}
-        self.assertEqual(sorted(cases), ["Lit", "OneTest", "Susp", "Test7", "b.Dup", "c.Dup"])
+        self.assertEqual(sorted(cases), ["BadEsc", "BadExit", "CommentedSuper", "DynPath", "ETestSim", "Lit", "OneTest", "QuotedDelims", "Sep", "SubSep", "Susp", "Test17", "Test18", "Test7", "TestBadSuite", "TestDefault", "UnicodeComment", "b.Dup", "c.Dup"])
         one = cases["OneTest"]
         self.assertEqual((one["spec"], one["path"], one["args"], one["exit"], one["deadlock"]), ("Spec", "dir", ["-config", "X.tla", "-workers", "1"], "VIOLATION_SAFETY", True))
         self.assertEqual(one["stats"], [["10", "7", "0"]])
-        self.assertTrue(cases["Susp"]["ignored"] and cases["Lit"]["nonlit"])
-        self.assertEqual((cases["Test7"]["spec"], cases["Test7"]["path"], cases["Test7"]["stats"]), ("test7", "suite", [["10", "7", "0"]]))
+        self.assertTrue(
+            cases["Susp"]["ignored"]
+            and cases["Lit"]["nonlit"]
+            and cases["DynPath"]["nonlit"]
+            and cases["BadEsc"]["nonlit"]
+            and cases["BadExit"]["nonlit"]
+            and cases["UnicodeComment"]["nonlit"]
+            and cases["TestBadSuite"]["nonlit"]
+        )
+        self.assertEqual((cases["Sep"]["nonlit"], cases["Sep"]["args"]), (False, ["-dumpTrace", "json", "states/S.json"]))
+        self.assertEqual(
+            (cases["CommentedSuper"]["nonlit"], cases["CommentedSuper"]["spec"], cases["CommentedSuper"]["args"]),
+            (False, "Clock", ["-config", "Clock.cfg"]),
+        )
+        self.assertEqual(
+            (cases["SubSep"]["nonlit"], cases["SubSep"]["path"], cases["SubSep"]["args"], cases["SubSep"]["exit"]),
+            (False, "dir/sub", ["-config", "X.cfg"], "VIOLATION_SAFETY"),
+        )
+        self.assertEqual(
+            (cases["QuotedDelims"]["nonlit"], cases["QuotedDelims"]["args"], cases["QuotedDelims"]["exit"]),
+            (False, ["-config", "a/*literal*/b.cfg", "{x,y}", 'p\tq"r\\s'], "VIOLATION_SAFETY"),
+        )
+        self.assertEqual((cases["Test7"]["nonlit"], cases["Test7"]["spec"], cases["Test7"]["path"], cases["Test7"]["stats"]), (False, "test7", "suite", [["10", "7", "0"]]))
+        self.assertEqual((cases["Test17"]["nonlit"], cases["Test17"]["stats"]), (False, [["7", "2", "0"]]))
+        self.assertEqual((cases["Test18"]["nonlit"], cases["Test18"]["stats"]), (False, [["14", "1", "0"]]))
+        self.assertEqual((cases["TestDefault"]["nonlit"], cases["TestDefault"]["stats"]), (False, [["2", "1", "0"]]))
+        self.assertEqual((cases["ETestSim"]["nonlit"], cases["ETestSim"]["args"], cases["ETestSim"]["exit"], cases["ETestSim"]["stats"]), (False, ["-simulate"], "ERROR", []))
+        self.assertTrue(tlcsuite.junit_agrees(cases["ETestSim"], {"result": "error", "exit": 255}))
+        self.assertFalse(tlcsuite.junit_agrees(cases["ETestSim"], {"result": "success", "exit": 0}))
 
     def test_prepare_skips_and_inline_config(self):
         with tempfile.TemporaryDirectory() as tmp:
