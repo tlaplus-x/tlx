@@ -73,6 +73,7 @@ fn write_install_read_in_order() {
                 assert_eq!(got, want, "{cfg:?} w={w} encoded={encoded}");
                 assert_eq!(q.unclaimed(), 0);
                 drop(prev);
+                q.mem().clear_pool();
                 assert_eq!(q.mem().bytes(), 0);
             }
         }
@@ -122,6 +123,7 @@ fn concurrent_claims() {
                 }
             });
             assert!(seen.iter().all(|c| c.load(Ordering::Relaxed) == 1), "{cfg:?} encoded={encoded}");
+            q.mem().clear_pool();
             assert_eq!(q.mem().bytes(), 0);
         }
     }
@@ -167,6 +169,7 @@ fn claims_take_parts_of_blocks() {
             assert_eq!(smallest, 1, "claims of parts of blocks: {cfg:?} encoded={encoded}");
             assert_eq!(q.unclaimed(), 0);
             drop(prev);
+            q.mem().clear_pool();
             assert_eq!(q.mem().bytes(), 0);
         }
     }
@@ -309,6 +312,7 @@ fn spilled_levels_read_back_in_order() {
             let c = sp.counters();
             // (Not the first segments of a level: read first.)
             assert!(q.spilled_segments() > 2 && c.read > 0, "{kinds:?} {seg_bytes}: {c:?}");
+            q.mem().clear_pool();
             assert_eq!(q.mem().bytes(), 0);
             assert_eq!(c.used, 0, "disk space given back");
             assert!(sp.error().is_none());
@@ -383,6 +387,7 @@ fn concurrent_claims_of_spilled_segments() {
         });
         assert!(seen.iter().all(|c| c.load(Ordering::Relaxed) == 1), "{kinds:?}");
         assert!(q.spilled_segments() > 0 && sp.counters().read > 0, "{kinds:?}");
+        q.mem().clear_pool();
         assert_eq!(q.mem().bytes(), 0);
         assert!(sp.error().is_none());
     }
@@ -493,6 +498,7 @@ fn pending_and_failed_writes_stay_charged_in_queue_mem() {
     q_slow.install();
     let mut next = 160;
     assert_eq!(read_level(&q_slow, &mut wr, &mut prev, &mut next, false), (0..160).collect::<Vec<_>>());
+    q_slow.mem().clear_pool();
     assert_eq!(q_slow.mem().bytes(), 0);
 
     // 2. Failed async writes keep their retained buffers charged until consumed.
@@ -517,6 +523,7 @@ fn pending_and_failed_writes_stay_charged_in_queue_mem() {
     q_fail.install();
     let mut next = 200;
     assert_eq!(read_level(&q_fail, &mut wr, &mut prev, &mut next, false), (0..200).collect::<Vec<_>>());
+    q_fail.mem().clear_pool();
     assert_eq!(q_fail.mem().bytes(), 0);
 }
 

@@ -108,7 +108,8 @@ Details that matter:
 
 `relieve` (`explore/mod.rs`) runs once at the start of the search and then every 50 ms from the monitor.
 When over budget, the stages are applied in this order, at most one more stage per cycle, so that the next
-RSS sample shows the effect of the previous one:
+RSS sample shows the effect of the previous one. Before escalating, `relieve` and fingerprint-set
+growth drain idle queue segment buffers and resample memory after returning it to the allocator:
 
 | Stage | Component | Action | Why this order |
 |---|---|---|---|
@@ -329,8 +330,9 @@ list (cache locality), then from others in order; this replaces the work-stealin
 level synchronization, cheaper, order-preserving). At the end of a level, with several workers, a claim
 takes only the tail of a block (about remaining/(2 x workers) records, guided self-scheduling); XOR blocks
 are claimed whole. With one worker there is one list and the order is exactly FIFO. Segment buffers are
-pooled (at most 64) to avoid page-fault and `madvise` costs. `LiveStats::queue` is unexpanded states of the
-current level plus the next level.
+pooled (at most 64) to avoid page-fault and `madvise` costs. Their retained capacity stays charged to
+the frontier budget until reused or freed; memory pressure drains the idle pool before spilling.
+`LiveStats::queue` is unexpanded states of the current level plus the next level.
 
 ### 5.3 Spilling and read-ahead
 
