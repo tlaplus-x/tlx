@@ -836,7 +836,7 @@ class SuiteCheck(unittest.TestCase):
                 })
                 oracle.assert_called_once_with(ids, stage=stage)
                 scale.assert_called_once_with(["scaled"])
-                examples.assert_called_once_with(float("inf"))
+                examples.assert_called_once_with(float("inf"), include_invalid=True)
 
     def test_suite_check_succeeds_without_third_party_external_or_examples(self):
         import corpus
@@ -1028,6 +1028,34 @@ class SuiteCheck(unittest.TestCase):
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 1, output)
             self.assertIn("ext/retired/Model", output)
+
+    def test_suite_check_resolves_invalid_upstream_entries_without_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout_fixture(tmp)
+            ids = {"ewd998/EWD998ChanID_export", "ewd998/EWD998ChanID_shiviz"}
+            spec_dir = os.path.join(root, "third_party", "Examples", "specifications", "ewd998")
+            os.makedirs(spec_dir)
+            write(os.path.join(spec_dir, "manifest.json"), json.dumps({
+                "modules": [{
+                    "path": "specifications/ewd998/EWD998ChanID.tla",
+                    "models": [{"path": f"specifications/{mid}.cfg",
+                                "mode": "exhaustive search", "runtime": "00:00:01"}
+                               for mid in sorted(ids)],
+                }],
+            }))
+            # Use the actual tracked entries, including their frozen expectations.
+            manifest = os.path.join(root, "bench", "suite.json")
+            with open(manifest) as source:
+                man = json.load(source)
+            man["models"] = [m for m in man["models"] if m["id"] in ids]
+            self.assertEqual({m["id"] for m in man["models"]}, ids)
+            write(manifest, json.dumps(man))
+            self.assertFalse(os.path.exists(os.path.join(root, "corpus", "out")))
+            result = self._run_suite_check_cli(root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("2 models,", output)
+            self.assertNotIn("corpus resolution skipped", output)
 
     def test_suite_check_cli_accepts_generated_examples_model_without_oracle(self):
         with tempfile.TemporaryDirectory() as tmp:

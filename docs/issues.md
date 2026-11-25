@@ -61,12 +61,6 @@ but both reached the 600-second warm-up limit with no timed samples in the
 [post-fix validation](research/post-fix-validation.md). Their large enumerations still
 need optimization or a documented larger resource bound; neither is a completed timing.
 
-## Incomplete upstream EWD998 examples
-
-The upstream examples `ewd998/EWD998ChanID_export` and `ewd998/EWD998ChanID_shiviz` are incomplete:
-`MCInit` leaves `passes` unassigned. TLC and tlx both reject them. They need corrected examples or
-explicit classification as invalid inputs, rather than an engine fix.
-
 ## Measurement quality and high-speedup validation
 
 Four frozen default-mode configurations have a sample range divided by the median above 25%:

@@ -70,6 +70,13 @@ MODEL_INPUTS = {"ewd998/EWD998ChanTrace": ("specifications/ewd998/EWD998ChanTrac
 # `-fp 0` order deterministically, so the oracle row of such a model is taken
 # there (the timing baselines keep their own, unchanged collection).
 TLC_ORACLE_ARGS = {"ewd998/EWD998ChanTrace": ["-fp", "0"]}
+# Known-invalid upstream configurations, excluded from default listing and collection.
+# Keep exact configuration ids: other EWD998 models remain eligible. Remove an
+# entry only after the upstream initialization is corrected and revalidated.
+INVALID_UPSTREAM_MODELS = {
+    "ewd998/EWD998ChanID_export": "invalid upstream input: MCInit leaves passes unassigned; rejected by TLC and tlx",
+    "ewd998/EWD998ChanID_shiviz": "invalid upstream input: MCInit leaves passes unassigned; rejected by TLC and tlx",
+}
 
 
 def secs(rt):
@@ -137,6 +144,9 @@ def by_id(models, only):
     ids = [i for i in only.split(",") if i] if isinstance(only, str) else list(only)
     if not ids:
         return models
+    invalid = [f"{i}: {INVALID_UPSTREAM_MODELS[i]}" for i in ids if i in INVALID_UPSTREAM_MODELS]
+    if invalid:
+        raise SystemExit("--ids: " + "; ".join(invalid))
     unknown = [i for i in ids if i not in {m["id"] for m in models}]
     if unknown:
         raise SystemExit("--ids: not in this selection (see `list`; a model outside the tier's runtime "
@@ -144,7 +154,8 @@ def by_id(models, only):
     return [m for m in models if m["id"] in ids]
 
 
-def models(max_runtime, min_runtime=0):
+def models(max_runtime, min_runtime=0, *, include_invalid=False):
+    """Select Examples models; benchmark manifest resolution may include invalid inputs."""
     res = []
     for mf in sorted(glob.glob(os.path.join(EX, "specifications", "*", "manifest.json"))):
         with open(mf) as stream:
@@ -171,6 +182,9 @@ def models(max_runtime, min_runtime=0):
                 if not min_runtime <= secs(runtime) <= max_runtime:
                     continue
                 model_id = m["path"].removeprefix("specifications/").removesuffix(".cfg")
+                if not include_invalid and model_id in INVALID_UPSTREAM_MODELS:
+                    print(f"excluded {model_id}: {INVALID_UPSTREAM_MODELS[model_id]}", file=sys.stderr)
+                    continue
                 res.append({
                     "id": model_id,
                     "tla": os.path.join(EX, mod["path"]),

@@ -355,6 +355,17 @@ interrupted run keeps what finished. TLC is run by `scripts/tlc.py` (also usable
 `scripts/tlc.py SPEC.tla -config X.cfg -workers 1` prints JSON statistics), with its state
 directory under `target/tlc-states/<pid>`.
 
+`corpus.INVALID_UPSTREAM_MODELS` explicitly excludes `ewd998/EWD998ChanID_export` and
+`ewd998/EWD998ChanID_shiviz`: their upstream `MCInit` leaves `passes` unassigned, so both TLC
+and tlx reject them. Listing and collection report the exclusion reason on stderr when those
+configurations fall within the selected runtime bounds. They are also excluded from shared
+oracle selection, even if old cached results exist; requesting either id explicitly reports
+the invalid-input reason. Other EWD998 configurations remain eligible. Remove these exclusions
+only after upstream initialization is corrected and revalidated; historical benchmark records
+remain unchanged. The benchmark suite resolver uses the full manifest for its explicitly
+declared entries, including these invalid inputs and their historical expectations; the
+exclusions apply to ordinary corpus and oracle selection.
+
 `--ids A,B` selects exact ids inside the tier's runtime bounds. It exists for a row whose
 well-formed result a staging or path fix changes: such a row is not an "error" row, so
 `--only-failed` leaves it in place, and the shared `corpus/out/tlc.json` copied into a worktree
