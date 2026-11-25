@@ -1,0 +1,169 @@
+{
+  "diagnostic": true,
+  "complete": false,
+  "date": "2026-11-24",
+  "platform": "Linux x86_64 shared workstation",
+  "source_base": "898db364baa35ecd8d8eb19187eaaf166a547ac7",
+  "source_change": "stable-library adaptive observations and on-demand host-region reporting",
+  "binary_profile": "test-release",
+  "binary_sha256": "af374f6d9f9c5f245871b9e0215af30cb588807a290e11e1748f6027db576eac",
+  "model": "ext/vanlightly-kafka/kafka_replication_v3_5",
+  "upstream_revision": "823615e8a096",
+  "args": [
+    "-compile",
+    "-tlc",
+    "-workers",
+    "1",
+    "-maxmem",
+    "512",
+    "-stats",
+    "json=stats.json"
+  ],
+  "native_sync": false,
+  "cache": "uncontrolled; native -O2 cache hit observed; prior diagnostic attempts used the same model",
+  "timeout_s": 20,
+  "grace_s": 5,
+  "exit_code": 143,
+  "interrupted": true,
+  "phases": {
+    "front end (parse, sema, cfg)": 0.281743,
+    "auto symmetry analysis": 0.000184,
+    "pre-run": 1.013537,
+    "pre-run states": 4301,
+    "IR lowering": 1.841591,
+    "IR verification": 0.434129,
+    "C generation": 1.940082,
+    "host regions": 4715,
+    "C source bytes": 9120234,
+    "C build -O2": 0.027107,
+    "C build -O2 cache": "hit",
+    "native -O2 load": 0.000434,
+    "native -O2 ready at (since start)": 7.458898,
+    "state words": 903,
+    "model build (lowering, C generation)": 6.898035,
+    "model builds": 4,
+    "initial states": 0.001127,
+    "search": 9.436283,
+    "search runs": 3,
+    "search runs stopped resumable": 3,
+    "fpset slots": 1048576,
+    "fpset entries": 43698,
+    "fpset load": "4.17%",
+    "fpset limit (slots)": 67108864,
+    "restarts (layout miss)": 3,
+    "JIT compile": 2.281234,
+    "JIT code bytes": 2680130,
+    "native JIT ready at (since start)": 18.110873,
+    "resumed searches": 2,
+    "states re-encoded": 4383,
+    "re-encoding": 0.295355,
+    "states expanded again (layout restarts, resumes)": 1982,
+    "total": 19.995519
+  },
+  "counters": {
+    "units": 25236,
+    "sampled_units": 3156,
+    "generated": 171696,
+    "fp_inserts": 171696,
+    "fp_new": 47754,
+    "fp_probes": 2985,
+    "encodes": 21071,
+    "decodes": 19009,
+    "fingerprints": 0,
+    "traces": 0,
+    "def_evals": 1520356,
+    "def_evals_primed": 0
+  },
+  "units_time_est_s": 9.948783,
+  "host_calls": 1802965,
+  "host_time_s": 1.198044074,
+  "top_host_regions": [
+    {
+      "function": "ReceiveBrokerRegResponse",
+      "operation": "Var",
+      "arguments": [],
+      "calls": 41808,
+      "time_s": 0.11129173
+    },
+    {
+      "function": "ReceiveMetadataUpdate",
+      "operation": "ValOp >",
+      "arguments": [
+        "Val",
+        "Int"
+      ],
+      "calls": 157782,
+      "time_s": 0.10703132800000002
+    },
+    {
+      "function": "ReceiveMetadataUpdate",
+      "operation": "ValOp \\in",
+      "arguments": [
+        "Int",
+        "Val"
+      ],
+      "calls": 273142,
+      "time_s": 0.099021819
+    },
+    {
+      "function": "SendAlterPartitionRequest",
+      "operation": "Interp Record",
+      "arguments": [
+        "Set bitset(6) of Int 0..5",
+        "Set bitset(6) of Int 0..5"
+      ],
+      "calls": 12943,
+      "time_s": 0.088470462
+    },
+    {
+      "function": "ReceiveMetadataUpdate",
+      "operation": "Interp Record",
+      "arguments": [
+        "Union(2 arms)",
+        "Int"
+      ],
+      "calls": 58360,
+      "time_s": 0.08821251
+    },
+    {
+      "function": "ReceiveBrokerRegResponse",
+      "operation": "Interp Except",
+      "arguments": [
+        "Val"
+      ],
+      "calls": 6094,
+      "time_s": 0.040635912
+    },
+    {
+      "function": "ReceiveMetadataUpdate",
+      "operation": "Eq",
+      "arguments": [
+        "Val",
+        "Int"
+      ],
+      "calls": 154653,
+      "time_s": 0.040502957
+    },
+    {
+      "function": "ReceiveBrokerRegResponse",
+      "operation": "Eq",
+      "arguments": [
+        "Val",
+        "Val"
+      ],
+      "calls": 59797,
+      "time_s": 0.04006339
+    }
+  ],
+  "adaptive_observations": 93,
+  "adaptive_choices": {
+    "undecided": 62,
+    "mixed_native": 15,
+    "fallback": 16
+  },
+  "adaptive_samples": 6528,
+  "adaptive_libraries": {
+    "optimized": 62,
+    "quick": 31
+  }
+}

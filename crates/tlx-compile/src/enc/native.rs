@@ -107,6 +107,15 @@ impl Native {
         self.opt.get().or_else(|| self.quick.get())
     }
 
+    /// Stable identity of the selected write-once library slot within a model.
+    pub(super) fn lib_slot(&self) -> Option<usize> {
+        if self.opt.get().is_some() {
+            Some(2)
+        } else {
+            self.quick.get().map(|_| 1)
+        }
+    }
+
     /// This model follows a layout-miss restart (see `at_exit_build`).
     pub(super) fn set_restarted(&self) {
         self.restarted.store(true, Ordering::Relaxed);

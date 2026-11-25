@@ -161,7 +161,30 @@ fn block_termination_signals() -> libc::sigset_t {
     }
 }
 
-/// Wait for SIGINT/SIGTERM on a dedicated thread and, on one, remove the
+// Exit ownership is claimed before signal reporting can block on the normal
+// writer. Normal termination commits only after reporting and the eval-thread
+// join; if sigwait already claimed a signal, that thread owns cleanup and exit.
+#[cfg(unix)]
+static EXIT_OWNER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Commit normal process termination, or let an already claimed signal finish.
+pub(crate) fn finish_exit() {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::Ordering;
+        if let Err(signal) = EXIT_OWNER.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire) {
+            if signal > 0 {
+                // The signal thread calls _exit after reporting and cleanup.
+                loop {
+                    std::thread::park();
+                }
+            }
+        }
+    }
+}
+
+/// Wait for SIGINT/SIGTERM on a dedicated thread and, on one, report partial
+/// statistics if requested and remove the
 /// spill directory this process created (the normal end of a run removes
 /// the same directory) and exit with the conventional status (128 +
 /// signal). With no spill directory the cleanup is a no-op.
@@ -171,8 +194,31 @@ fn spawn_signal_thread(set: libc::sigset_t) {
         let mut sig: libc::c_int = 0;
         // SAFETY: `sigwait` writes the signal number into `sig`.
         if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
-            for d in tlx_runtime::io::cleanup_dir_on_signal() {
-                eprintln!("tlx: the checkpoint in {} is kept; continue the run with -recover {}", d.display(), d.display());
+            use std::sync::atomic::Ordering;
+            if EXIT_OWNER.compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                // Normal exit has already committed; no report/cleanup is pending.
+                return;
+            }
+            // Darwin sends a pipe-write SIGPIPE to the process, so masking
+            // only the writer cannot protect other threads. Once shutdown is
+            // claimed, ignore it process-wide until _exit completes cleanup.
+            // SAFETY: setting a signal disposition has no preconditions; this
+            // path never returns to normal execution or restores SIGPIPE.
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+            bounded_output(crate::stats::interrupted);
+            let kept = tlx_runtime::io::cleanup_dir_on_signal();
+            if !kept.is_empty() {
+                bounded_output(move || {
+                    use std::io::Write;
+                    for d in kept {
+                        let _ = writeln!(
+                            std::io::stderr().lock(),
+                            "tlx: the checkpoint in {} is kept; continue the run with -recover {}",
+                            d.display(),
+                            d.display()
+                        );
+                    }
+                });
             }
             // SAFETY: `_exit` ends the process at once; the cleanup is
             // done and no other thread is relied on.
@@ -180,6 +226,35 @@ fn spawn_signal_thread(set: libc::sigset_t) {
         }
     })
     .expect("failed to spawn the signal thread");
+}
+
+/// Reporting must not hold shutdown hostage to a lock or a full pipe. The
+/// helper may remain blocked; _exit ends it after the signal thread cleans up.
+#[cfg(unix)]
+fn bounded_output(f: impl FnOnce() + Send + 'static) {
+    let (done, wait) = std::sync::mpsc::channel();
+    let writer = tlx_base::stack::spawn(std::thread::Builder::new().name("tlx-final-output".into()), move || {
+        f();
+        let _ = done.send(());
+    });
+    if writer.is_ok() {
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Used by the exiting evaluation thread. No caller resumes search. Claimed
+/// signal shutdown separately ignores SIGPIPE process-wide for Darwin.
+pub(crate) fn block_report_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: the initialized set is live for each call; pthread_sigmask
+    // changes only this thread's mask. The thread exits without restoring it,
+    // so a pending write-generated SIGPIPE cannot escape during shutdown.
+    unsafe {
+        let mut pipes: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut pipes);
+        libc::sigaddset(&mut pipes, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &pipes, std::ptr::null_mut());
+    }
 }
 
 #[cfg(test)]

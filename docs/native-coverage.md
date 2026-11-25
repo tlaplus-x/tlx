@@ -116,9 +116,11 @@ completion pass then measured it at a 900 s bound. The configurations without
 data are therefore a mixture of search spaces no bound in this record reaches
 and collection the census could not complete, and the size of the TLC oracle's
 own run is the only guide to which is which.
-The current CLI exits directly after signal cleanup, without final counters.
-A five-second TERM grace in current tooling permits spill cleanup but cannot
-recover partial statistics; a real-engine timeout regression checks this gap.
+At the time of this census the CLI exited after signal cleanup without counters.
+Current builds emit best-effort interrupted statistics during TERM grace, including
+active-worker and host-region snapshots. The census preserves these as partial
+evidence, never as completed measurements; see [configuration.md](configuration.md)
+for snapshot and adaptive-tier metadata semantics.
 
 The tooling that produced this record labels `Call` roots with their callee and
 anonymous applied operators with their source position (`Interp apply-def
@@ -343,6 +345,8 @@ effect on `bench/FlexibleRaftReduced5`; a single configuration's host share is
 therefore not by itself evidence of a regression or of a pass. Read a
 configuration near the line with an uninstrumented benchmark, and treat a
 census that does not record each function's chosen tier as inconclusive for it.
+Current stats and dynamic census output preserve per-worker adaptive decisions and
+sample timings; the historical rows above predate that metadata.
 
 ### Configurations without a dynamic measurement (M)
 
@@ -526,8 +530,8 @@ supports now, in order of the interpreter time it can move:
    decide" shows their verdict is set by `TLX_MIXED_ADAPT` and by the platform,
    not by the program: one binary and one spec read 11.9% locally and 24.4% in
    this census, and 66.7% with the adaptive tier off. `coverage --dynamic`
-   should record every function's chosen tier in `-stats` (or run with the tier
-   fixed), and each of those four should be re-read on a quiet machine with
+   now preserves adaptive choices from `-stats`; each of those four still needs
+   to be re-read with that metadata (or a fixed tier) on a quiet machine with
    `bench.py ab` before any of them is called a regression: their
    `ValOp > [Val, Int]`, `ValOp \in`, `@@` and `DOMAIN` rows are the rows whose
    region-entry counts move by up to 3.7x on `standard-raft-Raft` while the

@@ -115,7 +115,7 @@ pub struct RegionTable {
     /// Per region: evaluations, failed ones and nanoseconds spent (counted
     /// with `-stats`, by the thread in `TALLY` and added here after each
     /// native call).
-    counts: Vec<[AtomicU64; 6]>,
+    counts: Arc<[[AtomicU64; 6]]>,
 }
 
 /// The evaluations of the calling thread's current native call, per region
@@ -268,25 +268,49 @@ impl RegionTable {
         out
     }
 
-    /// Lossless census rows; unlike the human report, operation names and
-    /// argument shapes are neither truncated nor parsed back from prose.
-    pub fn report_json(&self, typing: &Typing) -> String {
-        let rows: Vec<_> = self.regions.iter().enumerate().map(|(rid, r)| {
-            let (operation, arguments) = {
-                    let mut root = &r.expr;
-                    loop { match &*root.kind {
+    /// Prepare immutable census metadata once and retain only the atomic
+    /// counters. The callback does not retain the model, IR or native libraries,
+    /// and serialization never runs inside a sampled native evaluation.
+    pub fn json_source(&self, typing: &Typing) -> impl Fn() -> String + Send + Sync + 'static {
+        let prefixes: Vec<_> = self
+            .regions
+            .iter()
+            .enumerate()
+            .map(|(rid, r)| {
+                let mut root = &r.expr;
+                loop {
+                    match &*root.kind {
                         crate::ir::ExprKind::Convert(x) => root = x,
                         crate::ir::ExprKind::Let { body, .. } => root = body,
                         _ => break,
-                    } }
-                    crate::coverage::operation(root, typing)
-                };
-            let args = arguments.iter().map(|a| stats::json_string(a)).collect::<Vec<_>>().join(",");
-            format!("{{\"id\":{rid},\"function\":{},\"context\":{},\"operation\":{},\"arguments\":[{args}],\"calls\":{},\"errors\":{},\"time_s\":{:.9}}}",
-                stats::json_string(&r.info.func), stats::json_string(&format!("{:?}", r.ctx)), stats::json_string(&operation),
-                self.counts[rid][3].load(Ordering::Relaxed), self.counts[rid][4].load(Ordering::Relaxed), self.counts[rid][5].load(Ordering::Relaxed) as f64 / 1e9)
-        }).collect();
-        format!("[{}]", rows.join(","))
+                    }
+                }
+                let (operation, arguments) = crate::coverage::operation(root, typing);
+                let args = arguments.iter().map(|a| stats::json_string(a)).collect::<Vec<_>>().join(",");
+                format!(
+                    "{{\"id\":{rid},\"function\":{},\"context\":{},\"operation\":{},\"arguments\":[{args}]",
+                    stats::json_string(&r.info.func),
+                    stats::json_string(&format!("{:?}", r.ctx)),
+                    stats::json_string(&operation)
+                )
+            })
+            .collect();
+        let counts = self.counts.clone();
+        move || {
+            let rows: Vec<_> = prefixes
+                .iter()
+                .zip(counts.iter())
+                .map(|(prefix, counts)| {
+                    format!(
+                        "{prefix},\"calls\":{},\"errors\":{},\"time_s\":{:.9}}}",
+                        counts[3].load(Ordering::Relaxed),
+                        counts[4].load(Ordering::Relaxed),
+                        counts[5].load(Ordering::Relaxed) as f64 / 1e9
+                    )
+                })
+                .collect();
+            format!("[{}]", rows.join(","))
+        }
     }
 
     /// Region evaluations and time per state variable they read (current

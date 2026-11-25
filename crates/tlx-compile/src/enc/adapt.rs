@@ -23,6 +23,9 @@
 
 use std::cell::RefCell;
 
+mod report;
+pub(super) use report::publish as report;
+
 /// Calls of each path timed per sampling phase.
 const SAMPLES: u32 = 32;
 /// Calls run on the chosen path after a sampling phase: `RUN_FIRST` after
@@ -72,11 +75,12 @@ struct Tier {
     chosen: Option<bool>,
     /// Length of the last running phase.
     period: u32,
+    means: Option<(f64, f64)>,
 }
 
 impl Tier {
     fn new() -> Tier {
-        Tier { sampling: true, left: 2 * SAMPLES, native: true, samples: [Vec::new(), Vec::new()], chosen: None, period: 0 }
+        Tier { sampling: true, left: 2 * SAMPLES, native: true, samples: [Vec::new(), Vec::new()], chosen: None, period: 0, means: None }
     }
 
     /// A tier that first runs natively for `warm` calls (0: samples at
@@ -116,6 +120,9 @@ impl Tier {
         }
         let (n, f) = (trimmed_mean(&mut self.samples[0]), trimmed_mean(&mut self.samples[1]));
         self.native = n <= MARGIN * f;
+        if tlx_runtime::stats::on() {
+            self.means = Some((n, f));
+        }
         self.samples.iter_mut().for_each(Vec::clear);
         self.period = if self.chosen == Some(self.native) { (self.period * 4).min(RUN_MAX) } else { RUN_FIRST };
         self.chosen = Some(self.native);
@@ -172,18 +179,50 @@ fn with_tier<R>(model: u64, lib: usize, kind: usize, i: usize, warm: u32, f: imp
 /// `warm`: a new tier first runs natively for this many calls (see
 /// `WARM`).
 pub(super) fn choose(model: u64, lib: usize, kind: usize, i: usize, warm: u32) -> Choice {
-    with_tier(model, lib, kind, i, warm, Tier::choose)
+    with_tier(model, lib, kind, i, warm, |t| {
+        let choice = t.choose();
+        if tlx_runtime::stats::on() {
+            report::observe((model, lib, kind, i), t, None);
+        }
+        choice
+    })
 }
 
 /// A timed call (see `Choice::timed`) by path `native` took `ns`
 /// nanoseconds. Returns the path chosen if this ended a sampling phase.
 pub(super) fn record(model: u64, lib: usize, kind: usize, i: usize, native: bool, ns: u64) -> Option<bool> {
-    with_tier(model, lib, kind, i, 0, |t| t.record(native, ns))
+    with_tier(model, lib, kind, i, 0, |t| {
+        let chosen = t.record(native, ns);
+        if tlx_runtime::stats::on() {
+            report::observe((model, lib, kind, i), t, Some((native, ns, chosen)));
+        }
+        chosen
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_preserves_samples_and_library_decisions() {
+        tlx_runtime::stats::enable(1);
+        let model = (1 << 40) + 19;
+        for _ in 0..2 * SAMPLES {
+            let c = choose(model, 1, ACTION, 0, 0);
+            record(model, 1, ACTION, 0, c.native, if c.native { 300 } else { 100 });
+        }
+        report(model, ACTION, 0, "telemetry-test");
+        let json = tlx_runtime::stats::json();
+        assert!(json.contains("\"chosen\":\"fallback\""));
+        assert!(json.contains("\"sample_calls\":{\"mixed_native\":32,\"fallback\":32}"));
+        assert!(json.contains("\"sample_ns\":{\"mixed_native\":9600,\"fallback\":3200}"));
+        choose(model, 2, ACTION, 0, 0);
+        report(model, ACTION, 0, "telemetry-test");
+        let json = tlx_runtime::stats::json();
+        assert_eq!(json.matches("\"name\":\"telemetry-test\"").count(), 2);
+        assert!(tlx_runtime::stats::text().contains("chosen fallback; samples mixed_native=32"));
+    }
 
     /// Run `n` calls where native calls take `nat` ns and fallback calls
     /// `fb` ns; returns the number of native calls.

@@ -29,6 +29,35 @@ completion or performance on the original benchmark configuration.
 | `ext/vanlightly-kafka/kafka_replication_v3_5`, compiled 16 workers and default one worker | Collect repeated same-instance before/after samples with explicit cache conditions. Investigate remaining layout migration and interpreted-region costs; compiler cancellation alone does not establish that the timeout problem is solved. |
 | `bcastFolklore/bcastFolklore`, default one worker | Collect repeated cloud benchmark samples after hoisting suffix-invariant temporal conditions out of `<>`/`[]` and compacting product storage (local `-maxmem 2048 -stats` verification now completes with 5 tableau states, 655,360 product nodes, 6,483,968 product edges, 58.3 MiB CSR, 76.2 MiB largest product and 239.7 MiB peak RSS vs. the 16,845 MiB freeze failure). |
 
+A [20-second Kafka prefix diagnostic](research/kafka-prefix.json) on Linux x86_64
+(2026-11-24, `test-release`, original fetched config, `-compile -tlc -workers 1
+-maxmem 512 -stats json=stats.json`, normal asynchronous native compilation,
+SIGTERM with five seconds of grace) observed three layout misses, two completed
+resumes and four model builds. Completed model-build timers accounted for 6.90 s;
+completed re-encoding of 4,383 states accounted for 0.30 s. The signal arrived
+during another restart, so that migration's unfinished work is not in these phase
+totals. The partial snapshot retained 25,236 expansions and 1,802,965 host-region
+calls (1.20 s of instrumented host time). The largest aggregated host rows were
+`ReceiveBrokerRegResponse`'s `Var` (0.111 s), `ReceiveMetadataUpdate`'s boxed `>`
+(0.107 s) and membership (0.099 s), and `SendAlterPartitionRequest`'s interpreted
+record construction (0.088 s). Repeated model compilation was a substantial
+observed cost, larger than all measured host-region work; no single host region
+dominated. The incomplete migration timer prevents ranking total migration cost.
+Adaptive metadata retained 93 worker/model/library observations: 15 last chose
+mixed native, 16 fallback, and 62 were undecided. These are historical observations,
+not 93 simultaneously active functions. The snapshot includes 62 optimized-slot
+and 31 quick-slot rows; installed-model revisits reuse the same rows.
+
+A preceding `coverage.py --dynamic` prefix with synchronous native compilation
+spent its entire 20-second budget before search, after generating 9.1 MB of C.
+Both runs now preserve `interrupted: true`; neither establishes a completed timing,
+a full-run bottleneck, or a performance improvement. Timers overlap and partial
+snapshots lag, so these numbers are not an additive wall-time breakdown. The machine
+was shared and cache state uncontrolled (an optimized native cache hit was observed). Fetch with `scripts/fetch-external.py
+--repos vanlightly-kafka`; the original module/config are under
+`third_party/external/vanlightly-kafka/kafka_data_replication/kraft/v3.5/`.
+Full-model repeated cloud measurements remain open.
+
 Other long-running configurations still need completion or a documented resource bound:
 `KeyValueStore/MCKVSSafetyLarge`, `TLC/TestMCReachability`, `byzpaxos/BPConProof`, `c1cs/c1cs`,
 `dag-consensus/TLCSailfish2`, `detector_chan96/EnvironmentController`, `diskpaxos/MC_HDiskSynod`

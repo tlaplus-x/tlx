@@ -1,17 +1,18 @@
 //! Local deoptimization must not restart or duplicate the search.
 use tlx_testkit::cli::counts;
 
-#[test]
-fn growing_shapes_do_not_restart_or_duplicate_states() {
-    let spec = r#"---- MODULE Escape ----
+const GROWING_SPEC: &str = r#"---- MODULE Escape ----
 EXTENDS Naturals, Sequences, TLC
 VARIABLES x, s
 Init == x = 0 /\ s = "n0"
 Next == \/ x < 79 /\ x' = x + 1 /\ s' = "n" \o ToString(x')
         \/ x = 79 /\ x' = 0 /\ s' = "n0"
 ===="#;
+
+#[test]
+fn growing_shapes_do_not_restart_or_duplicate_states() {
     let cfg = "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n";
-    let dir = tlx_testkit::TempDir::with_spec("escape", spec, cfg);
+    let dir = tlx_testkit::TempDir::with_spec("escape", GROWING_SPEC, cfg);
     for (backend, no_native) in [("0", "0"), ("1", "0"), ("only", "0"), ("0", "1")] {
         let mut cmd = tlx_testkit::tlx!();
         let r = cmd
@@ -42,4 +43,25 @@ Next == \/ x < 79 /\ x' = x + 1 /\ s' = "n" \o ToString(x')
         assert_eq!(metric("escape states reencoded"), 0, "{text}");
         assert!(metric("escape deoptimizations") > 0, "{text}");
     }
+}
+
+#[test]
+fn adaptive_rows_are_bounded_across_escape_model_reentry() {
+    let dir = tlx_testkit::TempDir::with_spec(
+        "escape-stats",
+        &GROWING_SPEC.replace("79", "4000"),
+        "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n",
+    );
+    let result = tlx_testkit::tlx!()
+        .args(["check", "Escape.tla", "-config", "Escape.cfg", "-tlc", "-compile", "-workers", "1", "-stats", "json"])
+        .dir(&dir)
+        .envs([("TLX_ESCAPE", "1"), ("TLX_PRERUN", "1"), ("TLX_PRERUN_REUSE", "0"), ("TLX_JIT", "only")])
+        .run();
+    let text = result.text();
+    assert_eq!(result.code, 0, "{text}");
+    assert!(text.contains("4001 distinct states found"), "{text}");
+    let stats = text.lines().find(|l| l.starts_with("{\"sample_every\"")).expect("stats JSON");
+    let models: usize = stats.split_once("\"escape recompilations\":").unwrap().1.split([',', '}']).next().unwrap().parse().unwrap();
+    let rows = stats.matches("\"library\":").count();
+    assert!(rows > 0 && rows <= 2 * (models + 1), "{rows} rows for {} models", models + 1);
 }

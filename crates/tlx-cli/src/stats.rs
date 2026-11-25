@@ -1,10 +1,11 @@
 //! `-stats [json[=FILE]]`: performance statistics of the run (see
 //! `tlx_runtime::stats`), reported when tlx exits: as text on stderr, or as
-//! one JSON object on stderr or in FILE. Without `-stats` nothing is
+//! JSON reports on stderr or in FILE. Without `-stats` nothing is
 //! collected and the output is unchanged.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tlx_runtime::stats::{self, Metric};
@@ -15,6 +16,8 @@ pub enum Out {
     Text,
     Json(Option<PathBuf>),
 }
+
+static REPORT: Mutex<bool> = Mutex::new(false);
 
 static OUT: OnceLock<Out> = OnceLock::new();
 
@@ -83,15 +86,43 @@ pub fn record_peak_rss(key: &str) {
 
 /// Report the statistics (if enabled), at the end of the run.
 pub fn finish(started: Instant) {
+    crate::process::block_report_sigpipe();
+    report(started.elapsed(), false);
+}
+
+/// Called on the shutdown output thread, not from an asynchronous signal handler.
+/// Live worker snapshots may lag; end-of-search-only metrics may be absent.
+pub fn interrupted() {
+    report(stats::since_start(), true);
+}
+
+fn report(elapsed: Duration, interrupted: bool) {
     let Some(out) = OUT.get() else { return };
-    stats::set("total", Metric::Secs(started.elapsed().as_secs_f64()));
+    // Serialize normal completion and interruption so JSON file writes cannot
+    // interleave. The signal report is last if normal reporting was underway.
+    let mut was_interrupted = REPORT.lock().unwrap_or_else(|e| e.into_inner());
+    if *was_interrupted && !interrupted {
+        return;
+    }
+    *was_interrupted |= interrupted;
+    stats::set("total", Metric::Secs(elapsed.as_secs_f64()));
+    stats::set_json("interrupted", interrupted.to_string());
+    if interrupted {
+        stats::set_section("interrupted", "  Partial statistics; active workers and phases may be incomplete.\n".into());
+    }
     record_peak_rss("peak RSS");
     match out {
-        Out::Text => eprint!("{}", stats::text()),
-        Out::Json(None) => eprintln!("{}", stats::json()),
+        // Reporting is best effort: an output error must not prevent the
+        // signal thread from cleaning up spill files and exiting.
+        Out::Text => {
+            let _ = write!(std::io::stderr().lock(), "{}", stats::text());
+        }
+        Out::Json(None) => {
+            let _ = writeln!(std::io::stderr().lock(), "{}", stats::json());
+        }
         Out::Json(Some(p)) => {
             if let Err(e) = std::fs::write(p, stats::json() + "\n") {
-                eprintln!("cannot write {}: {e}", p.display());
+                let _ = writeln!(std::io::stderr().lock(), "cannot write {}: {e}", p.display());
             }
         }
     }

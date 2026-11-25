@@ -31,8 +31,9 @@ fn bytes(b: u64) -> String {
     }
 }
 
-/// Everything the renderers need, captured once (after the workers ended and
-/// `flush`). The text and the JSON report are pure functions of it.
+/// Everything the renderers need, captured once after flushing the caller.
+/// Active workers contribute their last published completed-unit snapshots.
+/// The text and JSON reports are pure functions of it.
 struct Snapshot {
     phases: Vec<(String, Metric)>,
     total: Local,
@@ -45,17 +46,24 @@ struct Snapshot {
     json_fields: Vec<(String, String)>,
 }
 
-fn snapshot() -> Snapshot {
+fn snapshot(include_json: bool) -> Snapshot {
     flush();
     let g = global();
+    let mut total = g.total.clone();
+    for (_, live) in &g.live {
+        total.merge(live);
+    }
+    let workers = g.workers.clone();
+    let names = [g.action_names.clone(), g.invariant_names.clone(), g.aprop_names.clone()];
+    drop(g);
     Snapshot {
         phases: phases(),
-        total: g.total.clone(),
-        workers: g.workers.clone(),
-        names: [g.action_names.clone(), g.invariant_names.clone(), g.aprop_names.clone()],
+        total,
+        workers,
+        names,
         sample_every: SAMPLE_EVERY.load(Ordering::Relaxed),
         sections: sections(),
-        json_fields: json_fields(),
+        json_fields: if include_json { json_fields() } else { Vec::new() },
     }
 }
 
@@ -366,7 +374,7 @@ fn text_of(s: &Snapshot) -> String {
 
 /// The human-readable report.
 pub fn text() -> String {
-    text_of(&snapshot())
+    text_of(&snapshot(false))
 }
 
 // ----------------------------------------------------------------------
@@ -488,7 +496,7 @@ fn json_of(s: &Snapshot) -> String {
 
 /// The machine-readable report: one JSON object.
 pub fn json() -> String {
-    json_of(&snapshot())
+    json_of(&snapshot(true))
 }
 
 #[cfg(test)]
