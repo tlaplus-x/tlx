@@ -1085,7 +1085,7 @@ impl InterpModel {
     }
 
     /// The variables in the order TLC shows them (`len`: their number).
-    fn var_order(&self, len: usize) -> &[usize] {
+    pub fn var_order(&self, len: usize) -> &[usize] {
         self.var_order.get_or_init(|| print_order::tlc_var_order(&self.ip.prog).unwrap_or_else(|| (0..len).collect()))
     }
 

@@ -241,8 +241,10 @@ This is the single source for known limitations ([design.md](design.md) and
   code 255). With `-fpmem` the fingerprint set has a fixed size and a full table is a capacity
   error (it does not enter the disk tier).
 - **Compiled tier** (results are not affected): there is a long tail of coverage (VIEW together
-  with SYMMETRY still computes fingerprints on values; the remaining boxed nodes are in
-  [design.md](design.md) section 6.8); a layout miss in simulation restarts the whole simulation from
+  with SYMMETRY selects the TLC-least orbit representative directly on encoded words for fixed
+  shapes and falls back to values only when comparison reaches a handle-bearing `Dyn`/`Ref`
+  variable, an incomparable union arm, a mixed-key map, or uncompiled VIEW / permutation plans;
+  the remaining boxed nodes are in [design.md](design.md) section 6.8); a layout miss in simulation restarts the whole simulation from
   scratch with the same seed (side effects accounted for as in design.md section 6.5.3); a small model
   uses the result of the faithful pre-run only when that pre-run exhausts the state space
   ([design.md](design.md) section 6.5.1), a non-faithful pre-run that exhausts it still leads to compilation.
