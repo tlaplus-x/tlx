@@ -132,7 +132,7 @@ fn prerun_shapes_inner(
     // space can be much larger or unbounded. (With SYMMETRY too, the plain
     // fingerprints drop the VIEW as well.)
     let plain;
-    let base = if !faithful && !base.symmetry_maps().is_empty() {
+    let base = if !faithful && base.has_symmetry() {
         plain = base.with_fp_mode(FpMode::Plain);
         &plain
     } else {

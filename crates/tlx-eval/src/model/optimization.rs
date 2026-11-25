@@ -46,7 +46,7 @@ impl InterpModel {
             || !self.postconditions.is_empty()
             || !self.cfg_constants_allow_certification()
             || self.alias.is_some()
-            || !self.symmetry.is_empty()
+            || !self.group.is_empty()
             || cfg.symmetry.is_some()
         {
             return None;
@@ -90,7 +90,7 @@ impl InterpModel {
         if !self.live.is_empty()
             || (self.has_view() && !self.state_projection)
             || self.ordered_projection.is_some()
-            || !self.symmetry.is_empty()
+            || !self.group.is_empty()
             || cfg.symmetry.is_some()
             || !self.possible.is_empty()
             || !self.postconditions.is_empty()
@@ -177,24 +177,17 @@ impl InterpModel {
     }
 
     pub fn has_projected_symmetry(&self) -> bool {
-        self.state_projection && !self.symmetry.is_empty()
+        self.state_projection && !self.group.is_empty()
     }
 
     /// Canonicalize the projected value, so forgotten fields cannot decide
     /// which permutation represents its orbit. Internal sentinels may have
     /// different types from retained values; use the total structural order.
     pub(super) fn projected_orbit(&self, projected: Value) -> EResult<Value> {
-        let mut least: Option<Value> = None;
-        for permutation in &self.group.perms {
-            let Some(image) = permutation.apply(&projected)? else {
-                continue;
-            };
-            let current = least.as_ref().unwrap_or(&projected);
-            if tlx_value::order::try_total_cmp(&image, current)?.is_lt() {
-                least = Some(image);
-            }
-        }
-        Ok(least.unwrap_or(projected))
+        let Some(p) = self.group.least_total_perm(&projected)? else {
+            return Ok(projected);
+        };
+        Ok(p.apply(&projected)?.unwrap_or(projected))
     }
 
     /// Fast fingerprint for projected symmetry when `view` is a pure tuple of
@@ -221,8 +214,7 @@ impl InterpModel {
                                     fps.push(tlx_value::fingerprint::fingerprint(v)?);
                                 }
                             }
-                            Some(p) => {
-                                let perm = &self.group.perms[p];
+                            Some(perm) => {
                                 for v in &retained {
                                     let fp = match perm.apply(v)? {
                                         Some(img) => tlx_value::fingerprint::fingerprint(&img)?,

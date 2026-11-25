@@ -312,7 +312,7 @@ impl EncModel {
             Some(t) => FastRegions::compile(t, &typing, &fast.prog),
             _ => Vec::new(),
         };
-        let has_symmetry = !base.symmetry_maps().is_empty();
+        let has_symmetry = base.has_symmetry();
         let fp = match (symmetry, view) {
             (_, Some(view)) if base.has_projected_symmetry() => Fingerprint::View(view),
             // VIEW with SYMMETRY: TLC takes the VIEW of the orbit's least

@@ -44,7 +44,7 @@ pub use report::{location_record, ActionInfo};
 use spec::PropPart;
 pub use spec::TAUTOLOGY;
 pub use symmetry::StateVals;
-use symmetry::{Group, Perm};
+use symmetry::{ChosenPerm, Group, Perm};
 
 /// States whose definition memos a thread keeps (the state being expanded
 /// and its latest successors).
@@ -137,9 +137,8 @@ pub struct InterpModel {
     /// PROPERTY parts that are state predicates (checked on initial states).
     init_props: Vec<(String, Expr)>,
     pub check_deadlock: bool,
-    /// SYMMETRY: non-identity model-value permutations.
-    symmetry: Vec<Perm>,
-    /// The same permutations, in a form fast to apply.
+    /// SYMMETRY group (factorized for disjoint symmetric-group products, or
+    /// explicit fallback for arbitrary subgroups).
     group: Group,
     /// How states are fingerprinted (fixed: see `with_fp_mode`).
     fp_mode: FpMode,
@@ -460,16 +459,16 @@ impl InterpModel {
             def_refs(&ip, &cfg.action_constraints.iter().filter(|n| !cfg_true_const(&ip, n)).cloned().collect::<Vec<_>>())?;
         let mut live = liveness::live_spec(&ip, &props.liveness, &spec_temporal, &next)?;
 
-        let symmetry = match &cfg.symmetry {
-            Some(name) if reduce => symmetry::symmetry_perms(&ip, &def_ref(&ip, name)?)?,
-            _ => Vec::new(),
+        let group = match &cfg.symmetry {
+            Some(name) if reduce => symmetry::symmetry_group(&ip, &def_ref(&ip, name)?)?,
+            _ => Group::default(),
         };
-        if !symmetry.is_empty() && !live.is_empty() {
+        if !group.is_empty() && !live.is_empty() {
             let text = "Declaring symmetry during liveness checking is dangerous. It might cause TLC to miss violations of the stated liveness properties. Please check liveness without symmetry defined.".into();
             warnings.push(Warning { kind: WarningKind::LivenessSymmetry, text });
         }
         let view = cfg.view.as_ref().map(|n| def_ref(&ip, n)).transpose()?;
-        if !symmetry.is_empty() || view.is_some() {
+        if !group.is_empty() || view.is_some() {
             live.next_steps.clear();
         } else if !live.is_empty() {
             live.label_actions(&ip, &actions);
@@ -507,8 +506,7 @@ impl InterpModel {
             invariants,
             constraints,
             action_constraints,
-            group: Group::new(&symmetry),
-            symmetry,
+            group,
             fp_mode: if reduce { FpMode::Reduced } else { FpMode::Plain },
             view,
             state_projection: false,
@@ -562,13 +560,18 @@ impl InterpModel {
 
     /// Whether fingerprints depend on VIEW or SYMMETRY (not just the values).
     /// The SYMMETRY group (without the identity): each element maps the
-    /// model values it moves to their images.
+    /// model values it moves to their images (materialized on demand for
+    /// factorized groups up to order 720).
     pub fn symmetry_maps(&self) -> &[std::collections::HashMap<tlx_value::Sym, Value>] {
-        &self.symmetry
+        self.group.symmetry_maps()
     }
 
     pub fn has_view(&self) -> bool {
         self.view.is_some()
+    }
+
+    pub fn has_symmetry(&self) -> bool {
+        !self.group.is_empty()
     }
 
     /// Reduce the search by the group the permutations `gens` generate, as
@@ -578,14 +581,13 @@ impl InterpModel {
     /// `TLX_SYMMETRY_PARANOID=N` one expanded state in N is checked against
     /// it (`check_symmetry_claim`).
     pub fn apply_symmetry(&mut self, gens: Vec<std::collections::HashMap<Sym, Value>>) {
-        assert!(self.symmetry.is_empty(), "apply_symmetry with a declared SYMMETRY");
+        assert!(self.group.is_empty(), "apply_symmetry with a declared SYMMETRY");
         let every = tlx_base::knobs::Env::process().opt_num("TLX_SYMMETRY_PARANOID").ok().flatten();
         if let Some(every) = every.filter(|n| *n > 0) {
             let plain = InterpModel { claim: None, ..self.with_fp_mode(FpMode::Plain) };
             self.claim = Some(Arc::new(Claim { plain, gens: gens.clone(), every, seen: Default::default() }));
         }
-        self.symmetry = symmetry::closure(gens);
-        self.group = Group::new(&self.symmetry);
+        self.group = Group::from_generators(gens);
         self.fp_mode = FpMode::Reduced;
     }
 
@@ -630,7 +632,7 @@ impl InterpModel {
     }
 
     pub fn has_view_or_symmetry(&self) -> bool {
-        self.view.is_some() || !self.symmetry.is_empty()
+        self.view.is_some() || !self.group.is_empty()
     }
 
     /// Whether a search of a model of this spec records the liveness
@@ -911,7 +913,6 @@ impl InterpModel {
         let Some(p) = self.group.least_perm(&mut StateVals::Given(vals), &order)? else {
             return Ok((symmetry::combine_fps(&fps)?, Some(var_fps)));
         };
-        let p = &self.group.perms[p];
         let mut least = fps;
         for (v, f) in vals.iter().zip(least.iter_mut()) {
             if let Some(x) = p.apply(v)? {
@@ -928,11 +929,22 @@ impl InterpModel {
     /// by variable location, the order TLC prints them in), which with a
     /// VIEW decides which state's VIEW is fingerprinted.
     fn least_in_orbit(&self, vals: &[Value]) -> EResult<Option<Vec<Value>>> {
-        let Some(p) = self.least_perm_of(&mut StateVals::Given(vals))? else {
+        let Some(p) = self.least_perm_chosen(&mut StateVals::Given(vals))? else {
             return Ok(None);
         };
-        let p = &self.group.perms[p];
         vals.iter().map(|v| Ok(p.apply(v)?.unwrap_or_else(|| v.clone()))).collect::<EResult<Vec<_>>>().map(Some)
+    }
+
+    fn least_perm_chosen(&self, vals: &mut StateVals) -> EResult<Option<ChosenPerm<'_>>> {
+        if self.group.is_empty() {
+            return Ok(None);
+        }
+        let order = self.var_order(vals.len());
+        if self.view.is_some() {
+            self.group.least_view_perm(vals, order)
+        } else {
+            self.group.least_perm(vals, order)
+        }
     }
 
     /// The index (in `symmetry_maps`) of the permutation that maps `vals`
@@ -943,11 +955,7 @@ impl InterpModel {
             return Ok(None);
         }
         let order = self.var_order(vals.len());
-        if self.view.is_some() {
-            self.group.least_view_perm(vals, order)
-        } else {
-            self.group.least_perm(vals, order)
-        }
+        self.group.least_perm_index(vals, order, self.view.is_some())
     }
 
     /// `least_perm_of` for the compiled tier (whose VIEW fingerprints
