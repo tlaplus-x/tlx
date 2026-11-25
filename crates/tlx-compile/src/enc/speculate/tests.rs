@@ -4,7 +4,7 @@ use super::*;
 /// `Next`, and the cfg lines `cfg`) may create strings, its liveness
 /// atoms included: the pre-run is faithful.
 fn creates_strings(body: &str, cfg: &str) -> bool {
-    let src = tlx_testkit::module("S", &format!("EXTENDS Naturals, Sequences, TLC\n{body}"));
+    let src = tlx_testkit::module("S", &format!("EXTENDS Naturals, Sequences, SequencesExt, TLC\n{body}"));
     let m = tlx_testkit::spec::load(&src, &format!("INIT Init\nNEXT Next\n{cfg}"));
     let strings = model_strings(&m);
     search_makes_strings(&m, &strings) || live_makes_strings(&m, &strings)
@@ -36,6 +36,18 @@ fn sequence_operators_on_sequences_create_no_strings() {
         "VARIABLE q\nInit == q = <<1, 2>>\nNext == UNCHANGED q\nInv == q = <<>> \\/ Len(Tail(q)) >= 0\nLive == <>(Tail(q) = <<2>>)",
         "INVARIANT Inv\nPROPERTY Live\n"
     ));
+}
+
+#[test]
+fn replace_all_sub_seqs_creates_strings_only_for_strings() {
+    // Three strings: the result is a new string (as `\o` of strings).
+    assert!(creates_strings("VARIABLE x\nInit == x = \"banana\"\nNext == x' = ReplaceAllSubSeqs(\"x\", \"a\", x)", ""));
+    // A constant application also creates a string.
+    assert!(creates_strings("VARIABLE q\nInit == q = <<1>>\nNext == q' = ReplaceAllSubSeqs(\"x\", \"a\", \"banana\")", ""));
+    // Sequences of elements: the result reuses them, no string is created.
+    assert!(!creates_strings("VARIABLE q\nInit == q = <<1, 2>>\nNext == q' = ReplaceAllSubSeqs(<<1>>, <<2>>, q)", ""));
+    // Also when the elements themselves are strings.
+    assert!(!creates_strings("VARIABLE q\nInit == q = <<\"ab\", \"cd\">>\nNext == q' = ReplaceAllSubSeqs(<<\"x\">>, <<\"ab\">>, q)", ""));
 }
 
 #[test]

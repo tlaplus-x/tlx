@@ -788,6 +788,15 @@ impl<'a> Typer<'a> {
                 Ty::Top
             }
             B::Tail | B::SubSeq | B::SelectSeq | B::SortSeq | B::Prime | B::TLCEval | B::TLCCache => arg(0),
+            // A string only from three strings (TLC's `StringUtils.replace`);
+            // from sequences its elements are reused, so no string is created.
+            B::ReplaceAllSubSeqs if arg(0).may_be_string() && arg(1).may_be_string() && arg(2).may_be_string() => {
+                self.strings = true;
+                Ty::Top
+            }
+            // Otherwise the result may be `r` or `t` themselves (the
+            // definition's first two guards) or a sequence of their elements.
+            B::ReplaceAllSubSeqs => Ty::ns(arg(0).comp().join(arg(2).comp())).join(arg(0)).join(arg(2)),
             op if makes_strings(op) => {
                 self.strings = true;
                 Ty::Top
@@ -821,6 +830,7 @@ impl<'a> Typer<'a> {
             | B::Cardinality
             | B::Gcd
             | B::Atoi
+            | B::Choose
             | B::JavaTime
             | B::BagCardinality
             | B::CopiesIn => Ty::scalar(),

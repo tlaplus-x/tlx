@@ -243,7 +243,7 @@ TLC has Java overrides for 12 of its operators (all but `AssertEq` and `TLCGetAn
 
 ## 4. CommunityModules
 
-`third_party/community` has 22 non-theorem modules (including the Json copy that has the same name as the standard one). `modules.jar` has 17 classes in `tlc2.overrides` with 70 overrides (66 `@TLAPlusOperator` and 4 `@Evaluation`: `IOUtils!Serialize`, `IOUtils!Deserialize`, `SequencesExt!ReplaceAllSubSeqs`/`ReplaceFirstSubSeq`). tlx overrides operators natively by module name for 12 modules only (`DyadicRationals!GCD` is LOCAL; the list `COMMUNITY_NATIVE_MODULES`: BagsExt, CSV, DyadicRationals, FiniteSetsExt, Folds, Functions, Graphs, IOUtils, SequencesExt, Statistics, UndirectedGraphs, VectorClocks); Java overrides that tlx does not implement (IOUtils serialization, GraphViz, some SVG helpers, ...) report an explicit error (section 6.1).
+`third_party/community` has 22 non-theorem modules (including the Json copy that has the same name as the standard one). `modules.jar` has 17 classes in `tlc2.overrides` with 70 overrides (66 `@TLAPlusOperator` and 4 `@Evaluation`: `IOUtils!Serialize`, `IOUtils!Deserialize`, `SequencesExt!ReplaceAllSubSeqs`/`ReplaceFirstSubSeq`). tlx overrides operators natively by module name for 13 modules only (`DyadicRationals!GCD` is LOCAL; the list `COMMUNITY_NATIVE_MODULES`: BagsExt, CSV, Combinatorics, DyadicRationals, FiniteSetsExt, Folds, Functions, Graphs, IOUtils, SequencesExt, Statistics, UndirectedGraphs, VectorClocks); Java overrides that tlx does not implement (IOUtils serialization, GraphViz, some SVG helpers, ...) report an explicit error (section 6.1).
 
 Like TLC's jar, tlx ships the CommunityModules (`crates/tlx-sema/modules/community`, 34 `.tla` files, MIT license). Lookup order: spec directory, then `-I`/`TLX_PATH`, standard modules, CommunityModules, `TLX_CLASSPATH` (last, like TLC's classpath).
 
@@ -281,7 +281,7 @@ Column "TLC" says whether `modules.jar` has a Java override. Statuses are as in 
 | `AllSubSeqs` | yes | native | every subsequence in index order (the definition folds through FoldFunction and its order is decided by CHOOSE, which only the Java override guarantees); returns a normalized set; test `tests/specs/PH2.tla` |
 | `IndexFirstSubSeq`, `ReplaceSubSeqAt` | | definition | |
 | `ReplaceFirstSubSeq` | yes (Eval) | definition | agrees on sequences and strings |
-| `ReplaceAllSubSeqs` | yes (Eval) | unsupported | differs from TLC: a string argument (the main use of TLC's override) gives "DOMAIN of a string" in tlx; for a sequence argument TLC reports too many elements and tlx times out |
+| `ReplaceAllSubSeqs` | yes (Eval) | native | follows TLC's override for three strings (`StringUtils.replace`: the leftmost non-overlapping occurrences, the replacement not rescanned; an empty `s` interleaves `r` before every character, scalar-safe where TLC splits a surrogate pair, D-33) and the module definition for other values: its ordered guards (`s = t -> r`, `r = s -> t`, an empty `s` interleaving `r` before every element), the membership test comparing every window of `t` (so its comparison errors are observable), and the leftmost partition with the maximum number of matches (the definition's chunk-index tie-break can pick a later overlapping occurrence in TLC, D-34); tests `tests/specs/PH4.tla`, `PH6.tla` |
 
 ### 4.2 FiniteSetsExt (EXTENDS Integers, FiniteSets, Folds, Functions)
 
@@ -373,7 +373,7 @@ Column "TLC" says whether `modules.jar` has a Java override. Statuses are as in 
 |---|---|---|---|---|
 | Bitwise | `&`, `\|`, `^^`, `Not`, `shiftR` | yes (5) | definition | recursive definitions; 30-bit numbers are fast |
 | Combinatorics | `factorial` | yes | definition | 13! overflows in both |
-| | `choose(n, k)` | yes | partial | the definition goes through factorial: `choose(20, 10)` overflows in tlx, TLC's native code gives 184756 |
+| | `choose(n, k)` | yes | native | follows `Combinatorics.java` (`tlc2.util.Combinatorics.choose`): the binomial coefficient without the definition's intermediate `factorial` overflow (`choose(20, 10)` = 184756), 0 for `k > n`, computed exactly through `min(k, n-k)` with the 32-bit overflow error instead of a value (`choose(34, 17)`); TLC's spurious values beyond 32 bits are not copied (D-32); test `tests/specs/PH4.tla`, `PH5.tla` |
 | DyadicRationals | `IsDyadicRational`, `Zero`, `One`, `Add`, `Half`, `PrettyPrint` | Reduce (LOCAL) | definition (GCD native: follows the commons-math gcd used by TLC's Java `Reduce` - absolute values, gcd(0,0)=0, a result of 2^31 is an error - rather than the TLA+ definition) | |
 | BagsExt | `BagAdd`, `BagRemove`, `BagRemoveAll`, `SumBag`, `ProductBag` | | definition | |
 | | `FoldBag` | yes | native | follows `BagsExt.java` |

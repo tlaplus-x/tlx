@@ -66,7 +66,7 @@ impl<'a> Analyzer<'a> {
             B::Assert | B::AssertError | B::Unchanged | B::Enabled | B::Always => plain(),
             B::Eventually | B::LeadsTo | B::Compose | B::WhilePlus | B::Plus | B::Minus => plain(),
             B::Mul | B::Pow | B::Div | B::Mod | B::Neg | B::Cardinality | B::Len => plain(),
-            B::BagCardinality | B::CopiesIn | B::Gcd | B::Atoi => plain(),
+            B::BagCardinality | B::CopiesIn | B::Gcd | B::Atoi | B::Choose => plain(),
             B::Prime | B::TLCEval => arg(0),
             B::TLCCache => arg(0),
             B::Boolean | B::StringSet | B::Nat | B::Int => Sh::set(plain()),
@@ -88,6 +88,10 @@ impl<'a> Analyzer<'a> {
             B::Append => Sh::seq(arg(0).range().join(&arg(1))),
             B::Head => arg(0).range(),
             B::Tail | B::SubSeq => Sh::seq(arg(0).range()).join(&arg(0).scalar_part()),
+            // The result holds `r`'s and `t`'s elements (`s` is only searched
+            // for), or is `r` or `t` itself (the definition's first two
+            // guards); with three strings it is a string, like `\o`'s.
+            B::ReplaceAllSubSeqs => Sh::seq(arg(0).range().join(&arg(2).range())).join(&arg(0)).join(&arg(2)),
             B::SelectSeq => self.select_seq(arg(0), arg(1), span),
             B::SortSeq => self.sort_seq(arg(0), arg(1), span),
             B::AllSubSeqs => Sh::set(Sh::seq(arg(0).range())),

@@ -1,0 +1,104 @@
+# exit 0
+@!@!@STARTMSG 2262:0 @!@!@
+TLC2 Version 2026.10.02.163556 (rev: 1813307)
+@!@!@ENDMSG 2262 @!@!@
+@!@!@STARTMSG 2187:0 @!@!@
+Running breadth-first search Model-Checking with fp 0 and seed 6527251710877965068 with 1 worker on <machine>
+@!@!@ENDMSG 2187 @!@!@
+@!@!@STARTMSG 2220:0 @!@!@
+Starting SANY...
+@!@!@ENDMSG 2220 @!@!@
+Parsing file <specs>/PH4.tla
+Parsing file <tmp>/Combinatorics.tla (jar:file:<modules.jar>!/Combinatorics.tla)
+Parsing file <tmp>/SequencesExt.tla (jar:file:<modules.jar>!/SequencesExt.tla)
+Parsing file <tmp>/TLC.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/TLC.tla)
+Parsing file <tmp>/Sequences.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/Sequences.tla)
+Parsing file <tmp>/FiniteSets.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file <tmp>/Naturals.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/Naturals.tla)
+Parsing file <tmp>/Integers.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/Integers.tla)
+Parsing file <tmp>/FiniteSetsExt.tla (jar:file:<modules.jar>!/FiniteSetsExt.tla)
+Parsing file <tmp>/Folds.tla (jar:file:<modules.jar>!/Folds.tla)
+Parsing file <tmp>/Functions.tla (jar:file:<modules.jar>!/Functions.tla)
+Parsing file <tmp>/Bags.tla (jar:file:<tla2tools.jar>!/tla2sany/StandardModules/Bags.tla)
+Semantic processing of module Naturals
+Semantic processing of module Combinatorics
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module Integers
+Semantic processing of module Folds
+Semantic processing of module Functions
+Semantic processing of module FiniteSetsExt
+Semantic processing of module Bags
+Semantic processing of module TLC
+Semantic processing of module SequencesExt
+Semantic processing of module PH4
+Linting of module Combinatorics
+Linting of module Folds
+Linting of module Functions
+Linting of module FiniteSetsExt
+Linting of module SequencesExt
+Linting of module PH4
+@!@!@STARTMSG 2219:0 @!@!@
+SANY finished.
+@!@!@ENDMSG 2219 @!@!@
+@!@!@STARTMSG 2185:0 @!@!@
+Starting... (<date>)
+@!@!@ENDMSG 2185 @!@!@
+"choose20_10:"  184756
+"choose30_15:"  155117520
+"choose33_16:"  1166803110
+"choose0_0:"  1
+"choose5_0:"  1
+"choose5_5:"  1
+"choose5_1:"  5
+"choose5_4:"  5
+"choose0_1:"  0
+"choose5_6:"  0
+"str:"  "bxnxnx"
+"str-none:"  "ab"
+"str-overlap:"  "xa"
+"str-grow:"  "aaaaaa"
+"str-grow2:"  "bababa"
+"str-same:"  "xx"
+"str-empty:"  "xaxb"
+"str-empty-t:"  "x"
+"str-empty-r:"  "a"
+"id-s-t:"  "hit"
+"id-r-s:"  <<1, 2>>
+"seq-windows:"  <<0, 2, 0>>
+"seq:"  <<2, 2>>
+"seq-overlap:"  <<2, 2, 1>>
+"seq-none:"  <<3, 4>>
+"seq-long-s:"  <<1>>
+"seq-same:"  <<5>>
+"seq-empty:"  <<2, 1, 2, 3>>
+"seq-empty-grow:"  <<1, 2, 3, 1, 2, 4>>
+"seq-empty-t:"  <<4>>
+"seq-fcn:"  <<9, 2>>
+@!@!@STARTMSG 2189:0 @!@!@
+Computing initial states...
+@!@!@ENDMSG 2189 @!@!@
+@!@!@STARTMSG 2190:0 @!@!@
+Finished computing initial states: 1 distinct state generated at <date>.
+@!@!@ENDMSG 2190 @!@!@
+@!@!@STARTMSG 2193:0 @!@!@
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 5.4E-20
+@!@!@ENDMSG 2193 @!@!@
+@!@!@STARTMSG 2200:0 @!@!@
+Progress(1) at <date>: 2 states generated (<rate> s/min), 1 distinct states found (<rate> ds/min), 0 states left on queue.
+@!@!@ENDMSG 2200 @!@!@
+@!@!@STARTMSG 2199:0 @!@!@
+2 states generated, 1 distinct states found, 0 states left on queue.
+@!@!@ENDMSG 2199 @!@!@
+@!@!@STARTMSG 2194:0 @!@!@
+The depth of the complete state graph search is 1.
+@!@!@ENDMSG 2194 @!@!@
+@!@!@STARTMSG 2268:0 @!@!@
+The average outdegree of the complete state graph is 0 (minimum is 0, the maximum 0 and the 95th percentile is 0).
+@!@!@ENDMSG 2268 @!@!@
+@!@!@STARTMSG 2186:0 @!@!@
+Finished in <time> at (<date>)
+@!@!@ENDMSG 2186 @!@!@

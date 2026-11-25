@@ -310,6 +310,7 @@ impl Interp {
                 B::Seq => ops::seq_set(&a[0])?,
                 B::SubSeq => ops::subseq(&a[0], int(&a[1], "SubSeq")?, int(&a[2], "SubSeq")?)?,
                 B::AllSubSeqs => crate::natives::all_sub_seqs(&a[0])?,
+                B::ReplaceAllSubSeqs => crate::natives::replace_all_sub_seqs(&a[0], &a[1], &a[2])?,
                 B::ToJson => crate::natives::json::to_json(&a[0])?,
                 B::ToJsonArray => crate::natives::json::to_json_array(&a[0])?,
                 B::ToJsonObject => crate::natives::json::to_json_object(&a[0])?,
@@ -454,6 +455,7 @@ impl Interp {
                 B::GraphSimplePath => crate::natives::simple_path(&a[0], true)?,
                 B::UGraphSimplePath => crate::natives::simple_path(&a[0], false)?,
                 B::Gcd => Value::Int(tlx_value::arith::gcd(int(&a[0], "GCD")?, int(&a[1], "GCD")?)?),
+                B::Choose => crate::natives::choose(&a[0], &a[1])?,
                 B::SetMax | B::SetMin => {
                     // CHOOSE x \in S : \A y \in S : x >= y (resp. =<).
                     let elems = ops::enumerate_normalized(&a[0])?;
