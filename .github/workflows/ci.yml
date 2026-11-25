@@ -197,7 +197,7 @@ jobs:
           test "$QUALITY_RESULT" = success
           test "$TEST_RESULT" = success
       - name: Notify Multica on failure
-        if: failure() && github.ref == 'refs/heads/main'
+        if: failure() && github.ref == 'refs/heads/main' && contains(needs.*.result, 'failure')
         run: |
           curl -sS -X POST "${{ secrets.MULTICA_CI_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
