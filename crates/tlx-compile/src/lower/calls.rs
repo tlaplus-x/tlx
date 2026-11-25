@@ -88,10 +88,22 @@ pub(super) struct Calls {
     recursive: std::cell::RefCell<HashMap<hir::DefId, bool>>,
     /// Functions that could not be compiled (outside any other one).
     failed: std::collections::HashSet<FnKey>,
+    /// Syntactic call-site counts per definition across `prog.defs` (computed lazily once).
+    def_refs: std::cell::OnceCell<HashMap<hir::DefId, usize>>,
+    /// Non-recursive helper definitions seen at least once during lowering
+    /// (so a 1-call-site helper shared across multiple split action instances
+    /// is outlined from its second encounter onward).
+    seen_helpers: std::collections::HashSet<hir::DefId>,
 }
 
 /// Most attempts at inferring a result representation.
 const ATTEMPTS: usize = 4;
+/// Minimum HIR nodes to outline a pure non-recursive operator into a shared
+/// compiled function (lower when the body contains a quantifier/comprehension).
+const HELPER_MIN_HIR: usize = 24;
+const HELPER_LOOP_MIN_HIR: usize = 10;
+/// Minimum lowered IR nodes to keep an outlined non-recursive helper.
+const HELPER_MIN_IR: usize = 16;
 
 impl Lowerer<'_> {
     /// Source definition when a function body is still a lowering placeholder.
@@ -159,6 +171,114 @@ impl Lowerer<'_> {
         };
         let src = FnSrc { params: params.to_vec(), body: body.clone(), base: base.clone(), domains: None, caps: Vec::new() };
         self.call_fn(key, &src, vals, st)
+    }
+
+    /// `d(args)` as a call of a shared compiled helper when `d` is a
+    /// substantial, pure, non-recursive, state-level module operator applied
+    /// to typed arguments (so repeated call sites share one IR/C/JIT body
+    /// instead of duplicating it across every action and branch).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn helper_call(
+        &mut self,
+        d: hir::DefId,
+        params: &[LocalId],
+        body: &hir::Expr,
+        base: &LEnv,
+        args: &[hir::Expr],
+        env: &LEnv,
+        st: &St,
+        into: Option<ShapeId>,
+    ) -> Option<Expr> {
+        if self.ip.prog.def_is_let(d)
+            || self.is_recursive_def(d)
+            || self.ip.is_action_level(d)
+            || self.def_volatile(d)
+            || self.inline_stack.contains(&d)
+            || self.calls.progress.iter().any(|p| p.key.def == d)
+        {
+            return None;
+        }
+        if params.iter().any(|p| self.ip.prog.locals[p.idx()].arity > 0) {
+            return None;
+        }
+        if !worth_outlining(body) {
+            return None;
+        }
+        if self.def_ref_count(d) < 2 && self.calls.seen_helpers.insert(d) {
+            return None;
+        }
+        if !args.is_empty() && self.const_driven_call(args, env) {
+            return None;
+        }
+        if self.expr_makes_strings(body, base) {
+            return None;
+        }
+        let defer = self.defers_arg_errors(Some(d), body);
+        for (p, a) in params.iter().zip(args) {
+            if self.is_product_literal(a, env) || self.is_lazy_fn_ref(a, env) {
+                return None;
+            }
+            if defer {
+                let uses = super::expr::local_uses(&self.ip.prog, body, *p);
+                if st.init && uses == 0 {
+                    return None;
+                }
+                if !st.init && self.const_value(a, env).is_none() && self.constructs(a, env) && uses <= 1 {
+                    return None;
+                }
+            }
+        }
+        let mark = self.frame.snapshot();
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            let x = self.expr(a, env, st);
+            match self.typed_arg(x) {
+                Some(x) => vals.push(x),
+                None => {
+                    self.frame.restore(mark);
+                    return None;
+                }
+            }
+        }
+        let assigned = if st.init || self.primed { st.assigned.clone() } else { Vec::new() };
+        let key = FnKey {
+            def: d,
+            params: vals.iter().map(|x| x.ty).collect(),
+            primed: self.primed,
+            init: st.init,
+            assigned,
+            into,
+            caps: Vec::new(),
+        };
+        if let Some(&(id, ret)) = self.calls.done.get(&key) {
+            return Some(Expr::new(ret, ExprKind::Call { func: id, args: vals }));
+        }
+        if self.calls.failed.contains(&key) {
+            self.frame.restore(mark);
+            return None;
+        }
+        let start = self.typing.funcs.len();
+        let src = FnSrc { params: params.to_vec(), body: body.clone(), base: base.clone(), domains: None, caps: Vec::new() };
+        let (out, temps, ptemps) = self.lower_fn_body(&key, &src, st);
+        let mut cov = crate::ir::Coverage::default();
+        cov.expr(&out);
+        let ok =
+            out.ty != Ty::Val && cov.fully_typed() && helper_ir_native(&out) && (expr_nodes(&out) >= HELPER_MIN_IR || expr_has_loop(&out));
+        if !ok {
+            self.rollback_fns(start);
+            if self.calls.progress.is_empty() {
+                self.calls.failed.insert(key);
+            }
+            self.frame.restore(mark);
+            return None;
+        }
+        let id = self.typing.funcs.len() as u32;
+        let ret = out.ty;
+        let name: Arc<str> = self.ip.prog.defs[d.idx()].name.clone();
+        self.typing.funcs.push(FnDef { name, params: ptemps, temps, ret, body: out, budgeted: false });
+        self.typing.funcs_changed();
+        self.calls.done.insert(key, (id, ret));
+        Some(Expr::new(ret, ExprKind::Call { func: id, args: vals }))
     }
 
     /// `f[args]` as a call of a compiled function, if `f` is a recursive
@@ -640,6 +760,33 @@ impl Lowerer<'_> {
         args.iter().all(|a| self.const_value(a, env).is_some())
     }
 
+    /// Number of syntactic references to definition `d` across all definitions
+    /// in the program (cached once per lowerer).
+    fn def_ref_count(&self, d: hir::DefId) -> usize {
+        let counts = self.calls.def_refs.get_or_init(|| {
+            let mut map = HashMap::new();
+            let mut callees = Vec::new();
+            for def in &self.ip.prog.defs {
+                callees.clear();
+                match &def.kind {
+                    DefKind::Op(b) => collect_callees(b, &mut callees),
+                    DefKind::Fn { bounds, body } => {
+                        for b in bounds {
+                            collect_callees(&b.set, &mut callees);
+                        }
+                        collect_callees(body, &mut callees);
+                    }
+                    DefKind::Pending => {}
+                }
+                for c in &callees {
+                    *map.entry(self.ip.redirect_def(*c)).or_insert(0) += 1;
+                }
+            }
+            map
+        });
+        counts.get(&d).copied().unwrap_or(0)
+    }
+
     /// Whether operator `d` can reach an application of itself (through
     /// the operators its body applies).
     pub(super) fn is_recursive_def(&self, d: hir::DefId) -> bool {
@@ -693,4 +840,62 @@ fn branch_types(e: &Expr, out: &mut Vec<Ty>) {
         ExprKind::Fail(_) => {}
         _ => out.push(e.ty),
     }
+}
+
+/// Whether `body` is large enough (or contains a quantifier/comprehension) to
+/// justify outlining into a shared compiled helper.
+fn worth_outlining(body: &hir::Expr) -> bool {
+    fn walk(e: &hir::Expr, nodes: &mut usize, has_loop: &mut bool) {
+        if *nodes >= HELPER_MIN_HIR {
+            return;
+        }
+        *nodes += 1;
+        if matches!(&*e.kind, H::Quant { .. } | H::Choose { .. } | H::SetFilter { .. } | H::SetMap { .. } | H::FnConstruct { .. }) {
+            *has_loop = true;
+        }
+        tlx_sema::visit::children(e, &mut |c| walk(c, nodes, has_loop));
+    }
+    let (mut nodes, mut has_loop) = (0, false);
+    walk(body, &mut nodes, &mut has_loop);
+    nodes >= HELPER_MIN_HIR || (has_loop && nodes >= HELPER_LOOP_MIN_HIR)
+}
+
+/// Whether `e` contains only IR constructs that a compiled `FnDef` (which has
+/// no host `h`/`cx` pointers) can execute natively.
+fn helper_ir_native(e: &Expr) -> bool {
+    match &*e.kind {
+        ExprKind::Enabled(_) | ExprKind::RefOp { .. } | ExprKind::RefElems(_) => return false,
+        ExprKind::Const(_) if e.ty == Ty::Val => return false,
+        _ => {}
+    }
+    let mut ok = true;
+    e.for_each_child(&mut |c| ok = ok && helper_ir_native(c));
+    ok
+}
+
+fn expr_nodes(e: &Expr) -> usize {
+    let mut n = 1;
+    e.for_each_child(&mut |c| n += expr_nodes(c));
+    n
+}
+
+fn expr_has_loop(e: &Expr) -> bool {
+    let here = matches!(
+        &*e.kind,
+        ExprKind::Exists { .. }
+            | ExprKind::Forall { .. }
+            | ExprKind::Choose { .. }
+            | ExprKind::Filter { .. }
+            | ExprKind::SeqFilter { .. }
+            | ExprKind::Fold { .. }
+            | ExprKind::UnionFold { .. }
+            | ExprKind::Collect { .. }
+            | ExprKind::MapBuild { .. }
+            | ExprKind::MapSet { .. }
+    );
+    let mut found = here;
+    if !found {
+        e.for_each_child(&mut |c| found = found || expr_has_loop(c));
+    }
+    found
 }

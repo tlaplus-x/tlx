@@ -121,6 +121,28 @@ impl Lowerer<'_> {
             let set = Expr::new(Ty::Val, ExprKind::IntRange(int_lit(1), n));
             return Ok(Stmt::ForEach { bind: t, set, sorted: false, body: Box::new(rest) });
         }
+        if !st.partial
+            && self.cont_nontrivial(k, st)
+            && !self.may_assign(e, env, st)
+            && self.may_branch(e, env, 0)
+            && !self.volatile_expr(e, env)
+            && !self.expr_makes_strings(e, env)
+        {
+            let mark = self.frame.snapshot();
+            let saved_stmts = self.stmts;
+            match self.path_count(e, env, st) {
+                Ok(n) if native_path_count(&n) => {
+                    let rest = self.cont(k, st)?;
+                    let t = self.temp(Ty::Int);
+                    let set = Expr::new(Ty::Val, ExprKind::IntRange(int_lit(1), n));
+                    return Ok(Stmt::ForEach { bind: t, set, sorted: false, body: Box::new(rest) });
+                }
+                Ok(_) | Err(_) => {
+                    self.frame.restore(mark);
+                    self.stmts = saved_stmts;
+                }
+            }
+        }
         match &*e.kind {
             H::And(es) => {
                 let k2 = es[1..].iter().rev().fold(k.clone(), |k2, c| k2.push(Item::Expr(c.clone(), env.clone())));
@@ -143,12 +165,20 @@ impl Lowerer<'_> {
                 if let Some(b) = self.const_bool(cond, env) {
                     return self.go(if b { then } else { els }, env, k, st);
                 }
+                if let Some(s) = self.try_then(e, env, k, st)? {
+                    return Ok(s);
+                }
                 let c = self.bool_expr(cond, env, st);
                 let t = self.go(then, env, k, st)?;
                 let f = self.go(els, env, k, st)?;
                 Ok(if_stmt(c, t, f))
             }
-            H::Case { arms, other } => self.go_case(arms, other.as_ref(), env, k, st),
+            H::Case { arms, other } => {
+                if let Some(s) = self.try_then(e, env, k, st)? {
+                    return Ok(s);
+                }
+                self.go_case(arms, other.as_ref(), env, k, st)
+            }
             H::Let { defs, body } => {
                 let (env2, lets) = self.let_temps(defs, body, env, st);
                 let mut s = self.go(body, &env2, k, st)?;
@@ -177,6 +207,9 @@ impl Lowerer<'_> {
             H::Builtin { op: B::Unchanged, args } if !st.init => self.go_unchanged(&args[0], env, k, st),
             H::Builtin { op: B::Compose, args } if !st.init => self.go_compose(&args[0], &args[1], env, k, st),
             H::Builtin { op: B::Implies, args } => {
+                if let Some(s) = self.try_then(e, env, k, st)? {
+                    return Ok(s);
+                }
                 let c = self.bool_expr(&args[0], env, st);
                 let t = self.go(&args[1], env, k, st)?;
                 let f = self.cont(k, st)?;
@@ -543,8 +576,64 @@ impl Lowerer<'_> {
 
     /// Continue with `k` if `cond` holds.
     fn guarded(&mut self, cond: Expr, k: &Cont, st: &St) -> LResult<Stmt> {
+        if is_false(&cond) {
+            return Ok(Stmt::Stop);
+        }
         let then = self.cont(k, st)?;
         Ok(guard(cond, then))
+    }
+
+    /// Factor a deterministic conditional (`IF`/`CASE`/`=>`) before a
+    /// non-empty continuation `k` into `Stmt::Then { first, assigned, rest }`
+    /// so `k` is lowered once instead of duplicated across every branch.
+    fn try_then(&mut self, e: &hir::Expr, env: &LEnv, k: &Cont, st: &St) -> LResult<Option<Stmt>> {
+        if k.0.is_none() || matches!(&k.0, Some(node) if matches!(node.0, Item::Count(_))) {
+            return Ok(None);
+        }
+        let mark = self.frame.snapshot();
+        let saved_stmts = self.stmts;
+        let mut st1 = st.clone();
+        st1.partial = true;
+        let first = self.go(e, env, &Cont::default(), &st1)?;
+        if !first.is_deterministic() {
+            self.frame.restore(mark);
+            self.stmts = saved_stmts;
+            return Ok(None);
+        }
+        let Some(masks) = first.emitted_assignments_from(&st.assigned) else {
+            self.frame.restore(mark);
+            self.stmts = saved_stmts;
+            return Ok(None);
+        };
+        if masks.is_empty() {
+            return Ok(Some(first));
+        }
+        if masks.len() > 1 {
+            self.frame.restore(mark);
+            self.stmts = saved_stmts;
+            return Ok(None);
+        }
+        let assigned = masks.into_iter().next().unwrap();
+        let mut st2 = st.clone();
+        st2.assigned = assigned.clone();
+        let rest = self.cont(k, &st2)?;
+        Ok(Some(Stmt::Then { first: Box::new(first), assigned, rest: Box::new(rest) }))
+    }
+
+    /// Whether `k` has remaining work that would be costly to duplicate
+    /// across every branch of a non-assigning branching conjunct.
+    fn cont_nontrivial(&self, k: &Cont, st: &St) -> bool {
+        let Some(first) = &k.0 else { return false };
+        if matches!(first.0, Item::Count(_)) {
+            return false;
+        }
+        if first.1 .0.is_some() {
+            return true;
+        }
+        match &first.0 {
+            Item::Expr(c, cenv) => self.may_assign(c, cenv, st) || self.may_branch(c, cenv, 0),
+            Item::MustChange(_, _) | Item::Count(_) => false,
+        }
     }
 
     /// Bind the variables of `\E` bounds: returns the extended environment and
@@ -774,4 +863,25 @@ fn destructure(ls: &[LocalId], x: &Value) -> LResult<Vec<(LocalId, Value)>> {
 /// Component `i` (0-based) of a boxed tuple.
 fn tuple_component(t: Expr, i: usize) -> Expr {
     Expr::new(Ty::Val, ExprKind::Apply(t, val_lit(Value::Int(i as i64 + 1))))
+}
+
+/// Whether a path-count expression is eligible for eager path counting:
+/// - rejects `Fold { product: true, .. }` (branching `\A`, whether direct or
+///   behind an expanded operator), because `Fold` nests binders with the last
+///   binder varying fastest whereas action enumeration varies the first binder
+///   fastest (and `go_forall` handles branching `\A` via `Repeat`/unrolling),
+/// - requires typed sources for `Fold`/`Exists`/`Forall` so eager path
+///   counting never introduces boxed iterations that C/JIT would reject or
+///   that cannot preserve lazy-union multiplicity.
+fn native_path_count(e: &Expr) -> bool {
+    match &*e.kind {
+        ExprKind::Fold { product: true, .. } => return false,
+        ExprKind::Fold { set, .. } | ExprKind::Exists { set, .. } | ExprKind::Forall { set, .. } if !set.is_typed_source() => {
+            return false;
+        }
+        _ => {}
+    }
+    let mut ok = true;
+    e.for_each_child(&mut |c| ok = ok && native_path_count(c));
+    ok
 }

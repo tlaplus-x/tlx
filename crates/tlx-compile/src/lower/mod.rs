@@ -286,6 +286,16 @@ impl<'a> Lowerer<'a> {
         self.typing.into_inner()
     }
 
+    /// Next unused `Repeat` id (for preserving id uniqueness across cached IR).
+    pub(crate) fn repeats(&self) -> u32 {
+        self.repeats
+    }
+
+    /// Advance the `Repeat` id counter past any ids used in reused IR.
+    pub(crate) fn set_repeats(&mut self, n: u32) {
+        self.repeats = self.repeats.max(n);
+    }
+
     // ------------------------------------------------------------------
     // entry points
 
@@ -768,10 +778,9 @@ fn guard(cond: Expr, then: Stmt) -> Stmt {
     Stmt::Guard { cond, then: Box::new(then) }
 }
 
-/// `IF c THEN t ELSE f` as two guarded branches.
+/// `IF c THEN t ELSE f` as a single conditional statement.
 fn if_stmt(c: Expr, t: Stmt, f: Stmt) -> Stmt {
-    let nc = not(c.clone());
-    Stmt::Branches(vec![guard(c, t), guard(nc, f)])
+    Stmt::If { cond: c, then: Box::new(t), els: Box::new(f) }
 }
 
 #[cfg(test)]

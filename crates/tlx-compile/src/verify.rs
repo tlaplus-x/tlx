@@ -57,6 +57,8 @@ struct Check<'a> {
     assigned: Vec<bool>,
     current: bool,
     partial: bool,
+    /// Inside `Stmt::Then::first`: every `Emit` must have assigned at least these variables.
+    emit_need: Option<Vec<bool>>,
     repeats: Vec<u32>,
 }
 
@@ -71,6 +73,7 @@ impl<'a> Check<'a> {
             assigned: vec![matches!(context, Context::Transition); t.var_sid.len()],
             current: !matches!(context, Context::Init),
             partial: matches!(context, Context::Value),
+            emit_need: None,
             repeats: Vec::new(),
         };
         for &ty in temps {
@@ -668,9 +671,11 @@ impl<'a> Check<'a> {
                 same(e.ty, Ty::Bool)?;
                 let assigned = std::mem::replace(&mut self.assigned, vec![false; self.t.var_sid.len()]);
                 let partial = std::mem::replace(&mut self.partial, true);
+                let emit_need = self.emit_need.take();
                 let result = self.stmt(s);
                 self.assigned = assigned;
                 self.partial = partial;
+                self.emit_need = emit_need;
                 result
             }
             Tuple(xs) => {
@@ -719,7 +724,12 @@ impl<'a> Check<'a> {
     fn stmt(&mut self, s: &Stmt) -> Result {
         match s {
             Stmt::Stop | Stmt::Error(_) => Ok(()),
-            Stmt::Emit => require(self.partial || self.assigned.iter().all(|x| *x), "emit with unassigned state variables"),
+            Stmt::Emit => match &self.emit_need {
+                Some(need) => {
+                    require(need.iter().zip(&self.assigned).all(|(n, a)| !*n || *a), "then branch emits without required assignments")
+                }
+                None => require(self.partial || self.assigned.iter().all(|x| *x), "emit with unassigned state variables"),
+            },
             Stmt::Branches(bs) => {
                 for b in bs {
                     self.stmt(b)?;
@@ -729,6 +739,28 @@ impl<'a> Check<'a> {
             Stmt::Guard { cond, then } => {
                 self.expect(cond, Ty::Bool)?;
                 self.stmt(then)
+            }
+            Stmt::If { cond, then, els } => {
+                self.expect(cond, Ty::Bool)?;
+                self.stmt(then)?;
+                self.stmt(els)
+            }
+            Stmt::Then { first, assigned, rest } => {
+                require(first.is_deterministic(), "non-deterministic statement before Then join")?;
+                require(assigned.len() == self.assigned.len(), "then assignment mask length")?;
+                let outer_partial = std::mem::replace(&mut self.partial, true);
+                let outer_need = self.emit_need.replace(assigned.clone());
+                let first_res = self.stmt(first);
+                self.partial = outer_partial;
+                self.emit_need = outer_need;
+                first_res?;
+                let outer_assigned = self.assigned.clone();
+                for (a, b) in self.assigned.iter_mut().zip(assigned) {
+                    *a |= *b;
+                }
+                let rest_res = self.stmt(rest);
+                self.assigned = outer_assigned;
+                rest_res
             }
             Stmt::Let { temp, value, body } => {
                 self.expr(value)?;
@@ -765,9 +797,11 @@ impl<'a> Check<'a> {
                 require(second.emitted_assignments(self.assigned.len()).as_ref() == Some(&masks), "composition assignment mask mismatch")?;
                 let outer = std::mem::replace(&mut self.assigned, vec![false; self.t.var_sid.len()]);
                 let partial = std::mem::replace(&mut self.partial, true);
+                let emit_need = self.emit_need.take();
                 let result = self.stmt(first).and_then(|_| self.stmt(second));
                 self.assigned = outer;
                 self.partial = partial;
+                self.emit_need = emit_need;
                 result?;
                 for path in paths {
                     let outer = self.assigned.clone();

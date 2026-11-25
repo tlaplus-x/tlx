@@ -818,6 +818,14 @@ impl TableCx<'_, '_, '_> {
                 self.stmt(body, assigned);
                 assigned[*var as usize] = was;
             }
+            Stmt::Then { first, assigned: join_assigned, rest } => {
+                self.stmt(first, assigned);
+                let mut merged = assigned.clone();
+                for (a, b) in merged.iter_mut().zip(join_assigned) {
+                    *a |= *b;
+                }
+                self.stmt(rest, &mut merged);
+            }
             Stmt::Compose { first, second, paths, .. } => {
                 let saved = std::mem::replace(&mut self.enabled, true);
                 self.stmt(first, &mut vec![false; assigned.len()]);

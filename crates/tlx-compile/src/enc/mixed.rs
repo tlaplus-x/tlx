@@ -680,7 +680,13 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
 fn hash_stmt(h: &mut Hashing, s: &Stmt) {
     std::hash::Hash::hash(&std::mem::discriminant(s), h);
     match s {
-        Stmt::Stop | Stmt::Emit | Stmt::Guard { .. } => {}
+        Stmt::Stop | Stmt::Emit | Stmt::Guard { .. } | Stmt::If { .. } => {}
+        Stmt::Then { assigned, .. } => {
+            h.u64(assigned.len() as u64);
+            for a in assigned {
+                h.u64(*a as u64);
+            }
+        }
         Stmt::Branches(bs) => h.u64(bs.len() as u64),
         Stmt::Let { temp, .. } => h.u64(*temp as u64),
         Stmt::ForEach { bind, sorted, .. } => h.u64((*bind as u64) << 1 | *sorted as u64),

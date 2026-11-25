@@ -12,11 +12,11 @@ use crate::ir::*;
 impl CGen<'_> {
     /// Append the code of `s` (indented `ind` levels) to `out`.
     pub(super) fn stmt(&mut self, s: &Stmt, ind: usize, out: &mut String) -> R<()> {
-        let pad = "  ".repeat(ind);
+        let pad = "  ".repeat(ind.min(8));
         match s {
             Stmt::Compose { .. } => return no("action composition uses the compiled executor"),
             Stmt::Stop => {}
-            Stmt::Emit => match &self.enabled {
+            Stmt::Emit => match &self.emit_target {
                 Some((flag, label)) => writeln!(out, "{pad}{{ {flag} = 1; goto {label}; }}").unwrap(),
                 None => writeln!(out, "{pad}if (h->emit(cx, s1, 0)) return TLX_STOP;").unwrap(),
             },
@@ -32,6 +32,32 @@ impl CGen<'_> {
                 writeln!(out, "{pad}if ({c}) {{").unwrap();
                 self.stmt(then, ind + 1, out)?;
                 writeln!(out, "{pad}}}").unwrap();
+            }
+            Stmt::If { cond, then, els } => {
+                let c = self.bool_expr(cond)?;
+                writeln!(out, "{pad}if ({c}) {{").unwrap();
+                self.stmt(then, ind + 1, out)?;
+                writeln!(out, "{pad}}} else {{").unwrap();
+                self.stmt(els, ind + 1, out)?;
+                writeln!(out, "{pad}}}").unwrap();
+            }
+            Stmt::Then { first, assigned, rest } => {
+                let k = self.fresh();
+                let (flag, label) = (format!("jn{k}"), format!("jn{k}_done"));
+                writeln!(out, "{pad}{{ int {flag} = 0;").unwrap();
+                let saved = self.emit_target.replace((flag.clone(), label.clone()));
+                let r = self.stmt(first, ind + 1, out);
+                self.emit_target = saved;
+                r?;
+                writeln!(out, "{pad}{label}: ; if ({flag}) {{").unwrap();
+                let outer_assigned = self.assigned.clone();
+                for (a, b) in self.assigned.iter_mut().zip(assigned) {
+                    *a |= *b;
+                }
+                let r = self.stmt(rest, ind + 1, out);
+                self.assigned = outer_assigned;
+                r?;
+                writeln!(out, "{pad}}} }}").unwrap();
             }
             Stmt::Let { temp: t, value, body } => {
                 let v = self.expr(value)?;
@@ -66,7 +92,7 @@ impl CGen<'_> {
                 let mut code = String::new();
                 let planned = if value.ty == Ty::Enc(sid) {
                     let snap = self.snapshot();
-                    let r = self.plan_into(&crate::inplace::plan(value, self.ty), &d, ind + 1, &mut code);
+                    let r = self.plan_into(&crate::inplace::plan(value, self.ty), &d, ind.min(8) + 1, &mut code);
                     if r.is_err() {
                         self.rollback(snap);
                         code.clear();
@@ -81,11 +107,11 @@ impl CGen<'_> {
                 }
                 writeln!(out, "{pad}{{ uint64_t *{d} = s1 + {off};").unwrap();
                 out.push_str(&code);
+                writeln!(out, "{pad}}}").unwrap();
                 let was = std::mem::replace(&mut self.assigned[i], true);
-                let r = self.stmt(body, ind + 1, out);
+                let r = self.stmt(body, ind, out);
                 self.assigned[i] = was;
                 r?;
-                writeln!(out, "{pad}}}").unwrap();
             }
             Stmt::Error(_) => writeln!(out, "{pad}return TLX_ERR;").unwrap(),
             Stmt::Count(id) => writeln!(out, "{pad}cnt{id}++;").unwrap(),

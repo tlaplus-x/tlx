@@ -8,6 +8,7 @@
 mod atom_equality;
 mod composition;
 mod const_set_shapes;
+mod dedup_and_reuse;
 mod encoded_order;
 mod except_union;
 mod exec_errors;
@@ -47,6 +48,7 @@ fn all_test_files_registered() {
         "atom_equality",
         "composition",
         "const_set_shapes",
+        "dedup_and_reuse",
         "encoded_order",
         "except_union",
         "exec_errors",

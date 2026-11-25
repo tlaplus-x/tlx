@@ -437,6 +437,17 @@ impl Compiler<'_> {
                 let then = self.stmt(then)?;
                 Box::new(move |fx, emit| if c(fx)? { then(fx, emit) } else { Ok(true) })
             }
+            Stmt::If { cond, then, els } => {
+                let c = self.bool_(cond)?;
+                let then = self.stmt(then)?;
+                let els = self.stmt(els)?;
+                Box::new(move |fx, emit| if c(fx)? { then(fx, emit) } else { els(fx, emit) })
+            }
+            Stmt::Then { first, rest, .. } => {
+                let first = self.stmt(first)?;
+                let rest = self.stmt(rest)?;
+                Box::new(move |fx, emit| first(fx, &mut |fx| rest(fx, emit)))
+            }
             Stmt::Let { temp, value, body } => {
                 let code = self.expr(value)?;
                 let (st, old) = self.bind_let(*temp, code)?;

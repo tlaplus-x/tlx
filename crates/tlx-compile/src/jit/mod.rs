@@ -27,14 +27,19 @@ mod gen;
 mod rt;
 mod stmt;
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Signature, UserFuncName};
+use cranelift_codegen::ir::function::FunctionStencil;
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, UserFuncName};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
+use cranelift_codegen::{Context, FinalizedMachReloc};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{default_libcall_names, FuncId, Linkage, Module, ModuleReloc};
+use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc};
 use tlx_base::diag::{self, Topic};
 use tlx_native::native::{EntryPoints, NativeLib, UNSUPPORTED};
 
@@ -72,7 +77,7 @@ pub struct JitLibrary {
 /// What keeps JIT code and its constants alive.
 struct Keep {
     module: Option<JITModule>,
-    _statics: Statics,
+    _statics: SharedStatics,
 }
 
 // SAFETY: after `finalize_definitions` the module is never used again
@@ -92,38 +97,104 @@ impl Drop for Keep {
 
 /// Constant tables referenced by address from JIT code.
 #[derive(Default)]
-pub(crate) struct Statics {
+struct Statics {
     words: Vec<Box<[u64]>>,
+    words_map: HashMap<Vec<u64>, i64>,
     i32s: Vec<Box<[i32]>>,
+    i32s_map: HashMap<Vec<i32>, i64>,
     i64s: Vec<Box<[i64]>>,
+    i64s_map: HashMap<Vec<i64>, i64>,
 }
 
-impl Statics {
-    fn words(&mut self, w: &[u64]) -> i64 {
-        let b: Box<[u64]> = if w.is_empty() { vec![0].into() } else { w.into() };
+/// Append-only shared constant pool so identical constant tables keep stable
+/// addresses across layout-miss restarts and outlive the `JitCache` via `Keep`.
+#[derive(Clone, Default)]
+pub(crate) struct SharedStatics(Arc<Mutex<Statics>>);
+
+impl SharedStatics {
+    pub(crate) fn words(&self, w: &[u64]) -> i64 {
+        let mut s = self.0.lock().unwrap();
+        let key: &[u64] = if w.is_empty() { &[0] } else { w };
+        if let Some(&p) = s.words_map.get(key) {
+            return p;
+        }
+        let b: Box<[u64]> = key.into();
         let p = b.as_ptr() as i64;
-        self.words.push(b);
+        s.words.push(b);
+        s.words_map.insert(key.to_vec(), p);
         p
     }
-    fn i32s(&mut self, w: &[i32]) -> i64 {
-        let b: Box<[i32]> = if w.is_empty() { vec![-1].into() } else { w.into() };
+    pub(crate) fn i32s(&self, w: &[i32]) -> i64 {
+        let mut s = self.0.lock().unwrap();
+        let key: &[i32] = if w.is_empty() { &[-1] } else { w };
+        if let Some(&p) = s.i32s_map.get(key) {
+            return p;
+        }
+        let b: Box<[i32]> = key.into();
         let p = b.as_ptr() as i64;
-        self.i32s.push(b);
+        s.i32s.push(b);
+        s.i32s_map.insert(key.to_vec(), p);
         p
     }
-    fn i64s(&mut self, w: &[i64]) -> i64 {
-        let b: Box<[i64]> = if w.is_empty() { vec![0].into() } else { w.into() };
+    pub(crate) fn i64s(&self, w: &[i64]) -> i64 {
+        let mut s = self.0.lock().unwrap();
+        let key: &[i64] = if w.is_empty() { &[0] } else { w };
+        if let Some(&p) = s.i64s_map.get(key) {
+            return p;
+        }
+        let b: Box<[i64]> = key.into();
         let p = b.as_ptr() as i64;
-        self.i64s.push(b);
+        s.i64s.push(b);
+        s.i64s_map.insert(key.to_vec(), p);
         p
     }
+}
+
+/// Cross-attempt cache of compiled Cranelift machine code keyed by exact
+/// `(isa_key, user_namespaces, FunctionStencil)` structural equality (no
+/// hash-only reuse).
+#[derive(Default)]
+pub(crate) struct JitCache {
+    statics: SharedStatics,
+    entries: HashMap<u64, Vec<CachedFn>>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+#[cfg(test)]
+impl JitCache {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+    pub(crate) fn hits(&self) -> usize {
+        self.hits
+    }
+}
+
+struct CachedFn {
+    isa_key: String,
+    namespaces: Vec<u32>,
+    stencil: FunctionStencil,
+    align: u64,
+    bytes: Vec<u8>,
+    relocs: Vec<FinalizedMachReloc>,
+}
+
+fn stencil_hash(isa_key: &str, namespaces: &[u32], stencil: &FunctionStencil) -> u64 {
+    let mut h = DefaultHasher::new();
+    isa_key.hash(&mut h);
+    namespaces.hash(&mut h);
+    stencil.hash(&mut h);
+    h.finish()
 }
 
 /// Module-wide state of one compilation.
 pub(crate) struct Cx<'t> {
     ty: &'t Typing,
     module: JITModule,
-    statics: Statics,
+    /// Read-only module data containing `(nvars + 1)` byte offsets (`[off_0*8, ..., words*8]`).
+    var_offsets: DataId,
+    statics: SharedStatics,
     /// Compiled functions (`Typing::funcs`): declared ids and nativeness.
     fn_ids: Vec<FuncId>,
     fn_native: Vec<bool>,
@@ -137,15 +208,21 @@ pub(crate) struct Cx<'t> {
 
 /// Cranelift flags: `TLX_JIT_OPT` = none|speed (default speed),
 /// `TLX_JIT_VERIFY` turns the IR verifier on.
-fn isa_flags() -> settings::Flags {
+fn isa_flags() -> (settings::Flags, String) {
     let mut b = settings::builder();
     b.set("use_colocated_libcalls", "false").unwrap();
     b.set("is_pic", "false").unwrap();
     let env = tlx_base::knobs::Env::process();
     let opt = env.string_or_default("TLX_JIT_OPT");
-    b.set("opt_level", &opt).unwrap_or_else(|_| b.set("opt_level", "speed").unwrap());
-    b.set("enable_verifier", if env.flag("TLX_JIT_VERIFY") { "true" } else { "false" }).unwrap();
-    settings::Flags::new(b)
+    let opt_used = if b.set("opt_level", &opt).is_ok() {
+        opt
+    } else {
+        b.set("opt_level", "speed").unwrap();
+        "speed".to_string()
+    };
+    let verify = env.flag("TLX_JIT_VERIFY");
+    b.set("enable_verifier", if verify { "true" } else { "false" }).unwrap();
+    (settings::Flags::new(b), format!("opt={opt_used};verify={verify}"))
 }
 
 /// Compile a library: same functions and entry points as
@@ -161,6 +238,18 @@ pub fn library(
     action_names: &[String],
     inv_names: &[String],
 ) -> Result<JitLibrary, String> {
+    library_with_cache(verified, regions, refops, action_names, inv_names, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn library_with_cache(
+    verified: &crate::verify::Program<'_>,
+    regions: Option<RegionPlan>,
+    refops: Option<std::sync::Arc<crate::exec::refops::RefOpTable>>,
+    action_names: &[String],
+    inv_names: &[String],
+    cache: Option<&mut JitCache>,
+) -> Result<JitLibrary, String> {
     let ty = verified.typing();
     let init = verified.init();
     let actions = verified.actions();
@@ -173,14 +262,29 @@ pub fn library(
             return Err("region plan site count mismatch".into());
         }
     }
-    let isa = cranelift_native::builder().map_err(|e| e.to_string())?.finish(isa_flags()).map_err(|e| e.to_string())?;
-    let module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    let (flags, isa_key) = isa_flags();
+    let isa = cranelift_native::builder().map_err(|e| e.to_string())?.finish(flags).map_err(|e| e.to_string())?;
+    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    // Declare the read-only variable byte-offset table first so it always has
+    // DataId(0) across restarts.
+    let var_offsets = module.declare_data("var_offsets", Linkage::Local, false, false).map_err(|e| e.to_string())?;
+    let mut off_bytes = Vec::with_capacity((ty.layout.offsets.len() + 1) * 8);
+    for &o in &ty.layout.offsets {
+        off_bytes.extend_from_slice(&((o * 8) as u64).to_le_bytes());
+    }
+    off_bytes.extend_from_slice(&((ty.layout.words * 8) as u64).to_le_bytes());
+    let mut dd = DataDescription::new();
+    dd.define(off_bytes.into_boxed_slice());
+    dd.set_align(8);
+    module.define_data(var_offsets, &dd).map_err(|e| e.to_string())?;
+    let statics = cache.as_ref().map_or_else(SharedStatics::default, |c| c.statics.clone());
     let regions = regions.filter(|r| !r.table.is_empty()).map(RegionCursor::new);
     let (n_regions, regions_hash) = regions.as_ref().map_or((0, 0), |r| (r.table.len() as u32, r.table.hash()));
     let mut cx = Cx {
         ty,
         module,
-        statics: Statics::default(),
+        var_offsets,
+        statics,
         fn_ids: Vec::new(),
         fn_native: Vec::new(),
         regions,
@@ -267,15 +371,16 @@ pub fn library(
         s.returns.push(AbiParam::new(ret));
         s
     };
+    let words = ty.layout.words;
     let tlx_init = cx.trampoline(&mut ctx, &mut fbc, "tlx_init", sig(&cx, &[ptr, ptr], I32), init_id, &mut code_bytes)?;
-    let tlx_next = cx.dispatch(
+    let tlx_next = cx.dispatch_actions(
         &mut ctx,
         &mut fbc,
         "tlx_next",
         sig(&cx, &[ptr, ptr, ptr, I32], I32),
         &act_ids,
         &native.actions,
-        &[0, 1, 2],
+        words,
         &mut code_bytes,
     )?;
     let tlx_inv = cx.dispatch(
@@ -298,9 +403,8 @@ pub fn library(
         &[0, 1, 2, 3],
         &mut code_bytes,
     )?;
-    let words = ty.layout.words;
 
-    cx.flush(&mut code_bytes)?;
+    cx.flush(&mut code_bytes, &isa_key, cache)?;
     cx.module.finalize_definitions().map_err(|e| e.to_string())?;
     let f = |id: FuncId| cx.module.get_finalized_function(id);
     // SAFETY: the functions were defined with the signatures of the ABI
@@ -328,7 +432,8 @@ pub fn library(
 /// first element keeps the code alive.
 #[cfg(test)]
 pub fn fingerprint_fn(words: usize) -> Result<(Box<dyn std::any::Any>, unsafe extern "C" fn(*const u64) -> u64), String> {
-    let isa = cranelift_native::builder().map_err(|e| e.to_string())?.finish(isa_flags()).map_err(|e| e.to_string())?;
+    let (flags, _) = isa_flags();
+    let isa = cranelift_native::builder().map_err(|e| e.to_string())?.finish(flags).map_err(|e| e.to_string())?;
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
     let mut fbc = FunctionBuilderContext::new();
     let mut ctx = module.make_context();
@@ -336,7 +441,7 @@ pub fn fingerprint_fn(words: usize) -> Result<(Box<dyn std::any::Any>, unsafe ex
     module.finalize_definitions().map_err(|e| e.to_string())?;
     // SAFETY: defined with this signature.
     let f = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*const u64) -> u64>(module.get_finalized_function(id)) };
-    Ok((Box::new(Keep { module: Some(module), _statics: Statics::default() }), f))
+    Ok((Box::new(Keep { module: Some(module), _statics: SharedStatics::default() }), f))
 }
 
 impl<'t> Cx<'t> {
@@ -367,39 +472,79 @@ impl<'t> Cx<'t> {
     /// Compile the pending functions on several threads (Cranelift compiles
     /// a function independently of the others: calls and statics are
     /// relocations) and define them in the module, as `define_function`
-    /// does: the same code, alignment and relocations.
-    fn flush(&mut self, code_bytes: &mut usize) -> Result<(), String> {
-        type Compiled = Result<(u64, Vec<u8>, Vec<ModuleReloc>), String>;
+    /// does: the same code, alignment and relocations. Functions whose exact
+    /// `(isa_key, user_namespaces, FunctionStencil)` already exists in `cache`
+    /// reuse their compiled machine bytes with relocations remapped to this
+    /// module's ids.
+    fn flush(&mut self, code_bytes: &mut usize, isa_key: &str, mut cache: Option<&mut JitCache>) -> Result<(), String> {
+        type Compiled = Result<(u64, Vec<u8>, Vec<FinalizedMachReloc>), String>;
         let pending = std::mem::take(&mut self.pending);
         if pending.is_empty() {
             return Ok(());
         }
+        let mut misses: Vec<(FuncId, cranelift_codegen::ir::Function, u64, Vec<u32>)> = Vec::new();
+        let mut reused = 0u64;
+        for (id, func) in pending {
+            let namespaces: Vec<u32> = func.params.user_named_funcs().values().map(|n| n.namespace).collect();
+            let hash = stencil_hash(isa_key, &namespaces, &func.stencil);
+            let hit = cache.as_ref().and_then(|c| {
+                c.entries.get(&hash)?.iter().find(|e| e.isa_key == isa_key && e.namespaces == namespaces && e.stencil == func.stencil)
+            });
+            if let Some(entry) = hit {
+                let relocs: Vec<ModuleReloc> = entry.relocs.iter().map(|r| ModuleReloc::from_mach_reloc(r, &func, id)).collect();
+                *code_bytes += entry.bytes.len();
+                self.module.define_function_bytes(id, entry.align, &entry.bytes, &relocs).map_err(|e| format!("{e:?}"))?;
+                reused += 1;
+            } else {
+                misses.push((id, func, hash, namespaces));
+            }
+        }
+        if reused > 0 {
+            #[cfg(test)]
+            if let Some(c) = cache.as_deref_mut() {
+                c.hits += reused as usize;
+            }
+            tlx_runtime::stats::add_count("JIT functions reused from cache", reused);
+        }
+        if misses.is_empty() {
+            return Ok(());
+        }
         let isa = self.module.isa();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(JIT_THREADS).min(pending.len());
-        let compile_one = |(id, func): &(FuncId, cranelift_codegen::ir::Function)| -> Compiled {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(JIT_THREADS).min(misses.len());
+        let compile_one = |(_, func, _, _): &(FuncId, cranelift_codegen::ir::Function, u64, Vec<u32>)| -> Compiled {
             let mut ctx = Context::for_function(func.clone());
             let align = ctx.compile(isa, &mut Default::default()).map_err(|e| format!("{e:?}"))?.buffer.alignment as u64;
             let code = ctx.compiled_code().expect("compiled");
-            let relocs = code.buffer.relocs().iter().map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, *id)).collect();
-            Ok((align, code.code_buffer().to_vec(), relocs))
+            Ok((align, code.code_buffer().to_vec(), code.buffer.relocs().to_vec()))
         };
-        let mut out: Vec<Option<Compiled>> = (0..pending.len()).map(|_| None).collect();
+        let mut out: Vec<Option<Compiled>> = (0..misses.len()).map(|_| None).collect();
         let results = std::sync::Mutex::new(&mut out);
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(f) = pending.get(i) else { break };
+                    let Some(f) = misses.get(i) else { break };
                     let r = compile_one(f);
                     results.lock().unwrap()[i] = Some(r);
                 });
             }
         });
-        for ((id, _), r) in pending.iter().zip(out) {
-            let (align, bytes, relocs) = r.expect("every pending function was compiled")?;
+        for ((id, func, hash, namespaces), r) in misses.into_iter().zip(out) {
+            let (align, bytes, mach_relocs) = r.expect("every pending function was compiled")?;
+            let relocs: Vec<ModuleReloc> = mach_relocs.iter().map(|r| ModuleReloc::from_mach_reloc(r, &func, id)).collect();
             *code_bytes += bytes.len();
-            self.module.define_function_bytes(*id, align, &bytes, &relocs).map_err(|e| format!("{e:?}"))?;
+            self.module.define_function_bytes(id, align, &bytes, &relocs).map_err(|e| format!("{e:?}"))?;
+            if let Some(c) = cache.as_deref_mut() {
+                c.entries.entry(hash).or_default().push(CachedFn {
+                    isa_key: isa_key.to_string(),
+                    namespaces,
+                    stencil: func.stencil,
+                    align,
+                    bytes,
+                    relocs: mach_relocs,
+                });
+            }
         }
         Ok(())
     }
@@ -610,6 +755,63 @@ impl<'t> Cx<'t> {
             let call = b.ins().call(callee, &args);
             let r = b.inst_results(call)[0];
             b.ins().return_(&[r]);
+            b.seal_all_blocks();
+            b.finalize();
+        }
+        self.compile(ctx, id, code_bytes)?;
+        Ok(id)
+    }
+
+    /// `tlx_next(h, cx, s0, sel)`: allocates the next-state buffer `s1` once
+    /// here and passes `(h, cx, s0, s1)` to `act_sel`, keeping `act_i`
+    /// independent of the total state width `words` so unchanged actions hit
+    /// `JitCache` across layout-miss restarts.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_actions(
+        &mut self,
+        ctx: &mut Context,
+        fbc: &mut FunctionBuilderContext,
+        name: &str,
+        sig: Signature,
+        targets: &[FuncId],
+        native: &[bool],
+        words: usize,
+        code_bytes: &mut usize,
+    ) -> Result<FuncId, String> {
+        let id = self.module.declare_function(name, Linkage::Local, &sig).map_err(|e| e.to_string())?;
+        ctx.func.signature = sig;
+        ctx.func.name = UserFuncName::user(0, id.as_u32());
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, fbc);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            let params = b.block_params(entry).to_vec();
+            let sel = params[3];
+            let ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (words.max(1) * 8) as u32, 3));
+            let s1 = b.ins().stack_addr(I64, ss, 0);
+            let args = [params[0], params[1], params[2], s1];
+            let default = b.create_block();
+            let mut sw = Switch::new();
+            let mut cases = Vec::new();
+            for (i, t) in targets.iter().enumerate() {
+                if native[i] {
+                    let blk = b.create_block();
+                    sw.set_entry(i as u128, blk);
+                    cases.push((blk, *t));
+                }
+            }
+            sw.emit(&mut b, sel, default);
+            for (blk, t) in cases {
+                b.switch_to_block(blk);
+                let callee = self.module.declare_func_in_func(t, b.func);
+                let call = b.ins().call(callee, &args);
+                let r = b.inst_results(call)[0];
+                b.ins().return_(&[r]);
+            }
+            b.switch_to_block(default);
+            let u = b.ins().iconst(I32, UNSUPPORTED as i64);
+            b.ins().return_(&[u]);
             b.seal_all_blocks();
             b.finalize();
         }

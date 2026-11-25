@@ -86,6 +86,29 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
         self.b.ins().iadd(p, off)
     }
 
+    /// Byte offset of state variable `var` (or total state bytes when
+    /// `var == nvars`) loaded from the module's read-only `var_offsets` table.
+    /// Loading from the module table keeps Cranelift IR identical across
+    /// layout-miss restarts even when earlier variables widen and shift offsets.
+    pub(in crate::jit) fn var_byte_off(&mut self, var: usize) -> Value {
+        let gv = match self.var_offsets_gv {
+            Some(gv) => gv,
+            None => {
+                let gv = self.cx.module.declare_data_in_func(self.cx.var_offsets, self.b.func);
+                self.var_offsets_gv = Some(gv);
+                gv
+            }
+        };
+        let table = self.b.ins().symbol_value(I64, gv);
+        self.b.ins().load(I64, MemFlags::trusted().with_readonly(), table, (var * 8) as i32)
+    }
+
+    /// Pointer to state variable `var` inside state buffer `state`.
+    pub(in crate::jit) fn var_ptr(&mut self, state: Value, var: usize) -> Value {
+        let off = self.var_byte_off(var);
+        self.b.ins().iadd(state, off)
+    }
+
     pub(in crate::jit) fn offset(&mut self, p: Value, words: usize) -> Value {
         if words == 0 {
             p

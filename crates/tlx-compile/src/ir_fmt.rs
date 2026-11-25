@@ -102,6 +102,8 @@ pub fn stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::Compose { .. } => "compose".to_string(),
         Stmt::Branches(bs) => format!("branches {}", bs.len()),
         Stmt::Guard { .. } => "guard".to_string(),
+        Stmt::If { .. } => "if".to_string(),
+        Stmt::Then { .. } => "then".to_string(),
         Stmt::Let { temp, .. } => format!("let t{temp}"),
         Stmt::ForEach { bind, sorted, .. } => format!("foreach t{bind}{}", if *sorted { " sorted" } else { "" }),
         Stmt::Assign { var, .. } => format!("assign var' {var}"),

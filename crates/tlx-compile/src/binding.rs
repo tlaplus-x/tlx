@@ -90,6 +90,11 @@ impl<'a> State<'a> {
         self.primed
     }
 
+    /// Look up `l` in the environments currently in scope.
+    pub(crate) fn lookup(&self, l: LocalId) -> Option<&Binding> {
+        self.scope.iter().find_map(|e| e.lookup(l))
+    }
+
     /// Walk `e` at `depth`: the node policy, the generic resolution of
     /// `Const`, `Local`, `Apply`/`OpArg` and `Let`, then the children in the
     /// policy's child depth.

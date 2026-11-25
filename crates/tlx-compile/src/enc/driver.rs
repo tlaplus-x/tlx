@@ -344,6 +344,8 @@ struct Speculation {
     store: Option<StoreRef>,
     /// `TLX_VALUE_STORE=all` (testing): every slot is a `Ref`.
     store_all: bool,
+    /// Cross-attempt cache for unchanged lowered IR and JIT machine code.
+    cache: super::cache::CompileCache,
 }
 
 /// The version of `Speculation::encode`, and of the compiled tier's
@@ -447,7 +449,17 @@ impl Speculation {
         }
         r.finish().map_err(e)?;
         Ok((
-            Speculation { hints: hints(base), shapes, def_shapes, misses, def_misses, fallback, store: None, store_all: false },
+            Speculation {
+                hints: hints(base),
+                shapes,
+                def_shapes,
+                misses,
+                def_misses,
+                fallback,
+                store: None,
+                store_all: false,
+                cache: super::cache::CompileCache::default(),
+            },
             attempt,
             store_mode,
         ))
@@ -466,15 +478,25 @@ impl Speculation {
         let (shapes, def_shapes) = speculate(base, &hints, settings, walk_depth, workers, search)?;
         let misses = vec![0; shapes.len()];
         let def_misses = vec![0; def_shapes.len()];
-        Ok(Speculation { hints, shapes, def_shapes, misses, def_misses, fallback: false, store: None, store_all: false })
+        Ok(Speculation {
+            hints,
+            shapes,
+            def_shapes,
+            misses,
+            def_misses,
+            fallback: false,
+            store: None,
+            store_all: false,
+            cache: super::cache::CompileCache::default(),
+        })
     }
 
     /// The model of attempt `attempt` (in the current shapes).
-    fn model(&self, base: &Arc<InterpModel>, settings: &Settings, attempt: usize) -> EncModel {
+    fn model(&mut self, base: &Arc<InterpModel>, settings: &Settings, attempt: usize) -> EncModel {
         let (shapes, defs) = self.layout_shapes();
         let layout = Arc::new(Layout::new(shapes));
         let t0 = Instant::now();
-        let m = EncModel::new(base.clone(), layout, defs, settings);
+        let m = EncModel::new_with_cache(base.clone(), layout, defs, settings, Some(&mut self.cache));
         log(format_args!("lowering and code generation: {:.2}s", t0.elapsed().as_secs_f64()));
         stats::set("state words", Metric::Count(m.layout.words as u64));
         stats::add_secs("model build (lowering, C generation)", t0.elapsed());
@@ -917,6 +939,7 @@ mod tests {
             fallback: false,
             store: None,
             store_all: false,
+            cache: crate::enc::cache::CompileCache::default(),
         };
         let shapes = spec.encode(4);
         let recover = |shapes: &[u8], dynv: &[u8], store: Option<&[u8]>, mode: StoreMode, escape: bool| {

@@ -10,6 +10,13 @@ use super::{no, I32, I64, R};
 use crate::inplace::Plan;
 use crate::ir::*;
 
+/// Whether an `UNCHANGED` variable copy should read its byte size from
+/// `var_offsets` so widening that variable preserves identical Cranelift IR
+/// for actions that only copy it unchanged.
+fn is_dynamic_copy_shape(shape: &Shape, words: usize) -> bool {
+    words > 16 || matches!(shape, Shape::Set { .. } | Shape::Seq { .. } | Shape::Map { .. } | Shape::Union(_) | Shape::Dyn | Shape::Ref(_))
+}
+
 /// Most copies of code specialized per union arm, nested loops included
 /// (`Gen::for_bitset`, `Gen::by_arm`).
 const MAX_SPEC: usize = 16;
@@ -22,10 +29,14 @@ impl Gen<'_, '_, '_> {
         match s {
             Stmt::Compose { .. } => return no("action composition uses the compiled executor"),
             Stmt::Stop => {}
-            Stmt::Emit => match self.enabled {
-                Some(done) => {
+            Stmt::Emit => match self.emit_target {
+                Some((done, true)) => {
                     let one = self.iconst(1);
                     self.b.ins().jump(done, &[one.into()]);
+                    self.dead();
+                }
+                Some((done, false)) => {
+                    self.b.ins().jump(done, &[]);
                     self.dead();
                 }
                 None => self.emit(),
@@ -41,6 +52,31 @@ impl Gen<'_, '_, '_> {
                 self.brif(c, yes, &[], after, &[]);
                 self.switch(yes);
                 self.stmt(then)?;
+                self.b.ins().jump(after, &[]);
+                self.switch(after);
+            }
+            Stmt::If { cond, then, els } => {
+                let c = self.bool_expr(cond)?;
+                let (yes, no_, after) = (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                self.brif(c, yes, &[], no_, &[]);
+                self.switch(yes);
+                self.stmt(then)?;
+                self.b.ins().jump(after, &[]);
+                self.switch(no_);
+                self.stmt(els)?;
+                self.b.ins().jump(after, &[]);
+                self.switch(after);
+            }
+            Stmt::Then { first, rest, .. } => {
+                let join = self.b.create_block();
+                let after = self.b.create_block();
+                let saved = self.emit_target.replace((join, false));
+                let res = self.stmt(first);
+                self.emit_target = saved;
+                res?;
+                self.b.ins().jump(after, &[]);
+                self.switch(join);
+                self.stmt(rest)?;
                 self.b.ins().jump(after, &[]);
                 self.switch(after);
             }
@@ -65,17 +101,28 @@ impl Gen<'_, '_, '_> {
                 // (as `cgen::stmt`).
                 let i = *var as usize;
                 let sid = self.cx.ty.var_sid[i];
-                let off = self.cx.ty.var_offset(i);
                 let n = self.cx.ty.words(sid) as usize;
-                if value.ty == Ty::Enc(sid) {
+                let unchanged_dynamic = matches!(&*value.kind, ExprKind::Var(u) if *u == *var)
+                    && value.ty == Ty::Enc(sid)
+                    && is_dynamic_copy_shape(self.cx.ty.shape(sid), n)
+                    && !(self.mixing && self.cx.has_region_at(value));
+                if unchanged_dynamic {
+                    let (s0, s1) = (self.s0, self.s1);
+                    let src = self.var_ptr(s0, i);
+                    let dst = self.var_ptr(s1, i);
+                    let o0 = self.var_byte_off(i);
+                    let o1 = self.var_byte_off(i + 1);
+                    let bytes = self.b.ins().isub(o1, o0);
+                    self.copy_dyn(dst, src, bytes);
+                } else if value.ty == Ty::Enc(sid) {
                     let p = crate::inplace::plan(value, self.cx.ty);
                     let s1 = self.s1;
-                    let dst = self.offset(s1, off);
+                    let dst = self.var_ptr(s1, i);
                     self.plan_into(&p, dst)?;
                 } else {
                     let src = self.encoded(value, sid)?;
                     let s1 = self.s1;
-                    let dst = self.offset(s1, off);
+                    let dst = self.var_ptr(s1, i);
                     self.copy(dst, src, n);
                 }
                 self.stmt(body)?;

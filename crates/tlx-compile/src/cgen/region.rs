@@ -27,6 +27,8 @@ pub(super) struct Snapshot {
     nbuf: usize,
     statics: usize,
     nstatic: usize,
+    nstatic_u64: usize,
+    nstatic_arr: usize,
     regions: usize,
     handles: usize,
     loop_region: bool,
@@ -57,6 +59,8 @@ impl CGen<'_> {
             nbuf: self.nbuf,
             statics: self.statics.len(),
             nstatic: self.nstatic,
+            nstatic_u64: self.static_u64_keys.len(),
+            nstatic_arr: self.static_arr_keys.len(),
             regions: self.regions.len(),
             handles: self.handles,
             loop_region: self.loop_region,
@@ -68,6 +72,12 @@ impl CGen<'_> {
         self.nbuf = s.nbuf;
         self.statics.truncate(s.statics);
         self.nstatic = s.nstatic;
+        for key in self.static_u64_keys.drain(s.nstatic_u64..) {
+            self.static_u64_dedup.remove(&key);
+        }
+        for key in self.static_arr_keys.drain(s.nstatic_arr..) {
+            self.static_arr_dedup.remove(&key);
+        }
         self.regions.truncate(s.regions);
         self.handles = s.handles;
         self.loop_region = s.loop_region;
@@ -146,7 +156,7 @@ impl CGen<'_> {
         }
         let oracle = self.mixed.as_ref().expect("regions in mixed mode only").oracle;
         // Inside ENABLED: the action's context, over its local next state.
-        let enabled = self.enabled.is_some();
+        let enabled = self.in_enabled;
         let ctx = if enabled { RegionCtx::Action } else { self.rctx };
         // (An action that prints is mixed, `RegionOracle::mixes_next`: its
         // printing regions must not be memoized.)

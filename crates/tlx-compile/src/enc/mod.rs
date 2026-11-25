@@ -23,6 +23,7 @@
 //! - `diag`: diagnostics (coverage logging, IR dumps).
 
 mod adapt;
+mod cache;
 mod diag;
 mod driver;
 mod escape;

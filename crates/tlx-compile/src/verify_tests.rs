@@ -459,3 +459,63 @@ fn sorted_member_of_a_constant_word_array() {
     let wide = Expr::new(Ty::Bool, ExprKind::SortedMember { set: set(vec![1, 1, 0]), elem: elem.clone(), elem_words: 2 });
     reject(&t, wide, "width mismatch");
 }
+
+#[test]
+fn if_and_then_stmt_contracts() {
+    let t = typing();
+    let assign0 = |body| Stmt::Assign { var: 0, value: int(), body: Box::new(body) };
+    let ok = ActionFn {
+        name: "then_ok".into(),
+        temps: vec![],
+        body: Stmt::Then {
+            first: Box::new(Stmt::If { cond: boolean(), then: Box::new(assign0(Stmt::Emit)), els: Box::new(assign0(Stmt::Emit)) }),
+            assigned: vec![true],
+            rest: Box::new(Stmt::Emit),
+        },
+    };
+    super::action(&t, &ok, Context::Action).unwrap();
+
+    // Non-deterministic `first` is rejected.
+    let nondet = ActionFn {
+        name: "then_nondet".into(),
+        temps: vec![],
+        body: Stmt::Then {
+            first: Box::new(Stmt::Branches(vec![assign0(Stmt::Emit), assign0(Stmt::Emit)])),
+            assigned: vec![true],
+            rest: Box::new(Stmt::Emit),
+        },
+    };
+    assert!(super::action(&t, &nondet, Context::Action).unwrap_err().contains("deterministic"));
+
+    // Wrong mask length is rejected.
+    let bad_mask = ActionFn {
+        name: "then_mask_len".into(),
+        temps: vec![],
+        body: Stmt::Then { first: Box::new(assign0(Stmt::Emit)), assigned: vec![], rest: Box::new(Stmt::Emit) },
+    };
+    assert!(super::action(&t, &bad_mask, Context::Action).unwrap_err().contains("mask length"));
+
+    // `first` emitting without assigning a promised variable is rejected.
+    let missing_assign = ActionFn {
+        name: "then_missing".into(),
+        temps: vec![],
+        body: Stmt::Then {
+            first: Box::new(Stmt::If { cond: boolean(), then: Box::new(assign0(Stmt::Emit)), els: Box::new(Stmt::Emit) }),
+            assigned: vec![true],
+            rest: Box::new(Stmt::Emit),
+        },
+    };
+    assert!(super::action(&t, &missing_assign, Context::Action).unwrap_err().contains("required assignments"));
+
+    // Temps bound inside `first` are not in scope in `rest`.
+    let leaked_temp = ActionFn {
+        name: "then_temp_leak".into(),
+        temps: vec![Ty::Bool],
+        body: Stmt::Then {
+            first: Box::new(Stmt::Let { temp: 0, value: boolean(), body: Box::new(assign0(Stmt::Emit)) }),
+            assigned: vec![true],
+            rest: Box::new(Stmt::Guard { cond: Expr::new(Ty::Bool, ExprKind::Temp(0)), then: Box::new(Stmt::Emit) }),
+        },
+    };
+    assert!(super::action(&t, &leaked_temp, Context::Action).unwrap_err().contains("outside its definition scope"));
+}

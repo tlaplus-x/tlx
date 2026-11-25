@@ -54,13 +54,33 @@ impl Lowerer<'_> {
                 if self.some_bound_empty(bounds, env) {
                     return Ok(int_lit(product as i64));
                 }
-                // One fold per binder, the first binder outermost (the
-                // order only matters for errors).
+                // Evaluate and validate all domains upfront in binding order
+                // when there are multiple bounds (matching `bind_bounds` / TLC,
+                // so an empty earlier domain never hides an error in a later
+                // one), using `action_iter_set_expr` to preserve union
+                // multiplicity.
                 let mut slots = Vec::new();
+                let mut upfront: Vec<(Temp, Expr)> = Vec::new();
                 let mut env2 = env.clone();
+                let multi = bounds.len() > 1;
                 for b in bounds {
-                    let set = self.extensional_set_expr(&b.set, env, st);
+                    let set = self.action_iter_set_expr(&b.set, env, st);
                     let (set, ety) = self.typed_iter(set);
+                    let set = if multi {
+                        if self.bound_is_valid_set(&set) {
+                            self.hoist_valid_bound(set, &mut upfront)
+                        } else {
+                            let (s, bnd) = self.share(set);
+                            upfront.extend(bnd);
+                            let dummy = self.temp(Ty::Val);
+                            let chk = self.temp(Ty::Bool);
+                            let probe = Expr::new(Ty::Bool, ExprKind::Exists { bind: dummy, set: s.clone(), body: bool_lit(true) });
+                            upfront.push((chk, probe));
+                            s
+                        }
+                    } else {
+                        set
+                    };
                     match &b.vars {
                         BoundVars::Many(ls) => {
                             for l in ls {
@@ -80,10 +100,11 @@ impl Lowerer<'_> {
                     }
                 }
                 let n = self.path_count(body, &env2, st)?;
-                Ok(slots.into_iter().rev().fold(n, |n, (bind, set, check)| {
+                let folded = slots.into_iter().rev().fold(n, |n, (bind, set, check)| {
                     let body = binders::checked(check, n);
                     Expr::new(Ty::Int, ExprKind::Fold { product, bind, set, body })
-                }))
+                });
+                Ok(let_in(upfront.into_iter().rev(), folded))
             }
             H::If { cond, then, els } => {
                 if let Some(b) = self.const_bool(cond, env) {

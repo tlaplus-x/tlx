@@ -127,9 +127,8 @@ impl CGen<'_> {
             }
             ExprKind::Lookup { x, table } => {
                 let v = self.expr(x)?;
-                let tbl = format!("tbl{}", self.fresh_static());
                 let items: Vec<String> = table.iter().map(|x| x.to_string()).collect();
-                self.static_array(&tbl, "int32_t", &items, "-1");
+                let tbl = self.static_array("tbl", "int32_t", &items, "-1");
                 format!("({{ uint64_t r_ = ({v})[0]; r_ < {} ? (int64_t){tbl}[r_] : (int64_t)-1; }})", table.len())
             }
             ExprKind::RankFlat { x, radices } => {
@@ -193,7 +192,6 @@ impl CGen<'_> {
 
     fn cgen_union_field(&mut self, base: &Expr, locs: &[Option<FieldLoc>]) -> R<String> {
         if locs.iter().all(|o| !matches!(o, Some(FieldLoc::Bits(_)))) {
-            let tbl = format!("uo{}", self.fresh_static());
             let items: Vec<String> = locs
                 .iter()
                 .map(|o| match o {
@@ -203,14 +201,13 @@ impl CGen<'_> {
                     _ => Ok("-1".to_string()),
                 })
                 .collect::<R<_>>()?;
-            self.static_array(&tbl, "int32_t", &items, "");
+            let tbl = self.static_array("uo", "int32_t", &items, "");
             let b = self.expr(base)?;
             Ok(format!(
                 "({{ const uint64_t *u_ = {b}; int32_t o_ = u_[0] < {} ? {tbl}[u_[0]] : -1; if (o_ < 0) return TLX_ERR; u_ + 1 + o_; }})",
                 items.len()
             ))
         } else {
-            let tbl = format!("uo{}", self.fresh_static());
             let items: Vec<String> = locs
                 .iter()
                 .map(|o| {
@@ -219,7 +216,7 @@ impl CGen<'_> {
                         .ok_or_else(|| super::super::Unsupported("union field descriptor overflow".into()))
                 })
                 .collect::<R<_>>()?;
-            self.static_array(&tbl, "int64_t", &items, &UNION_DESC_MISSING.to_string());
+            let tbl = self.static_array("uo", "int64_t", &items, "-1");
             let b = self.expr(base)?;
             let buf = self.buf(1);
             let extract = c_union_scalar_extract("u_", "d_");
@@ -231,8 +228,6 @@ impl CGen<'_> {
     }
 
     fn cgen_union_field_int(&mut self, base: &Expr, entries: &[Option<(FieldLoc, i64)>]) -> R<String> {
-        let k = self.fresh_static();
-        let (to, tl) = (format!("ufo{k}"), format!("ufl{k}"));
         let descs: Vec<String> = entries
             .iter()
             .map(|o| {
@@ -242,8 +237,8 @@ impl CGen<'_> {
             })
             .collect::<R<_>>()?;
         let los: Vec<String> = entries.iter().map(|o| o.map_or("0".to_string(), |x| format!("{}LL", x.1))).collect();
-        self.static_array(&to, "int64_t", &descs, &UNION_DESC_MISSING.to_string());
-        self.static_array(&tl, "int64_t", &los, "0");
+        let to = self.static_array("ufo", "int64_t", &descs, "-1");
+        let tl = self.static_array("ufl", "int64_t", &los, "0");
         let b = self.expr(base)?;
         let extract = c_union_scalar_extract("u_", "d_");
         Ok(format!(

@@ -306,6 +306,7 @@ pub(super) fn build(
     base: &InterpModel,
     settings: &Settings,
     mixed: Option<Mixed>,
+    #[cfg(feature = "jit")] mut jit_cache: Option<&mut crate::jit::JitCache>,
     notes: &mut Vec<String>,
 ) -> Option<NativeHandle> {
     let sync = settings.native_sync;
@@ -354,7 +355,14 @@ pub(super) fn build(
     let sync = sync || cached;
     let mut jit_lib = None;
     if mode == Jit::Only || (mode == Jit::Tier && !sync) {
-        jit_lib = jit(&native, f, base, oracle, &plan.sites, notes);
+        #[cfg(feature = "jit")]
+        {
+            jit_lib = jit(&native, f, base, oracle, &plan.sites, jit_cache.as_deref_mut(), notes);
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            jit_lib = jit(&native, f, base, oracle, &plan.sites, notes);
+        }
     }
     if let Some(lib) = jit_lib {
         if mode == Jit::Only {
@@ -387,6 +395,9 @@ pub(super) fn build(
         let (events, _) = native.take_events();
         if native.lib().is_none() {
             // The C build failed: the JIT library then.
+            #[cfg(feature = "jit")]
+            let lib = if mode == Jit::Tier { jit(&native, f, base, oracle, &plan.sites, jit_cache, notes) } else { None };
+            #[cfg(not(feature = "jit"))]
             let lib = if mode == Jit::Tier { jit(&native, f, base, oracle, &plan.sites, notes) } else { None };
             let Some(lib) = lib else {
                 notes.extend(events);
@@ -435,13 +446,14 @@ fn jit(
     base: &InterpModel,
     oracle: Option<&dyn RegionOracle>,
     sites: &[usize],
+    cache: Option<&mut crate::jit::JitCache>,
     notes: &mut Vec<String>,
 ) -> Option<NativeLib> {
     let regions = match (oracle, &native.regions) {
         (Some(oracle), Some(table)) => Some(crate::native_plan::RegionPlan { oracle, table, sites }),
         _ => None,
     };
-    let r = crate::jit::library(f, regions, native.refops.clone(), base.action_names(), base.invariant_names());
+    let r = crate::jit::library_with_cache(f, regions, native.refops.clone(), base.action_names(), base.invariant_names(), cache);
     match r {
         Ok(j) => {
             stats::add_secs("JIT compile", j.compile_time);
