@@ -12,7 +12,8 @@
 //! - **hot counters** (states expanded, successors per action, fingerprint
 //!   set probes, encodings, ...) are per-thread (`thread_local`), flushed
 //!   into the global totals when a worker ends (`worker_done`) or before
-//!   the report (`flush`): no shared atomics per state;
+//!   the report (`flush`). Periodic completed-unit snapshots let another thread
+//!   report a partial run without accessing active workers' thread-local state;
 //! - **times** inside the search are sampled: one *unit* of work (a state
 //!   expanded, a simulation step) in `SAMPLE_EVERY` is timed in detail
 //!   (`Span`s around actions, invariants, fingerprints, ...), and the
@@ -24,7 +25,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod report;
@@ -352,11 +353,13 @@ impl Local {
 
 thread_local! {
     static LOCAL: RefCell<Local> = const { RefCell::new(Local::new()) };
+    static PUBLISHED: RefCell<Option<Instant>> = const { RefCell::new(None) };
 }
 
 struct Global {
     total: Local,
     workers: Vec<WorkerTimes>,
+    live: Vec<(std::thread::ThreadId, Local)>,
     action_names: Vec<String>,
     invariant_names: Vec<String>,
     aprop_names: Vec<String>,
@@ -365,6 +368,7 @@ struct Global {
 static GLOBAL: Mutex<Global> = Mutex::new(Global {
     total: Local::new(),
     workers: Vec::new(),
+    live: Vec::new(),
     action_names: Vec::new(),
     invariant_names: Vec::new(),
     aprop_names: Vec::new(),
@@ -633,6 +637,22 @@ fn end_unit_on(s: Span) {
     local(|l| {
         l.sampling = false;
         l.in_unit = false;
+        // Check the clock only occasionally; publish complete units, never
+        // reset sampling or nested-span bookkeeping during an active search.
+        if l.c[C::Units as usize] % 256 == 1 {
+            PUBLISHED.with(|last| {
+                let mut last = last.borrow_mut();
+                if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+                    let id = std::thread::current().id();
+                    let mut g = global();
+                    match g.live.iter_mut().find(|(thread, _)| *thread == id) {
+                        Some((_, snapshot)) => *snapshot = l.clone(),
+                        None => g.live.push((id, l.clone())),
+                    }
+                    *last = Some(Instant::now());
+                }
+            });
+        }
     });
 }
 
@@ -665,6 +685,7 @@ pub fn worker_done(life: Duration) {
     }
     let l = take_local();
     let mut g = global();
+    g.live.retain(|(id, _)| *id != std::thread::current().id());
     g.workers.push(WorkerTimes {
         life_ns: life.as_nanos() as u64,
         idle_ns: l.idle_ns,
@@ -678,7 +699,9 @@ pub fn worker_done(life: Duration) {
 pub fn flush() {
     if on() {
         let l = take_local();
-        global().total.merge(&l);
+        let mut g = global();
+        g.live.retain(|(id, _)| *id != std::thread::current().id());
+        g.total.merge(&l);
     }
 }
 
@@ -908,23 +931,72 @@ pub fn set_section(title: &str, text: String) {
     }
 }
 
-static JSON: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+#[derive(Clone)]
+enum JsonField {
+    Frozen(String),
+    Live(Arc<dyn Fn() -> String + Send + Sync>),
+}
 
-/// Set field `key` of the JSON report to `raw` (JSON text; if on).
-pub fn set_json(key: &str, raw: String) {
+impl JsonField {
+    fn render(&self) -> String {
+        match self {
+            Self::Frozen(raw) => raw.clone(),
+            Self::Live(source) => source(),
+        }
+    }
+}
+
+static JSON: Mutex<Vec<(String, JsonField)>> = Mutex::new(Vec::new());
+
+fn json_field(key: &str, value: JsonField) {
     if !on() {
         return;
     }
     let mut j = JSON.lock().unwrap_or_else(|e| e.into_inner());
     match j.iter_mut().find(|(k, _)| k == key) {
-        Some((_, x)) => *x = raw,
-        None => j.push((key.to_string(), raw)),
+        Some((_, x)) => *x = value,
+        None => j.push((key.to_string(), value)),
     }
 }
 
-/// The fields `set_json` set, in order of first setting.
+/// Set field `key` of the JSON report to `raw` (JSON text; if on).
+pub fn set_json(key: &str, raw: String) {
+    json_field(key, JsonField::Frozen(raw));
+}
+
+/// Register an owned, thread-safe source once, outside measured evaluation.
+/// Sources run only for JSON reporting or retirement, outside registry locks.
+/// They must not recurse into the report; capture counters, not a model owner.
+pub fn set_json_source(key: &str, source: Arc<dyn Fn() -> String + Send + Sync>) {
+    json_field(key, JsonField::Live(source));
+}
+
+/// Preserve a retiring source's final observation and release its live counters.
+pub fn freeze_json(key: &str) {
+    if !on() {
+        return;
+    }
+    let source = {
+        let j = JSON.lock().unwrap_or_else(|e| e.into_inner());
+        match j.iter().find(|(k, _)| k == key) {
+            Some((_, JsonField::Live(source))) => source.clone(),
+            _ => return,
+        }
+    };
+    let raw = source();
+    let mut j = JSON.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, value)) = j.iter_mut().find(|(k, _)| k == key) {
+        if matches!(value, JsonField::Live(current) if Arc::ptr_eq(current, &source)) {
+            *value = JsonField::Frozen(raw);
+        }
+    }
+}
+
+/// The fields registered, in order of first setting. Callbacks run without
+/// holding registry locks, so a slow report cannot stall counter publication.
 pub(crate) fn json_fields() -> Vec<(String, String)> {
-    JSON.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    let fields = JSON.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    fields.into_iter().map(|(key, value)| (key, value.render())).collect()
 }
 
 /// The text of report section `title`, if set.
@@ -949,6 +1021,57 @@ pub fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_sources_are_lazy_and_freeze_at_retirement() {
+        use std::sync::atomic::AtomicUsize;
+        enable(1);
+        let owner = std::thread::current().id();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let value = Arc::new(AtomicUsize::new(17));
+        let (source_reads, source_value) = (reads.clone(), value.clone());
+        set_json_source(
+            "test live source",
+            Arc::new(move || {
+                if std::thread::current().id() == owner {
+                    source_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                source_value.load(Ordering::Relaxed).to_string()
+            }),
+        );
+        text();
+        assert_eq!(reads.load(Ordering::Relaxed), 0, "text must not render JSON sources");
+        assert!(json().contains("\"test live source\":17"));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        value.store(23, Ordering::Relaxed);
+        assert!(json().contains("\"test live source\":23"));
+        freeze_json("test live source");
+        let frozen_reads = reads.load(Ordering::Relaxed);
+        value.store(99, Ordering::Relaxed);
+        assert!(json().contains("\"test live source\":23"));
+        assert_eq!(reads.load(Ordering::Relaxed), frozen_reads);
+    }
+
+    #[test]
+    fn live_snapshot_is_replaced_by_final_worker_totals() {
+        enable(1);
+        std::thread::spawn(|| {
+            let unit = begin_unit(1);
+            successor(0);
+            end_unit(unit);
+            let id = std::thread::current().id();
+            {
+                let g = global();
+                let (_, live) = g.live.iter().find(|(thread, _)| *thread == id).expect("published worker");
+                assert_eq!(live.c[C::Units as usize], 1);
+                assert_eq!(live.c[C::Generated as usize], 1);
+            }
+            worker_done(Duration::from_millis(1));
+            assert!(!global().live.iter().any(|(thread, _)| *thread == id));
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn spans_are_exclusive() {

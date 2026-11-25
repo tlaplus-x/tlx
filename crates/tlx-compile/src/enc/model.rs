@@ -341,6 +341,12 @@ impl EncModel {
         };
         let escape =
             settings.escape.then(|| super::escape::Escape::new(layout.clone(), base.clone(), settings, irreversible_actions.unwrap()));
+        let id = MODEL_IDS.fetch_add(1, Ordering::Relaxed);
+        if stats::on() {
+            if let Some(t) = native.as_deref().and_then(|n| n.regions.as_ref()) {
+                stats::set_json_source(&format!("native_regions_{id}"), Arc::new(t.json_source(&typing)));
+            }
+        }
         EncModel {
             escape,
             fp,
@@ -376,7 +382,7 @@ impl EncModel {
             pure_invariants,
             bailouts: tlx_base::counter::Striped::new(),
             notes,
-            id: MODEL_IDS.fetch_add(1, Ordering::Relaxed),
+            id,
             restartable: false,
             speculation: Vec::new(),
         }
@@ -576,7 +582,9 @@ impl EncModel {
         if self.adapt && self.is_mixed(kind, i) {
             if let Some(lib) = self.lib_id() {
                 let warm = if self.memo.exec_id() != 0 { adapt::WARM } else { 0 };
-                return adapt::choose(self.id, lib, kind, i, warm);
+                let choice = adapt::choose(self.id, lib, kind, i, warm);
+                self.report_adaptive(kind, i);
+                return choice;
             }
         }
         Choice { native: true, timed: false }
@@ -595,7 +603,7 @@ impl EncModel {
     /// The identity of the native library in use (it changes when the C
     /// library replaces the JIT one).
     fn lib_id(&self) -> Option<usize> {
-        self.native.as_deref().and_then(|n| n.lib()).map(|l| l as *const _ as usize)
+        self.native.as_deref().and_then(|n| n.lib_slot())
     }
 
     /// A timed call (`Choice::timed`) of function `i` of `kind` started at
@@ -603,6 +611,18 @@ impl EncModel {
     fn record(&self, kind: usize, i: usize, c: Choice, t0: Instant, excluded: u64) {
         let ns = (t0.elapsed().as_nanos() as u64).saturating_sub(excluded);
         adapt::record(self.id, self.lib_id().unwrap_or(0), kind, i, c.native, ns);
+        self.report_adaptive(kind, i);
+    }
+
+    fn report_adaptive(&self, kind: usize, i: usize) {
+        if stats::on() {
+            let name = match kind {
+                ACTION => self.base.action_names()[i].as_str(),
+                STATE_PRED => self.invariants[i].name.as_ref(),
+                _ => self.aprops[i].name.as_ref(),
+            };
+            adapt::report(self.id, kind, i, name);
+        }
     }
 
     /// The statistics path of a native call of function `i` of `kind`.
@@ -614,9 +634,8 @@ impl EncModel {
         }
     }
 
-    /// Preserve each layout's counters before a restart discards its table.
-    /// Keys are model identities so reporting an escape version again replaces
-    /// its snapshot rather than double-counting it.
+    /// Name predicates at native indices, including constraints and escaped
+    /// layouts. Each layout's registered region source is frozen on retirement.
     pub(super) fn report_native_regions(&self) {
         // Search starts install the public property names. Extend them after
         // the run to name constraint tallies at their native predicate indices.
@@ -627,9 +646,6 @@ impl EncModel {
         );
         if !stats::on() {
             return;
-        }
-        if let Some(t) = self.native.as_deref().and_then(|n| n.regions.as_ref()) {
-            stats::set_json(&format!("native_regions_{}", self.id), t.report_json(&self.typing));
         }
         if let Some(e) = &self.escape {
             for m in e.models() {
@@ -1278,6 +1294,7 @@ fn bailout_debug(what: &str, e: &tlx_eval::EvalError) {
 
 impl Drop for EncModel {
     fn drop(&mut self) {
+        stats::freeze_json(&format!("native_regions_{}", self.id));
         // A model the driver discards for a widening restart
         // (`restartable`) never searches again: its layout is replaced, so
         // the C library being built for it could never be loaded, and the

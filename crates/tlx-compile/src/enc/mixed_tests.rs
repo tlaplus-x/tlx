@@ -138,6 +138,8 @@ fn census_region_json_uses_search_counts_without_initial_predicate_work() {
         info: RegionInfo { func: "predicate".into(), ..Default::default() },
     };
     let table = RegionTable::new(&typing, vec![region]);
+    let source = table.json_source(&typing);
+    assert!(source().contains("\"calls\":0"));
     // All-stage and search-only values deliberately differ. Initial-state
     // predicates have the same RegionCtx as search predicates.
     TALLY.with(|t| {
@@ -146,7 +148,9 @@ fn census_region_json_uses_search_counts_without_initial_predicate_work() {
         t.touched = vec![0];
     });
     assert_eq!(table.drain_counts(), (10, 1));
-    let json = table.report_json(&typing);
+    let json = source();
     assert!(json.contains("\"calls\":2,\"errors\":0,\"time_s\":0.000000020"), "{json}");
     assert!(table.report(&[]).contains("10 evals"));
+    drop(table);
+    assert_eq!(source(), json, "the source owns its counters independently of the table");
 }

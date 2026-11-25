@@ -208,11 +208,13 @@ fn main() -> ExitCode {
     // Evaluate on a thread with the large stack that deep recursion (and the
     // recursion guard in tlx-eval) needs: the OS gives the main thread a
     // smaller, fixed stack. `check` and the statistics live on that thread.
-    tlx_base::stack::run_on_named_stack(tlx_base::stack::EVAL_STACK_SIZE, Some("tlx"), move || {
+    let code = tlx_base::stack::run_on_named_stack(tlx_base::stack::EVAL_STACK_SIZE, Some("tlx"), move || {
         let code = check::check(started);
         stats::finish(started);
         code
-    })
+    });
+    process::finish_exit();
+    code
 }
 
 /// Documentation syntax checks need neither module resolution nor a model configuration.

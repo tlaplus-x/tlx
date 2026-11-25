@@ -25,6 +25,13 @@ class Reports(unittest.TestCase):
         self.assertAlmostEqual(d['host_time_share'], .375)
         self.assertEqual(d['host_calls'], 11)
 
+    def test_adaptive_metadata_survives_dynamic_report(self):
+        row = {'name': 'Next', 'worker': 'ThreadId(4)', 'library': 'optimized',
+               'chosen': 'fallback', 'sample_calls': {'mixed_native': 32, 'fallback': 32}}
+        d = C.dynamic_report({'adaptive_tiers_1_4_2_0_0': row, 'interrupted': True})
+        self.assertEqual(d['adaptive_tiers'], [row])
+        self.assertTrue(d['interrupted'])
+
     def test_missing_and_empty_stats_are_unknown_not_zero_or_one(self):
         self.assertIsNone(C.dynamic_report({})['native_share'])
         self.assertIsNone(C.dynamic_report({'actions': [{'calls': {'native': 1}}]})['native_share'])
@@ -90,7 +97,7 @@ class Reports(unittest.TestCase):
             self.assertFalse(r['dynamic']['complete'])
             self.assertEqual(r['static']['nodes']['typed'], 1)
 
-    def test_real_engine_timeout_without_final_stats_remains_unknown(self):
+    def test_real_engine_timeout_preserves_partial_stats(self):
         binary = next((os.path.join(C.ROOT, 'target', profile, 'tlx')
                        for profile in ('test-release', 'release')
                        if os.path.isfile(os.path.join(C.ROOT, 'target', profile, 'tlx'))), None)
@@ -100,18 +107,21 @@ class Reports(unittest.TestCase):
             tla, cfg = os.path.join(tmp, 'CensusTimeout.tla'), os.path.join(tmp, 'CensusTimeout.cfg')
             with open(tla, 'w') as f:
                 f.write('---- MODULE CensusTimeout ----\nEXTENDS Naturals\nVARIABLE x\n'
-                        "Init == x = 0\nNext == x < 1000000000 /\\ x' = x + 1\n====\n")
+                        "Init == x = 0\nNext == x < 1000000000 /\\ x' \\in {2*x + 1, 2*x + 2}\n====\n")
             with open(cfg, 'w') as f:
                 f.write('INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n')
+            # Branching keeps the search active with a small depth histogram,
+            # so rendering its report fits the bounded shutdown allowance.
             # Allow enough time for C compilation on slow CI runners so the
             # static coverage report is printed before SIGTERM stops BFS.
             r = C.run({'id': 'signal-fixture', 'tla': tla, 'cfg': cfg}, 15, binary, True)
             self.assertEqual(r['status'], 'timeout')
             self.assertTrue(r['static']['reported'], r['output'])
             self.assertIsNone(r['dynamic']['native_share'])
-            self.assertIsNone(r['dynamic']['partial_native_share'])
+            self.assertIsNotNone(r['dynamic']['partial_native_share'])
             self.assertFalse(r['dynamic']['complete'])
-            self.assertEqual(r['stats'], {})
+            self.assertTrue(r['stats']['interrupted'])
+            self.assertGreater(r['dynamic']['evaluations'], 0)
 
     def test_the_staged_trace_input_closes_the_ewd998_census_gap(self):
         """The one small-census unknown that was staging, not an engine gap.

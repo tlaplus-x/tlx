@@ -54,7 +54,9 @@ def dynamic_report(stats):
             'native_share': native / total if known and total else None,
             'host_calls': sum(r['calls'] for r in regions), 'host_time_s': host_s,
             'host_time_share': host_s / units_s if units_s and stats else None,
-            'search_thread_s_est': units_s, 'by_kind': by_kind, 'regions': regions}
+            'search_thread_s_est': units_s, 'by_kind': by_kind, 'regions': regions,
+            'adaptive_tiers': [row for key, row in stats.items() if key.startswith('adaptive_tiers_')],
+            'interrupted': stats.get('interrupted', False)}
 
 
 def static_report(out):
@@ -187,8 +189,7 @@ def run(m, timeout, binary, dynamic=False):
                      stop_when=None if dynamic else lambda: reported and time.monotonic() > reported[0] + GRACE,
                      grace=TIMEOUT_GRACE if dynamic else 0, errors='replace', raise_timeout=False)
         # Streaming capture kills immediately; TERM allows normal spill cleanup.
-        # The current CLI then _exit's without final stats. Grace is not a
-        # promise of partial counters; absent evidence remains unknown.
+        # TERM also requests best-effort partial stats; absent evidence remains unknown.
         out = p.stdout + (p.stderr or '')
         stats, stats_error = {}, None
         if os.path.isfile(path):
@@ -204,11 +205,11 @@ def run(m, timeout, binary, dynamic=False):
             status = 'static only'
         # A timeout's partial counters are not a complete model measurement.
         d = dynamic_report(stats)
-        if p.timed_out or status in ('unknown', 'error', 'compile failure', 'killed', 'stats error'):
+        if stats.get('interrupted') or p.timed_out or status in ('unknown', 'error', 'compile failure', 'killed', 'stats error'):
             d['partial_native_share'] = d['native_share']
             d['partial_host_time_share'] = d['host_time_share']
             d['native_share'] = d['host_time_share'] = None
-        d['complete'] = status not in ('timeout', 'unknown', 'error', 'compile failure', 'killed', 'stats error')
+        d['complete'] = not stats.get('interrupted', False) and status not in ('timeout', 'unknown', 'error', 'compile failure', 'killed', 'stats error')
         static = static_report(out)
         closure = []
         for kind, counts in d['by_kind'].items():
