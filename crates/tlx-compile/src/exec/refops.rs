@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tlx_layout::store::{self, RefOpError, Store};
+use tlx_layout::store::{self, RefOpError, Store, StorePin};
 
 use crate::ir::RefOp;
 use crate::types::Typing;
@@ -34,11 +34,9 @@ impl RArg<'_> {
 /// counted with relaxed atomics only when `-stats` is on).
 pub(crate) static CALLS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Run `op` on `args` (in its representations), writing the result to
-/// `out` (one word, or `ToEnc`'s encoding). An error is a TLC error or a
-/// case the store leaves to the interpreter (`RefOpError::Eval`), or a full
-/// store.
-pub(crate) fn run(s: &Store, typing: &Typing, op: &RefOp, args: &[RArg], out: &mut [u64]) -> Result<(), RefOpError> {
+/// Run `op` on `args` (in its representations) against an already-pinned
+/// store, writing the result to `out` (one word, or `ToEnc`'s encoding).
+pub(crate) fn run_pinned(s: &StorePin<'_>, typing: &Typing, op: &RefOp, args: &[RArg], out: &mut [u64]) -> Result<(), RefOpError> {
     use RefOp as O;
     let w = |i: usize| args[i].w();
     out[0] = match op {
@@ -80,7 +78,7 @@ pub(crate) fn run(s: &Store, typing: &Typing, op: &RefOp, args: &[RArg], out: &m
             let fs: Vec<(tlx_value::Sym, u64)> = names.iter().zip(args).map(|(n, a)| (*n, a.w())).collect();
             s.record(&fs)?
         }
-        O::Eq => store::eq_tlc(s, w(0), w(1))? as u64,
+        O::Eq => store::eq_tlc_pin(s, w(0), w(1))? as u64,
         O::FromInt => store::int_handle(w(0) as i64).ok_or(RefOpError::Eval)?,
         O::FromBool => store::bool_handle(w(0) != 0),
         O::ToInt => store::as_int(w(0)).ok_or(RefOpError::Eval)? as u64,
@@ -96,11 +94,16 @@ pub(crate) fn run(s: &Store, typing: &Typing, op: &RefOp, args: &[RArg], out: &m
         O::ToEnc(sid) => {
             let v = s.thaw(w(0));
             let n = typing.words(*sid) as usize;
-            typing.node(*sid).encode(&v, &mut out[..n]).map_err(|_| RefOpError::Eval)?;
+            typing.node(*sid).encode(&v, &mut out[..n]).map_err(|m| if m.store_full { RefOpError::Full } else { RefOpError::Eval })?;
             return Ok(());
         }
     };
     Ok(())
+}
+
+/// Run `op` on `args` (in its representations), pinning `s` for the call.
+pub(crate) fn run(s: &Store, typing: &Typing, op: &RefOp, args: &[RArg], out: &mut [u64]) -> Result<(), RefOpError> {
+    run_pinned(&s.pin(), typing, op, args, out)
 }
 
 /// Count one operation (`-stats`; `native`: called by JIT or C code).
@@ -229,18 +232,19 @@ fn op_text(op: &RefOp) -> String {
     }
 }
 
-impl tlx_native::mixed::RefOps for RefOpTable {
-    fn len(&self) -> u32 {
-        self.ops.len() as u32
-    }
+struct PinnedRefOps<'a> {
+    table: &'a RefOpTable,
+    pin: StorePin<'a>,
+}
 
-    fn hash(&self) -> u64 {
-        self.hash
+impl tlx_native::mixed::RefOpsScope for PinnedRefOps<'_> {
+    fn len(&self) -> u32 {
+        self.table.ops.len() as u32
     }
 
     unsafe fn run(&self, id: u32, args: *const u64, out: *mut u64) -> bool {
-        let (op, n) = &self.ops[id as usize];
-        let node = self.nodes[id as usize].as_ref();
+        let (op, n) = &self.table.ops[id as usize];
+        let node = self.table.nodes[id as usize].as_ref();
         // SAFETY: the library is generated for this verified operation table:
         // args is non-null, u64-aligned, and readable for n initialized words
         // in one allocation for this call (including a non-null empty span).
@@ -268,13 +272,13 @@ impl tlx_native::mixed::RefOps for RefOpTable {
             // SAFETY: the preceding raw write initialized the entire live
             // output allocation; this slice does not escape the call.
             let out = unsafe { std::slice::from_raw_parts_mut(out, words) };
-            run(&self.store, &self.typing, op, &rargs, out).is_ok()
+            run_pinned(&self.pin, &self.table.typing, op, &rargs, out).is_ok()
         } else {
             // Scalar outputs need no initialization of the native slot. Keep
             // the safe executor's result in a local word, then publish it only
             // on success (failed operations leave the output untouched).
             let mut word = [0];
-            let ok = run(&self.store, &self.typing, op, &rargs, &mut word).is_ok();
+            let ok = run_pinned(&self.pin, &self.table.typing, op, &rargs, &mut word).is_ok();
             if ok {
                 // SAFETY: out owns room for the one-word result for this call;
                 // a raw write accepts uninitialized storage, without a borrow.
@@ -285,7 +289,7 @@ impl tlx_native::mixed::RefOps for RefOpTable {
         // NativeLib::ref_op_cb runs this method under catch_unwind; a panic
         // is resumed after the generated call returns, never across the C ABI.
         if tlx_runtime::stats::on() {
-            let c = &self.counts[id as usize];
+            let c = &self.table.counts[id as usize];
             c[0].fetch_add(1, Ordering::Relaxed);
             if !ok {
                 c[1].fetch_add(1, Ordering::Relaxed);
@@ -295,7 +299,22 @@ impl tlx_native::mixed::RefOps for RefOpTable {
     }
 
     fn elems(&self, set: u64) -> Option<&[u64]> {
-        self.store.set_elems(set)
+        self.pin.set_elems(set)
+    }
+}
+
+impl tlx_native::mixed::RefOps for RefOpTable {
+    fn len(&self) -> u32 {
+        self.ops.len() as u32
+    }
+
+    fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    fn with_scope(&self, f: &mut dyn FnMut(&dyn tlx_native::mixed::RefOpsScope)) {
+        let scope = PinnedRefOps { table: self, pin: self.store.pin() };
+        f(&scope);
     }
 }
 
@@ -327,22 +346,24 @@ mod tests {
             hash: 0,
             counts: (0..2).map(|_| [AtomicU64::new(0), AtomicU64::new(0)]).collect(),
         };
-        let mut scalar = MaybeUninit::<u64>::uninit();
-        // SAFETY: valid table ids, initialized one-word args and exclusive
-        // aligned output slots of the exact signature size; none overlap.
-        unsafe {
-            assert!(table.run(0, [3].as_ptr(), scalar.as_mut_ptr()));
-            assert_eq!(scalar.assume_init(), store::int_handle(3).unwrap());
-            let mut unchanged = 17;
-            assert!(!table.run(0, [i64::MAX as u64].as_ptr(), &mut unchanged));
-            assert_eq!(unchanged, 17);
-            let tuple = Value::tuple(vec![Value::Int(3), Value::Int(4)]);
-            let mut expected = [0u64; 2];
-            expected_node.encode(&tuple, &mut expected).unwrap();
-            let value = table.store.freeze(&tuple).unwrap();
-            let mut encoded = MaybeUninit::<[u64; 2]>::uninit();
-            assert!(table.run(1, [value].as_ptr(), encoded.as_mut_ptr().cast()));
-            assert_eq!(encoded.assume_init(), expected);
-        }
+        let tuple = Value::tuple(vec![Value::Int(3), Value::Int(4)]);
+        let mut expected = [0u64; 2];
+        expected_node.encode(&tuple, &mut expected).unwrap();
+        let value = table.store.freeze(&tuple).unwrap();
+        table.with_scope(&mut |scope| {
+            let mut scalar = MaybeUninit::<u64>::uninit();
+            // SAFETY: valid table ids, initialized one-word args and exclusive
+            // aligned output slots of the exact signature size; none overlap.
+            unsafe {
+                assert!(scope.run(0, [3].as_ptr(), scalar.as_mut_ptr()));
+                assert_eq!(scalar.assume_init(), store::int_handle(3).unwrap());
+                let mut unchanged = 17;
+                assert!(!scope.run(0, [i64::MAX as u64].as_ptr(), &mut unchanged));
+                assert_eq!(unchanged, 17);
+                let mut encoded = MaybeUninit::<[u64; 2]>::uninit();
+                assert!(scope.run(1, [value].as_ptr(), encoded.as_mut_ptr().cast()));
+                assert_eq!(encoded.assume_init(), expected);
+            }
+        });
     }
 }

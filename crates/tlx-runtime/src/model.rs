@@ -74,6 +74,10 @@ pub enum ErrorKind {
     /// compiled model, which stops the search to widen the layout and
     /// resume (`Effects::interrupts`). Reported, if ever, as a general error.
     LayoutMiss,
+    /// Not an error of the spec: a run-owned value store hit its byte budget.
+    /// The explorer triggers safepoint reclamation and retries, or stops if
+    /// the live root set genuinely exceeds `-maxmem`.
+    StoreFull,
 }
 
 impl ModelError {
@@ -88,6 +92,11 @@ impl ModelError {
     /// Whether this is a layout miss of a compiled model (`ErrorKind::LayoutMiss`).
     pub fn is_layout_miss(&self) -> bool {
         self.kind == ErrorKind::LayoutMiss
+    }
+
+    /// Whether this is a value-store budget hit (`ErrorKind::StoreFull`).
+    pub fn is_store_full(&self) -> bool {
+        self.kind == ErrorKind::StoreFull
     }
 
     /// The error, raised in `context`.
@@ -189,6 +198,15 @@ pub trait Effects: Sync {
     fn interrupts(&self, _e: &ModelError) -> bool {
         false
     }
+
+    /// Whether error `e` can be consumed as a `ResumePoint` by the caller
+    /// (`explore_resumable`). Defaults to any non-`StoreFull` error so general
+    /// callers keep the full `explore_resumable` contract; the compiled driver
+    /// overrides this to `self.interrupts(e)` so terminal evaluation errors
+    /// release the archive for GC-backed counterexample replay.
+    fn resumes(&self, e: &ModelError) -> bool {
+        !e.is_store_full()
+    }
 }
 
 /// Checkpoints (docs/scale.md §9): what a model keeps besides its states
@@ -230,6 +248,136 @@ pub trait Checkpointed: Sync {
     }
 }
 
+/// Outcome of one safepoint collection of a model's value store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcResult {
+    pub live_bytes: usize,
+    pub budget: usize,
+    pub reclaimed_bytes: u64,
+    pub full: bool,
+}
+
+/// Escalation stage for one value-store GC retry after `ErrorKind::StoreFull`.
+///
+/// Defined once here and shared across explorer workers, liveness checking,
+/// archive replay, and compiled predicate/emission paths so every retry loop
+/// escalates consistently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreGcRetry {
+    /// Drop the optional layout-miss archive during collection to free its
+    /// handles before retrying.
+    pub force_drop_archive: bool,
+    /// Enable the thread-local interpreter fallback
+    /// (`StoreGc::set_transient_fallback`) so a single evaluation's discarded
+    /// transient intermediates do not re-overflow an archive-free store.
+    pub transient_fallback: bool,
+}
+
+impl StoreGcRetry {
+    /// Ordered retry stages after an initial `StoreFull` failure:
+    /// 1. Collect while keeping the layout-miss archive.
+    /// 2. Collect and drop the layout-miss archive.
+    /// 3. Collect (archive-free) and fall back to the interpreter for transients.
+    /// 4. Final archive-free + interpreter-fallback retry (handles concurrent worker races).
+    pub const STAGES: [Self; 4] = [
+        Self { force_drop_archive: false, transient_fallback: false },
+        Self { force_drop_archive: true, transient_fallback: false },
+        Self { force_drop_archive: true, transient_fallback: true },
+        Self { force_drop_archive: true, transient_fallback: true },
+    ];
+
+    /// Retry stages for compiled-only evaluation before switching explicitly
+    /// to the interpreter: soft collect, then archive-free collect.
+    pub const COMPILED_STAGES: [Self; 2] = [Self::STAGES[0], Self::STAGES[1]];
+}
+
+/// Live-root mark-and-sweep reclamation for a model's run-owned value store
+/// (`Caps::gc`). Only present for models with `Shape::Ref` slots.
+///
+/// # Root-tracking safety contract
+///
+/// Reclamation is non-moving mark-and-sweep over handles held in states (`S`)
+/// and encoded words. Any runtime, explorer, or liveness path that can trigger
+/// or reach a safepoint or `collect` callback MUST uphold all of the following:
+///
+/// 1. **Complete live-root reporting:** Every `S` or raw handle that can still
+///    be read, hashed, decoded, or passed to the model after `collect` returns
+///    MUST be visited by `visit_roots` (via `mark_state`, `mark_words`, or
+///    `take_thread_roots`). Omitting a live handle allows its backing node to
+///    be swept while still referenced. In particular, callers must cover:
+///    - queued/frontier states (global queues, worker-local readers, writers,
+///      batches, spilled segments, and any retained layout-miss archive),
+///    - candidate/ordering buffers (`CandStore`) and retained observer,
+///      initial, parent, or counterexample replay states (`path`, `trace`,
+///      `prefix`, `cur`, `admitted`, `rejected`, `memo`, pending buffers),
+///    - in-flight states held on the stack across a predicate, action, or edge
+///      recorder call (`s`, `t`, `extra`), and
+///    - pending thread-local un-emitted handles (`take_thread_roots`, such as
+///      compiled emit buffers held across mid-emission [`GcEvent::Collect`]).
+/// 2. **Exclusive safepoint:** Callers must hold [`StoreGc::enter_scope`] for
+///    the run and invoke [`StoreGc::collect`] only when no other thread
+///    concurrently reads or pins the store (at a worker safepoint barrier in
+///    multi-worker search, or exclusively during init, recovery, archive
+///    migration, and replay).
+/// 3. **Exhaustion handling:** When retries through [`StoreGcRetry::STAGES`]
+///    still fail with `ErrorKind::StoreFull`, callers must latch
+///    [`StoreGc::mark_full`] (preserving any committed checkpoint) and
+///    propagate the `StoreFull` error rather than masking it as a rejected
+///    state or replay failure.
+pub trait StoreGc<S>: Sync {
+    /// Enter a GC-managed search scope (returns an RAII guard kept for the run).
+    fn enter_scope(&self) -> Box<dyn std::any::Any + Send + Sync>;
+
+    /// Whether the store has crossed its soft limit or hit its budget and
+    /// wants a safepoint collection.
+    fn needs_gc(&self) -> bool;
+
+    /// Permanently mark the store exhausted after a GC-backed retry still
+    /// could not fit the live root set within the budget.
+    fn mark_full(&self);
+
+    /// Visit every store handle in a live state object `s`.
+    fn mark_state(&self, s: &S, mark: &mut dyn FnMut(u64));
+
+    /// Visit every store handle in an encoded state's words.
+    fn mark_words(&self, words: &[u64], mark: &mut dyn FnMut(u64));
+
+    /// Collect any pending thread-local un-emitted store handles held on the
+    /// calling worker thread (e.g. compiled emit buffer words) into `out`
+    /// before parking at a safepoint.
+    fn take_thread_roots(&self, _out: &mut Vec<u64>) {}
+
+    /// Run one safepoint mark-and-sweep collection over all live roots
+    /// enumerated by `visit_roots`. If `visit_roots` returns `Err(msg)`,
+    /// aborts before sweeping and returns `Err(msg)`.
+    fn collect(&self, visit_roots: &mut dyn FnMut(&mut dyn FnMut(u64)) -> Result<(), String>) -> Result<GcResult, String>;
+
+    /// Hint to compiled predicate/atom evaluation on the calling thread to
+    /// fall back to the interpreter when a single evaluation's transient
+    /// store intermediates still overflow a freshly-collected archive-free store.
+    fn set_transient_fallback(&self, _on: bool) {}
+}
+
+/// Event delivered by [`Model::action_successors_gc`] and
+/// [`Model::init_states_gc`], allowing a model to request a value-store
+/// collection mid-emission (e.g. during VIEW/SYMMETRY fingerprinting or
+/// interpreted state encoding) without re-running the action or re-emitting
+/// earlier successors.
+///
+/// Handlers of [`GcEvent::Collect`] must uphold the root-tracking safety
+/// contract on [`StoreGc`]: deposit or pass every in-flight state held across
+/// the callback (plus `take_thread_roots`) before running collection.
+pub enum GcEvent<S> {
+    /// Deliver one generated state (with its action index, or `0` for Init).
+    /// Return `false` to stop generation immediately.
+    Emit(S, u32),
+    /// Request a value-store GC keeping the caller's in-flight state and any
+    /// buffered thread-local emit handles rooted. `force_drop_archive` forces
+    /// dropping the layout-miss archive before retrying the allocation.
+    /// Return `false` if the search has stopped.
+    Collect { force_drop_archive: bool },
+}
+
 /// The optional capabilities of a model (`Model::caps`): None is "not
 /// supported". The accessors give the defaults of a model without a
 /// capability.
@@ -245,11 +393,13 @@ pub struct Caps<'a, S> {
     pub effects: Option<&'a dyn Effects>,
     /// What checkpoints keep besides the states.
     pub checkpoint: Option<&'a dyn Checkpointed>,
+    /// Safepoint reclamation of a run-owned value store, if any.
+    pub gc: Option<&'a dyn StoreGc<S>>,
 }
 
 impl<S> Default for Caps<'_, S> {
     fn default() -> Self {
-        Caps { format: None, live_atoms: None, effects: None, checkpoint: None }
+        Caps { format: None, live_atoms: None, effects: None, checkpoint: None, gc: None }
     }
 }
 
@@ -294,6 +444,12 @@ impl<'a, S> Caps<'a, S> {
     /// `Effects::interrupts`.
     pub fn interrupts(&self, e: &ModelError) -> bool {
         self.effects.is_some_and(|x| x.interrupts(e))
+    }
+
+    /// `Effects::resumes` (defaults to `!e.is_store_full()` when no `Effects`
+    /// capability is installed).
+    pub fn resumes(&self, e: &ModelError) -> bool {
+        self.effects.map_or(!e.is_store_full(), |x| x.resumes(e))
     }
 
     /// `Checkpointed::files`.
@@ -356,6 +512,11 @@ pub trait Model: Sync {
         })
     }
 
+    /// Like `init_states_while`, with mid-emission value-store GC support.
+    fn init_states_gc(&self, out: &mut dyn FnMut(GcEvent<Self::State>) -> bool) -> Result<(), ModelError> {
+        self.init_states_while(&mut |s| out(GcEvent::Emit(s, 0)))
+    }
+
     /// Generate the successors of `s` (including stuttering ones), passing each
     /// to `out` as soon as it is produced; stop early when `out` returns false.
     /// `action` identifies the disjunct of Next that produced the successor
@@ -374,6 +535,16 @@ pub trait Model: Sync {
             go_on
         })?;
         Ok(go_on)
+    }
+
+    /// Like `action_successors`, with mid-emission value-store GC support.
+    fn action_successors_gc(
+        &self,
+        s: &Self::State,
+        action: u32,
+        out: &mut dyn FnMut(GcEvent<Self::State>) -> bool,
+    ) -> Result<bool, ModelError> {
+        self.action_successors(s, action, &mut |t, a| out(GcEvent::Emit(t, a)))
     }
 
     /// Whether the model evaluates `TLCExt!Trace`: the search then keeps
@@ -406,6 +577,14 @@ pub trait Model: Sync {
     /// Returns the index (into `invariant_names`) of the first violated invariant.
     fn check_invariants(&self, s: &Self::State) -> Result<Option<usize>, ModelError>;
 
+    /// GC-aware `check_invariants`: retries only the failing invariant across
+    /// `collect(force_drop_archive)` so earlier invariants' committed side
+    /// effects (e.g. `TLCSet`) are never replayed on a `StoreFull` retry.
+    fn check_invariants_gc(&self, s: &Self::State, collect: &mut dyn FnMut(bool) -> bool) -> Result<Option<usize>, ModelError> {
+        let _ = collect;
+        self.check_invariants(s)
+    }
+
     /// A key of `s` (whose fingerprint is `fp`) for `check_invariants`, when
     /// that is a pure function of the state (no output, registers, random
     /// choices, ...): states with equal keys get the same result. The
@@ -424,13 +603,36 @@ pub trait Model: Sync {
     /// State constraint (CONSTRAINT): states violating it are not expanded.
     fn constraint(&self, s: &Self::State) -> Result<bool, ModelError>;
 
+    /// GC-aware `constraint`: retries only the failing constraint predicate.
+    fn constraint_gc(&self, s: &Self::State, collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        let _ = collect;
+        self.constraint(s)
+    }
+
     /// Action constraint (ACTION_CONSTRAINT): transitions violating it are dropped.
     fn action_constraint(&self, s: &Self::State, t: &Self::State) -> Result<bool, ModelError>;
+
+    /// GC-aware `action_constraint`: retries only the failing action constraint.
+    fn action_constraint_gc(&self, s: &Self::State, t: &Self::State, collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        let _ = collect;
+        self.action_constraint(s, t)
+    }
 
     /// Action properties (`PROPERTY [][A]_v`): checked on every generated
     /// transition. Returns the index (into `action_property_names`) of the
     /// first violated one.
     fn check_transition(&self, s: &Self::State, t: &Self::State) -> Result<Option<usize>, ModelError>;
+
+    /// GC-aware `check_transition`: retries only the failing action property.
+    fn check_transition_gc(
+        &self,
+        s: &Self::State,
+        t: &Self::State,
+        collect: &mut dyn FnMut(bool) -> bool,
+    ) -> Result<Option<usize>, ModelError> {
+        let _ = collect;
+        self.check_transition(s, t)
+    }
 
     fn action_property_names(&self) -> &[String];
 
@@ -463,6 +665,13 @@ pub trait Model: Sync {
 #[inline]
 pub fn admits<M: Model + ?Sized>(m: &M, s: &M::State, t: &M::State) -> Result<bool, ModelError> {
     Ok(m.constraint(t)? && m.action_constraint(s, t)?)
+}
+
+/// GC-aware `admits`: evaluates `CONSTRAINT` then `ACTION_CONSTRAINT`,
+/// retrying only the failing predicate across `collect(force_drop_archive)`.
+#[inline]
+pub fn admits_gc<M: Model + ?Sized>(m: &M, s: &M::State, t: &M::State, collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+    Ok(m.constraint_gc(t, collect)? && m.action_constraint_gc(s, t, collect)?)
 }
 
 /// The checks of a model that has none (no implied inits, constraints or

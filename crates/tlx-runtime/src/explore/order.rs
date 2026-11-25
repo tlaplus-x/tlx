@@ -445,7 +445,7 @@ impl Cand {
 
 /// What a candidate kept needs besides its state (stored with the state).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Meta {
+pub(super) struct Meta {
     /// The parent's trace-log entry.
     parent: LogRef,
     depth: u32,
@@ -482,7 +482,7 @@ struct Meta {
 /// class represents it, the counts, the BFS positions (from the keys) and
 /// the outdegrees do not depend on that order; which of several violations
 /// of the level is reported first does (docs/compat.md, tier 3).
-enum CandStore<'m, S> {
+pub(super) enum CandStore<'m, S> {
     /// The states as words, XOR-varint encoded against the previous one.
     Words(Box<Words<'m, S>>),
     /// The states themselves.
@@ -497,7 +497,7 @@ enum CandSeg {
     Disk(BlockRef),
 }
 
-struct Words<'m, S> {
+pub(super) struct Words<'m, S> {
     codec: &'m dyn StateCodec<S>,
     /// The full segments, in order, and the one appended to (records are
     /// only appended).
@@ -749,6 +749,69 @@ impl<'m, S> CandStore<'m, S> {
             CandStore::Objects(v) => v.capacity() * std::mem::size_of::<Option<(S, Meta)>>(),
         }
     }
+
+    /// Non-destructively visit every unconsumed candidate state in this store
+    /// for safepoint GC root scanning (safe both before and during `resolve`).
+    pub(super) fn visit_states(&mut self, visit: &mut dyn FnMut(crate::queue::StateRef<'_, S>)) -> Result<(), IoError> {
+        match self {
+            CandStore::Objects(v) => {
+                for (s, _) in v.iter().flatten() {
+                    visit(crate::queue::StateRef::Obj(s));
+                }
+                Ok(())
+            }
+            CandStore::Words(w) => {
+                let mut rem = w.pushed.saturating_sub(w.decoded);
+                if rem == 0 {
+                    return Ok(());
+                }
+                let mut dec = w.dec.clone();
+                let mut scan_buf = |buf: &[u8], start: usize, rem: &mut usize, dec: &mut XorPrev| {
+                    let mut pos = start;
+                    while *rem > 0 && pos < buf.len() {
+                        let _action = get_uvar_trusted(buf, &mut pos);
+                        let _depth = get_uvar_trusted(buf, &mut pos);
+                        let _fp = codec::get_xor(buf, &mut pos, dec);
+                        visit(crate::queue::StateRef::Words(&dec.words));
+                        *rem -= 1;
+                    }
+                };
+                if w.pos < w.rd.len() {
+                    scan_buf(&w.rd, w.pos, &mut rem, &mut dec);
+                }
+                for seg in w.segs.iter_mut().skip(w.next) {
+                    if rem == 0 {
+                        break;
+                    }
+                    match seg {
+                        CandSeg::Mem(v) => scan_buf(v, 0, &mut rem, &mut dec),
+                        CandSeg::Pending(p) => match p.settle::<Vec<u8>>() {
+                            Ok(r) => {
+                                let store = w.store.as_ref().expect("a store of the spilled candidates");
+                                let bytes = store.read(&r)?;
+                                *seg = CandSeg::Disk(r);
+                                scan_buf(&bytes, 0, &mut rem, &mut dec);
+                            }
+                            Err((v, _)) => {
+                                scan_buf(&v, 0, &mut rem, &mut dec);
+                                *seg = CandSeg::Mem(v);
+                            }
+                        },
+                        CandSeg::Disk(r) => {
+                            let store = w.store.as_ref().expect("a store of the spilled candidates");
+                            let bytes = store.read(r)?;
+                            scan_buf(&bytes, 0, &mut rem, &mut dec);
+                        }
+                    }
+                }
+                if rem > 0 && !w.cur.is_empty() {
+                    scan_buf(&w.cur, 0, &mut rem, &mut dec);
+                }
+                debug_assert_eq!(rem, 0, "CandStore::visit_states missed {rem} candidates");
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A worker's part of the choice of representatives.
@@ -781,6 +844,14 @@ impl<'m, S> OrderLocal<'m, S> {
             store: CandStore::new(codec, seg_bytes),
             charge: Charge::default(),
         }
+    }
+
+    pub(super) fn take_store(&mut self) -> CandStore<'m, S> {
+        std::mem::replace(&mut self.store, CandStore::new(None, 0))
+    }
+
+    pub(super) fn restore_store(&mut self, store: CandStore<'m, S>) {
+        self.store = store;
     }
 }
 
@@ -879,7 +950,9 @@ impl<M: Model> WorkerState<'_, '_, M> {
                         return Err(fp_set_full(seen));
                     }
                     shared.control().request(SP_GROW);
+                    shared.mid_task_parked.fetch_add(1, Ordering::AcqRel);
                     shared.safepoint.park(|req, crew| shared.serve_safepoint(req, crew));
+                    shared.mid_task_parked.fetch_sub(1, Ordering::AcqRel);
                     parked = true;
                 }
             }
@@ -935,7 +1008,19 @@ impl<M: Model> WorkerState<'_, '_, M> {
         let table_charge = Charge::default();
         table_charge.set(&order.cand_bytes, entries.capacity() * 16);
         for (i, c) in cands.iter().enumerate() {
-            if shared.control().stopped() {
+            if shared.store_gc.is_some() {
+                if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                    shared.control().request(super::SP_STORE_GC);
+                }
+                if shared.control().get() != 0 {
+                    self.order.as_mut().unwrap().restore_store(store);
+                    let go = self.proceed();
+                    store = self.order.as_mut().unwrap().take_store();
+                    if !go {
+                        break;
+                    }
+                }
+            } else if shared.control().stopped() {
                 break;
             }
             let (state, Meta { parent, depth, action }) = match store.get(c.at, c.fp, &shared.opts.spill) {
@@ -951,8 +1036,18 @@ impl<M: Model> WorkerState<'_, '_, M> {
             // The atoms of the tableaux on a new state (recording the
             // liveness edges: the fingerprint is the state then, see
             // `explore`), as one worker evaluates them when it finds it.
-            if let Some(e) = &mut self.shard.edges {
-                if let Err((outcome, at)) = edge_error(model, e.found(&state), parent) {
+            if self.shard.edges.is_some() {
+                let first = self.shard.edges.as_mut().map_or(Ok(()), |e| e.found(&state));
+                let edge_res = match first {
+                    Err(e) if e.is_store_full() => {
+                        self.order.as_mut().unwrap().restore_store(store);
+                        let r = self.retry_edge(&[&state], e, |edges| edges.found(&state));
+                        store = self.order.as_mut().unwrap().take_store();
+                        r
+                    }
+                    other => other,
+                };
+                if let Err((outcome, at)) = edge_error(model, edge_res, parent) {
                     shared.fail(outcome, at);
                     break;
                 }
@@ -969,7 +1064,26 @@ impl<M: Model> WorkerState<'_, '_, M> {
             }
             let span = stats::span();
             // (`TLCExt!Trace` on the state: its parent's path and the state.)
-            let f = shared.with_path_of(parent, || invariant_failure(model, &state, r));
+            let f = if let Some(gc) = shared.store_gc {
+                let mut store_opt = Some(store);
+                let mut stopped = false;
+                let res = shared.with_path_of(parent, || {
+                    super::invariant_failure_gc(model, &state, r, &mut |force_drop| {
+                        self.order.as_mut().unwrap().restore_store(store_opt.take().unwrap());
+                        self.park_for_store_gc(&[&state], force_drop);
+                        store_opt = Some(self.order.as_mut().unwrap().take_store());
+                        stopped = shared.control().stopped();
+                        !stopped
+                    })
+                });
+                store = store_opt.unwrap();
+                if matches!(&res, Some((Outcome::Error(e), _)) if e.is_store_full()) && !stopped {
+                    gc.mark_full();
+                }
+                res
+            } else {
+                shared.with_path_of(parent, || invariant_failure(model, &state, r))
+            };
             span.end(T::Invariants);
             if let Some((outcome, at)) = f {
                 shared.fail(outcome, at);

@@ -8,7 +8,7 @@
 //! Mixed-mode native code calls back into the host for its regions
 //! (`HostRegions`), with a per-worker `MixedCx` (`MIXED`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,7 +21,7 @@ use tlx_layout::{Layout, Shape};
 use tlx_native::mixed::MixedCx;
 use tlx_native::native::{Mixed, NativeLib, OK};
 use tlx_runtime::stats::{self, Path};
-use tlx_runtime::{ErrorKind, Model, ModelError};
+use tlx_runtime::{ErrorKind, GcEvent, Model, ModelError, StoreGcRetry};
 use tlx_sema::hir::DefId;
 use tlx_value::Value;
 
@@ -232,6 +232,10 @@ pub struct EncModel {
     /// (present even while all current slots are fixed, so `model-store`
     /// matches the store mode recorded in `speculation`).
     pub(super) checkpoint_store: Option<tlx_layout::store::StoreRef>,
+    /// Compile-time constant value-store handles baked into IR/native/JIT code
+    /// (`ConstWords`, `ConstElems`, `Const` of `Ref`-bearing shapes); kept
+    /// rooted in every safepoint GC cycle.
+    pub(super) pinned_handles: Box<[u64]>,
 }
 
 impl EncModel {
@@ -449,6 +453,22 @@ impl EncModel {
                 stats::set_json_source(&format!("native_regions_{id}"), Arc::new(t.json_source(&typing)));
             }
         }
+        let pinned_handles = if sem.as_ref().and_then(|s| s.store.as_ref()).is_some() {
+            collect_pinned_handles(
+                &typing,
+                init.as_ref(),
+                &actions,
+                &invariants,
+                &aprops,
+                match &fp {
+                    Fingerprint::View(v) | Fingerprint::SymView { view: v, .. } => Some(v),
+                    _ => None,
+                },
+                native.as_deref().and_then(|n| n.regions.as_ref()),
+            )
+        } else {
+            Box::new([])
+        };
         EncModel {
             escape,
             fp,
@@ -488,6 +508,7 @@ impl EncModel {
             restartable: false,
             speculation: Vec::new(),
             checkpoint_store: None,
+            pinned_handles,
         }
     }
 
@@ -605,12 +626,15 @@ impl EncModel {
         let table = self.native.as_deref().and_then(|n| n.regions.as_ref()).expect("a library with regions");
         let fast = Some(FastRegions { prog: &self.fast.prog, progs: &self.fast_regions });
         let regions = HostRegions { ip: &self.base.ip, typing: &self.typing, table, memo: self.memo.exec_id(), fast };
+        let gc_gen = self.store_gc_gen();
         MIXED.with(|m| match m.try_borrow_mut() {
             Ok(mut m) => {
-                let (id, cx) = &mut *m;
-                // The decoded-state cache holds states of this model's layout.
-                if *id != self.id {
+                let (id, gen, cx) = &mut *m;
+                // The decoded-state cache holds states of this model's layout
+                // (and pre-GC handles become stale after a value-store sweep).
+                if *id != self.id || *gen != gc_gen {
                     *id = self.id;
+                    *gen = gc_gen;
                     cx.cache.clear();
                 }
                 let r = f(Mixed { cx: &mut *cx, regions: &regions, level });
@@ -883,13 +907,35 @@ impl EncModel {
         err.map_or(Ok(()), Err)
     }
 
-    /// `compiled_successors` of an action that may print: its output is
-    /// held back while it runs and printed if the run succeeds, else
-    /// dropped (the interpreter redoes the run, printing again).
-    /// TLX_PARANOID compares the lines with the interpreter's. (Out of
-    /// line: `run_action`'s path for the other actions stays as short.)
+    /// Interpreted Init with in-place value-store GC retry per initial state so
+    /// interpreter side effects run once and generation stops immediately if
+    /// `sink` returns false.
+    fn interpreted_init_gc(&self, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<(), ModelError> {
+        let has_store = self.value_store().is_some();
+        let mut err = None;
+        self.base.init_states_while(&mut |v| match self.encode_gc(&v, has_store, sink) {
+            Ok(Some(e)) => sink(GcEvent::Emit(e, 0)),
+            Ok(None) => false,
+            Err(e) => {
+                err = Some(e);
+                false
+            }
+        })?;
+        err.map_or(Ok(()), Err)
+    }
+
+    /// `compiled_successors` of an action that may print: its output is held
+    /// back in the returned vector instead of released immediately, so a
+    /// `StoreFull` retry or interpreter fallback discards it cleanly and
+    /// committed output is released exactly once.
     #[inline(never)]
-    fn compiled_successors_printing(&self, s: &EState, i: usize, native: bool, buf: &mut Vec<Box<[u64]>>) -> Option<Path> {
+    fn compiled_successors_printing_hold(
+        &self,
+        s: &EState,
+        i: usize,
+        native: bool,
+        buf: &mut Vec<Box<[u64]>>,
+    ) -> (Option<Path>, Vec<String>) {
         let mark = tlx_eval::Interp::hold_begin();
         let ok = self.compiled_successors(s, i, native, buf);
         let lines = tlx_eval::Interp::hold_end(mark);
@@ -897,9 +943,10 @@ impl EncModel {
             if self.paranoid {
                 self.cross_check_output(s, i, &lines);
             }
-            self.base.ip.release_output(lines);
+            (ok, lines)
+        } else {
+            (None, Vec::new())
         }
-        ok
     }
 
     /// Paranoid: the lines a compiled run of action `i` on `s` printed
@@ -1010,6 +1057,50 @@ impl EncModel {
         r
     }
 
+    /// GC-aware `predicate`: runs the fast path once, and only on `StoreFull`
+    /// enters the cold per-predicate retry loop via `collect(force_drop_archive)`
+    /// (falling back to the interpreter on retry 3) without replaying earlier
+    /// predicates in the same check list.
+    #[inline]
+    fn predicate_gc(
+        &self,
+        p: PredAt<'_>,
+        steps: impl Fn() -> Option<bool>,
+        interp: impl Fn() -> Result<bool, ModelError>,
+        what: impl Fn(&str) -> String,
+        collect: &mut dyn FnMut(bool) -> bool,
+    ) -> Result<(bool, Path), ModelError> {
+        match self.predicate(p, &steps, &interp, &what) {
+            Err(e) if e.is_store_full() => self.retry_predicate_gc(p, &steps, &interp, &what, collect, e),
+            other => other,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn retry_predicate_gc(
+        &self,
+        p: PredAt<'_>,
+        steps: &impl Fn() -> Option<bool>,
+        interp: &impl Fn() -> Result<bool, ModelError>,
+        what: &impl Fn(&str) -> String,
+        collect: &mut dyn FnMut(bool) -> bool,
+        first_err: ModelError,
+    ) -> Result<(bool, Path), ModelError> {
+        let mut last = first_err;
+        for stage in StoreGcRetry::STAGES {
+            if !collect(stage.force_drop_archive) {
+                return Err(last);
+            }
+            let _fb = stage.transient_fallback.then(TransientFallbackScope::enter);
+            match self.predicate(p, steps, interp, what) {
+                Err(e) if e.is_store_full() => last = e,
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
     /// `predicate` without the adaptive tiering's timing (natively only if
     /// `native`).
     #[inline]
@@ -1028,35 +1119,57 @@ impl EncModel {
             }
             b
         };
+        let has_store = self.value_store().is_some();
+        let skip_compiled = has_store && Self::transient_fallback();
         let mut path = Path::Interp;
-        let native = native && !self.escaped(p.s) && !p.t.is_some_and(|t| self.escaped(t));
-        let has = |n: &Native| native && if p.t.is_some() { n.has.action_properties[p.idx] } else { n.has.invariants[p.idx] };
-        if let Some(lib) = self.native_lib(has) {
-            let mut rc = match p.t {
-                None => self.lib_inv(lib, p.s, p.idx, p.level),
-                Some(t) => self.lib_aprop(lib, p.s, t, p.idx, p.level),
-            };
-            if p.inject && self.inject.is_some() && (rc == 0 || rc == 1) && self.inject_now(&[InjectKind::Inv]).is_some() {
-                rc = 1 - rc;
+        if !skip_compiled {
+            let native = native && !self.escaped(p.s) && !p.t.is_some_and(|t| self.escaped(t));
+            let has = |n: &Native| native && if p.t.is_some() { n.has.action_properties[p.idx] } else { n.has.invariants[p.idx] };
+            if let Some(lib) = self.native_lib(has) {
+                if has_store {
+                    tlx_layout::store::clear_full_hit();
+                }
+                let mut rc = match p.t {
+                    None => self.lib_inv(lib, p.s, p.idx, p.level),
+                    Some(t) => self.lib_aprop(lib, p.s, t, p.idx, p.level),
+                };
+                if p.inject && self.inject.is_some() && (rc == 0 || rc == 1) && self.inject_now(&[InjectKind::Inv]).is_some() {
+                    rc = 1 - rc;
+                }
+                let verdict = match p.t {
+                    None => self.native_verdict(rc, &[p.s])?,
+                    Some(t) => self.native_verdict(rc, &[p.s, t])?,
+                };
+                match verdict {
+                    Some(b) => return Ok((checked(b, ""), self.native_path(kind, p.idx))),
+                    None => {
+                        if has_store && tlx_layout::store::take_full_hit() {
+                            return Err(self.store_full_error());
+                        }
+                        path = Path::Fallback;
+                    }
+                }
             }
-            let verdict = match p.t {
-                None => self.native_verdict(rc, &[p.s])?,
-                Some(t) => self.native_verdict(rc, &[p.s, t])?,
-            };
-            match verdict {
-                Some(b) => return Ok((checked(b, ""), self.native_path(kind, p.idx))),
-                None => path = Path::Fallback,
-            }
+        } else {
+            path = Path::Fallback;
         }
         if let Some(b) = steps() {
             return Ok((checked(b, " (as a change of its subscript)"), Path::Interp));
         }
-        let ir = match p.t {
-            None => self.ir_predicate(p.s, p.idx, p.level),
-            Some(t) => self.ir_trans_predicate(p.s, t, p.idx, p.level),
-        };
-        if let Some(b) = ir {
-            return Ok((checked(b, ""), Path::Ir));
+        if !skip_compiled {
+            if has_store {
+                tlx_layout::store::clear_full_hit();
+            }
+            let ir = match p.t {
+                None => self.ir_predicate(p.s, p.idx, p.level),
+                Some(t) => self.ir_trans_predicate(p.s, t, p.idx, p.level),
+            };
+            if let Some(b) = ir {
+                return Ok((checked(b, ""), Path::Ir));
+            }
+            if has_store && tlx_layout::store::take_full_hit() {
+                return Err(self.store_full_error());
+            }
         }
         Ok((interp()?, path))
     }
@@ -1102,7 +1215,7 @@ impl EncModel {
         let mut buf = Vec::new();
         tlx_eval::Interp::begin_random_scope();
         if let Some(e) = &self.escape {
-            // Output is held transactionally by compiled_successors_printing.
+            // Output is held transactionally by compiled_successors_printing_hold.
             // Other effects only have a whole-search journal, not an action
             // transaction, so they must run in the interpreter exactly once.
             if e.irreversible_actions[i] {
@@ -1117,10 +1230,14 @@ impl EncModel {
                 return (self.interpreted_successors(s, i, out), Path::Fallback);
             }
         }
-        let ok = if self.prints[i] {
-            self.compiled_successors_printing(s, i, native, &mut buf)
+        let has_store = self.value_store().is_some();
+        if has_store {
+            tlx_layout::store::clear_full_hit();
+        }
+        let (ok, pending_lines) = if self.prints[i] {
+            self.compiled_successors_printing_hold(s, i, native, &mut buf)
         } else {
-            self.compiled_successors(s, i, native, &mut buf)
+            (self.compiled_successors(s, i, native, &mut buf), Vec::new())
         };
         if let Some(path) = ok {
             if self.inject.is_some() {
@@ -1131,12 +1248,21 @@ impl EncModel {
                 self.inject_successors(s, &mut buf);
             }
             if self.paranoid {
-                self.cross_check(s, i, &buf);
+                if let Err(e) = self.cross_check(s, i, &buf) {
+                    return (Err(e), path);
+                }
+            }
+            if !pending_lines.is_empty() {
+                self.base.ip.release_output(pending_lines);
             }
             let r = self.emit_compiled(buf, s, i, out);
             (r, path)
         } else {
             let compiled = self.compiled_path(i, native).is_some();
+            if has_store && tlx_layout::store::take_full_hit() {
+                let path = self.compiled_path(i, native).unwrap_or(Path::Ir);
+                return (Err(self.store_full_error()), path);
+            }
             if let Some(e) = self.escape.as_ref().filter(|_| compiled) {
                 e.guards.add(1);
                 e.deopts.add(1);
@@ -1153,22 +1279,327 @@ impl EncModel {
         }
     }
 
-    /// Hand the compiled successors of `s` by action `i` to `out`; false
-    /// if exploration is to stop.
+    /// GC-aware `run_action`: retries compiled action generation across
+    /// `GcEvent::Collect` (dropping the archive on retry 2 and falling back to
+    /// the interpreter on retry 3 so transient compiled intermediates cannot
+    /// starve a small store), releases captured `PrintT` output once the
+    /// compiled batch is committed, and finishes/delivers states strictly one
+    /// at a time in order so first-failure order is preserved across retries.
+    fn run_action_gc(
+        &self,
+        s: &EState,
+        i: usize,
+        native: bool,
+        sink: &mut dyn FnMut(GcEvent<EState>) -> bool,
+    ) -> (Result<bool, ModelError>, Path) {
+        tlx_eval::Interp::begin_random_scope();
+        if let Some(e) = &self.escape {
+            if e.irreversible_actions[i] {
+                return (self.interpreted_successors_gc(s, i, sink), Path::Interp);
+            }
+            if self.escaped(s) {
+                e.guards.add(1);
+                if let Some(r) = self.escape_action(s, i, &mut |t, a| sink(GcEvent::Emit(t, a))) {
+                    return (r, Path::Fallback);
+                }
+                e.deopts.add(1);
+                return (self.interpreted_successors_gc(s, i, sink), Path::Fallback);
+            }
+        }
+        let has_store = self.value_store().is_some();
+        let mut buf = Vec::new();
+        let mut tries = 0usize;
+        let (ok, pending_lines) = loop {
+            buf.clear();
+            if has_store {
+                tlx_layout::store::clear_full_hit();
+            }
+            let (ok, lines) = if self.prints[i] {
+                self.compiled_successors_printing_hold(s, i, native, &mut buf)
+            } else {
+                (self.compiled_successors(s, i, native, &mut buf), Vec::new())
+            };
+            if ok.is_some() {
+                break (ok, lines);
+            }
+            if has_store && tlx_layout::store::take_full_hit() {
+                if let Some(stage) = StoreGcRetry::COMPILED_STAGES.get(tries) {
+                    tries += 1;
+                    if !sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive }) {
+                        return (Ok(false), self.compiled_path(i, native).unwrap_or(Path::Ir));
+                    }
+                    continue;
+                }
+                // Even archive-free GC could not hold this compiled action's
+                // transient intermediates: sweep the aborted attempt and fall
+                // back to the interpreter (which evaluates intermediates as
+                // `Value` without interning discarded temporaries).
+                if !sink(GcEvent::Collect { force_drop_archive: true }) {
+                    return (Ok(false), Path::Fallback);
+                }
+                let compiled = self.compiled_path(i, native).is_some();
+                if self.actions[i].is_some() && (native || compiled) {
+                    self.bailouts.add(1);
+                }
+                return (self.interpreted_successors_gc(s, i, sink), Path::Fallback);
+            }
+            break (None, Vec::new());
+        };
+        if let Some(path) = ok {
+            if self.inject.is_some() {
+                if !self.restartable && self.inject_now(&[InjectKind::Miss]).is_some() {
+                    return (Err(ModelError::of_kind(ErrorKind::LayoutMiss, MISS_MSG)), Path::Native);
+                }
+                self.inject_successors(s, &mut buf);
+            }
+            if self.paranoid {
+                if let Err(e) = self.cross_check_gc(s, i, &mut buf, sink) {
+                    return (Err(e), path);
+                }
+            }
+            let r = self.emit_compiled_gc(buf, s.level + 1, i as u32, pending_lines, sink);
+            (r, path)
+        } else {
+            let compiled = self.compiled_path(i, native).is_some();
+            if let Some(e) = self.escape.as_ref().filter(|_| compiled) {
+                e.guards.add(1);
+                e.deopts.add(1);
+                if let Some(r) = self.escape_action(s, i, &mut |t, a| sink(GcEvent::Emit(t, a))) {
+                    return (r, Path::Fallback);
+                }
+            }
+            if self.actions[i].is_some() && (native || compiled) {
+                self.bailouts.add(1);
+            }
+            let path = if compiled { Path::Fallback } else { Path::Interp };
+            (self.interpreted_successors_gc(s, i, sink), path)
+        }
+    }
+
+    /// Paranoid cross-check for compiled successors while keeping `buf` rooted
+    /// across any `StoreFull` GC retry triggered by `check_store_slots`.
+    fn cross_check_gc(
+        &self,
+        s: &EState,
+        i: usize,
+        buf: &mut Vec<Box<[u64]>>,
+        sink: &mut dyn FnMut(GcEvent<EState>) -> bool,
+    ) -> Result<(), ModelError> {
+        let mut last = match self.cross_check(s, i, buf) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.is_store_full() => e,
+            Err(e) => return Err(e),
+        };
+        for stage in StoreGcRetry::STAGES {
+            let held = std::mem::take(buf);
+            let guard = EmitGuard::push_words(self.id, held);
+            let ok = sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive });
+            *buf = guard.take_words();
+            if !ok {
+                return Err(last);
+            }
+            match self.cross_check(s, i, buf) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_store_full() => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// Paranoid cross-check for compiled Init while keeping `buf` rooted
+    /// across any `StoreFull` GC retry triggered by `check_store_slots`.
+    fn cross_check_init_gc(&self, buf: &mut Vec<Box<[u64]>>, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<(), ModelError> {
+        let mut last = match self.cross_check_init(buf) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.is_store_full() => e,
+            Err(e) => return Err(e),
+        };
+        for stage in StoreGcRetry::STAGES {
+            let held = std::mem::take(buf);
+            let guard = EmitGuard::push_words(self.id, held);
+            let ok = sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive });
+            *buf = guard.take_words();
+            if !ok {
+                return Err(last);
+            }
+            match self.cross_check_init(buf) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_store_full() => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// Hand the compiled successors of `s` by action `i` to `out` strictly in
+    /// order; false if exploration is to stop.
     fn emit_compiled(
         &self,
-        buf: Vec<Box<[u64]>>,
+        mut buf: Vec<Box<[u64]>>,
         s: &EState,
         i: usize,
         out: &mut dyn FnMut(EState, u32) -> bool,
     ) -> Result<bool, ModelError> {
-        for w in buf {
+        if buf.is_empty() {
+            return Ok(true);
+        }
+        if self.value_store().is_none() || buf.len() == 1 {
+            for w in buf {
+                let t = self.finish(w, s.level + 1)?;
+                if !out(t, i as u32) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // Keep un-emitted words rooted in `PENDING_EMIT` while streaming one
+        // state at a time in order so `out` sees the first failure before later
+        // states' VIEW/SYMMETRY fingerprints are evaluated.
+        buf.reverse();
+        let guard = EmitGuard::push_words(self.id, buf);
+        while let Some(w) = guard.pop_word() {
             let t = self.finish(w, s.level + 1)?;
             if !out(t, i as u32) {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// GC-aware ordered emission of compiled successors: finishes and delivers
+    /// states one at a time in order, retrying `finish` (VIEW/SYMMETRY) in
+    /// place across `GcEvent::Collect` without re-running the action. Releases
+    /// captured `PrintT` output once the first state's fingerprinting succeeds
+    /// (or immediately if the batch is empty).
+    fn emit_compiled_gc(
+        &self,
+        mut buf: Vec<Box<[u64]>>,
+        level: u32,
+        action: u32,
+        pending_lines: Vec<String>,
+        sink: &mut dyn FnMut(GcEvent<EState>) -> bool,
+    ) -> Result<bool, ModelError> {
+        if buf.is_empty() {
+            if !pending_lines.is_empty() {
+                self.base.ip.release_output(pending_lines);
+            }
+            return Ok(true);
+        }
+        // Fast path for the common 1-successor action: zero `PENDING_EMIT`
+        // touches unless `finish_or_return` actually hits `StoreFull`.
+        if buf.len() == 1 {
+            let w = buf.pop().unwrap();
+            match self.finish_or_return(w, level) {
+                Ok(t) => {
+                    if !pending_lines.is_empty() {
+                        self.base.ip.release_output(pending_lines);
+                    }
+                    return Ok(sink(GcEvent::Emit(t, action)));
+                }
+                Err((w, e)) if e.is_store_full() => {
+                    return self.emit_compiled_gc_slow(vec![w], level, action, pending_lines, sink, Some(e));
+                }
+                Err((_, e)) => {
+                    if !pending_lines.is_empty() {
+                        self.base.ip.release_output(pending_lines);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        buf.reverse();
+        self.emit_compiled_gc_slow(buf, level, action, pending_lines, sink, None)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn emit_compiled_gc_slow(
+        &self,
+        buf_rev: Vec<Box<[u64]>>,
+        level: u32,
+        action: u32,
+        mut pending_lines: Vec<String>,
+        sink: &mut dyn FnMut(GcEvent<EState>) -> bool,
+        mut first_full: Option<ModelError>,
+    ) -> Result<bool, ModelError> {
+        let guard = EmitGuard::push_words(self.id, buf_rev);
+        while let Some(w) = guard.pop_word() {
+            let initial = match first_full.take() {
+                Some(e) => Err((w, e)),
+                None => self.finish_or_return(w, level),
+            };
+            let t = match initial {
+                Ok(t) => t,
+                Err((mut w_cur, mut last)) if last.is_store_full() => {
+                    let mut finished = None;
+                    for stage in StoreGcRetry::STAGES {
+                        guard.push_word(w_cur);
+                        if !sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive }) {
+                            return Ok(false);
+                        }
+                        w_cur = guard.pop_word().expect("re-pushed emit word");
+                        let _fb = stage.transient_fallback.then(TransientFallbackScope::enter);
+                        match self.finish_or_return(w_cur, level) {
+                            Ok(t) => {
+                                finished = Some(t);
+                                break;
+                            }
+                            Err((w_next, e2)) if e2.is_store_full() => {
+                                w_cur = w_next;
+                                last = e2;
+                            }
+                            Err((_, e2)) => {
+                                if !pending_lines.is_empty() {
+                                    self.base.ip.release_output(pending_lines);
+                                }
+                                return Err(e2);
+                            }
+                        }
+                    }
+                    match finished {
+                        Some(t) => t,
+                        None => return Err(last),
+                    }
+                }
+                Err((_, e)) => {
+                    if !pending_lines.is_empty() {
+                        self.base.ip.release_output(pending_lines);
+                    }
+                    return Err(e);
+                }
+            };
+            if !pending_lines.is_empty() {
+                self.base.ip.release_output(std::mem::take(&mut pending_lines));
+            }
+            if !sink(GcEvent::Emit(t, action)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Encode one interpreter state `v`, retrying in place across
+    /// `GcEvent::Collect` if `StoreFull` occurs without re-running the
+    /// interpreter action. Returns `Ok(None)` if the search stopped during GC.
+    fn encode_gc(&self, v: &VState, has_store: bool, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<Option<EState>, ModelError> {
+        let mut last = match self.encode(v) {
+            Ok(e) => return Ok(Some(e)),
+            Err(e) if has_store && e.is_store_full() => e,
+            Err(e) => return Err(e),
+        };
+        for stage in StoreGcRetry::STAGES {
+            if !sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive }) {
+                return Ok(None);
+            }
+            let _fb = stage.transient_fallback.then(TransientFallbackScope::enter);
+            match self.encode(v) {
+                Ok(e) => return Ok(Some(e)),
+                Err(e) if e.is_store_full() => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
     }
 
     /// Successors of `s` by action `i` from the interpreter; false if
@@ -1186,6 +1617,41 @@ impl EncModel {
                 let go = out(e, act);
                 go_on &= go;
                 go
+            }
+            Err(e) => {
+                err = Some(e);
+                go_on = false;
+                false
+            }
+        })?;
+        match err {
+            Some(e) => Err(e),
+            None => Ok(go_on),
+        }
+    }
+
+    /// GC-aware interpreted successors: runs `base.successors_of` once and
+    /// encodes/delivers each successor strictly in order with in-place GC
+    /// retries, keeping interpreter effects (`Print`, `TLCSet`, files) exact
+    /// and preserving first-failure order.
+    fn interpreted_successors_gc(&self, s: &EState, i: usize, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<bool, ModelError> {
+        let has_store = self.value_store().is_some();
+        let mut go_on = true;
+        let mut err = None;
+        self.base.successors_of(&self.decode_current(s), i, &mut |t, act| match self.encode_gc(&t, has_store, sink) {
+            Ok(Some(e)) => {
+                if self.escaped(&e) {
+                    if let Some(escape) = &self.escape {
+                        escape.observe(&t.vals);
+                    }
+                }
+                let go = sink(GcEvent::Emit(e, act));
+                go_on &= go;
+                go
+            }
+            Ok(None) => {
+                go_on = false;
+                false
             }
             Err(e) => {
                 err = Some(e);
@@ -1217,21 +1683,80 @@ impl Model for EncModel {
 
     fn init_states(&self, out: &mut dyn FnMut(EState)) -> Result<(), ModelError> {
         let mut buf = Vec::new();
+        let has_store = self.value_store().is_some();
         // (Random choices restart for each evaluation, as in the interpreter.)
         tlx_eval::Interp::begin_random_scope();
+        if has_store {
+            tlx_layout::store::clear_full_hit();
+        }
         // (With -coverage, the interpreter counts what Init rejects.)
         if self.base.coverage || !self.compiled_init(&mut buf) {
+            if !self.base.coverage && has_store && tlx_layout::store::take_full_hit() {
+                return Err(self.store_full_error());
+            }
             return self.interpreted_init(out);
         }
         if self.inject.is_some() && self.inject_now(&[InjectKind::Init]).is_some() {
             buf.pop();
         }
         if self.paranoid {
-            self.cross_check_init(&buf);
+            self.cross_check_init(&buf)?;
         }
-        for w in buf {
-            out(self.finish(w, 1)?);
+        if has_store {
+            buf.reverse();
+            let guard = EmitGuard::push_words(self.id, buf);
+            while let Some(w) = guard.pop_word() {
+                out(self.finish(w, 1)?);
+            }
+        } else {
+            for w in buf {
+                out(self.finish(w, 1)?);
+            }
         }
+        Ok(())
+    }
+
+    fn init_states_gc(&self, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<(), ModelError> {
+        let has_store = self.value_store().is_some();
+        tlx_eval::Interp::begin_random_scope();
+        if self.base.coverage {
+            return self.interpreted_init_gc(sink);
+        }
+        let mut buf = Vec::new();
+        let mut tries = 0usize;
+        let ok = loop {
+            buf.clear();
+            if has_store {
+                tlx_layout::store::clear_full_hit();
+            }
+            if self.compiled_init(&mut buf) {
+                break true;
+            }
+            if has_store && tlx_layout::store::take_full_hit() {
+                if let Some(stage) = StoreGcRetry::COMPILED_STAGES.get(tries) {
+                    tries += 1;
+                    if !sink(GcEvent::Collect { force_drop_archive: stage.force_drop_archive }) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if !sink(GcEvent::Collect { force_drop_archive: true }) {
+                    return Ok(());
+                }
+                return self.interpreted_init_gc(sink);
+            }
+            break false;
+        };
+        if !ok {
+            return self.interpreted_init_gc(sink);
+        }
+        if self.inject.is_some() && self.inject_now(&[InjectKind::Init]).is_some() {
+            buf.pop();
+        }
+        if self.paranoid {
+            self.cross_check_init_gc(&mut buf, sink)?;
+        }
+        let _ = self.emit_compiled_gc(buf, 1, 0, Vec::new(), sink)?;
         Ok(())
     }
 
@@ -1250,6 +1775,9 @@ impl Model for EncModel {
 
     fn action_successors(&self, s: &EState, action: u32, out: &mut dyn FnMut(EState, u32) -> bool) -> Result<bool, ModelError> {
         self.check_state_model(s);
+        if action == 0 && self.base.symmetry_check_due() {
+            self.base.check_symmetry_claim(&self.decode_current(s));
+        }
         let i = action as usize;
         // Generation mode (`-generate`): the random choices within actions
         // are the interpreter's (compiled actions enumerate every successor).
@@ -1280,6 +1808,38 @@ impl Model for EncModel {
         r
     }
 
+    fn action_successors_gc(&self, s: &EState, action: u32, sink: &mut dyn FnMut(GcEvent<EState>) -> bool) -> Result<bool, ModelError> {
+        self.check_state_model(s);
+        if action == 0 && self.base.symmetry_check_due() {
+            self.base.check_symmetry_claim(&self.decode_current(s));
+        }
+        let i = action as usize;
+        let span = stats::span();
+        if tlx_runtime::live::generating() {
+            let r = self.interpreted_successors_gc(s, i, sink);
+            span.action(i, Path::Interp);
+            return r;
+        }
+        let c = self.choose(ACTION, i);
+        if !c.timed {
+            let (r, path) = self.run_action_gc(s, i, c.native, sink);
+            span.action(i, path);
+            return r;
+        }
+        let t0 = Instant::now();
+        let mut excluded = 0u64;
+        let mut timed_sink = |ev: GcEvent<EState>| {
+            let t1 = Instant::now();
+            let go = sink(ev);
+            excluded += t1.elapsed().as_nanos() as u64;
+            go
+        };
+        let (r, path) = self.run_action_gc(s, i, c.native, &mut timed_sink);
+        self.record(ACTION, i, c, t0, excluded);
+        span.action(i, path);
+        r
+    }
+
     fn fingerprint(&self, s: &EState) -> u64 {
         self.check_state_model(s);
         s.fp
@@ -1295,6 +1855,14 @@ impl Model for EncModel {
             return Ok(None);
         }
         self.invariants_violated(s)
+    }
+
+    fn check_invariants_gc(&self, s: &EState, collect: &mut dyn FnMut(bool) -> bool) -> Result<Option<usize>, ModelError> {
+        self.check_state_model(s);
+        if self.base.invariant_names().is_empty() {
+            return Ok(None);
+        }
+        self.invariants_violated_gc(s, collect)
     }
 
     fn invariant_key(&self, _s: &EState, fp: u64) -> Option<u64> {
@@ -1314,11 +1882,30 @@ impl Model for EncModel {
         Ok(holds)
     }
 
+    fn constraint_gc(&self, s: &EState, collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        self.check_state_model(s);
+        let holds = self.base.constraint_exprs().is_empty() || self.constraints_hold_gc(s, collect)?;
+        if holds && self.base.possible_pending(false) {
+            self.base.witness(&self.decode(s), None)?;
+        }
+        Ok(holds)
+    }
+
     fn action_constraint(&self, s: &EState, t: &EState) -> Result<bool, ModelError> {
         self.check_state_model(s);
         self.check_state_model(t);
         // (Called on every state or step: nothing to do is cheap.)
         let holds = self.base.action_constraint_exprs().is_empty() || self.action_constraints_hold(s, t)?;
+        if holds && self.base.possible_pending(true) {
+            self.base.witness(&self.decode_current(s), Some(&self.decode(t)))?;
+        }
+        Ok(holds)
+    }
+
+    fn action_constraint_gc(&self, s: &EState, t: &EState, collect: &mut dyn FnMut(bool) -> bool) -> Result<bool, ModelError> {
+        self.check_state_model(s);
+        self.check_state_model(t);
+        let holds = self.base.action_constraint_exprs().is_empty() || self.action_constraints_hold_gc(s, t, collect)?;
         if holds && self.base.possible_pending(true) {
             self.base.witness(&self.decode_current(s), Some(&self.decode(t)))?;
         }
@@ -1333,6 +1920,15 @@ impl Model for EncModel {
             return Ok(None);
         }
         self.action_property_violated(s, t)
+    }
+
+    fn check_transition_gc(&self, s: &EState, t: &EState, collect: &mut dyn FnMut(bool) -> bool) -> Result<Option<usize>, ModelError> {
+        self.check_state_model(s);
+        self.check_state_model(t);
+        if self.base.action_property_names().is_empty() {
+            return Ok(None);
+        }
+        self.action_property_violated_gc(s, t, collect)
     }
 
     fn action_property_names(&self) -> &[String] {
@@ -1352,6 +1948,7 @@ impl Model for EncModel {
             live_atoms: self.base.records_live_edges().then_some(self as _),
             effects: Some(self),
             checkpoint: Some(self),
+            gc: self.value_store().map(|_| self as &dyn tlx_runtime::StoreGc<EState>),
         }
     }
     fn invariant_names(&self) -> &[String] {
@@ -1376,9 +1973,210 @@ impl Model for EncModel {
 }
 
 thread_local! {
-    /// The mixed-mode state of this worker's native calls, and the id of
-    /// the `EncModel` whose layout its decoded-state cache is for.
-    static MIXED: RefCell<(u64, MixedCx)> = RefCell::new((0, MixedCx::new()));
+    /// The mixed-mode state of this worker's native calls, the id of the
+    /// `EncModel` whose layout its decoded-state cache is for, and the value
+    /// store GC generation it was populated under.
+    static MIXED: RefCell<(u64, u64, MixedCx)> = RefCell::new((0, 0, MixedCx::new()));
+    /// Un-emitted compiled/encoded states currently being streamed to `out` on
+    /// this worker thread, kept here so mid-action GC safepoints mark their
+    /// `Shape::Ref` handles.
+    static PENDING_EMIT: RefCell<Vec<PendingEmit>> = const { RefCell::new(Vec::new()) };
+    /// Thread-local flag set on persistent `StoreFull` retries so compiled
+    /// predicates and VIEW expressions skip store-allocating native/IR paths
+    /// and evaluate through the interpreter instead.
+    static TRANSIENT_FALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+struct TransientFallbackScope(bool);
+
+impl TransientFallbackScope {
+    fn enter() -> Self {
+        let prev = TRANSIENT_FALLBACK.with(|f| f.replace(true));
+        TransientFallbackScope(prev)
+    }
+}
+
+impl Drop for TransientFallbackScope {
+    fn drop(&mut self) {
+        TRANSIENT_FALLBACK.with(|f| f.set(self.0));
+    }
+}
+
+struct PendingEmit {
+    model_id: u64,
+    words: Vec<Box<[u64]>>,
+}
+
+struct EmitGuard;
+
+impl EmitGuard {
+    fn push_words(model_id: u64, words: Vec<Box<[u64]>>) -> EmitGuard {
+        PENDING_EMIT.with(|p| p.borrow_mut().push(PendingEmit { model_id, words }));
+        EmitGuard
+    }
+
+    fn push_word(&self, w: Box<[u64]>) {
+        PENDING_EMIT.with(|p| {
+            if let Some(entry) = p.borrow_mut().last_mut() {
+                entry.words.push(w);
+            }
+        });
+    }
+
+    fn pop_word(&self) -> Option<Box<[u64]>> {
+        PENDING_EMIT.with(|p| p.borrow_mut().last_mut().and_then(|e| e.words.pop()))
+    }
+
+    fn take_words(self) -> Vec<Box<[u64]>> {
+        let words = PENDING_EMIT.with(|p| p.borrow_mut().last_mut().map(|e| std::mem::take(&mut e.words)).unwrap_or_default());
+        drop(self);
+        words
+    }
+}
+
+impl Drop for EmitGuard {
+    fn drop(&mut self) {
+        PENDING_EMIT.with(|p| {
+            p.borrow_mut().pop();
+        });
+    }
+}
+
+impl EncModel {
+    pub(super) fn set_transient_fallback(on: bool) {
+        TRANSIENT_FALLBACK.with(|f| f.set(on));
+    }
+
+    #[inline]
+    pub(super) fn transient_fallback() -> bool {
+        TRANSIENT_FALLBACK.with(Cell::get)
+    }
+
+    /// Append all `Shape::Ref` handles from un-emitted states currently held
+    /// in `PENDING_EMIT` for this model on the calling thread into `out`.
+    pub(super) fn take_pending_emit_roots(&self, out: &mut Vec<u64>) {
+        let Some(sem) = &self.sem else { return };
+        if sem.state.is_empty() {
+            return;
+        }
+        PENDING_EMIT.with(|p| {
+            for entry in p.borrow().iter() {
+                if entry.model_id != self.id {
+                    continue;
+                }
+                for w in &entry.words {
+                    for &off in &sem.state {
+                        if let Some(&h) = w.get(off) {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Walk all lowered IR (Init, actions, invariants, action properties, helper
+/// functions, VIEW, and mixed-mode regions) and collect every value-store
+/// handle baked into constant encodings (`ConstWords`, `ConstElems`, and
+/// `Const` of `Ref`-bearing shapes) so GC never sweeps handles embedded in
+/// compiled/JIT/C code.
+fn collect_pinned_handles(
+    typing: &Typing,
+    init: Option<&ActionFn>,
+    actions: &[Option<ActionFn>],
+    invariants: &[PredFn],
+    aprops: &[PredFn],
+    view: Option<&View>,
+    regions: Option<&super::mixed::RegionTable>,
+) -> Box<[u64]> {
+    let mut handles = Vec::new();
+    let mut offs = Vec::new();
+    let mut enc_buf = Vec::new();
+
+    fn walk_expr(e: &crate::ir::Expr, typing: &Typing, offs: &mut Vec<usize>, enc_buf: &mut Vec<u64>, out: &mut Vec<u64>) {
+        match &*e.kind {
+            crate::ir::ExprKind::ConstWords(w) => {
+                if let crate::ir::Ty::Enc(sid) = e.ty {
+                    offs.clear();
+                    if tlx_layout::layout::ref_offsets(typing.shape(sid), 0, offs).is_some() {
+                        for &o in offs.iter() {
+                            if let Some(&h) = w.get(o) {
+                                out.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::ir::ExprKind::ConstElems { elem, words, count } => {
+                offs.clear();
+                if tlx_layout::layout::ref_offsets(typing.shape(*elem), 0, offs).is_some() && !offs.is_empty() {
+                    let ew = typing.words(*elem) as usize;
+                    for k in 0..(*count as usize) {
+                        let base = k * ew;
+                        for &o in offs.iter() {
+                            if let Some(&h) = words.get(base + o) {
+                                out.push(h);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::ir::ExprKind::Const(v) => {
+                if let crate::ir::Ty::Enc(sid) = e.ty {
+                    let shape = typing.shape(sid);
+                    if tlx_layout::layout::has_ref(shape) {
+                        offs.clear();
+                        if tlx_layout::layout::ref_offsets(shape, 0, offs).is_some() && !offs.is_empty() {
+                            enc_buf.resize(typing.words(sid) as usize, 0);
+                            if let Ok(n) = v.normalize() {
+                                if typing.node(sid).encode(&n, enc_buf).is_ok() {
+                                    for &o in offs.iter() {
+                                        if let Some(&h) = enc_buf.get(o) {
+                                            out.push(h);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        e.for_each_child(&mut |c| walk_expr(c, typing, offs, enc_buf, out));
+    }
+
+    fn walk_stmt(s: &Stmt, ty: &Typing, offs: &mut Vec<usize>, enc_buf: &mut Vec<u64>, handles: &mut Vec<u64>) {
+        s.for_each_expr_deep(&mut |e| walk_expr(e, ty, offs, enc_buf, handles));
+    }
+
+    if let Some(i) = init {
+        walk_stmt(&i.body, typing, &mut offs, &mut enc_buf, &mut handles);
+    }
+    for a in actions.iter().flatten() {
+        walk_stmt(&a.body, typing, &mut offs, &mut enc_buf, &mut handles);
+    }
+    for p in invariants.iter().chain(aprops) {
+        walk_expr(&p.body, typing, &mut offs, &mut enc_buf, &mut handles);
+    }
+    for f in &typing.funcs {
+        walk_expr(&f.body, typing, &mut offs, &mut enc_buf, &mut handles);
+    }
+    if let Some(v) = view {
+        walk_stmt(&v.action.body, &v.typing, &mut offs, &mut enc_buf, &mut handles);
+        for f in &v.typing.funcs {
+            walk_expr(&f.body, &v.typing, &mut offs, &mut enc_buf, &mut handles);
+        }
+    }
+    if let Some(table) = regions {
+        for r in &table.regions {
+            walk_expr(&r.expr, typing, &mut offs, &mut enc_buf, &mut handles);
+        }
+    }
+    handles.sort_unstable();
+    handles.dedup();
+    handles.into_boxed_slice()
 }
 
 /// Source of the ids of `EncModel`s (0: none).

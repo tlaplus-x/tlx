@@ -94,6 +94,22 @@ const REPROBE_MAX: u64 = 1 << 26;
 
 static SCOPE_IDS: AtomicU64 = AtomicU64::new(1);
 
+/// Monotonically incremented on every value-store GC sweep so per-thread memo
+/// tables (whose `Cached::Words` results may contain swept `Shape::Ref`
+/// handles) flush stale entries without cross-thread coordination.
+static STORE_GC_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Current value-store GC generation for per-thread cache invalidation.
+#[inline]
+pub(crate) fn store_gc_gen() -> u64 {
+    STORE_GC_GEN.load(Ordering::Acquire)
+}
+
+/// Advance the value-store GC generation after a sweep.
+pub(crate) fn invalidate_for_store_gc() {
+    STORE_GC_GEN.fetch_add(1, Ordering::Release);
+}
+
 /// The lifetime of one lowering's IR (owned by the model that runs it):
 /// memo entries refer to IR nodes by address, so the per-thread tables
 /// are reset when a thread starts executing another scope's IR. Dropping
@@ -451,6 +467,7 @@ const START_SLOTS: usize = 1024;
 
 struct Memo {
     scope: u64,
+    gc_gen: u64,
     nodes: tlx_base::hash::FxMap<usize, NodeInfo>,
     slots: Vec<Option<Entry>>,
     /// The configured size (slots) that `slots` grows to.
@@ -469,6 +486,7 @@ impl Memo {
     fn new() -> Memo {
         Memo {
             scope: 0,
+            gc_gen: 0,
             nodes: Default::default(),
             slots: Vec::new(),
             max_slots: 0,
@@ -481,12 +499,19 @@ impl Memo {
         }
     }
 
-    /// Switch to scope `scope` (dropping everything of another scope).
+    /// Switch to scope `scope` (dropping everything of another scope) and
+    /// flush cached entries if a value-store GC sweep happened (preserving
+    /// per-node probation statistics).
     fn enter(&mut self, scope: u64, slots: usize) {
+        let gc_gen = store_gc_gen();
         if self.scope != scope {
             self.flush_stats();
             self.scope = scope;
+            self.gc_gen = gc_gen;
             self.nodes.clear();
+            self.clear_table();
+        } else if self.gc_gen != gc_gen {
+            self.gc_gen = gc_gen;
             self.clear_table();
         }
         if self.max_slots != slots {

@@ -134,12 +134,15 @@ fn run_check(
     let escape_opts = (settings.escape && opts.checkpoint.is_some()).then(|| Options { checkpoint: None, ..opts.clone() });
     let opts = escape_opts.as_ref().unwrap_or(opts);
     // Ensure a checkpoint held across layout-miss restarts is always finalized
-    // if `run_check` exits before a terminal `explore_from` runs.
+    // if `run_check` exits before a terminal `explore_from` runs (unless the
+    // caller deferred cleanup until post-search liveness/replay completes).
     struct FinishCheckpoint<'a>(Option<&'a tlx_runtime::Checkpointer>);
     impl Drop for FinishCheckpoint<'_> {
         fn drop(&mut self) {
             if let Some(c) = self.0 {
-                c.finish();
+                if !c.finish_deferred() {
+                    c.finish();
+                }
             }
         }
     }
@@ -169,6 +172,12 @@ fn run_check(
         if from.is_none() {
             searched = Duration::ZERO;
             if attempt > first {
+                // Reclaim dead nodes from the previous attempt or an abandoned
+                // archive migration so the restart from scratch gets the full
+                // value-store budget.
+                if m.value_store().is_some() {
+                    let _ = tlx_runtime::StoreGc::collect(&m, &mut |_| Ok(()));
+                }
                 stats::add_count("states repeated from scratch", repeated);
                 stats::add_count("restarts from scratch", 1);
                 if archive_lost {
@@ -676,6 +685,11 @@ impl Speculation {
                         stats::set(&format!("{}value store nodes and payloads", stats::MEMORY), Metric::Bytes(st.node_bytes));
                         stats::set(&format!("{}value store index (est.)", stats::MEMORY), Metric::Bytes(st.index_bytes));
                         stats::set(&format!("{}value store budget", stats::MEMORY), Metric::Bytes(st.budget));
+                        if st.gc_cycles > 0 {
+                            stats::set(&format!("{}value store GC cycles", stats::MEMORY), Metric::Count(st.gc_cycles));
+                            stats::set(&format!("{}value store reclaimed nodes", stats::MEMORY), Metric::Count(st.reclaimed_nodes));
+                            stats::set(&format!("{}value store reclaimed bytes", stats::MEMORY), Metric::Bytes(st.reclaimed_bytes));
+                        }
                         let calls = |i: usize| crate::exec::refops::CALLS[i].load(std::sync::atomic::Ordering::Relaxed);
                         stats::set("value store operations (closure IR)", Metric::Count(calls(0)));
                         stats::set("value store operations (native ref_op)", Metric::Count(calls(1)));
@@ -728,9 +742,9 @@ impl Speculation {
         (shapes, defs)
     }
 
-    /// Err if the value store filled up: its budget is a hard limit (no
-    /// reclamation yet), and values it refused were neither stored nor
-    /// fingerprinted correctly.
+    /// Err if the value store filled up: after safepoint reclamation could not
+    /// fit the live root set within the budget, the store latched full and
+    /// values it refused were neither stored nor fingerprinted correctly.
     fn check_store(&self, checkpoint: Option<&tlx_runtime::Checkpointer>) -> Result<(), String> {
         match &self.store {
             Some(s) if s.is_full() => {
@@ -839,6 +853,12 @@ fn migrate(m: &EncModel, c: ResumePoint<EState>, old: &Layout, workers: usize, s
         workers
     };
     debug_assert_eq!(c.words(), old.words);
+    // Keep the value store in GC-managed mode during optional archive
+    // migration so a budget hit while converting the archive fails migration
+    // cleanly without permanently latching `Store::is_full()`; when migration
+    // returns `None`, `run_check` reclaims the partial allocations before
+    // restarting from scratch.
+    let _store_gc_guard = m.value_store().map(|s| s.0.enter_gc_scope());
     // An archived state (`words` in layout `old`, of depth `depth`) in the
     // layout of `m`: its words in `out`, its fingerprint.
     let reencode = |words: &[u64], depth: u32, out: &mut [u64]| -> Result<u64, tlx_runtime::ModelError> {

@@ -168,6 +168,9 @@ pub struct Checkpointer {
     present: AtomicBool,
     /// Keep the last checkpoint when the search ends (`AfterCommit::Stop`).
     keep: AtomicBool,
+    /// Defer `finish()` from `explore` finalization until post-search phases
+    /// (such as liveness checking and counterexample replay) complete.
+    defer_finish: AtomicBool,
 }
 
 impl std::fmt::Debug for Checkpointer {
@@ -185,7 +188,19 @@ impl Checkpointer {
             hold: Mutex::new(None),
             present: AtomicBool::new(false),
             keep: AtomicBool::new(false),
+            defer_finish: AtomicBool::new(false),
         })
+    }
+
+    /// Defer checkpoint cleanup until the caller invokes [`Checkpointer::finish`]
+    /// after post-search phases (liveness checking, counterexample replay) complete.
+    pub fn set_defer_finish(&self, defer: bool) {
+        self.defer_finish.store(defer, Ordering::SeqCst);
+    }
+
+    /// Whether checkpoint cleanup is deferred past `explore` finalization.
+    pub fn finish_deferred(&self) -> bool {
+        self.defer_finish.load(Ordering::SeqCst)
     }
 
     /// Whether checkpoints were asked for (`CheckpointConfig::explicit`).

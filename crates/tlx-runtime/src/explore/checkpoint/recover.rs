@@ -320,6 +320,7 @@ fn recover<'m, M: Model>(
             archive_blocks = seed.archived().map(|b| b.len() as u64);
         } else {
             shared.retention.drop_archive();
+            seed.stop_archiving();
         }
     }
     if let Some(c) = &shared.ckpt {

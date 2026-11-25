@@ -13,4 +13,7 @@ pub mod padded;
 pub mod par;
 pub mod rng;
 pub mod stack;
+pub mod sync {
+    pub use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+}
 pub mod time;

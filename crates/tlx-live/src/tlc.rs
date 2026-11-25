@@ -71,9 +71,11 @@ pub enum Event {
 /// processing (and of the states it expanded on demand since), so a caller
 /// streaming the events only needs to keep those states.
 pub trait Expand {
+    type Error;
+
     /// The expansion of successor `idx` of the expanded state `from`; the
     /// caller gives it an id of its own (`Expansion::conc`).
-    fn expand(&mut self, from: u32, idx: u32) -> Result<Expansion, String>;
+    fn expand(&mut self, from: u32, idx: u32) -> Result<Expansion, Self::Error>;
 }
 
 /// A concrete state of a counterexample, as the caller can rebuild it: one
@@ -104,7 +106,12 @@ pub struct CLasso {
 
 /// Check `prop` under `fairness` TLC's way on the behavior graph given by
 /// `events`; `Ok(Err(lasso))` if it is violated.
-pub fn check_concrete(events: &[Event], ex: &mut dyn Expand, prop: &Ltl, fairness: &[Fairness]) -> Result<Result<(), CLasso>, String> {
+pub fn check_concrete<X: Expand + ?Sized>(
+    events: &[Event],
+    ex: &mut X,
+    prop: &Ltl,
+    fairness: &[Fairness],
+) -> Result<Result<(), CLasso>, X::Error> {
     let mut c = ConcreteChecker::new(std::slice::from_ref(prop), fairness);
     for ev in events {
         c.event(ev, ex);
@@ -119,22 +126,22 @@ pub fn check_concrete(events: &[Event], ex: &mut dyn Expand, prop: &Ltl, fairnes
 /// event (as TLC's search calls `LiveCheck`): the products of every
 /// property's tableaux are built while the events stream in, so the caller
 /// does not have to keep the states of the graph.
-pub struct ConcreteChecker {
+pub struct ConcreteChecker<E = String> {
     /// In order: properties, then the solutions of each.
-    slots: Vec<Slot>,
+    slots: Vec<Slot<E>>,
     pats: Pats,
 }
 
-struct Slot {
+struct Slot<E> {
     prop: usize,
     pems: Vec<Pem>,
     p: TProduct,
     /// An expansion failed while building the product.
-    err: Option<String>,
+    err: Option<E>,
 }
 
-impl ConcreteChecker {
-    pub fn new(props: &[Ltl], fairness: &[Fairness]) -> ConcreteChecker {
+impl<E> ConcreteChecker<E> {
+    pub fn new(props: &[Ltl], fairness: &[Fairness]) -> ConcreteChecker<E> {
         let mut slots = Vec::new();
         for (prop, f) in props.iter().enumerate() {
             for sol in solutions(f, fairness) {
@@ -150,7 +157,7 @@ impl ConcreteChecker {
     }
 
     /// The next event of the search.
-    pub fn event(&mut self, ev: &Event, ex: &mut dyn Expand) {
+    pub fn event<X: Expand<Error = E> + ?Sized>(&mut self, ev: &Event, ex: &mut X) {
         for s in &mut self.slots {
             if s.err.is_none() {
                 if let Err(e) = s.p.event(ev, ex, &mut self.pats) {
@@ -195,7 +202,7 @@ impl ConcreteChecker {
     /// `props`) with a counterexample, or the first expansion error, checking
     /// the properties in order as TLC (a violation of an earlier property
     /// wins over an error building the product of a later one).
-    pub fn finish(self) -> Result<Option<(usize, CLasso)>, String> {
+    pub fn finish(self) -> Result<Option<(usize, CLasso)>, E> {
         let pats = self.pats;
         for mut s in self.slots {
             if let Some(e) = s.err {
@@ -468,5 +475,59 @@ mod tests {
         // DNF overflow (> i32::MAX disjuncts) is still rejected without allocating.
         let huge_sf: Vec<Fairness> = (0..32).map(|i| Fairness { strong: true, enabled: i, taken: i }).collect();
         assert!(check_size(&Ltl::Eventually(Box::new(st(0))), &huge_sf).is_err());
+    }
+
+    #[test]
+    fn concrete_checker_preserves_typed_error_in_property_order() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum ErrKind {
+            First,
+            Second,
+        }
+        struct PerSlotErr(usize);
+        impl Expand for PerSlotErr {
+            type Error = ErrKind;
+            fn expand(&mut self, _from: u32, _idx: u32) -> Result<Expansion, ErrKind> {
+                self.0 += 1;
+                Err(if self.0 == 1 { ErrKind::First } else { ErrKind::Second })
+            }
+        }
+        let p = Ltl::Always(Box::new(Ltl::Or(vec![st(0), Ltl::Always(Box::new(st(0)))])));
+        let q = Ltl::Eventually(Box::new(Ltl::Always(Box::new(Ltl::Or(vec![st(1), Ltl::Eventually(Box::new(st(0)))])))));
+        let mut checker: ConcreteChecker<ErrKind> = ConcreteChecker::new(&[p, q], &[]);
+        let mut ex = PerSlotErr(0);
+        let b0 = Bits::from_words(&[1]);
+        let b1 = Bits::from_words(&[0]);
+        checker.event(&Event::Init { node: 0, conc: 0, bits: b0.clone() }, &mut ex);
+        checker.event(
+            &Event::Next {
+                node: 0,
+                exp: Expansion {
+                    conc: 0,
+                    bits: b0.clone(),
+                    succ: vec![
+                        Succ { node: 0, idx: 0, bits: b0.clone(), step: Bits::new(), label: 0 },
+                        Succ { node: 1, idx: 1, bits: b1.clone(), step: Bits::new(), label: 1 },
+                    ],
+                },
+            },
+            &mut ex,
+        );
+        checker.event(
+            &Event::Next {
+                node: 1,
+                exp: Expansion {
+                    conc: 1,
+                    bits: b1.clone(),
+                    succ: vec![
+                        Succ { node: 1, idx: 0, bits: b1.clone(), step: Bits::new(), label: 0 },
+                        Succ { node: 0, idx: 1, bits: b0, step: Bits::new(), label: 1 },
+                    ],
+                },
+            },
+            &mut ex,
+        );
+        assert_eq!(ex.0, 2, "both property slots should trigger on-demand expansion");
+        assert_eq!(checker.finish(), Err(ErrKind::First));
     }
 }

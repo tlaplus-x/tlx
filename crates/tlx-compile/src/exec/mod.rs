@@ -35,6 +35,7 @@ thread_local! {
 
 struct DefMemo {
     ip: u64,
+    gc_gen: u64,
     layout: Arc<tlx_layout::Layout>,
     words: Box<[u64]>,
     memo: Rc<StateMemo>,
@@ -48,10 +49,11 @@ const DEF_MEMO_STATES: usize = 4;
 /// action properties) on that state as the current state (`next`: as the
 /// complete next state of a step), as the interpreter memoizes per state.
 pub(crate) fn def_memo(ip: &Interp, layout: &Arc<tlx_layout::Layout>, words: &[u64], next: bool) -> Rc<StateMemo> {
+    let gc_gen = memo::store_gc_gen();
     DEF_MEMOS.with(|m| {
         let m = &mut m.borrow_mut()[next as usize];
         let uid = ip.uid();
-        if let Some(i) = m.iter().rposition(|e| *e.words == *words && e.ip == uid && Arc::ptr_eq(&e.layout, layout)) {
+        if let Some(i) = m.iter().rposition(|e| e.gc_gen == gc_gen && *e.words == *words && e.ip == uid && Arc::ptr_eq(&e.layout, layout)) {
             let memo = m[i].memo.clone();
             if i + 1 != m.len() {
                 let e = m.remove(i);
@@ -72,10 +74,11 @@ pub(crate) fn def_memo(ip: &Interp, layout: &Arc<tlx_layout::Layout>, words: &[u
                 e.layout = layout.clone();
             }
             e.ip = uid;
+            e.gc_gen = gc_gen;
             e.memo = memo.clone();
             m.push(e);
         } else {
-            m.push(DefMemo { ip: uid, layout: layout.clone(), words: words.into(), memo: memo.clone() });
+            m.push(DefMemo { ip: uid, gc_gen, layout: layout.clone(), words: words.into(), memo: memo.clone() });
         }
         memo
     })

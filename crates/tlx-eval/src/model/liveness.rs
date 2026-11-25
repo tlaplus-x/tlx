@@ -923,6 +923,9 @@ impl AtomBits<super::State> for super::InterpModel {
     fn tableau_bits(&self, t: &super::State) -> Result<Vec<u64>, tlx_runtime::ModelError> {
         self.live.tableau_bits(&self.ip, &t.vals, t.level).map_err(|e| self.error(e))
     }
+    fn has_action_atoms(&self) -> bool {
+        !self.live.action_atoms.is_empty()
+    }
 }
 
 /// The liveness predicates evaluated by the interpreter on the variable

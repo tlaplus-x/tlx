@@ -44,6 +44,10 @@ pub(crate) struct Run {
     pub(crate) opts: Option<Options>,
     /// `-coverage`: the coverage entries of the model.
     pub(crate) coverage: Option<Arc<coverage::Table>>,
+    /// The run's checkpointer, finalized only after post-search liveness and
+    /// counterexample replay complete so replay-time store exhaustion can
+    /// preserve the last committed checkpoint.
+    pub(crate) checkpoint: Option<Arc<tlx_runtime::Checkpointer>>,
 }
 
 /// A simulation being reported.
@@ -56,11 +60,22 @@ pub(crate) struct Sim {
 }
 
 /// After the search: liveness, POSTCONDITION, then the TLC-style report.
-pub(crate) fn finish<T: Tier>(m: &T, mut r: Report<T::State>, run: &Run) -> ExitCode {
+pub(crate) fn finish<T: Tier>(m: &T, r: Report<T::State>, run: &Run) -> ExitCode {
+    finish_with_trace(m, r, None, run)
+}
+
+/// Like `finish`, preserving a pre-decoded `saved_trace` snapshot taken before
+/// any secondary search on `m` (such as `-dump`).
+pub(crate) fn finish_with_trace<T: Tier>(
+    m: &T,
+    mut r: Report<T::State>,
+    mut saved_trace: Option<Vec<(Arc<[tlx_value::Value]>, Option<u32>)>>,
+    run: &Run,
+) -> ExitCode {
     let base = m.base();
     let init = run.sim.as_ref().map_or_else(|| "Initial predicate".to_string(), |sim| sim.init_label.clone());
     let view = live::TraceView::new(m, init);
-    explain_incomplete(m, &mut r);
+    explain_incomplete(m, &mut r, saved_trace.as_deref());
     let recorded = match &r.live_graph {
         Some(Ok(g)) => g.bytes(),
         _ => 0,
@@ -78,9 +93,10 @@ pub(crate) fn finish<T: Tier>(m: &T, mut r: Report<T::State>, run: &Run) -> Exit
     if let (Some(opts), false) = (&run.opts, base.live.is_empty()) {
         let early = live::reports_early(base);
         let again = match (&r.outcome, &lv) {
-            (Outcome::Ok, Some((live::Liveness::Error(_), _))) => true,
+            (Outcome::Ok, Some((live::Liveness::Error(e), _))) => !e.is_store_full(),
             (Outcome::Ok, Some((live::Liveness::Violated(..), _))) => early,
             (Outcome::Ok | Outcome::FpSetFull { .. } | Outcome::Io(_), _) => false,
+            (Outcome::Error(e), _) if e.is_store_full() => false,
             // A violation: the search found none of these errors where TLC
             // evaluates the predicates before it, if the initial
             // states were expanded (a state at depth 3 was found). (After an
@@ -93,6 +109,12 @@ pub(crate) fn finish<T: Tier>(m: &T, mut r: Report<T::State>, run: &Run) -> Exit
             }
             _ => true,
         };
+        if again && saved_trace.is_none() && !r.trace.is_empty() && m.caps().gc.is_some() {
+            // Decode the original trace into owned `Value`s before `find_error`
+            // launches a second search on `m`, whose safepoint GC sweeps the
+            // value store without rooting `r.trace`.
+            saved_trace = Some(r.trace.drain(..).map(|t| (m.values(&t.state), t.action)).collect());
+        }
         let found = again.then(|| {
             let t0 = Instant::now();
             let r2 = live::find_error(m, opts, early, &view);
@@ -101,15 +123,46 @@ pub(crate) fn finish<T: Tier>(m: &T, mut r: Report<T::State>, run: &Run) -> Exit
         });
         if let Some(r2) = found.flatten() {
             r = Report { elapsed: r.elapsed, ..r2 };
+            saved_trace = None;
             lv = None;
         }
     }
+    // Finalize the run's checkpoint only after liveness checking and replay have
+    // returned, so value-store exhaustion during replay (including a secondary
+    // `live::find_error` trace rebuild) preserves the last committed checkpoint
+    // while normal completion/violation cleans it up.
+    if let Some(c) = &run.checkpoint {
+        let keep = m.caps().keep_checkpoint()
+            || r.trace_store_full
+            || matches!(&lv, Some((live::Liveness::Error(e), _)) if e.is_store_full())
+            || matches!(&r.outcome, Outcome::Error(e) if e.is_store_full());
+        if keep && c.keep_last() {
+            if let Some((live::Liveness::Error(e), _)) = &mut lv {
+                if e.is_store_full() && !e.message.contains("recovering the last checkpoint") {
+                    e.message.push_str(", recovering the last checkpoint, which is kept");
+                }
+            }
+            if r.trace_store_full {
+                if let Some(note) = &mut r.trace_note {
+                    if !note.contains("recovering the last checkpoint") {
+                        note.push_str(", recovering the last checkpoint, which is kept");
+                    }
+                }
+            }
+        }
+        c.finish();
+    }
     let post = postcondition(base, &r, run.sim.is_some());
     // -dumpTrace: TLC writes the counterexample of a violation (not after
-    // an evaluation error).
+    // an evaluation error, and not when trace reconstruction yielded 0 states).
+    let has_trace = saved_trace.as_ref().map_or(!r.trace.is_empty(), |s| !s.is_empty());
     let steps: Option<Vec<_>> = (dump_trace::requested()
+        && has_trace
         && matches!(r.outcome, Outcome::InvariantViolated(_) | Outcome::ActionPropertyViolated(_) | Outcome::Deadlock))
-    .then(|| r.trace.iter().map(|t| (m.values(&t.state), t.action)).collect());
+    .then(|| match &saved_trace {
+        Some(saved) => saved.clone(),
+        None => r.trace.iter().map(|t| (m.values(&t.state), t.action)).collect(),
+    });
     // (And of a liveness violation, the lasso shown.)
     let lasso = match (&r.outcome, &lv) {
         (Outcome::TemporalViolated { counterexample, .. }, _) | (_, Some((live::Liveness::Violated(_, counterexample), _))) => {
@@ -124,12 +177,12 @@ pub(crate) fn finish<T: Tier>(m: &T, mut r: Report<T::State>, run: &Run) -> Exit
             dump_trace::write_lasso(base, l);
         }
     };
-    report::<T>(r, lv, post, &view, run, &dump)
+    report::<T>(r, saved_trace.as_deref(), lv, post, &view, run, &dump)
 }
 
 /// An incomplete state reported by a compiled tier (by its message only):
 /// found again with the interpreter, which shows the state.
-pub(crate) fn explain_incomplete<T: Tier>(m: &T, r: &mut Report<T::State>) {
+pub(crate) fn explain_incomplete<T: Tier>(m: &T, r: &mut Report<T::State>, saved_trace: Option<&[(Arc<[tlx_value::Value]>, Option<u32>)]>) {
     let base = m.base();
     let Outcome::Error(e) = &r.outcome else { return };
     if matches!(e.context, ErrorContext::IncompleteState { .. })
@@ -139,9 +192,12 @@ pub(crate) fn explain_incomplete<T: Tier>(m: &T, r: &mut Report<T::State>) {
     }
     let found = if e.message.starts_with("The initial state ") {
         base.init_states(&mut |_| {}).err()
-    } else if let Some(last) = r.trace.last() {
-        let vals: Vec<Option<tlx_value::Value>> = m.values(&last.state).iter().cloned().map(Some).collect();
-        let Ok(s) = base.make_state(&vals, r.trace.len() as u32, "the last state") else { return };
+    } else if let Some((vals, len)) = saved_trace
+        .and_then(|s| s.last().map(|(v, _)| (v.clone(), s.len())))
+        .or_else(|| r.trace.last().map(|last| (m.values(&last.state), r.trace.len())))
+    {
+        let vals: Vec<Option<tlx_value::Value>> = vals.iter().cloned().map(Some).collect();
+        let Ok(s) = base.make_state(&vals, len as u32, "the last state") else { return };
         (0..base.action_names().len()).find_map(|i| base.successors_of(&s, i, &mut |_, _| true).err())
     } else {
         None

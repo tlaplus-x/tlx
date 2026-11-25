@@ -14,7 +14,8 @@ use crate::args::{parse_args, Args};
 use crate::out::code;
 use crate::recovery::{checkpointer, identity_mismatch, print_start, run_identity};
 use crate::report::{
-    finish, live_branches, Run, EXIT_ASSUMPTION, EXIT_CONFIG_ERROR, EXIT_EVAL_ERROR, EXIT_GENERAL_ERROR, EXIT_LIVENESS_EVAL,
+    finish, finish_with_trace, live_branches, Run, EXIT_ASSUMPTION, EXIT_CONFIG_ERROR, EXIT_EVAL_ERROR, EXIT_GENERAL_ERROR,
+    EXIT_LIVENESS_EVAL,
 };
 use crate::{autosym, coverage, live, load, out, process, recovery, settings, simulation, stats, symcheck};
 use crate::{parse_only, print_finished, print_mode, PROGRESS_EVERY, PROGRESS_EVERY_SHORT};
@@ -245,7 +246,8 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
             print_finished(started);
             return ExitCode::from(EXIT_EVAL_ERROR);
         }
-        let run = Run { workers: 1, actions: Vec::new(), started, sim: None, fp_mem: a.fp_mem(), opts: None, coverage: None };
+        let run =
+            Run { workers: 1, actions: Vec::new(), started, sim: None, fp_mem: a.fp_mem(), opts: None, coverage: None, checkpoint: None };
         return finish(&model, r, &run);
     }
     let mut opts = a.options(a.workers, check_deadlock);
@@ -259,7 +261,12 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
             Some(coverage::reporter(table.clone(), interval, if a.progress { PROGRESS_EVERY_SHORT } else { PROGRESS_EVERY }));
         table
     });
-    // (The searches after the search take no checkpoints.)
+    if let Some(c) = &opts.checkpoint {
+        c.set_defer_finish(true);
+    }
+    // (The searches after the search take no checkpoints; the run's own
+    // checkpointer is finalized in `report::finish_with_trace` once liveness
+    // and counterexample replay have returned.)
     let run = Run {
         workers: opts.workers,
         actions: model.action_names().to_vec(),
@@ -268,6 +275,7 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
         fp_mem: a.fp_mem(),
         opts: Some(Options { checkpoint: None, ..opts.clone() }),
         coverage,
+        checkpoint: opts.checkpoint.clone(),
     };
     if a.compile {
         print_start(&recovery);
@@ -283,6 +291,9 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
                 return finish(&*base, r, &run);
             }
             Err(e) => {
+                if let Some(c) = &run.checkpoint {
+                    c.finish();
+                }
                 out::error(
                     code::GENERAL,
                     &match &a.recover {
@@ -293,7 +304,13 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
                 return ExitCode::from(EXIT_GENERAL_ERROR);
             }
         };
-        if a.dump.is_some() {
+        let mut r = r;
+        let saved_trace = if a.dump.is_some() {
+            // Decode any retained trace into owned `Value`s before the dump
+            // search runs on `m` (whose GC/trace rebuild sweeps the store
+            // without rooting `r.trace`).
+            let saved =
+                (!r.trace.is_empty() && m.caps().gc.is_some()).then(|| r.trace.drain(..).map(|t| (m.values(&t.state), t.action)).collect());
             // The compiled search may restart; dump with a final search
             // (with the interpreter if it misses: it cannot restart).
             let dump_opts = Options { progress: None, coverage: false, coverage_report: None, checkpoint: None, ..opts.clone() };
@@ -302,8 +319,11 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
                 tlx_base::diag::emit(tlx_base::diag::Topic::Compile, "layout miss writing the -dump file; writing it with the interpreter");
                 explore_dumping(&*m.base, &dump_opts, &a.dump, None);
             }
-        }
-        return finish(&m, r, &run);
+            saved
+        } else {
+            None
+        };
+        return finish_with_trace(&m, r, saved_trace, &run);
     }
     print_start(&recovery);
     let r = explore_dumping(&model, &opts, &a.dump, recovery.as_ref());

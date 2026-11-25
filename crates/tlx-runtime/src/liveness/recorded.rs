@@ -74,6 +74,27 @@ pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, w
     LiveResult::Holds
 }
 
+/// Reclaim transient value-store allocations during lasso counterexample
+/// replay, keeping the replayed `path`, active `extra` states, and any
+/// thread-local emit handles rooted.
+fn collect_lasso<S>(gc: &dyn crate::model::StoreGc<S>, path: &[(S, u32)], extra: &[&S]) -> bool {
+    let mut tls = Vec::new();
+    gc.take_thread_roots(&mut tls);
+    gc.collect(&mut |mark| {
+        for (s, _) in path {
+            gc.mark_state(s, mark);
+        }
+        for s in extra {
+            gc.mark_state(s, mark);
+        }
+        for &h in &tls {
+            mark(h);
+        }
+        Ok(())
+    })
+    .is_ok()
+}
+
 /// The states along `steps` of the recorded graph of `m`, each with the
 /// action of the edge leaving it: re-executed from the initial state, taking
 /// at each node the successor in the model the edge stands for (the edges of
@@ -82,23 +103,110 @@ pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, w
 /// state's fingerprint is not the node's (a bug: the graph is of this model).
 fn replay<M: Model>(m: &M, first: Option<u64>, steps: &[ReplayStep]) -> Result<Vec<(M::State, u32)>, ModelError> {
     let lost = || ModelError::new("internal error: a counterexample of the recorded liveness graph cannot be replayed");
-    // (An error counts as a step out of the model: the search evaluated
-    // these steps without one, so the path is lost then, reported below.)
-    let in_model = |s: &M::State, t: &M::State| crate::admits(m, s, t).unwrap_or(false);
     let first = first.ok_or_else(lost)?;
+    let store_gc = m.caps().gc;
+    let _gc_guard = store_gc.map(|gc| gc.enter_scope());
+    if let Some(gc) = store_gc {
+        // Sweep dead handles left over from the completed search before
+        // reconstructing the lasso so replay starts with the full budget.
+        let _ = gc.collect(&mut |_| Ok(()));
+    }
     let mut found = None;
-    m.init_states(&mut |s| {
-        if found.is_none() && m.fingerprint(&s) == first && matches!(m.constraint(&s), Ok(true)) {
-            found = Some(s);
+    if let Some(gc) = store_gc {
+        let mut err: Option<ModelError> = None;
+        let res = m.init_states_gc(&mut |ev| match ev {
+            crate::model::GcEvent::Collect { .. } => collect_lasso(gc, &[], &[]),
+            crate::model::GcEvent::Emit(s, _) => {
+                if found.is_some() || err.is_some() {
+                    return false;
+                }
+                if m.fingerprint(&s) == first {
+                    match m.constraint_gc(&s, &mut |_| collect_lasso(gc, &[], &[&s])) {
+                        Ok(true) => {
+                            found = Some(s);
+                            return false;
+                        }
+                        Ok(false) => {}
+                        Err(e) if e.is_store_full() => {
+                            gc.mark_full();
+                            err = Some(e);
+                            return false;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                true
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
         }
-    })?;
+        res.inspect_err(|e| {
+            if e.is_store_full() {
+                gc.mark_full();
+            }
+        })?;
+    } else {
+        m.init_states(&mut |s| {
+            if found.is_none() && m.fingerprint(&s) == first && matches!(m.constraint(&s), Ok(true)) {
+                found = Some(s);
+            }
+        })?;
+    }
     let mut cur = found.ok_or_else(lost)?;
     let mut path = Vec::with_capacity(steps.len());
     for step in steps {
         let e = step.edge as usize;
         let (t, a) = if step.stutter {
             (cur.clone(), STUTTER)
+        } else if let Some(gc) = store_gc {
+            if gc.needs_gc() {
+                collect_lasso(gc, &path, &[&cur]);
+            }
+            let (mut i, mut next, mut err) = (0, None, None);
+            for act_idx in 0..m.action_names().len() as u32 {
+                let go = m.action_successors_gc(&cur, act_idx, &mut |ev| match ev {
+                    crate::model::GcEvent::Collect { .. } => collect_lasso(gc, &path, &[&cur]),
+                    crate::model::GcEvent::Emit(t, a) => {
+                        if err.is_some() {
+                            return false;
+                        }
+                        match crate::model::admits_gc(m, &cur, &t, &mut |_| collect_lasso(gc, &path, &[&cur, &t])) {
+                            Ok(true) => {
+                                if i == e {
+                                    next = Some((t, a));
+                                    return false;
+                                }
+                                i += 1;
+                            }
+                            Ok(false) => {}
+                            Err(e) if e.is_store_full() => {
+                                gc.mark_full();
+                                err = Some(e);
+                                return false;
+                            }
+                            Err(_) => {}
+                        }
+                        true
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let go = go.inspect_err(|e| {
+                    if e.is_store_full() {
+                        gc.mark_full();
+                    }
+                })?;
+                if !go {
+                    break;
+                }
+            }
+            next.ok_or_else(lost)?
         } else {
+            // (An error counts as a step out of the model: the search evaluated
+            // these steps without one, so the path is lost then, reported below.)
+            let in_model = |s: &M::State, t: &M::State| crate::admits(m, s, t).unwrap_or(false);
             let (mut i, mut next) = (0, None);
             m.successors(&cur, &mut |t, a| {
                 if in_model(&cur, &t) {

@@ -68,7 +68,7 @@ fn panic_in_emit_propagates() {
 #[test]
 fn refop_table_mismatch_is_refused() {
     use std::sync::Arc;
-    use tlx_native::mixed::RefOps;
+    use tlx_native::mixed::{RefOps, RefOpsScope};
 
     struct Table(u32, u64);
     impl RefOps for Table {
@@ -78,12 +78,8 @@ fn refop_table_mismatch_is_refused() {
         fn hash(&self) -> u64 {
             self.1
         }
-        // SAFETY: this fixture never calls a refop; rejection precedes execution.
-        unsafe fn run(&self, _: u32, _: *const u64, _: *mut u64) -> bool {
+        fn with_scope(&self, _: &mut dyn FnMut(&dyn RefOpsScope)) {
             panic!("the loader must not invoke refops")
-        }
-        fn elems(&self, _: u64) -> Option<&[u64]> {
-            panic!("the loader must not enumerate refops")
         }
     }
     let src = COUNTERS.replace("BAD", "0");

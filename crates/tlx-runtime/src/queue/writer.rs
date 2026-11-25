@@ -268,4 +268,39 @@ impl<S> Writer<S> {
         self.kept = 0;
         std::mem::take(&mut self.blocks)
     }
+
+    /// Non-destructively visit every state held by this writer (sealed blocks,
+    /// open object block, and open encoded segment blocks) for safepoint root
+    /// scanning.
+    pub(crate) fn visit_states(
+        &self,
+        cache: &mut super::SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(super::StateRef<'_, S>),
+    ) -> Result<(), crate::io::IoError> {
+        for b in &self.blocks {
+            b.visit_states(cache, prev, visit)?;
+        }
+        for t in &self.tasks {
+            visit(super::StateRef::Obj(&t.state));
+        }
+        for o in self.seg_blocks.iter().chain(self.open.iter()) {
+            let mut pos = o.start;
+            prev.reset();
+            for _ in 0..o.n {
+                match o.kind {
+                    Kind::Raw => {
+                        let size = codec::raw_size(prev.words.len());
+                        let _ = codec::get_raw(&self.seg[pos..pos + size], &mut prev.words);
+                        pos += size;
+                    }
+                    Kind::Xor => {
+                        let _ = codec::get_xor(&self.seg, &mut pos, prev);
+                    }
+                }
+                visit(super::StateRef::Words(&prev.words));
+            }
+        }
+        Ok(())
+    }
 }

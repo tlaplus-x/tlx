@@ -38,7 +38,7 @@ pub mod safepoint;
 mod tracelog;
 mod worker;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 pub(crate) use tlx_base::par::{join_pool_with as join_all, on_panic as abort_on_panic};
@@ -49,7 +49,7 @@ use self::checkpoint::CkptRun;
 use self::frontier::{Frontier, Local, Task};
 use self::history::History;
 use self::levels::Levels;
-use self::order::{Order, Positions};
+use self::order::{CandStore, Order, Positions};
 use self::resume::{Pre, Retention};
 use self::safepoint::{Control, Crew, Safepoint};
 use self::tracelog::{log_ref, LogRef, TraceLog, NO_PARENT};
@@ -59,12 +59,13 @@ use crate::fpset::{FpConfig, FpSet, Full};
 use crate::io::SpillMode;
 use crate::live::{self, LiveStats};
 use crate::mem::{Component, Gauge, MemBudget, Stage};
-use crate::model::{Model, ModelError};
+use crate::model::{GcResult, Model, ModelError, StoreGc};
+use crate::queue::{Reader, SegCache, Writer};
 
 pub use self::checkpoint::{AfterCommit, CheckpointConfig, Checkpointer, Event as CheckpointEvent, Recovery};
 pub use self::coverage::{Coverage, CoverageReport};
 pub use self::edges::{liveness_memory_error, ActionMasks, AtomBits, LiveGraph, LIVENESS_MEMORY};
-pub use self::observer::SearchObserver;
+pub use self::observer::{ExpandedBatch, SearchObserver};
 pub use self::resume::{ResumePoint, TranscodeError};
 
 #[derive(Clone, Debug)]
@@ -270,8 +271,14 @@ pub struct Report<S> {
     /// the error happened while computing initial states).
     pub trace: Vec<TraceStep<S>>,
     /// A genuine prefix was reconstructed, but runtime-dependent generation
-    /// prevented rebuilding the whole counterexample (docs/compat.md D-30).
+    /// prevented rebuilding the whole counterexample (docs/compat.md D-30),
+    /// or value-store budget exhaustion stopped trace reconstruction.
     pub trace_note: Option<String>,
+    /// True when safety counterexample trace reconstruction stopped due to
+    /// value-store budget exhaustion (`ErrorKind::StoreFull`), so callers that
+    /// own a deferred checkpoint (including after a secondary `find_error`
+    /// search) preserve it for recovery with a larger `-maxmem`.
+    pub trace_store_full: bool,
     pub elapsed: Duration,
     /// The failure happened while computing (or checking) the initial
     /// states (TLC then reports no statistics).
@@ -375,6 +382,69 @@ struct Shared<'m, M: Model> {
     cov_base: Vec<u64>,
     /// `TLCExt!Trace` (`Model::uses_trace`): the paths to the states found.
     paths: Option<Mutex<PathTable>>,
+    /// Safepoint reclamation of the model's value store (`Caps::gc`), if any.
+    store_gc: Option<&'m dyn StoreGc<M::State>>,
+    /// Per-worker deposited root containers while parked at a safepoint or
+    /// waiting at a level barrier (populated only when `store_gc.is_some()`).
+    gc_roots: Box<[Mutex<ParkedRoots<'m, M::State>>]>,
+    /// Workers currently parked mid-task on `FpSet::Full` (unscanned stack
+    /// states): `SP_STORE_GC` is deferred until this drops to 0.
+    mid_task_parked: AtomicUsize,
+    /// Incremented after every completed `gc_store` cycle so workers waiting
+    /// in `park_for_store_gc` know a collection ran before retrying.
+    store_gc_epoch: AtomicU64,
+    /// Set by a worker retrying a hard allocation failure after a prior GC
+    /// left the layout-miss archive intact: forces the next `gc_store` cycle
+    /// to drop the archive before declaring store exhaustion.
+    store_gc_drop_archive: AtomicBool,
+}
+
+/// RAII guard for `StoreGc::set_transient_fallback` so the thread-local hint
+/// is always cleared on scope exit or panic.
+pub(crate) struct TransientFallbackGuard<'a, S>(&'a dyn StoreGc<S>);
+
+impl<'a, S> TransientFallbackGuard<'a, S> {
+    pub(crate) fn enter(gc: &'a dyn StoreGc<S>) -> Self {
+        gc.set_transient_fallback(true);
+        Self(gc)
+    }
+}
+
+impl<S> Drop for TransientFallbackGuard<'_, S> {
+    fn drop(&mut self) {
+        self.0.set_transient_fallback(false);
+    }
+}
+
+/// Worker-owned containers temporarily deposited into `Shared::gc_roots` while
+/// parked at a safepoint or waiting at a level barrier so the safepoint
+/// executor can scan every live root across all workers.
+struct ParkedRoots<'m, S> {
+    reader: Option<Reader<S>>,
+    /// Stolen or staged batch tasks currently held by this worker (`Local::batch`).
+    batch: Vec<Task<S>>,
+    writer: Option<Writer<S>>,
+    archive: Option<Writer<S>>,
+    cands: Option<CandStore<'m, S>>,
+    /// In-flight state objects held on the worker's stack (e.g. current task,
+    /// successor, buffered observer states) when parking mid-task.
+    in_flight: Vec<S>,
+    /// Extra raw store handles from worker thread-local emit buffers.
+    extra_handles: Vec<u64>,
+}
+
+impl<S> Default for ParkedRoots<'_, S> {
+    fn default() -> Self {
+        ParkedRoots {
+            reader: None,
+            batch: Vec::new(),
+            writer: None,
+            archive: None,
+            cands: None,
+            in_flight: Vec::new(),
+            extra_handles: Vec::new(),
+        }
+    }
 }
 
 /// The path (`live::PathNode`) to each state found at the last two depths:
@@ -413,6 +483,9 @@ pub(super) const SP_GROW: u32 = 1 << 1;
 /// Safepoint request: drop the fingerprint set's old table (its run is on
 /// disk), made by the budget once nothing else is left to give back.
 const SP_DROP_OLD: u32 = 1 << 2;
+
+/// Safepoint request: mark-and-sweep unreachable nodes in the model's value store.
+pub(super) const SP_STORE_GC: u32 = 1 << 3;
 
 /// A fingerprint set growing from at least this many home slots at a
 /// safepoint of fewer workers than the search has is rehashed by as many
@@ -489,9 +562,174 @@ impl<M: Model> Shared<'_, M> {
         if req & SP_GROW != 0 {
             self.grow_seen(Some(crew));
         }
+        if req & SP_STORE_GC != 0 {
+            if self.mid_task_parked.load(Ordering::Acquire) > 0 {
+                // A worker is parked inside `FpSet::insert_when_full` or
+                // `Order::offer` with unscanned stack states; defer GC until
+                // that insert completes and every worker reaches a clean point.
+                self.control().request(SP_STORE_GC);
+            } else {
+                self.gc_store();
+            }
+        }
         if req & SP_TEST != 0 {
             self.test_safepoint(crew);
         }
+    }
+
+    /// Shared archive-drop policy for both worker safepoints and init-phase GC:
+    /// proactive collections keep the layout-miss archive up to 3/4 of budget;
+    /// hard allocation retries force an archive-free collection when prior
+    /// headroom was insufficient.
+    #[inline]
+    fn should_drop_archive(res: &GcResult, force_drop: bool) -> bool {
+        force_drop || res.full || res.live_bytes > res.budget / 4 * 3
+    }
+
+    /// Run safepoint value-store reclamation across all parked workers and
+    /// shared queues. Proactive collections keep the layout-miss archive
+    /// rooted up to 3/4 of budget; persistent hard allocation retries set
+    /// `store_gc_drop_archive` to force an archive-free collection before
+    /// declaring exhaustion.
+    pub(super) fn gc_store(&self) {
+        let Some(gc) = self.store_gc else { return };
+        let t0 = Instant::now();
+        let force_drop = self.store_gc_drop_archive.swap(false, Ordering::AcqRel);
+        let mut keep_archive = self.retention.on && !self.retention.off();
+        if keep_archive && force_drop {
+            self.retention.drop_archive();
+            keep_archive = false;
+        }
+        if !keep_archive {
+            for slot in self.gc_roots.iter() {
+                slot.lock().archive = None;
+            }
+            self.frontier.clear_staged_archiving();
+        }
+        let res = match self.run_store_gc(gc, keep_archive) {
+            Ok(r) => r,
+            Err(e) => {
+                self.store_gc_epoch.fetch_add(1, Ordering::Release);
+                self.fail(Outcome::Io(e), NO_PARENT);
+                return;
+            }
+        };
+        if keep_archive && Self::should_drop_archive(&res, false) {
+            self.retention.drop_archive();
+            for slot in self.gc_roots.iter() {
+                slot.lock().archive = None;
+            }
+            self.frontier.clear_staged_archiving();
+            if let Err(e) = self.run_store_gc(gc, false) {
+                self.store_gc_epoch.fetch_add(1, Ordering::Release);
+                self.fail(Outcome::Io(e), NO_PARENT);
+                return;
+            }
+        }
+        self.store_gc_epoch.fetch_add(1, Ordering::Release);
+        crate::stats::add_secs("value store GC", t0.elapsed());
+    }
+
+    fn run_store_gc(&self, gc: &dyn StoreGc<M::State>, include_archive: bool) -> Result<GcResult, String> {
+        let mut cache = SegCache::default();
+        let mut prev = self.frontier.scratch();
+        gc.collect(&mut |mark| {
+            {
+                let mut visit = |s: crate::queue::StateRef<'_, M::State>| match s {
+                    crate::queue::StateRef::Obj(st) => gc.mark_state(st, mark),
+                    crate::queue::StateRef::Words(w) => gc.mark_words(w, mark),
+                };
+                self.frontier.visit_queued(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                self.frontier
+                    .visit_staged(include_archive, |i| self.gc_roots[i].lock().archive.is_some(), &mut cache, &mut prev, &mut visit)
+                    .map_err(|e| e.0)?;
+                for slot in self.gc_roots.iter() {
+                    let mut roots = slot.lock();
+                    if let Some(r) = &roots.reader {
+                        let keep_consumed = include_archive && roots.archive.is_some() && r.compressed();
+                        r.visit_states(keep_consumed, &mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                    }
+                    for t in &roots.batch {
+                        visit(crate::queue::StateRef::Obj(&t.state));
+                    }
+                    if let Some(w) = &roots.writer {
+                        w.visit_states(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                    }
+                    if include_archive {
+                        if let Some(a) = &roots.archive {
+                            a.visit_states(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                        }
+                    }
+                    if let Some(cs) = &mut roots.cands {
+                        cs.visit_states(&mut visit).map_err(|e| e.0)?;
+                    }
+                    for s in &roots.in_flight {
+                        visit(crate::queue::StateRef::Obj(s));
+                    }
+                }
+                for p in self.live_pre.lock().iter() {
+                    p.visit_states(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                }
+            }
+            for slot in self.gc_roots.iter() {
+                for &h in &slot.lock().extra_handles {
+                    mark(h);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Single-threaded value-store collection during `init_phase` (no workers
+    /// running yet), sharing `should_drop_archive` with `gc_store`.
+    fn gc_store_exclusive(&self, seed: &mut Local<'_, '_, M::State>, extra: &[&M::State], force_drop: bool) -> Result<(), String> {
+        let Some(gc) = self.store_gc else { return Ok(()) };
+        let t0 = Instant::now();
+        let mut thread_roots = Vec::new();
+        gc.take_thread_roots(&mut thread_roots);
+        let run = |seed: &Local<'_, '_, M::State>, include_archive: bool| -> Result<GcResult, String> {
+            let mut cache = SegCache::default();
+            let mut prev = self.frontier.scratch();
+            gc.collect(&mut |mark| {
+                {
+                    let mut visit = |s: crate::queue::StateRef<'_, M::State>| match s {
+                        crate::queue::StateRef::Obj(st) => gc.mark_state(st, mark),
+                        crate::queue::StateRef::Words(w) => gc.mark_words(w, mark),
+                    };
+                    self.frontier.visit_queued(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                    self.frontier
+                        .visit_staged(include_archive, |_| seed.archiving(), &mut cache, &mut prev, &mut visit)
+                        .map_err(|e| e.0)?;
+                    seed.visit_local(include_archive, &mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                    for &s in extra {
+                        visit(crate::queue::StateRef::Obj(s));
+                    }
+                    for p in self.live_pre.lock().iter() {
+                        p.visit_states(&mut cache, &mut prev, &mut visit).map_err(|e| e.0)?;
+                    }
+                }
+                for &h in &thread_roots {
+                    mark(h);
+                }
+                Ok(())
+            })
+        };
+        let mut keep_archive = self.retention.on && !self.retention.off();
+        if keep_archive && force_drop {
+            self.retention.drop_archive();
+            keep_archive = false;
+        }
+        if !keep_archive {
+            seed.stop_archiving();
+        }
+        let res = run(seed, keep_archive)?;
+        if keep_archive && Self::should_drop_archive(&res, false) {
+            self.retention.drop_archive();
+            seed.stop_archiving();
+            let _ = run(seed, false)?;
+        }
+        crate::stats::add_secs("value store GC", t0.elapsed());
+        Ok(())
     }
 
     /// Make room in the seen set (at a safepoint: `crew`; or while no
@@ -757,6 +995,9 @@ impl<M: Model> Shared<'_, M> {
     /// the order of `crate::mem` (the fingerprint set's stage applies when
     /// it grows).
     fn relieve(&self) {
+        if self.store_gc.is_some_and(|gc| gc.needs_gc()) {
+            self.control().request(SP_STORE_GC);
+        }
         let b = &self.budget;
         if !b.limited() {
             return;
@@ -923,8 +1164,8 @@ impl<M: Model> live::Source for Shared<'_, M> {
 
 /// The failure, if any, of checking initial state `s` (logged at `at`):
 /// invariants, then the state-predicate parts of the properties.
-fn init_failure<M: Model>(model: &M, s: &M::State, at: LogRef) -> Option<Failure> {
-    let failure = invariant_failure(model, s, at).or_else(|| match model.check_init_property(s) {
+fn init_failure_gc<M: Model>(model: &M, s: &M::State, at: LogRef, collect: &mut dyn FnMut(bool) -> bool) -> Option<Failure> {
+    let failure = invariant_failure_gc(model, s, at, collect).or_else(|| match model.check_init_property(s) {
         Ok(None) => None,
         Ok(Some(p)) => Some((Outcome::InitPropertyViolated(p), at)),
         Err(e) => Some((Outcome::Error(e), at)),
@@ -938,6 +1179,16 @@ fn init_failure<M: Model>(model: &M, s: &M::State, at: LogRef) -> Option<Failure
 /// The failure, if any, of checking the invariants of state `s` (logged at `at`).
 fn invariant_failure<M: Model>(model: &M, s: &M::State, at: LogRef) -> Option<Failure> {
     match model.check_invariants(s) {
+        Ok(None) => None,
+        Ok(Some(i)) => Some((Outcome::InvariantViolated(model.invariant_names()[i].clone()), at)),
+        Err(e) => Some((Outcome::Error(e), at)),
+    }
+}
+
+/// GC-aware `invariant_failure`: retries only the failing invariant predicate
+/// across `collect(force_drop_archive)` without replaying earlier invariants.
+fn invariant_failure_gc<M: Model>(model: &M, s: &M::State, at: LogRef, collect: &mut dyn FnMut(bool) -> bool) -> Option<Failure> {
+    match model.check_invariants_gc(s, collect) {
         Ok(None) => None,
         Ok(Some(i)) => Some((Outcome::InvariantViolated(model.invariant_names()[i].clone()), at)),
         Err(e) => Some((Outcome::Error(e), at)),
@@ -1058,73 +1309,197 @@ fn init_phase<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
     let mut seq = Vec::new();
     // Whether an observer stopped the search (`SearchObserver::stop`).
     let mut stopped = false;
-    let generated = model.init_states_while(&mut |s| {
-        if err.is_some() || observed.is_some() {
+    let keep_enumerating = |err: &Option<Failure>, observed: &Option<ModelError>, stopped: bool| -> bool {
+        if stopped || observed.is_some() {
+            return false;
+        }
+        match err {
+            None => true,
             // DoInitFunctor keeps enumerating after FingerprintException
             // (catch(Throwable)), unlike EvalException / TLCRuntimeException.
-            // Later states count but are neither fingerprinted nor checked.
-            if matches!(&err, Some((Outcome::Error(e), _)) if e.kind == crate::ErrorKind::FunctionDomain) {
-                stats.init_generated += 1;
-                shared.init_generated.store(stats.init_generated, Ordering::Relaxed);
-            }
-            return true;
+            Some((Outcome::Error(e), _)) if e.kind == crate::ErrorKind::FunctionDomain => true,
+            Some(_) => false,
         }
-        stats.init_generated += 1;
-        shared.init_generated.store(stats.init_generated, Ordering::Relaxed);
-        let in_model = match model.constraint(&s) {
-            Ok(b) => b,
-            Err(e) => {
-                err = Some((Outcome::Error(e.on_initial_state(model, &s)), NO_PARENT));
-                return true;
+    };
+    let generated = {
+        let res = model.init_states_gc(&mut |ev| {
+            let s = match ev {
+                crate::model::GcEvent::Emit(s, _) => s,
+                crate::model::GcEvent::Collect { force_drop_archive } => {
+                    if let Err(io) = shared.gc_store_exclusive(seed, &[], force_drop_archive) {
+                        err = Some((Outcome::Io(io), NO_PARENT));
+                        return false;
+                    }
+                    return keep_enumerating(&err, &observed, stopped);
+                }
+            };
+            if err.is_some() || observed.is_some() {
+                // DoInitFunctor keeps enumerating after FingerprintException
+                // (catch(Throwable)), unlike EvalException / TLCRuntimeException.
+                // Later states count but are neither fingerprinted nor checked.
+                if matches!(&err, Some((Outcome::Error(e), _)) if e.kind == crate::ErrorKind::FunctionDomain) {
+                    stats.init_generated += 1;
+                    shared.init_generated.store(stats.init_generated, Ordering::Relaxed);
+                }
+                return keep_enumerating(&err, &observed, stopped);
             }
-        };
-        let fp = model.fingerprint(&s);
-        if !in_model {
-            // Not added to the seen set, but invariants are still checked.
-            let lr = log_ref(0, log.push(NO_PARENT, fp));
-            if let Some(o) = observer {
-                o.on_new_state(&s, fp, 1, None);
+            stats.init_generated += 1;
+            shared.init_generated.store(stats.init_generated, Ordering::Relaxed);
+            let mut io_err = None;
+            let in_model = if let Some(gc) = shared.store_gc {
+                let res = model.constraint_gc(&s, &mut |force_drop| match shared.gc_store_exclusive(seed, &[&s], force_drop) {
+                    Ok(()) => true,
+                    Err(io) => {
+                        io_err = Some(io);
+                        false
+                    }
+                });
+                if let Err(ref e) = res {
+                    if e.is_store_full() && io_err.is_none() {
+                        gc.mark_full();
+                    }
+                }
+                res
+            } else {
+                model.constraint(&s)
+            };
+            if let Some(io) = io_err {
+                err = Some((Outcome::Io(io), NO_PARENT));
+                return false;
             }
-            err = init_failure(model, &s, lr);
-            return true;
-        }
-        // (The workers have not started yet.)
-        match shared.insert_exclusive(fp) {
-            Ok(true) => {
+            let in_model = match in_model {
+                Ok(b) => b,
+                Err(e) => {
+                    err = Some((Outcome::Error(e.on_initial_state(model, &s)), NO_PARENT));
+                    return keep_enumerating(&err, &observed, stopped);
+                }
+            };
+            let fp = model.fingerprint(&s);
+            if !in_model {
+                // Not added to the seen set, but invariants are still checked.
                 let lr = log_ref(0, log.push(NO_PARENT, fp));
-                if shared.order.is_some() {
-                    seq.push(lr);
-                }
-                stats.init_distinct += 1;
-                shared.init_distinct.store(stats.init_distinct, Ordering::Relaxed);
-                // As TLC, the state is queued before it is checked (this
-                // shows in `TLCGet("queue")`).
-                let t = s.clone();
-                shared.note_path(lr, 1, &s, None, None);
-                seed.push_new(Task { state: s, log: lr, depth: 1 });
                 if let Some(o) = observer {
-                    o.on_new_state(&t, fp, 1, None);
+                    o.on_new_state(&s, fp, 1, None);
                 }
-                // TLC's DoInitFunctor calls LiveCheck.addInitState after
-                // enqueueing a new state, before checking its invariants.
-                if let Some(o) = observer {
-                    observed = o.on_init(&t, stats.init_generated - 1).err();
+                let mut io_err = None;
+                err = if let Some(gc) = shared.store_gc {
+                    let f = init_failure_gc(model, &s, lr, &mut |force_drop| match shared.gc_store_exclusive(seed, &[&s], force_drop) {
+                        Ok(()) => true,
+                        Err(io) => {
+                            io_err = Some(io);
+                            false
+                        }
+                    });
+                    if let Some(io) = io_err {
+                        Some((Outcome::Io(io), NO_PARENT))
+                    } else {
+                        if matches!(&f, Some((Outcome::Error(e), _)) if e.is_store_full()) {
+                            gc.mark_full();
+                        }
+                        f
+                    }
+                } else {
+                    init_failure_gc(model, &s, lr, &mut |_| false)
+                };
+                return keep_enumerating(&err, &observed, stopped);
+            }
+            // (The workers have not started yet.)
+            match shared.insert_exclusive(fp) {
+                Ok(true) => {
+                    let lr = log_ref(0, log.push(NO_PARENT, fp));
+                    if shared.order.is_some() {
+                        seq.push(lr);
+                    }
+                    stats.init_distinct += 1;
+                    shared.init_distinct.store(stats.init_distinct, Ordering::Relaxed);
+                    // As TLC, the state is queued before it is checked (this
+                    // shows in `TLCGet("queue")`).
+                    let t = s.clone();
+                    shared.note_path(lr, 1, &s, None, None);
+                    seed.push_new(Task { state: s, log: lr, depth: 1 });
+                    if let Some(o) = observer {
+                        o.on_new_state(&t, fp, 1, None);
+                    }
+                    // TLC's DoInitFunctor calls LiveCheck.addInitState after
+                    // enqueueing a new state, before checking its invariants.
+                    if let Some(o) = observer {
+                        if shared.store_gc.is_some() {
+                            let mut io_err = None;
+                            observed = o
+                                .on_init_gc(&t, stats.init_generated - 1, &mut |extra, force_drop| {
+                                    let mut in_flight = Vec::with_capacity(1 + extra.len());
+                                    in_flight.push(&t);
+                                    in_flight.extend_from_slice(extra);
+                                    match shared.gc_store_exclusive(seed, &in_flight, force_drop) {
+                                        Ok(()) => true,
+                                        Err(io) => {
+                                            io_err = Some(io);
+                                            false
+                                        }
+                                    }
+                                })
+                                .err();
+                            if let Some(io) = io_err {
+                                err = Some((Outcome::Io(io), NO_PARENT));
+                            }
+                        } else {
+                            observed = o.on_init(&t, stats.init_generated - 1).err();
+                        }
+                    }
+                    if observed.is_none() {
+                        let mut io_err = None;
+                        err = if let Some(gc) = shared.store_gc {
+                            let f = init_failure_gc(model, &t, lr, &mut |force_drop| match shared.gc_store_exclusive(
+                                seed,
+                                &[&t],
+                                force_drop,
+                            ) {
+                                Ok(()) => true,
+                                Err(io) => {
+                                    io_err = Some(io);
+                                    false
+                                }
+                            });
+                            if let Some(io) = io_err {
+                                Some((Outcome::Io(io), NO_PARENT))
+                            } else {
+                                if matches!(&f, Some((Outcome::Error(e), _)) if e.is_store_full()) {
+                                    gc.mark_full();
+                                }
+                                f
+                            }
+                        } else {
+                            init_failure_gc(model, &t, lr, &mut |_| false)
+                        };
+                    }
+                    if err.is_none() && shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
+                        if let Err(io) = shared.gc_store_exclusive(seed, &[], false) {
+                            err = Some((Outcome::Io(io), NO_PARENT));
+                        }
+                    }
+                    if stats.init_distinct.is_multiple_of(INIT_TICK) && shared.budget.limited() && err.is_none() {
+                        err = init_relieve(shared, seed, &mut log);
+                    }
+                    if let (Some(o), None) = (observer, &err) {
+                        stopped = observed.is_none() && o.stop(true, stats.init_distinct);
+                    }
                 }
-                if observed.is_none() {
-                    err = init_failure(model, &t, lr);
-                }
-                if stats.init_distinct.is_multiple_of(INIT_TICK) && shared.budget.limited() && err.is_none() {
-                    err = init_relieve(shared, seed, &mut log);
-                }
-                if let (Some(o), None) = (observer, &err) {
-                    stopped = observed.is_none() && o.stop(true, stats.init_distinct);
+                Ok(false) => {}
+                Err(_) => err = Some(fp_set_full(&shared.seen)),
+            }
+            keep_enumerating(&err, &observed, stopped)
+        });
+        if err.is_none() && observed.is_none() {
+            if let Err(ref e) = res {
+                if e.is_store_full() {
+                    if let Some(gc) = shared.store_gc {
+                        gc.mark_full();
+                    }
                 }
             }
-            Ok(false) => {}
-            Err(_) => err = Some(fp_set_full(&shared.seen)),
         }
-        !stopped
-    });
+        res
+    };
     if stopped {
         shared.halted.store(true, Ordering::Relaxed);
         shared.control().stop();

@@ -546,6 +546,24 @@ impl<S> Pre<S> {
             Pre::Tasks(ts) => ts.first().map_or(0, |t| t.depth),
         }
     }
+
+    /// Visit every state kept in this pre-resume batch for safepoint GC.
+    pub(super) fn visit_states(
+        &self,
+        cache: &mut SegCache,
+        prev: &mut XorPrev,
+        visit: &mut dyn FnMut(crate::queue::StateRef<'_, S>),
+    ) -> Result<(), IoError> {
+        match self {
+            Pre::Block(b) => b.visit_states(cache, prev, visit),
+            Pre::Tasks(ts) => {
+                for t in ts {
+                    visit(crate::queue::StateRef::Obj(&t.state));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Record the liveness edges of the states `pre` (of the levels before the
@@ -563,6 +581,13 @@ pub(super) fn record_archived<'m, M: Model>(
     threads: usize,
     block_bytes: usize,
 ) -> Result<Vec<EdgeRec<'m, M::State>>, ModelError> {
+    if let Some(gc) = model.caps().gc {
+        // (The search printed what these states print.)
+        model.caps().replaying(true);
+        let res = record_archived_gc(model, atoms, pre, block_bytes, gc);
+        model.caps().replaying(false);
+        return res.map(|rec| vec![rec]);
+    }
     // Contiguous runs of about the same number of states.
     let total: usize = pre.iter().map(|p| p.len()).sum();
     let per = total.div_ceil(threads.max(1)).max(1);
@@ -583,6 +608,199 @@ pub(super) fn record_archived<'m, M: Model>(
         pool.map_owned(runs, |abort, run| Ok::<_, std::convert::Infallible>(record_run(model, atoms, run, block_bytes, abort))).unwrap();
     model.caps().replaying(false);
     recs.into_iter().collect()
+}
+
+/// Reclaim value-store nodes during pre-resume edge reconstruction, keeping
+/// every unconsumed `Pre` batch, any active in-flight states, and pending
+/// thread-local emit handles rooted.
+fn collect_pre<M: Model>(
+    model: &M,
+    gc: &dyn crate::model::StoreGc<M::State>,
+    remaining: &[Pre<M::State>],
+    extra: &[&M::State],
+) -> Result<(), ModelError> {
+    let mut tls = Vec::new();
+    gc.take_thread_roots(&mut tls);
+    let words = model.caps().codec().map_or(0, |c| c.words());
+    let mut prev = XorPrev::new(words);
+    let mut cache = SegCache::default();
+    gc.collect(&mut |mark| {
+        for p in remaining {
+            p.visit_states(&mut cache, &mut prev, &mut |sr| match sr {
+                crate::queue::StateRef::Obj(s) => gc.mark_state(s, mark),
+                crate::queue::StateRef::Words(w) => gc.mark_words(w, mark),
+            })
+            .map_err(|e| e.0)?;
+        }
+        for s in extra {
+            gc.mark_state(s, mark);
+        }
+        for &h in &tls {
+            mark(h);
+        }
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(ModelError::new)
+}
+
+/// GC-aware `record_archived`: sweeps dead search nodes first, then re-expands
+/// the unconsumed `pre` batches while collecting on store pressure and retrying
+/// atom evaluation before latching `StoreFull`.
+fn record_archived_gc<'m, M: Model>(
+    model: &'m M,
+    atoms: &'m (dyn AtomBits<M::State> + Sync),
+    pre: Vec<Pre<M::State>>,
+    block_bytes: usize,
+    gc: &'m dyn crate::model::StoreGc<M::State>,
+) -> Result<EdgeRec<'m, M::State>, ModelError> {
+    collect_pre(model, gc, &pre, &[])?;
+    let mut rec = EdgeRec::new(atoms, block_bytes);
+    let mut prev = XorPrev::new(model.caps().codec().map_or(0, |c| c.words()));
+    let mut cache = SegCache::default();
+    for idx in 0..pre.len() {
+        let remaining = &pre[idx..];
+        match &pre[idx] {
+            Pre::Block(b) => {
+                let codec = model.caps().codec().expect("encoded states without a codec");
+                let depth = b.depth();
+                b.records(&mut cache, &mut prev, |log, fp, w| {
+                    let s = codec.decode(w, depth, fp);
+                    record_state_gc(model, gc, &mut rec, &s, fp, (depth == 1).then_some(log), remaining)
+                })
+                .map_err(|e| ModelError::new(e.0))??;
+            }
+            Pre::Tasks(ts) => {
+                for t in ts {
+                    record_state_gc(
+                        model,
+                        gc,
+                        &mut rec,
+                        &t.state,
+                        model.fingerprint(&t.state),
+                        (t.depth == 1).then_some(t.log),
+                        remaining,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(rec)
+}
+
+/// GC-aware `record_state`: expands `s` via `action_successors_gc`, checks
+/// `admits_gc`, and retries `EdgeRec::{successor, end}` across value-store GC.
+fn record_state_gc<M: Model>(
+    model: &M,
+    gc: &dyn crate::model::StoreGc<M::State>,
+    rec: &mut EdgeRec<'_, M::State>,
+    s: &M::State,
+    fp: u64,
+    init: Option<u64>,
+    remaining: &[Pre<M::State>],
+) -> Result<(), ModelError> {
+    if gc.needs_gc() {
+        collect_pre(model, gc, remaining, &[s])?;
+    }
+    rec.begin();
+    let mut err: Option<ModelError> = None;
+    for a in 0..model.action_names().len() as u32 {
+        let go = model.action_successors_gc(s, a, &mut |ev| match ev {
+            crate::model::GcEvent::Collect { .. } => match collect_pre(model, gc, remaining, &[s]) {
+                Ok(()) => true,
+                Err(e) => {
+                    err = Some(e);
+                    false
+                }
+            },
+            crate::model::GcEvent::Emit(t, act) => {
+                let mut gc_err = None;
+                let in_model = crate::model::admits_gc(model, s, &t, &mut |_| match collect_pre(model, gc, remaining, &[s, &t]) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        gc_err = Some(e);
+                        false
+                    }
+                });
+                if let Some(e) = gc_err {
+                    err = Some(e);
+                    return false;
+                }
+                let in_model = match in_model {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if e.is_store_full() {
+                            gc.mark_full();
+                        }
+                        err = Some(e);
+                        return false;
+                    }
+                };
+                let tfp = model.fingerprint(&t);
+                let mut edge_res = rec.successor(s, &t, tfp, act, in_model);
+                if matches!(&edge_res, Err(e) if e.is_store_full()) {
+                    for stage in crate::model::StoreGcRetry::STAGES {
+                        if let Err(e) = collect_pre(model, gc, remaining, &[s, &t]) {
+                            err = Some(e);
+                            return false;
+                        }
+                        let _fb = stage.transient_fallback.then(|| super::TransientFallbackGuard::enter(gc));
+                        edge_res = rec.successor(s, &t, tfp, act, in_model);
+                        if !matches!(&edge_res, Err(e) if e.is_store_full()) {
+                            break;
+                        }
+                    }
+                }
+                match edge_res {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if e.is_store_full() {
+                            gc.mark_full();
+                            let _ = rec.fail(e.clone());
+                        }
+                        err = Some(e);
+                        false
+                    }
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        match go {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) => {
+                if e.is_store_full() {
+                    gc.mark_full();
+                }
+                return Err(e);
+            }
+        }
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let mut end_res = rec.end(s, fp, init);
+    if matches!(&end_res, Err(e) if e.is_store_full()) {
+        for stage in crate::model::StoreGcRetry::STAGES {
+            collect_pre(model, gc, remaining, &[s])?;
+            let _fb = stage.transient_fallback.then(|| super::TransientFallbackGuard::enter(gc));
+            end_res = rec.end(s, fp, init);
+            if !matches!(&end_res, Err(e) if e.is_store_full()) {
+                break;
+            }
+        }
+        if let Err(e) = end_res {
+            if e.is_store_full() {
+                gc.mark_full();
+                return rec.fail(e);
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+    end_res
 }
 
 /// `record_archived` of one run of states, on this thread (an error if

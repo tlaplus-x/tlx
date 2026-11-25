@@ -14,8 +14,8 @@ use std::cmp::Ordering;
 use tlx_value::plan::{Schedule, Witness, SCAN_LIMIT};
 use tlx_value::{FcnDom, Sym};
 
-use super::order::{cmp_tlc, eq_tlc, fn_view, Fn};
-use super::{as_int, int_handle, str_handle, tag, Body, Store, StoreError, TAG_MODEL_VALUE, TAG_STR};
+use super::order::{cmp_tlc_pin, eq_tlc_pin, fn_view, Fn};
+use super::{as_int, int_handle, str_handle, tag, Body, Store, StoreError, StorePin, TAG_MODEL_VALUE, TAG_STR};
 
 pub use tlx_value::plan::Absent;
 
@@ -46,7 +46,8 @@ fn eval<T>() -> R<T> {
 
 /// The witness of a function node (None: not a function).
 pub fn witness(s: &Store, f: u64) -> Option<Witness> {
-    match &s.node(f)?.body {
+    let pin = s.pin();
+    match &pin.node(f)?.body {
         Body::Tuple(_) => Some(Witness::Tuple),
         Body::Record(_) => Some(Witness::Record),
         Body::Fcn(_, FcnDom::Enumerated) => Some(Witness::Enumerated),
@@ -55,7 +56,7 @@ pub fn witness(s: &Store, f: u64) -> Option<Witness> {
     }
 }
 
-impl Store {
+impl StorePin<'_> {
     /// `DOMAIN f` (`ops::domain`): `1..n` of a tuple, `lo..hi` of an
     /// interval-backed function, or the enumerated set of a record's fields or
     /// an enumerated function's keys.
@@ -134,7 +135,7 @@ impl Store {
                         }
                         if schedule == Schedule::Scan {
                             for (i, fk) in keys.iter().enumerate() {
-                                if eq_tlc(self, *fk, k)? {
+                                if eq_tlc_pin(self, *fk, k)? {
                                     return Ok(Some(i));
                                 }
                             }
@@ -143,7 +144,7 @@ impl Store {
                         let (mut lo, mut hi) = (0usize, keys.len());
                         while lo < hi {
                             let mid = lo + (hi - lo) / 2;
-                            match cmp_tlc(self, keys[mid], k)? {
+                            match cmp_tlc_pin(self, keys[mid], k)? {
                                 Ordering::Equal => return Ok(Some(mid)),
                                 Ordering::Less => lo = mid + 1,
                                 Ordering::Greater => hi = mid,
@@ -261,7 +262,7 @@ impl Store {
     fn contains_key(&self, keys: &[u64], k: u64) -> R<bool> {
         if Witness::Enumerated.schedule(keys.len()) == Schedule::Scan {
             for fk in keys {
-                if eq_tlc(self, k, *fk)? {
+                if eq_tlc_pin(self, k, *fk)? {
                     return Ok(true);
                 }
             }
@@ -270,7 +271,7 @@ impl Store {
         let (mut lo, mut hi) = (0usize, keys.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match cmp_tlc(self, k, keys[mid])? {
+            match cmp_tlc_pin(self, k, keys[mid])? {
                 Ordering::Equal => return Ok(true),
                 Ordering::Less => hi = mid,
                 Ordering::Greater => lo = mid + 1,
@@ -302,7 +303,7 @@ impl Store {
                 let (mut lo, mut hi) = (0usize, out.len());
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
-                    match cmp_tlc(self, p.0, out[mid].0)? {
+                    match cmp_tlc_pin(self, p.0, out[mid].0)? {
                         Ordering::Equal => return eval(),
                         Ordering::Less => hi = mid,
                         Ordering::Greater => lo = mid + 1,
@@ -313,7 +314,7 @@ impl Store {
             return Ok(out);
         }
         let mut failed = false;
-        pairs.sort_by(|a, b| match cmp_tlc(self, a.0, b.0) {
+        pairs.sort_by(|a, b| match cmp_tlc_pin(self, a.0, b.0) {
             Ok(o) => o,
             Err(_) => {
                 failed = true;
@@ -324,7 +325,7 @@ impl Store {
             return eval();
         }
         for w in pairs.windows(2) {
-            if cmp_tlc(self, w[1].0, w[0].0)? != Ordering::Greater {
+            if cmp_tlc_pin(self, w[1].0, w[0].0)? != Ordering::Greater {
                 return eval();
             }
         }
@@ -343,7 +344,7 @@ impl Store {
                 let (mut lo, mut hi) = (0usize, es.len());
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
-                    match cmp_tlc(self, v, es[mid])? {
+                    match cmp_tlc_pin(self, v, es[mid])? {
                         Ordering::Equal => return Ok(true),
                         Ordering::Less => hi = mid,
                         Ordering::Greater => lo = mid + 1,
@@ -453,6 +454,76 @@ impl Store {
             fs = out;
         }
         Ok(self.intern(Body::Record(fs.into()))?)
+    }
+}
+
+impl Store {
+    pub fn domain(&self, f: u64) -> R<u64> {
+        self.pin().domain(f)
+    }
+
+    pub fn select(&self, f: u64, k: u64) -> R<Option<usize>> {
+        self.pin().select(f, k)
+    }
+
+    pub fn value_at(&self, f: u64, i: usize) -> u64 {
+        self.pin().value_at(f, i)
+    }
+
+    pub fn apply(&self, f: u64, k: u64) -> R<u64> {
+        self.pin().apply(f, k)
+    }
+
+    pub fn field(&self, r: u64, name: Sym) -> R<u64> {
+        self.pin().field(r, name)
+    }
+
+    pub fn set_at(&self, f: u64, i: usize, v: u64) -> R<u64> {
+        self.pin().set_at(f, i, v)
+    }
+
+    pub fn single(&self, k: u64, v: u64) -> R<u64> {
+        self.pin().single(k, v)
+    }
+
+    pub fn merge(&self, f: u64, g: u64) -> R<u64> {
+        self.pin().merge(f, g)
+    }
+
+    pub fn member(&self, v: u64, set: u64) -> R<bool> {
+        self.pin().member(v, set)
+    }
+
+    pub fn in_domain(&self, k: u64, f: u64) -> R<bool> {
+        self.pin().in_domain(k, f)
+    }
+
+    pub fn cardinality(&self, set: u64) -> R<i64> {
+        self.pin().cardinality(set)
+    }
+
+    pub fn len(&self, s: u64) -> R<i64> {
+        self.pin().len(s)
+    }
+
+    pub fn append(&self, s: u64, x: u64) -> R<u64> {
+        self.pin().append(s, x)
+    }
+
+    pub fn head(&self, s: u64) -> R<u64> {
+        self.pin().head(s)
+    }
+
+    pub fn tail(&self, s: u64) -> R<u64> {
+        self.pin().tail(s)
+    }
+
+    pub fn tuple(&self, es: &[u64]) -> R<u64> {
+        self.pin().tuple(es)
+    }
+
+    pub fn record(&self, fields: &[(Sym, u64)]) -> R<u64> {
+        self.pin().record(fields)
     }
 }
 

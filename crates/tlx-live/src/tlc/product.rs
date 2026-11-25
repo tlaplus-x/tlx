@@ -129,7 +129,7 @@ impl TProduct {
     }
 
     /// Adds the nodes and edges of the next event of the search.
-    pub(super) fn event(&mut self, ev: &Event, ex: &mut dyn Expand, pats: &mut Pats) -> Result<(), String> {
+    pub(super) fn event<X: Expand + ?Sized>(&mut self, ev: &Event, ex: &mut X, pats: &mut Pats) -> Result<(), X::Error> {
         let aut = Arc::clone(&self.aut);
         match ev {
             Event::Init { node, conc, bits } => {
@@ -323,7 +323,7 @@ impl TProduct {
     /// Adds the edges of node `v` for the steps of `exp` (TLC's
     /// `addNextState`), expanding new nodes of done graph nodes at once
     /// from their state.
-    fn expand<'e>(&mut self, v: u32, exp: Cow<'e, Expansion>, ex: &mut dyn Expand, pats: &mut Pats) -> Result<(), String> {
+    fn expand<'e, X: Expand + ?Sized>(&mut self, v: u32, exp: Cow<'e, Expansion>, ex: &mut X, pats: &mut Pats) -> Result<(), X::Error> {
         let aut = Arc::clone(&self.aut);
         self.bits[v as usize] = pats.id(&exp.bits);
         self.xconc[v as usize] = exp.conc;
