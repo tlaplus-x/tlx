@@ -496,13 +496,13 @@ impl<M: Model> Shared<'_, M> {
 
     /// Make room in the seen set (at a safepoint: `crew`; or while no
     /// worker runs: None) within the memory budget, once its table reached
-    /// its high watermark: grow it twice as large if that fits along with
-    /// the current table (both are held while growing), else, after the
-    /// earlier stages of memory pressure, stage 5: rotate it to disk
-    /// (`rotate_seen`), or without a disk tier grow it as large as fits,
-    /// or not at all (the set stops growing and fills up to its hard
-    /// limit). A set that rotated rotates from then on. Also installs a
-    /// finished merge of the disk tier's runs.
+    /// its high watermark: grow it twice as large if the replacement table
+    /// and bounded rehash chunk slack fit, else, after the earlier stages
+    /// of memory pressure, grow into the remaining budget if that adds at
+    /// least an eighth more slots, else stage 5: rotate it to disk
+    /// (`rotate_seen`), or without a disk tier stop growing and fill up to
+    /// its hard limit. A set that rotated rotates from then on. Also
+    /// installs a finished merge of the disk tier's runs.
     fn grow_seen(&self, crew: Option<&Crew<'_>>) {
         let seen = &self.seen;
         // SAFETY: every active worker is parked (or none runs), the
@@ -523,13 +523,22 @@ impl<M: Model> Shared<'_, M> {
             }
             return;
         }
+        let parts = crew.map_or(1, |c| c.size()).max(threads).max(1);
         let mut slots = seen.next_slots();
         if self.budget.limited() {
             let old = seen.bytes();
-            // The memory left for the tables (the current one included).
+            let peak = seen.grow_peak_bytes(slots, parts);
+            // The memory left for the fingerprint set.
             let room = |others: usize| self.budget.total().saturating_sub(others);
             let mut others = self.budget.used(self.accounted()).saturating_sub(old);
-            if old + FpSet::table_bytes(slots) > room(others) {
+            if peak > room(others) {
+                if self.budget.stage() != Stage::None {
+                    crate::mem::purge();
+                }
+                self.budget.sample();
+                others = self.budget.used(self.accounted()).saturating_sub(old);
+            }
+            if peak > room(others) {
                 // Pressure: the earlier stages first.
                 if let Some(order) = &self.order {
                     order.shrink();
@@ -543,12 +552,12 @@ impl<M: Model> Shared<'_, M> {
                     }
                     self.budget.reach(Stage::Archive);
                 }
-                if old + FpSet::table_bytes(slots) > room(others) && self.start_spilling(true) {
+                if peak > room(others) && self.start_spilling(true) {
                     // (The workers write their logs out as soon as the
                     // safepoint ends.)
                     others = others.saturating_sub(self.log_bytes());
                 }
-                if old + FpSet::table_bytes(slots) > room(others) {
+                if peak > room(others) {
                     self.frontier.squeeze(true);
                     self.spill_candidates();
                     self.budget.reach(Stage::Frontier);
@@ -556,16 +565,23 @@ impl<M: Model> Shared<'_, M> {
                         others = others.saturating_sub(self.budget.meters().bytes(Component::Frontier));
                     }
                 }
-                if old + FpSet::table_bytes(slots) > room(others) {
-                    self.budget.reach(Stage::FpSet);
-                    if seen.rotatable() {
-                        self.rotate_seen(crew, threads);
-                        return;
-                    }
-                    let fit = (room(others).saturating_sub(old) / 8).saturating_sub(crate::fpset::OVERFLOW);
+                if peak > room(others) {
+                    let fit = seen.grow_fit_slots(room(others), parts);
                     let n = seen.slots();
-                    slots = if fit >= n + n / 4 { fit } else { n };
-                    seen.cap(slots);
+                    if fit >= n + n / 8 && seen.grow_peak_bytes(fit, parts) <= room(others) {
+                        slots = fit;
+                        if !seen.rotatable() {
+                            seen.cap(slots);
+                        }
+                    } else {
+                        self.budget.reach(Stage::FpSet);
+                        if seen.rotatable() {
+                            self.rotate_seen(crew, threads);
+                            return;
+                        }
+                        slots = n;
+                        seen.cap(slots);
+                    }
                 }
             }
         }
@@ -602,10 +618,11 @@ impl<M: Model> Shared<'_, M> {
             // lookups would go to disk.)
             let total = self.budget.total();
             let room = total.saturating_sub(others + seen.index_bytes() + seen.next_run_bytes()).max(total / TABLES_SHARE);
-            let of = |bytes: usize| (bytes / 8).saturating_sub(crate::fpset::OVERFLOW);
+            let cur_bytes = seen.table_bytes_now();
+            let of = FpSet::slots_for_bytes;
             let half = of(room / 2).clamp(floor, limit.max(floor));
-            let beside = of(room.saturating_sub(FpSet::table_bytes(cur)));
-            if FpSet::table_bytes(cur) + FpSet::table_bytes(half) <= room {
+            let beside = of(room.saturating_sub(cur_bytes));
+            if cur_bytes + FpSet::table_bytes(half) <= room {
                 (half, true)
             } else if beside >= floor.max(half / 2) {
                 (beside.min(limit.max(floor)), true)

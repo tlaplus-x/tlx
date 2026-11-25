@@ -1,8 +1,11 @@
 //! Lock-free set of 64-bit state fingerprints (docs/scale.md §4.1).
 //!
-//! An open-addressing table of `AtomicU64` slots with linear probing; 0
-//! marks an empty slot (fingerprint 0 is remapped to 1). Insertion is a
-//! single CAS, there are no locks.
+//! An open-addressing table with linear probing; 0 marks an empty slot
+//! (fingerprint 0 is remapped to 1). Below `2^21` home slots, each slot is an
+//! `AtomicU64` (`8 B/slot`); from `2^21` slots (`12.8 MiB`) on, slots use
+//! lossless low-bit `fastrange` quotienting in 64-byte cache lines (`6.4 B/slot`,
+//! 10 slots/line), storing only the probe displacement and low fingerprint bits
+//! while recovering the high bits from the home bucket (`table`).
 //!
 //! Placement by the high bits: the home slot of `fp` in a table of `n`
 //! slots is `fp * n >> 64` ("fastrange"), monotonic in the fingerprint, so
@@ -10,9 +13,9 @@
 //! be a power of two, and a range of high bits is a range of slots. Probes
 //! never wrap around: `OVERFLOW` slots follow the `n` home slots, and a
 //! probe that runs off their end finds the table full. Probes test aligned
-//! groups of `GROUP` slots with a single branch: at the loads a growing
-//! table runs at (0.375 to 0.75), a slot-by-slot loop costs a branch
-//! misprediction per lookup that ends a few slots past home.
+//! groups of slots with a single branch: at the loads a growing table runs
+//! at (0.375 to 0.75), a slot-by-slot loop costs a branch misprediction per
+//! lookup that ends a few slots past home.
 //!
 //! Load limits: an insert that brings the table to its high watermark
 //! (`HIGH`, 0.75) asks for a larger table (the caller's `high` callback,
@@ -26,8 +29,10 @@
 //!
 //! Growth (`grow`): a table twice as large (at most `FpConfig::limit`
 //! slots) into which every fingerprint is inserted again, in parallel by the
-//! workers parked at a safepoint, each taking contiguous ranges of the old
-//! table (whose fingerprints land in a contiguous range of the new one).
+//! workers parked at a safepoint. Because `fastrange` is monotonic, workers
+//! sweep page-aligned chunks from low to high slots and release completed
+//! old-table pages immediately (`madvise`), keeping physical memory bounded
+//! by the new table plus one chunk per active worker instead of `old + new`.
 //! Growing needs exclusive access: no other thread may use the set
 //! meanwhile, except `len` (live statistics).
 //!
@@ -48,15 +53,17 @@
 mod bloom;
 mod count;
 mod disk;
+mod overflow;
+mod table;
 
-use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use self::count::{Count, SLACK};
+use self::count::Count;
 use self::disk::{assemble, Disk, PieceWriter, Run, BLOCK_FPS};
+use self::table::{Table, COMPACT48_MIN_SLOTS};
 use crate::explore::safepoint::Crew;
 use crate::io::{BlockStore, IoError, Spill};
 use crate::mem::{Gauge, Part};
@@ -71,21 +78,18 @@ const HIGH_DEN: usize = 4;
 const HARD_NUM: usize = 9;
 const HARD_DEN: usize = 10;
 
-/// Probes look at aligned groups of this many slots.
-const GROUP: usize = 4;
-
 /// Slots after the last home slot, where probes end (they never wrap).
 pub const OVERFLOW: usize = 4096;
 
 /// The smallest table.
 pub const MIN_SLOTS: usize = 1024;
 
-/// The first table of a growable set (8 MiB).
+/// The first table of a growable set (`1M` home slots, `8 MiB`).
 pub const START_SLOTS: usize = 1 << 20;
 
 /// The default limit of a growable set (`FpConfig::default`; the CLI uses
-/// a quarter of the physical memory): 4 GiB.
-const DEFAULT_LIMIT_SLOTS: usize = 1 << 29;
+/// `-maxmem`): `1G` slots (~6.4 GiB).
+const DEFAULT_LIMIT_SLOTS: usize = 1 << 30;
 
 /// The most shards `-fpbits` asks for (as TLC).
 pub const MAX_BITS: u32 = 30;
@@ -110,6 +114,9 @@ pub struct FpConfig {
     /// With the disk tier used from the start (`-spill always`), the table
     /// has at most this many home slots (`forced_disk`).
     pub disk_slots: usize,
+    /// Optional hard cap on displacement-overflow segment bytes (set by
+    /// `fixed_mib` so a fixed `-fpmem` table never exceeds its byte budget).
+    overflow_cap: Option<usize>,
 }
 
 impl Default for FpConfig {
@@ -122,20 +129,43 @@ impl FpConfig {
     /// A table of `slots` home slots (at least `MIN_SLOTS`) that never grows.
     pub fn fixed(slots: usize) -> FpConfig {
         let slots = slots.max(MIN_SLOTS);
-        FpConfig { initial: slots, limit: slots, fixed: true, bits: 0, disk_slots: FORCED_DISK_SLOTS }
+        FpConfig { initial: slots, limit: slots, fixed: true, bits: 0, disk_slots: FORCED_DISK_SLOTS, overflow_cap: None }
     }
 
-    /// A table that never grows, of `mib` MiB (`-fpmem`; the overflow
-    /// slots come on top).
+    /// A table that never grows, of `mib` MiB (`-fpmem`; the fixed probe
+    /// overflow tail comes on top, while any compact displacement-overflow
+    /// storage stays strictly within `mib` MiB).
     pub fn fixed_mib(mib: usize) -> FpConfig {
-        FpConfig::fixed(mib.saturating_mul(1 << 20) / 8)
+        const FIXED_COMPACT_RESERVE: usize = 1 << 20;
+        let home_budget = mib.saturating_mul(1 << 20);
+        let compact_slots = Table::home_slots_for_bytes(home_budget.saturating_sub(FIXED_COMPACT_RESERVE));
+        if compact_slots >= COMPACT48_MIN_SLOTS {
+            let max_total = home_budget.saturating_add(Table::probe_tail_bytes(compact_slots));
+            let overflow_cap = max_total.saturating_sub(Table::array_bytes(compact_slots));
+            FpConfig {
+                initial: compact_slots,
+                limit: compact_slots,
+                fixed: true,
+                bits: 0,
+                disk_slots: FORCED_DISK_SLOTS,
+                overflow_cap: Some(overflow_cap),
+            }
+        } else {
+            let raw_slots = (home_budget / 8).clamp(MIN_SLOTS, COMPACT48_MIN_SLOTS - 1);
+            FpConfig { initial: raw_slots, limit: raw_slots, fixed: true, bits: 0, disk_slots: FORCED_DISK_SLOTS, overflow_cap: Some(0) }
+        }
     }
 
     /// A table that starts with `START_SLOTS` home slots and grows up to
     /// `limit` of them.
     pub fn growing(limit: usize) -> FpConfig {
         let limit = limit.max(MIN_SLOTS);
-        FpConfig { initial: START_SLOTS.min(limit), limit, fixed: false, bits: 0, disk_slots: FORCED_DISK_SLOTS }
+        FpConfig { initial: START_SLOTS.min(limit), limit, fixed: false, bits: 0, disk_slots: FORCED_DISK_SLOTS, overflow_cap: None }
+    }
+
+    /// A growable table whose slot limit fits within `bytes` of memory.
+    pub fn growing_within(bytes: usize) -> FpConfig {
+        FpConfig::growing(FpSet::max_slots_in(bytes))
     }
 
     /// A growable table limited to `bytes` of memory (a memory budget) at
@@ -144,7 +174,7 @@ impl FpConfig {
         if self.fixed {
             return self;
         }
-        let limit = self.limit.min(bytes / 8).max(MIN_SLOTS);
+        let limit = self.limit.min(FpSet::max_slots_in(bytes)).max(MIN_SLOTS);
         FpConfig { initial: self.initial.clamp(MIN_SLOTS, limit), limit, ..self }
     }
 
@@ -181,222 +211,12 @@ impl FpConfig {
 
     /// The most memory of the table, in MiB (rounded down, at least 1).
     pub fn limit_mib(&self) -> usize {
-        (self.limit.saturating_mul(8) >> 20).max(1)
-    }
-}
-
-/// Tables of at least this many bytes are mapped from the OS directly
-/// (`Slots`).
-const MAP_BYTES: usize = 1 << 20;
-
-/// The zeroed slots of a table. Large ones are an anonymous mapping of
-/// their own (unix): its pages stay unresident until a slot on them is
-/// used, and are returned to the OS when the table is dropped. From the
-/// global allocator, zeroed memory that it had used before (e.g. freed by
-/// the front end or the compiled tier) is cleared, which makes every page
-/// of the table resident at once (8 MiB for the initial table).
-struct Slots {
-    ptr: std::ptr::NonNull<AtomicU64>,
-    len: usize,
-    /// Mapped (`munmap` on drop), or from the global allocator.
-    mapped: bool,
-}
-
-// SAFETY: `Slots` owns its memory like a `Box<[AtomicU64]>`, which is
-// `Send` and `Sync`.
-unsafe impl Send for Slots {}
-unsafe impl Sync for Slots {}
-
-impl Slots {
-    fn zeroed(len: usize) -> Slots {
-        let layout = Layout::array::<AtomicU64>(len).expect("fingerprint set too large");
-        #[cfg(unix)]
-        if layout.size() >= MAP_BYTES {
-            // SAFETY: an anonymous private mapping of `layout.size()` bytes
-            // at an address chosen by the OS; it touches no existing memory.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    layout.size(),
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if p != libc::MAP_FAILED {
-                // (As mimalloc does for its arenas: huge pages where the
-                // process allows them, see `TLX_THP`.)
-                #[cfg(target_os = "linux")]
-                // SAFETY: advice on the mapping just made.
-                unsafe {
-                    libc::madvise(p, layout.size(), libc::MADV_HUGEPAGE);
-                }
-                // (Page-aligned, so aligned for `AtomicU64`; zero-filled.)
-                return Slots { ptr: std::ptr::NonNull::new(p.cast()).expect("mapped"), len, mapped: true };
-            }
-        }
-        // SAFETY: `layout` has a non-zero size (at least `OVERFLOW` slots).
-        let ptr = unsafe { alloc_zeroed(layout) } as *mut AtomicU64;
-        let Some(ptr) = std::ptr::NonNull::new(ptr) else { handle_alloc_error(layout) };
-        Slots { ptr, len, mapped: false }
-    }
-}
-
-impl std::ops::Deref for Slots {
-    type Target = [AtomicU64];
-    fn deref(&self) -> &[AtomicU64] {
-        // SAFETY: `ptr` points to `len` initialized `AtomicU64`s (zeroed
-        // memory is `len` valid `AtomicU64(0)` values) owned by `self`.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-}
-
-impl Drop for Slots {
-    fn drop(&mut self) {
-        let layout = Layout::array::<AtomicU64>(self.len).expect("allocated with it");
-        if self.mapped {
-            #[cfg(unix)]
-            // SAFETY: the mapping made in `zeroed`, no longer referenced.
-            unsafe {
-                libc::munmap(self.ptr.as_ptr().cast(), layout.size());
-            }
+        let bytes = if self.fixed {
+            Table::home_bytes(self.limit).saturating_add(self.overflow_cap.unwrap_or(0)).saturating_add(64)
         } else {
-            // SAFETY: allocated by the global allocator with `layout`.
-            unsafe { std::alloc::dealloc(self.ptr.as_ptr().cast(), layout) }
-        }
-    }
-}
-
-/// A table: `n` home slots and the overflow slots.
-struct Table {
-    slots: Slots,
-    n: usize,
-    /// The numbers of entries at the high watermark and at the hard limit.
-    high: usize,
-    hard: usize,
-    /// The set's entries before this table took inserts (those rotated to
-    /// disk), and its number of entries at the watermarks (`base` plus
-    /// `high`, `hard`: compared with the set's length).
-    base: usize,
-    high_at: usize,
-    hard_at: usize,
-    /// From this many entries of the set on (`Count::flushed`), inserts
-    /// count in the shared counter directly (see `count`): whether that
-    /// started (and the stripes were drained), and whether an insert
-    /// reached the high watermark.
-    direct_at: usize,
-    drained: AtomicBool,
-    high_reached: AtomicBool,
-}
-
-impl Table {
-    /// A table of `n` home slots, taking inserts after `base` entries.
-    fn new(n: usize, base: usize) -> Table {
-        let len = n.checked_add(OVERFLOW).expect("fingerprint set too large");
-        // (Zeroed memory, not a `Vec` of atomics built element by element:
-        // the pages stay untouched until used.)
-        let slots = Slots::zeroed(len);
-        let high = Table::high_of(n);
-        let hard = n / HARD_DEN * HARD_NUM + (n % HARD_DEN * HARD_NUM).div_ceil(HARD_DEN);
-        let high_at = base + high;
-        Table {
-            slots,
-            n,
-            high,
-            hard,
-            base,
-            high_at,
-            hard_at: base + hard,
-            direct_at: high_at.saturating_sub(SLACK),
-            drained: AtomicBool::new(false),
-            high_reached: AtomicBool::new(false),
-        }
-    }
-
-    /// The entries of a table of `n` home slots at its high watermark.
-    fn high_of(n: usize) -> usize {
-        n / HIGH_DEN * HIGH_NUM + n % HIGH_DEN * HIGH_NUM / HIGH_DEN
-    }
-
-    /// The home slot of (normalized) fingerprint `fp`.
-    #[inline]
-    fn home(&self, fp: u64) -> usize {
-        ((fp as u128 * self.n as u128) >> 64) as usize
-    }
-
-    #[inline]
-    fn slot(&self, i: usize) -> &AtomicU64 {
-        debug_assert!(i < self.slots.len());
-        // SAFETY: callers keep `i < n + OVERFLOW = slots.len()`.
-        unsafe { self.slots.get_unchecked(i) }
-    }
-
-    fn bytes(&self) -> usize {
-        self.slots.len() * 8
-    }
-
-    /// Whether the table holds `fp` (normalized).
-    fn contains(&self, fp: u64) -> bool {
-        (self.home(fp)..self.slots.len()).map(|i| self.slot(i).load(Ordering::Acquire)).take_while(|&c| c != 0).any(|c| c == fp)
-    }
-
-    /// The fingerprints of the clusters (runs of occupied slots) that start
-    /// in slots `lo..hi`, in ascending order, sorting each cluster in place
-    /// (`f` is called with each). With exclusive access.
-    ///
-    /// Clusters are sorted with respect to each other: placement is
-    /// monotonic, and an entry is never stored before its home slot or
-    /// beyond an empty slot after it. A sorted cluster is still a valid
-    /// linear-probing layout (as in ordered hash tables): the entries of
-    /// a cluster `a..b` with homes before `h` fill at least `h - a` of its
-    /// slots, so the entry of home `h` stays at or after `h`.
-    fn sorted_clusters(&self, lo: usize, hi: usize, mut f: impl FnMut(u64) -> Result<(), IoError>) -> Result<(), IoError> {
-        let end = self.slots.len();
-        let mut i = lo;
-        if i > 0 && self.slot(i - 1).load(Ordering::Relaxed) != 0 {
-            // (A cluster that starts before `lo` is the previous range's.)
-            while i < end && self.slot(i).load(Ordering::Relaxed) != 0 {
-                i += 1;
-            }
-        }
-        let mut cluster: Vec<u64> = Vec::new();
-        while i < hi.min(end) {
-            if self.slot(i).load(Ordering::Relaxed) == 0 {
-                i += 1;
-                continue;
-            }
-            cluster.clear();
-            let a = i;
-            while i < end {
-                let x = self.slot(i).load(Ordering::Relaxed);
-                if x == 0 {
-                    break;
-                }
-                cluster.push(x);
-                i += 1;
-            }
-            cluster.sort_unstable();
-            for (k, &x) in cluster.iter().enumerate() {
-                self.slot(a + k).store(x, Ordering::Relaxed);
-                f(x)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Insert `fp` (not present, not 0) while the table is being filled
-    /// by `grow` (concurrently, but only with such inserts).
-    fn place(&self, fp: u64) {
-        let end = self.slots.len();
-        let mut i = self.home(fp);
-        while i < end {
-            if self.slot(i).compare_exchange(0, fp, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                return;
-            }
-            i += 1;
-        }
-        panic!("fingerprint set: the overflow area is full while growing");
+            Table::array_bytes(self.limit).saturating_add(64)
+        };
+        (bytes >> 20).max(1)
     }
 }
 
@@ -465,7 +285,9 @@ fn norm(fp: u64) -> u64 {
 impl FpSet {
     /// A set of size `config`.
     pub fn with_config(config: FpConfig) -> FpSet {
-        let t = Table::new(config.initial.max(MIN_SLOTS), 0);
+        let mem = Arc::new(Gauge::new());
+        let ovf_cap = config.overflow_cap.unwrap_or(usize::MAX);
+        let t = Table::new(config.initial.max(MIN_SLOTS), 0, mem.clone(), ovf_cap);
         let peak = t.bytes();
         let s = FpSet {
             limit: AtomicUsize::new(config.limit.max(t.n)),
@@ -479,7 +301,7 @@ impl FpSet {
             spill: None,
             rotations: AtomicU64::new(0),
             rotate_ns: AtomicU64::new(0),
-            mem: Arc::new(Gauge::new()),
+            mem,
             tables: Part::default(),
             old_bytes: AtomicUsize::new(0),
         };
@@ -546,86 +368,47 @@ impl FpSet {
     pub fn insert_by(&self, me: usize, fp: u64, probes: &mut u64, high: impl FnOnce()) -> Result<bool, Full> {
         let fp = norm(fp);
         let t = self.table();
-        let end = t.slots.len();
-        let mut i = t.home(fp);
         // (The disk tier is asked once, at the first empty slot.)
         let mut asked = false;
         let mut ask = false;
-        loop {
-            // The first slot from `i` on holding `fp` or empty, looked for in
-            // aligned groups of `GROUP` slots (one branch per group; a group
-            // never straddles a cache line). (Relaxed loads: finding `fp`
-            // tells nothing about other memory.)
-            let g = i & !(GROUP - 1);
-            if g + GROUP <= end {
-                let mut m = 0u32;
-                for k in 0..GROUP {
-                    let x = t.slot(g + k).load(Ordering::Relaxed);
-                    m |= ((x == fp) as u32 | (x == 0) as u32) << k;
-                }
-                m &= u32::MAX << (i - g);
-                if m == 0 {
-                    *probes += (g + GROUP - i) as u64;
-                    i = g + GROUP;
-                    if i >= end {
-                        return Err(Full);
-                    }
-                    continue;
-                }
-                let j = g + m.trailing_zeros() as usize;
-                *probes += (j - i) as u64;
-                i = j;
-            }
-            let cur = t.slot(i).load(Ordering::Relaxed);
-            if cur == fp {
-                return Ok(false);
-            }
-            if cur == 0 {
-                let flushed = self.count.flushed();
-                if flushed >= t.hard_at {
-                    return Err(Full);
-                }
-                if !asked && self.spilling() {
-                    asked = true;
-                    match self.on_disk(fp) {
-                        OnDisk::No => {}
-                        OnDisk::NoMergeReady => ask = true,
-                        OnDisk::Yes => return Ok(false),
-                        OnDisk::Error => return Err(Full),
-                    }
-                }
-                match t.slot(i).compare_exchange(0, fp, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => {
-                        // (Far below the watermarks, the number of entries
-                        // is counted in stripes: it cannot reach them.)
-                        if flushed < t.direct_at {
-                            self.count.add_striped(me);
-                            if ask {
-                                high();
-                            }
-                            return Ok(true);
-                        }
-                        if !t.drained.load(Ordering::Relaxed) && !t.drained.swap(true, Ordering::Relaxed) {
-                            self.count.drain();
-                        }
-                        let n = self.count.add_direct(1);
-                        let reached =
-                            n >= t.high_at && !t.high_reached.load(Ordering::Relaxed) && !t.high_reached.swap(true, Ordering::Relaxed);
-                        if ask || reached && (t.n < self.limit() || self.spill.is_some()) {
-                            high();
-                        }
-                        return Ok(true);
-                    }
-                    Err(other) if other == fp => return Ok(false),
-                    Err(_) => {}
-                }
-            }
-            i += 1;
-            *probes += 1;
-            if i == end {
+        let mut flushed = 0;
+        let inserted = t.insert_with(fp, probes, || {
+            flushed = self.count.flushed();
+            if flushed >= t.hard_at {
                 return Err(Full);
             }
+            if !asked && self.spilling() {
+                asked = true;
+                match self.on_disk(fp) {
+                    OnDisk::No => {}
+                    OnDisk::NoMergeReady => ask = true,
+                    OnDisk::Yes => return Ok(Some(false)),
+                    OnDisk::Error => return Err(Full),
+                }
+            }
+            Ok(None)
+        })?;
+        if !inserted {
+            return Ok(false);
         }
+        // (Far below the watermarks, the number of entries is counted in
+        // stripes: it cannot reach them.)
+        if flushed < t.direct_at {
+            self.count.add_striped(me);
+            if ask {
+                high();
+            }
+            return Ok(true);
+        }
+        if !t.drained.load(Ordering::Relaxed) && !t.drained.swap(true, Ordering::Relaxed) {
+            self.count.drain();
+        }
+        let n = self.count.add_direct(1);
+        let reached = n >= t.high_at && !t.high_reached.load(Ordering::Relaxed) && !t.high_reached.swap(true, Ordering::Relaxed);
+        if ask || reached && (t.n < self.limit() || self.spill.is_some()) {
+            high();
+        }
+        Ok(true)
     }
 
     /// Whether `fp` (normalized; not in the table) is in the disk tier
@@ -739,7 +522,68 @@ impl FpSet {
 
     /// The memory of a table of `slots` home slots.
     pub fn table_bytes(slots: usize) -> usize {
-        slots.saturating_add(OVERFLOW).saturating_mul(8)
+        Table::array_bytes(slots)
+    }
+
+    /// The most home slots whose table fits in `bytes` (`0` if even `OVERFLOW`
+    /// does not fit).
+    pub fn slots_for_bytes(bytes: usize) -> usize {
+        Table::slots_for_bytes(bytes)
+    }
+
+    /// Slot limit corresponding to a memory budget `bytes` (`FpConfig::within`).
+    pub fn max_slots_in(bytes: usize) -> usize {
+        if bytes == usize::MAX {
+            usize::MAX
+        } else if bytes >= Table::array_bytes(COMPACT48_MIN_SLOTS) {
+            Table::slots_for_bytes(bytes)
+        } else {
+            bytes / 8
+        }
+    }
+
+    /// Old-table bytes retained concurrently with the destination table while
+    /// `parts` threads stream and discard its units into a new table (capped
+    /// at the old table's size).
+    fn grow_retained_bytes(&self, parts: usize) -> usize {
+        let old = self.table();
+        let unit_slots = old.rehash_unit_slots(self.shards);
+        if old.is_mapped() && old.slot_len() > unit_slots {
+            old.overflow_bytes().saturating_add(parts.max(1).saturating_mul(old.unit_bytes(unit_slots))).min(old.bytes())
+        } else {
+            old.bytes()
+        }
+    }
+
+    /// Peak physical bytes of old + destination tables during a `parts`-thread
+    /// growth whose destination owns `new_bytes` (including overflow). Covers
+    /// both expanding and tier-shrinking transitions.
+    fn grow_tables_peak(&self, new_bytes: usize, parts: usize) -> usize {
+        let old_bytes = self.table().bytes();
+        let retained = self.grow_retained_bytes(parts);
+        old_bytes.max(new_bytes).saturating_add(retained).min(old_bytes.saturating_add(new_bytes))
+    }
+
+    /// Peak physical bytes of the set while replacing the current table with
+    /// one of `slots` home slots across `parts` threads (including bounded
+    /// destination overflow segments and disk tier indexes).
+    pub fn grow_peak_bytes(&self, slots: usize, parts: usize) -> usize {
+        let new_bytes = Self::table_bytes(slots).saturating_add(self.table().max_grow_overflow_bytes(slots, self.table_len()));
+        self.grow_tables_peak(new_bytes, parts).saturating_add(self.disk_bytes())
+    }
+
+    /// Most home slots (within `limit`) to which the set can grow inside
+    /// `room` bytes across `parts` threads.
+    pub fn grow_fit_slots(&self, room: usize, parts: usize) -> usize {
+        let overhead = self.grow_retained_bytes(parts).saturating_add(self.disk_bytes());
+        let mut fit = Self::slots_for_bytes(room.saturating_sub(overhead)).min(self.limit());
+        if fit > self.slots() {
+            let ovf = self.table().max_grow_overflow_bytes(fit, self.table_len());
+            if ovf > 0 {
+                fit = Self::slots_for_bytes(room.saturating_sub(overhead.saturating_add(ovf))).min(self.limit());
+            }
+        }
+        fit
     }
 
     /// Never grow beyond `slots` home slots (nor beyond the current table).
@@ -776,26 +620,44 @@ impl FpSet {
         if old.n >= slots {
             return false;
         }
-        let new = Table::new(slots, old.base);
-        self.peak_bytes.fetch_max(old.bytes() + new.bytes() + self.disk_bytes(), Ordering::Relaxed);
-        let len = old.slots.len();
-        // Contiguous ranges of the old table (the shards of `-fpbits`, or
-        // more ranges than workers, for balance), taken in turn by the
-        // parts of the broadcast.
-        let parts = crew.map_or(1, |c| c.size()).max(threads);
-        let ranges = self.shards.max(4 * parts).min(len.div_ceil(4096)).max(1);
-        let rehash = |part: usize| {
-            for r in (part..ranges).step_by(parts) {
-                let (lo, hi) = (len * r / ranges, len * (r + 1) / ranges);
-                for s in &old.slots[lo..hi] {
-                    let fp = s.load(Ordering::Relaxed);
-                    if fp != 0 {
-                        new.place(fp);
-                    }
+        let len = old.slot_len();
+        let unit_slots = old.rehash_unit_slots(self.shards);
+        let parts = crew.map_or(1, |c| c.size()).max(threads).max(1);
+        let new = Table::new(slots, old.base, self.mem.clone(), usize::MAX);
+        self.peak_bytes.fetch_max(self.grow_tables_peak(new.array_bytes_now(), parts).saturating_add(self.disk_bytes()), Ordering::Relaxed);
+        if old.is_mapped() && len > unit_slots {
+            let units = len.div_ceil(unit_slots);
+            let next = AtomicUsize::new(0);
+            let rehash = |_part: usize| loop {
+                let u = next.fetch_add(1, Ordering::Relaxed);
+                if u >= units {
+                    break;
                 }
-            }
-        };
-        run_parts(crew, parts, rehash);
+                let lo = u * unit_slots;
+                let hi = ((u + 1) * unit_slots).min(len);
+                old.rehash_range(lo, hi, &new);
+                // SAFETY: each unit `u` is claimed once, `rehash_range` reads
+                // only `lo..hi` (and `old.overflow`, which stays live until
+                // `old` drops), and `unit_slots` aligns to `Line` and OS page
+                // boundaries.
+                unsafe { old.discard_slot_range(lo, hi) };
+            };
+            run_parts(crew, parts, rehash);
+        } else {
+            // Contiguous ranges of the old table (the shards of `-fpbits`, or
+            // more ranges than workers, for balance), taken in turn by the
+            // parts of the broadcast.
+            let ranges = self.shards.max(4 * parts).min(len.div_ceil(4096)).max(1);
+            let rehash = |part: usize| {
+                for r in (part..ranges).step_by(parts) {
+                    let (lo, hi) = (len * r / ranges, len * (r + 1) / ranges);
+                    old.rehash_range(lo, hi, &new);
+                }
+            };
+            run_parts(crew, parts, rehash);
+        }
+        let actual_peak = self.grow_tables_peak(new.bytes(), parts).saturating_add(self.disk_bytes());
+        self.peak_bytes.fetch_max(actual_peak.max(new.bytes() + self.disk_bytes()), Ordering::Relaxed);
         // SAFETY: exclusive access (this function's contract); `old` is not
         // used any more.
         unsafe {
@@ -836,7 +698,9 @@ impl FpSet {
         unsafe { self.drop_old() };
         self.peak_bytes.fetch_max(t.bytes() + self.disk_bytes() + run.bytes(), Ordering::Relaxed);
         // SAFETY: exclusive access; `t` is not used any more.
-        let table = unsafe { std::mem::replace(&mut *self.table.0.get(), Table::new(slots.max(MIN_SLOTS), self.len())) };
+        let table = unsafe {
+            std::mem::replace(&mut *self.table.0.get(), Table::new(slots.max(MIN_SLOTS), self.len(), self.mem.clone(), usize::MAX))
+        };
         // SAFETY: exclusive access.
         unsafe { self.disk_mut() }.expect("the disk tier").add(run, keep.then_some(table));
         self.account();
@@ -872,12 +736,14 @@ impl FpSet {
         }
     }
 
-    /// Publish the memory of the tables and runs (after they changed, with
-    /// exclusive access).
+    /// Publish the memory of the table arrays and runs (after they changed,
+    /// with exclusive access). Displacement-overflow segments charge `self.mem`
+    /// directly as they are allocated and dropped, so they are excluded here.
     fn account(&self) {
         let old = self.disk().map_or(0, Disk::old_bytes);
         self.old_bytes.store(old, Ordering::Relaxed);
-        self.tables.set(&self.mem, self.table().bytes() + old + self.disk().map_or(0, Disk::runs_bytes));
+        let old_array = self.disk().map_or(0, Disk::old_array_bytes);
+        self.tables.set(&self.mem, self.table().array_bytes_now() + old_array + self.disk().map_or(0, Disk::runs_bytes));
     }
 
     /// The gauge of the set's memory (`bytes`, as published).
@@ -951,9 +817,10 @@ impl FpSet {
     }
 
     /// The largest memory of the set at once (during a growth, both
-    /// tables; with the disk tier, both tables and its indexes).
+    /// tables; with the disk tier, both tables and its indexes; includes live
+    /// displacement-overflow segment allocations).
     pub fn peak_bytes(&self) -> usize {
-        self.peak_bytes.load(Ordering::Relaxed)
+        self.peak_bytes.load(Ordering::Relaxed).max(self.mem.peak())
     }
 
     /// The number of times the table grew, and the time it took.
@@ -963,11 +830,11 @@ impl FpSet {
 
     /// Checkpoints: call `f` with the fingerprints of part `part` of
     /// `parts` of the current table (0 as 1), in ascending order (sorting
-    /// its probe clusters in place, as a rotation does); stops at the first
-    /// error. The parts, in order, are the table's fingerprints in
-    /// ascending order, and the fingerprints of the set are those of the
-    /// table and of the runs (`run_count`, `for_each_in_run`); several
-    /// threads may each take parts, as a rotation does.
+    /// each probe cluster into a scratch buffer without mutating the table);
+    /// stops at the first error. The parts, in order, are the table's
+    /// fingerprints in ascending order, and the fingerprints of the set are
+    /// those of the table and of the runs (`run_count`, `for_each_in_run`);
+    /// several threads may each take parts, as a rotation does.
     ///
     /// # Safety
     /// As `grow`, except that other threads may call this function too
@@ -979,14 +846,14 @@ impl FpSet {
         mut f: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<(), String> {
         let t = self.table();
-        let len = t.slots.len();
+        let len = t.slot_len();
         let (lo, hi) = (len * part / parts, len * (part + 1) / parts);
         t.sorted_clusters(lo, hi, |fp| f(fp).map_err(IoError)).map_err(|e| e.0)
     }
 
     /// The slots of the current table (sizing `for_each_in_table_part`).
     pub fn table_slots(&self) -> usize {
-        self.table().slots.len()
+        self.table().slot_len()
     }
 
     /// The number of runs on disk.
@@ -1077,7 +944,7 @@ impl FpSet {
         // (The empty table takes the inserts after these entries.)
         let slots = self.table().n;
         // SAFETY: exclusive access; the old table is empty and not used any more.
-        unsafe { *self.table.0.get() = Table::new(slots, self.len()) };
+        unsafe { *self.table.0.get() = Table::new(slots, self.len(), self.mem.clone(), usize::MAX) };
         // SAFETY: exclusive access.
         unsafe { self.disk_mut() }.expect("the disk tier").add_loaded(run);
         self.account();
@@ -1087,6 +954,7 @@ impl FpSet {
 
     /// Whether the set holds `fp` (an IO error of the disk tier counts as
     /// no).
+    #[inline]
     pub fn contains(&self, fp: u64) -> bool {
         let fp = norm(fp);
         self.table().contains(fp) || self.disk().is_some_and(|d| d.contains(fp).unwrap_or(false))
@@ -1127,12 +995,12 @@ fn run_parts(crew: Option<&Crew<'_>>, parts: usize, f: impl Fn(usize) + Sync) {
 
 /// Write the `entries` fingerprints of table `t` to `store` as a run, on
 /// the workers of `crew` or `threads` threads (see `FpSet::rotate`): each
-/// takes contiguous ranges of slots, sorts their clusters in place and
-/// writes them as pieces of the run, in order. On an error, the blocks
-/// written are deleted.
+/// takes contiguous ranges of slots, sorts their clusters into a scratch
+/// buffer and writes them as pieces of the run, in order. On an error, the
+/// blocks written are deleted.
 fn write_run(t: &Table, store: &Arc<BlockStore>, crew: Option<&Crew<'_>>, threads: usize, entries: usize) -> Result<Run, IoError> {
     let bloom = bloom::Bloom::new(entries);
-    let len = t.slots.len();
+    let len = t.slot_len();
     let parts = crew.map_or(1, |c| c.size()).max(threads).max(1);
     // (Ranges of about a block of entries, at least one per part.)
     let ranges = (entries / BLOCK_FPS + 1).max(parts).min(len.div_ceil(4096)).max(1);
