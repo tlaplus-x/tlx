@@ -890,9 +890,7 @@ impl InterpModel {
         let plain = self.fp_mode == FpMode::Plain;
         if let (Some(v), false) = (&self.view, plain) {
             if self.has_projected_symmetry() {
-                let projected = self.projected_value(v, vals, level)?;
-                let canonical = self.projected_orbit(projected)?;
-                return Ok((tlx_value::fingerprint::fingerprint(&canonical)?, None));
+                return Ok((self.projected_orbit_fp(v, vals, level)?, None));
             }
             let least = self.least_in_orbit(vals)?;
             let state: &[Value] = least.as_deref().unwrap_or(vals);

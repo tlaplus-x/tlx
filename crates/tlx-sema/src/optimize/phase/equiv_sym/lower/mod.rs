@@ -32,7 +32,7 @@ enum AtomKind {
 }
 
 pub(super) struct LowerCtx<'a> {
-    program: &'a Program,
+    var_map: Vec<Option<usize>>,
     groups: &'a [GroupInfo],
     all_keys: &'a BTreeSet<Arc<str>>,
     consts: &'a BTreeMap<ConstId, &'a CfgValue>,
@@ -65,8 +65,34 @@ impl<'a> LowerCtx<'a> {
         consts: &'a BTreeMap<ConstId, &'a CfgValue>,
         totality: &'a TotalityChecker<'a>,
     ) -> Self {
+        let var_map = (0..program.vars.len()).map(Some).collect();
+        Self::with_var_map(var_map, groups, all_keys, consts, totality)
+    }
+
+    pub(super) fn with_retained(
+        program: &'a Program,
+        groups: &'a [GroupInfo],
+        all_keys: &'a BTreeSet<Arc<str>>,
+        consts: &'a BTreeMap<ConstId, &'a CfgValue>,
+        totality: &'a TotalityChecker<'a>,
+        retained: &[VarId],
+    ) -> Self {
+        let mut var_map = vec![None; program.vars.len()];
+        for (slot, &v) in retained.iter().enumerate() {
+            var_map[v.idx()] = Some(slot);
+        }
+        Self::with_var_map(var_map, groups, all_keys, consts, totality)
+    }
+
+    fn with_var_map(
+        var_map: Vec<Option<usize>>,
+        groups: &'a [GroupInfo],
+        all_keys: &'a BTreeSet<Arc<str>>,
+        consts: &'a BTreeMap<ConstId, &'a CfgValue>,
+        totality: &'a TotalityChecker<'a>,
+    ) -> Self {
         Self {
-            program,
+            var_map,
             groups,
             all_keys,
             consts,
@@ -90,6 +116,10 @@ impl<'a> LowerCtx<'a> {
             atom_preds: Vec::new(),
             atom_pred_ids: BTreeMap::new(),
         }
+    }
+
+    pub(super) fn var_lean_idx(&self, v: VarId) -> Option<usize> {
+        self.var_map.get(v.idx()).copied().flatten()
     }
 
     fn bump(&mut self) -> Option<()> {
@@ -414,13 +444,125 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    pub(super) fn lower_erased_branch(
+        &mut self,
+        b: &crate::optimize::phase::Branch,
+        omitted: &[VarId],
+        allow_prime: bool,
+    ) -> Option<(Vec<String>, String)> {
+        let mut doms = Vec::new();
+        let saved = self.check_env.clone();
+        let body = self.lower_erased_bounds(&b.bounds, &b.terms, omitted, allow_prime, &mut doms);
+        self.check_env = saved;
+        let body = self.charge(body?)?;
+        Some((doms, body))
+    }
+
+    fn lower_erased_bounds(
+        &mut self,
+        bounds: &[Bound],
+        terms: &[Expr],
+        omitted: &[VarId],
+        allow_prime: bool,
+        doms: &mut Vec<String>,
+    ) -> Option<String> {
+        if bounds.is_empty() {
+            return self.lower_erased_terms(terms, omitted, allow_prime);
+        }
+        let b = &bounds[0];
+        let rest = &bounds[1..];
+        match &b.vars {
+            BoundVars::Many(ids) => {
+                let ak = self.elem_atom_kind(&b.set);
+                let (elem_shape, dom_origin) = self.totality.bound_elem_info(&b.set, false, &self.check_env);
+                let mut bound_ids = Vec::with_capacity(ids.len());
+                let mut ok = true;
+                for &id in ids {
+                    match self.lower_set_pred_rec(&b.set, allow_prime, false) {
+                        Some(dom) => {
+                            doms.push(dom);
+                            self.locals.push(Slot::Local(id, ak));
+                            self.check_env.bind_local(id, elem_shape.clone(), dom_origin.clone());
+                            bound_ids.push(id);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                let inner = if ok { self.lower_erased_bounds(rest, terms, omitted, allow_prime, doms) } else { None };
+                for id in bound_ids.into_iter().rev() {
+                    self.locals.pop();
+                    self.check_env.unbind_local(id);
+                }
+                inner
+            }
+            BoundVars::Tuple(ids) if rest.is_empty() => {
+                let elem_shapes = self.totality.prove_tuple_set_arity(&b.set, ids.len(), false, &self.check_env)?;
+                let dom = self.lower_set_pred_rec(&b.set, allow_prime, false)?;
+                doms.push(dom);
+                self.locals.push(Slot::Temp);
+                let body = self.bind_tuple_for_form(ids, &elem_shapes, 0, |ctx| ctx.lower_erased_terms(terms, omitted, allow_prime));
+                self.locals.pop();
+                body
+            }
+            BoundVars::Tuple(_) => None,
+        }
+    }
+
+    fn lower_erased_terms(&mut self, terms: &[Expr], omitted: &[VarId], allow_prime: bool) -> Option<String> {
+        let mut acc: Option<String> = None;
+        for term in terms {
+            let lowered = match &*term.kind {
+                ExprKind::Builtin { op: B::Eq, args }
+                    if args.len() == 2 && crate::optimize::phase::variable(&args[0], allow_prime).is_some_and(|v| omitted.contains(&v)) =>
+                {
+                    continue;
+                }
+                ExprKind::Builtin { op: B::Unchanged, args } if allow_prime && args.len() == 1 => {
+                    self.lower_unchanged_frame(&args[0], omitted)?
+                }
+                _ => self.lower_form_rec(term, allow_prime, false, allow_prime)?,
+            };
+            acc = Some(match acc {
+                None => lowered,
+                Some(prev) => self.charge(format!("(Form.conj {prev} {lowered})"))?,
+            });
+            self.totality.apply_positive_fact(term, false, &mut self.check_env);
+        }
+        Some(acc.unwrap_or_else(|| "(Form.truth true)".to_string()))
+    }
+
+    fn lower_unchanged_frame(&mut self, arg: &Expr, omitted: &[VarId]) -> Option<String> {
+        match &*arg.kind {
+            ExprKind::Var(v) if omitted.contains(v) => Some("(Form.truth true)".to_string()),
+            ExprKind::Var(v) => {
+                let idx = self.var_lean_idx(*v)?;
+                Some(format!("(Form.eq (Expr.primeVar ⟨{idx}, by decide⟩) (Expr.var ⟨{idx}, by decide⟩))"))
+            }
+            ExprKind::Tuple(es) => {
+                let mut acc: Option<String> = None;
+                for item in es {
+                    let rhs = self.lower_unchanged_frame(item, omitted)?;
+                    if rhs == "(Form.truth true)" {
+                        continue;
+                    }
+                    acc = Some(match acc {
+                        None => rhs,
+                        Some(prev) => format!("(Form.conj {prev} {rhs})"),
+                    });
+                }
+                Some(acc.unwrap_or_else(|| "(Form.truth true)".to_string()))
+            }
+            _ => self.lower_unchanged(arg),
+        }
+    }
+
     fn lower_unchanged(&mut self, arg: &Expr) -> Option<String> {
         match &*arg.kind {
             ExprKind::Var(v) => {
-                let idx = v.idx();
-                if idx >= self.program.vars.len() {
-                    return None;
-                }
+                let idx = self.var_lean_idx(*v)?;
                 Some(format!("(Form.eq (Expr.primeVar ⟨{idx}, by decide⟩) (Expr.var ⟨{idx}, by decide⟩))"))
             }
             ExprKind::Tuple(es) => {
@@ -596,6 +738,19 @@ impl<'a> LowerCtx<'a> {
                 Some(format!("(SetPred.expr {expr})"))
             }
             ExprKind::SetEnum(es) => {
+                if let Some(cfg_set) = self.try_const_set_enum(es) {
+                    if let Some((mask, fixed)) = self.try_group_set(&cfg_set) {
+                        if mask != 0 {
+                            if fixed.is_empty() {
+                                self.used_groups |= mask;
+                                let m = self.mask_lean(mask);
+                                return Some(format!("(SetPred.group {m})"));
+                            }
+                            let expr = self.lower_cfg_value(&cfg_set)?;
+                            return Some(format!("(SetPred.expr {expr})"));
+                        }
+                    }
+                }
                 let items: Vec<_> = es.iter().map(|x| self.lower_expr_rec(x, allow_prime, in_prime)).collect::<Option<_>>()?;
                 Some(format!("(SetPred.enum [{}])", items.join(", ")))
             }

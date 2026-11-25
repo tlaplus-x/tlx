@@ -23,7 +23,6 @@ pub use equiv_sym::{
 };
 pub use erasure::{unobserved_projection, unobserved_projection_with_spec};
 pub use history::{history_projection, history_projection_with_spec};
-pub use keyed::{symmetry_projection_certificate, symmetry_projection_certificate_with_spec};
 pub use ordered::{ordered_projection, ordered_projection_with_spec, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::{sequence_length_projection, sequence_length_projection_with_spec};
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
@@ -701,6 +700,48 @@ pub fn symmetry_certificate_with_spec(
         .or_else(|| choose_sym::choose_symmetry_certificate_with_spec(program, cfg, init, next, spec, groups))
 }
 
+/// Certify unobserved-variable erasure followed by symmetry for the exact
+/// installed retained-variable tuple, preferring `ErasedKeyedCertificate` and
+/// falling back to `ErasedEquivCertificate`.
+pub fn symmetry_projection_certificate(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    observations: &[Expr],
+    groups: &[Vec<String>],
+    view: &Expr,
+) -> Option<String> {
+    symmetry_projection_certificate_with_spec(program, cfg, init, next, CheckSpec::invariants_only(observations), groups, view)
+}
+
+/// Certify unobserved-variable erasure followed by symmetry covering invariants,
+/// init properties, constraints, action constraints, and action properties.
+pub fn symmetry_projection_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[Vec<String>],
+    view: &Expr,
+) -> Option<String> {
+    keyed::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view)
+        .or_else(|| equiv_sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
+}
+
+/// Validate that `view` is a strictly ascending retained-variable tuple and
+/// return `(retained, omitted)` with `!omitted.is_empty()`.
+pub(in crate::optimize::phase) fn parse_retained_view(program: &Program, view: &Expr) -> Option<(Vec<VarId>, Vec<VarId>)> {
+    let ExprKind::Tuple(values) = &*view.kind else { return None };
+    let retained = values.iter().map(|e| variable(e, false)).collect::<Option<Vec<_>>>()?;
+    if retained.windows(2).any(|pair| pair[0].0 >= pair[1].0) || retained.iter().any(|v| v.idx() >= program.vars.len()) {
+        return None;
+    }
+    let omitted: Vec<_> = (0..program.vars.len()).map(|i| VarId(i as u32)).filter(|v| !retained.contains(v)).collect();
+    (!omitted.is_empty()).then_some((retained, omitted))
+}
+
 use tlx_front::cfg::Config;
 
 use crate::{builtins::Builtin as B, hir::*, Program};
@@ -797,7 +838,15 @@ struct Branch {
 }
 
 fn branches(e: &Expr) -> Option<Vec<Branch>> {
-    fn split(e: &Expr, remaining: &mut usize, depth: usize) -> Option<Vec<Branch>> {
+    split_branches(e, false)
+}
+
+pub(in crate::optimize::phase) fn branches_with_if(e: &Expr) -> Option<Vec<Branch>> {
+    split_branches(e, true)
+}
+
+fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
+    fn split(e: &Expr, split_if: bool, remaining: &mut usize, depth: usize) -> Option<Vec<Branch>> {
         if *remaining == 0 || depth >= 128 {
             return None;
         }
@@ -806,7 +855,7 @@ fn branches(e: &Expr) -> Option<Vec<Branch>> {
             ExprKind::Or(es) => {
                 let mut out = Vec::new();
                 for e in es {
-                    out.extend(split(e, remaining, depth + 1)?);
+                    out.extend(split(e, split_if, remaining, depth + 1)?);
                     if out.len() > 512 {
                         return None;
                     }
@@ -816,7 +865,7 @@ fn branches(e: &Expr) -> Option<Vec<Branch>> {
             ExprKind::And(es) => {
                 let mut out = vec![Branch { bounds: vec![], terms: vec![] }];
                 for e in es {
-                    let alternatives = split(e, remaining, depth + 1)?;
+                    let alternatives = split(e, split_if, remaining, depth + 1)?;
                     if out.len().saturating_mul(alternatives.len()) > 512 {
                         return None;
                     }
@@ -837,7 +886,7 @@ fn branches(e: &Expr) -> Option<Vec<Branch>> {
                 Some(out)
             }
             ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
-                let mut out = split(body, remaining, depth + 1)?;
+                let mut out = split(body, split_if, remaining, depth + 1)?;
                 for b in &mut out {
                     if bounds.len() + b.bounds.len() > 128 {
                         return None;
@@ -848,10 +897,26 @@ fn branches(e: &Expr) -> Option<Vec<Branch>> {
                 }
                 Some(out)
             }
+            ExprKind::If { cond, then, els } if split_if => {
+                let mut left = split(then, split_if, remaining, depth + 1)?;
+                let mut right = split(els, split_if, remaining, depth + 1)?;
+                let neg = Expr::new(ExprKind::Builtin { op: B::Not, args: vec![cond.clone()] }, cond.span);
+                for b in &mut left {
+                    b.terms.insert(0, cond.clone());
+                }
+                for b in &mut right {
+                    b.terms.insert(0, neg.clone());
+                }
+                left.extend(right);
+                if left.len() > 512 {
+                    return None;
+                }
+                Some(left)
+            }
             _ => Some(vec![Branch { bounds: vec![], terms: vec![e.clone()] }]),
         }
     }
-    split(e, &mut 100_000, 0)
+    split(e, split_if, &mut 100_000, 0)
 }
 
 fn variable(e: &Expr, primed: bool) -> Option<VarId> {

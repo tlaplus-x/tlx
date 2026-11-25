@@ -183,6 +183,48 @@ ActPropMentionsTag == [][\A n \in Nodes : state'[n] \in {0, 1}]_<<state, tag>>
     (p, cfg, proj, composed)
 }
 
+fn fixture_erased_equiv_constrained() -> (Program, Config, FieldProjection, String) {
+    let tla = r#"---- MODULE ErasedEquivConstrained ----
+EXTENDS Naturals, FiniteSets
+CONSTANT Nodes, Cap, n1, n2, n3
+DefaultNodes == {n1, n2, n3}
+DefaultCap == 2
+VARIABLE msgs, audit
+Init == msgs = {} /\ audit = [kind |-> "init", count |-> 0]
+Next == \E p, q \in Nodes :
+          /\ p # q
+          /\ Cardinality(msgs) < Cap
+          /\ [src |-> p, dst |-> q] \notin msgs
+          /\ msgs' = msgs \cup {[src |-> p, dst |-> q]}
+          /\ audit' = [kind |-> "send", count |-> Cardinality(msgs)]
+Inv == Cardinality(msgs) <= Cap
+InitProp == msgs = {}
+StateLimit == Cardinality(msgs) < Cap
+ActLimit == Cardinality(msgs') >= Cardinality(msgs)
+ActPropSafe == [][Cardinality(msgs') >= Cardinality(msgs)]_msgs
+ActPropMentionsAudit == [][Cardinality(msgs') >= Cardinality(msgs)]_<<msgs, audit>>
+====
+"#;
+    let cfg_src =
+        "INIT Init\nNEXT Next\nCONSTANTS\n  n1 = n1\n  n2 = n2\n  n3 = n3\n  Nodes <- DefaultNodes\n  Cap <- DefaultCap\nINVARIANT Inv\n";
+    let (p, cfg) = load("ErasedEquivConstrained", tla, cfg_src);
+    assert!(cfg_constants_supported(&p, &cfg));
+    let (inv, ip, c, ac, ap) = (
+        [def_expr(&p, "Inv")],
+        [def_expr(&p, "InitProp")],
+        [def_expr(&p, "StateLimit")],
+        [def_expr(&p, "ActLimit")],
+        [action_prop_expr(&p, "ActPropSafe")],
+    );
+    let spec = CheckSpec { invariants: &inv, init_props: &ip, constraints: &c, action_constraints: &ac, action_props: &ap };
+    let proj = unobserved_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("erasure should drop structured audit when [][A]_msgs does not mention audit");
+    let composed =
+        symmetry_projection_certificate_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec, &node_groups(), &proj.view)
+            .expect("erased equiv symmetry should compose with constrained erasure");
+    (p, cfg, proj, composed)
+}
+
 fn fixture_field_constrained() -> (Program, Config, FieldProjection) {
     let tla = r#"---- MODULE FieldConstrained ----
 EXTENDS Naturals
@@ -507,6 +549,32 @@ fn erasure_and_erased_keyed_certify_constrained_and_refuse_observed_subscript() 
         &proj.view,
     )
     .is_none());
+
+    let (ep, ecfg, eproj, ecomposed) = fixture_erased_equiv_constrained();
+    assert_eq!(eproj.fields, vec!["audit"]);
+    assert_constrained_lean(eproj.certificate.as_deref().unwrap(), "GeneratedErasure");
+    assert_constrained_lean(&ecomposed, "GeneratedErasedEquivSymmetry");
+    assert!(ecomposed.contains("theorem erasure_constrained_certificate :"));
+
+    let (einv, eip, ec, eac, eap_bad) = (
+        [def_expr(&ep, "Inv")],
+        [def_expr(&ep, "InitProp")],
+        [def_expr(&ep, "StateLimit")],
+        [def_expr(&ep, "ActLimit")],
+        [action_prop_expr(&ep, "ActPropMentionsAudit")],
+    );
+    let ebad_spec = CheckSpec { invariants: &einv, init_props: &eip, constraints: &ec, action_constraints: &eac, action_props: &eap_bad };
+    assert!(unobserved_projection_with_spec(&ep, &ecfg, &def_expr(&ep, "Init"), &def_expr(&ep, "Next"), ebad_spec).is_none());
+    assert!(symmetry_projection_certificate_with_spec(
+        &ep,
+        &ecfg,
+        &def_expr(&ep, "Init"),
+        &def_expr(&ep, "Next"),
+        ebad_spec,
+        &node_groups(),
+        &eproj.view,
+    )
+    .is_none());
 }
 
 #[test]
@@ -824,6 +892,7 @@ fn large_const_subst_scales_to_512_and_refuses_above_cap_and_handles_marker_lite
 #[ignore = "requires lean on PATH; verifies all constrained certificate families sequentially with proofs/check_generated.py --negative"]
 fn verify_all_constrained_certificate_families_with_lean_negative() {
     let (_, _, erased_proj, erased_keyed_cert) = fixture_erased_constrained();
+    let (_, _, _, erased_equiv_cert) = fixture_erased_equiv_constrained();
     let (_, _, field_proj) = fixture_field_constrained();
     let (_, _, seq_proj) = fixture_sequence_constrained();
     let (_, _, nat_cert) = fixture_erasure_const_nat();
@@ -835,6 +904,7 @@ fn verify_all_constrained_certificate_families_with_lean_negative() {
         ("ChooseSym", fixture_choose_constrained()),
         ("Erasure", erased_proj.certificate.unwrap()),
         ("ErasedKeyed", erased_keyed_cert),
+        ("ErasedEquiv", erased_equiv_cert),
         ("Field", field_proj.certificate.unwrap()),
         ("Length", seq_proj.certificate.unwrap()),
         ("History", fixture_history_constrained()),

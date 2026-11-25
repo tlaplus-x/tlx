@@ -29,6 +29,7 @@ SUPPORTED_NAMESPACES = (
     "GeneratedNested",
     "GeneratedLive",
     "GeneratedErasedSymmetry",
+    "GeneratedErasedEquivSymmetry",
 )
 # Representative tracked specifications covering every supported generated
 # certificate namespace when check_generated.py is invoked without explicit files.
@@ -54,6 +55,7 @@ DEFAULT_CASES = (
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedLive", "check", "proofs/ordered/LiveVersions.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedErasedSymmetry", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize"), (0,)),
+    ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/ErasedMultiKey.tla", None, ("-interp", "-optimize"), (0,)),
 )
 THEOREMS = {
     "certificate", "optimization_correct", "specification_correct",
@@ -152,11 +154,11 @@ def verify(lean, path, negative, lean_pool=None):
         raise RuntimeError(f"{path}: mismatched constSubstDeclared/constSubstExpanded declarations")
 
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
-    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry"}:
+    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry", "GeneratedErasedEquivSymmetry"}:
         theorems |= {"orbit_key_equivalent"}
     if namespace == "GeneratedChooseSymmetry":
         theorems |= {"inductive_invariant", "orbit_key_equivalent"}
-    if namespace == "GeneratedErasedSymmetry":
+    if namespace in {"GeneratedErasedSymmetry", "GeneratedErasedEquivSymmetry"}:
         theorems |= {"erasure_certificate"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
         theorems |= {"select_concrete", "select_reduced"}
@@ -239,6 +241,8 @@ def verify(lean, path, negative, lean_pool=None):
                 ("fun i => s.2 i ∧ q i e", "fun i => q i e", "lost prefix verdict"),
             ] if namespace == "GeneratedHistory" else [
                 ("next c d := ∃ w, m.step c d w", "next c d := False ∧ ∃ w, m.step c d w", "removed reduced successors"),
+                ("s.2 = m.seed s.1 w", "False ∧ s.2 = m.seed s.1 w", "removed concrete hidden initialization"),
+                ("t.2 = m.update s.1 t.1 w s.2", "False ∧ t.2 = m.update s.1 t.1 w s.2", "removed concrete hidden successors"),
             ] if namespace == "GeneratedErasure" else [
                 ("| .keep => n", "| .keep => 0", "discarded preserved length"),
                 ("| .reset values => values.length", "| .reset values => 0", "discarded reset contents length"),
@@ -265,7 +269,7 @@ def verify(lean, path, negative, lean_pool=None):
                 ("| .set xs => some (dedupList (xs.map mkVal)).length", "| .set xs => some xs.length", "replaced set cardinality with non-extensional list length"),
                 ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
-            ] if namespace == "GeneratedEquivSymmetry" else [
+            ] if namespace in {"GeneratedEquivSymmetry", "GeneratedErasedEquivSymmetry"} else [
                 ("fun i => p.toFun (keys i)", "fun i => keys i", "failed to rename bound keys"),
                 ("fun m k => r m (p.invFun k)", "fun m k => r m k", "failed to permute map keys"),
                 ("fun f k => fl f (p.invFun k)", "fun f k => fl f k", "failed to permute flag keys"),
@@ -295,6 +299,11 @@ def verify(lean, path, negative, lean_pool=None):
             ])
             if namespace == "GeneratedErasedSymmetry":
                 preamble_changes.append(("t.2 = m.hiddenUpdate b s.1 w keys s.2", "False ∧ t.2 = m.hiddenUpdate b s.1 w keys s.2", "removed concrete hidden successors"))
+            if namespace == "GeneratedErasedEquivSymmetry":
+                preamble_changes.extend([
+                    ("s.2 = m.hiddenSeed b s.1 ws", "False ∧ s.2 = m.hiddenSeed b s.1 ws", "removed concrete hidden initialization"),
+                    ("t.2 = m.hiddenUpdate b s.1 t.1 ws s.2", "False ∧ t.2 = m.hiddenUpdate b s.1 t.1 ws s.2", "removed concrete hidden successors"),
+                ])
             if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
                 preamble_changes.extend([
                     ("(b = true ↔ p.reduced h)", "(b = false ↔ p.reduced h)", "inverted filter decision"),

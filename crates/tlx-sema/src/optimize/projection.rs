@@ -17,6 +17,46 @@ use crate::{visit, Program};
 /// Unknown constructs retain their referenced variables; effects or exhausted
 /// analysis budgets disable the reduction. Does not change executable HIR.
 pub fn unobserved_variables(program: &Program, init: &Expr, next: &Expr, observations: &[Expr]) -> Vec<VarId> {
+    let Some(graph) = scan_liveness(program, init, next, observations, false) else {
+        return Vec::new();
+    };
+    graph.dead_vars(&vec![false; program.vars.len()])
+}
+
+/// Backward liveness dependency graph for general pure deterministic
+/// assignments (`v = rhs` / `v' = rhs` without primed reads in `rhs`).
+/// Callers must verify totality and overflow freedom of every omitted
+/// variable's RHS via `sym_totality::TotalityChecker`, pruning uncertifiable
+/// variables with [`CandidateLiveness::dead_vars`].
+pub(crate) struct CandidateLiveness {
+    read: Vec<bool>,
+    dependencies: Vec<Vec<usize>>,
+}
+
+impl CandidateLiveness {
+    /// Least fixed point of `L = (read ∪ forced_live) ∪ dependencies(L)`,
+    /// returning variables outside `L`.
+    pub(crate) fn dead_vars(&self, forced_live: &[bool]) -> Vec<VarId> {
+        let mut live: Vec<bool> = self.read.iter().zip(forced_live).map(|(&base, &forced)| base || forced).collect();
+        let mut work: Vec<usize> = live.iter().enumerate().filter_map(|(i, &is_live)| is_live.then_some(i)).collect();
+        // Cycles with no path to a live root remain dead; one live member retains the cycle.
+        while let Some(v) = work.pop() {
+            for &input in &self.dependencies[v] {
+                if !live[input] {
+                    live[input] = true;
+                    work.push(input);
+                }
+            }
+        }
+        live.iter().enumerate().filter(|(_, &is_live)| !is_live).map(|(i, _)| VarId(i as u32)).collect()
+    }
+}
+
+pub(crate) fn unobserved_candidates(program: &Program, init: &Expr, next: &Expr, observations: &[Expr]) -> Option<CandidateLiveness> {
+    scan_liveness(program, init, next, observations, true)
+}
+
+fn scan_liveness(program: &Program, init: &Expr, next: &Expr, observations: &[Expr], general_rhs: bool) -> Option<CandidateLiveness> {
     let mut scan = Scan {
         program,
         read: vec![false; program.vars.len()],
@@ -25,6 +65,7 @@ pub fn unobserved_variables(program: &Program, init: &Expr, next: &Expr, observa
         expanding: HashSet::new(),
         remaining: 100_000,
         complete: true,
+        general_rhs,
     };
     let initial = scan.action(init, false, 0);
     let steps = scan.action(next, true, 0);
@@ -32,26 +73,12 @@ pub fn unobserved_variables(program: &Program, init: &Expr, next: &Expr, observa
         scan.value(e, 0);
     }
     if !scan.complete {
-        return Vec::new();
+        return None;
     }
-    let mut work = Vec::new();
-    for (i, (init, step)) in initial.iter().zip(steps).enumerate() {
-        scan.read[i] |= *init != 1 || step > 1;
-        if scan.read[i] {
-            work.push(i);
-        }
+    for (i, (init_w, step_w)) in initial.iter().zip(steps).enumerate() {
+        scan.read[i] |= *init_w != 1 || if general_rhs { step_w != 1 } else { step_w > 1 };
     }
-    // Least fixed point of L = roots union dependencies(L). Cycles with no
-    // path to an observation remain dead; one live member retains the cycle.
-    while let Some(v) = work.pop() {
-        for &input in &scan.dependencies[v] {
-            if !scan.read[input] {
-                scan.read[input] = true;
-                work.push(input);
-            }
-        }
-    }
-    scan.read.iter().enumerate().filter(|(_, live)| !**live).map(|(i, _)| VarId(i as u32)).collect()
+    Some(CandidateLiveness { read: scan.read, dependencies: scan.dependencies })
 }
 
 struct Scan<'a> {
@@ -62,6 +89,7 @@ struct Scan<'a> {
     expanding: HashSet<DefId>,
     remaining: usize,
     complete: bool,
+    general_rhs: bool,
 }
 
 impl Scan<'_> {
@@ -126,13 +154,26 @@ impl Scan<'_> {
                     self.expanding.remove(id);
                 }
             }
-            ExprKind::Builtin { op: B::Eq, args }
-                if args.len() == 2 && (literal(&args[1]) || primed && matches!(&*args[1].kind, ExprKind::Var(_))) =>
-            {
+            ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 => {
                 if let Some(v) = target(&args[0], primed) {
-                    writes[v.idx()] = 1;
-                    if let ExprKind::Var(input) = &*args[1].kind {
-                        self.dependencies[v.idx()].push(input.idx());
+                    if !self.general_rhs {
+                        if literal(&args[1]) || (primed && matches!(&*args[1].kind, ExprKind::Var(_))) {
+                            writes[v.idx()] = 1;
+                            if let ExprKind::Var(input) = &*args[1].kind {
+                                self.dependencies[v.idx()].push(input.idx());
+                            }
+                        } else {
+                            self.value(e, depth + 1);
+                        }
+                    } else {
+                        let mut deps = Vec::new();
+                        let mut seen_rhs = HashSet::new();
+                        if self.rhs_deps(&args[1], &mut deps, &mut seen_rhs, depth + 1) {
+                            writes[v.idx()] = 1;
+                            self.dependencies[v.idx()].extend(deps);
+                        } else {
+                            self.value(e, depth + 1);
+                        }
                     }
                 } else {
                     self.value(e, depth + 1);
@@ -185,6 +226,88 @@ impl Scan<'_> {
             _ => {}
         }
         visit::children(e, &mut |child| self.value(child, depth + 1));
+    }
+
+    /// Scan a candidate deterministic assignment RHS without marking read
+    /// variables unconditionally live. Records all variable dependencies into
+    /// `deps`, rejects primed/action constructs inside the RHS, and flags any
+    /// volatile/effectful operator via `self.complete = false`.
+    fn rhs_deps(&mut self, e: &Expr, deps: &mut Vec<usize>, seen_rhs: &mut HashSet<DefId>, depth: usize) -> bool {
+        if !self.enter(depth) {
+            return false;
+        }
+        let mut ok = true;
+        match &*e.kind {
+            ExprKind::Var(v) => deps.push(v.idx()),
+            ExprKind::Builtin { op, .. } => {
+                if op.is_volatile() || op.metadata().effect != crate::builtins::Effect::Pure {
+                    self.complete = false;
+                    return false;
+                }
+                if matches!(op, B::Prime | B::Unchanged | B::Enabled) {
+                    return false;
+                }
+            }
+            ExprKind::Apply { op, .. } | ExprKind::OpArg(op) => match *op {
+                OpRef::Builtin(b) => {
+                    if b.is_volatile() || b.metadata().effect != crate::builtins::Effect::Pure {
+                        self.complete = false;
+                        return false;
+                    }
+                    if matches!(b, B::Prime | B::Unchanged | B::Enabled) {
+                        return false;
+                    }
+                }
+                OpRef::Const(_) => {
+                    self.complete = false;
+                    return false;
+                }
+                OpRef::Param(_) => {}
+                OpRef::Def(id) => {
+                    if seen_rhs.insert(id) {
+                        let d = &self.program.defs[id.idx()];
+                        if let Some(b) = d.builtin {
+                            if b.is_volatile() || b.metadata().effect != crate::builtins::Effect::Pure {
+                                self.complete = false;
+                                return false;
+                            }
+                            if matches!(b, B::Prime | B::Unchanged | B::Enabled) {
+                                return false;
+                            }
+                        } else {
+                            match &d.kind {
+                                DefKind::Op(body) => {
+                                    ok &= self.rhs_deps(body, deps, seen_rhs, depth + 1);
+                                }
+                                DefKind::Fn { bounds, body } => {
+                                    for b in bounds {
+                                        ok &= self.rhs_deps(&b.set, deps, seen_rhs, depth + 1);
+                                    }
+                                    ok &= self.rhs_deps(body, deps, seen_rhs, depth + 1);
+                                }
+                                DefKind::Pending => {
+                                    self.complete = false;
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            ExprKind::QuantUnbounded { .. }
+            | ExprKind::TemporalQuant { .. }
+            | ExprKind::Fairness { .. }
+            | ExprKind::BoxAction { .. }
+            | ExprKind::AngleAction { .. }
+            | ExprKind::InstVar { .. } => return false,
+            _ => {}
+        }
+        visit::children(e, &mut |child| {
+            if ok {
+                ok &= self.rhs_deps(child, deps, seen_rhs, depth + 1);
+            }
+        });
+        ok
     }
 
     fn operator(&mut self, op: OpRef, depth: usize) {

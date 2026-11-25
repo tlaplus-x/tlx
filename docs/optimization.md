@@ -42,7 +42,7 @@ negative mutation checks are explicit.
 
 | Reduction | Connected certificate | Current behavior |
 |---|---|---|
-| Unobserved variables | `ErasureCertificate.lean`: literal initializations, literal/copy/frame updates (including copy cycles); independent retained state | Enabled (`-optimize`) |
+| Unobserved variables | `ErasureCertificate.lean`: proved-total pure deterministic initializations and updates (scalars, records, functions, sets, sequences, conditionals, quantifiers, `EXCEPT`), copy cycles, and iterative pruning of uncertifiable dead dependency cones; independent retained state | Enabled (`-optimize`) |
 | Finite history summary | `HistoryCertificate.lean`: seen-set + prefix-monitor summaries; Boolean hole feedback into guards, retained updates, event values and conditional transfers | Enabled (`-optimize`) |
 | Relative ages | `AgeCertificate.lean`: single logical clock, fixed-domain timestamp maps, keep/reset/erase transfers, capped deadlines, `Decision` trees, and `Test.select` finite/dynamic-bound filters and quantifiers | Enabled (`-optimize`) |
 | Combined age/history | `AgeHistoryCertificate.lean`: one relative-age clock and one finite history over a shared retained core, with `Decision` and `Test.select`/`Test.bind` continuations | Enabled (`-optimize`); falls back to standalone age or history when composition declines |
@@ -54,16 +54,17 @@ negative mutation checks are explicit.
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–6 model values each, product order `<= 720`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`) | Enabled in default mode when `KeyedCertificate` declines and no `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
-| Projection composed with symmetry | `ErasedKeyedCertificate.lean`: unobserved-variable erasure composed with certified keyed symmetry (including disjoint products of full keyed groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed symmetry certifies the retained tuple |
+| Projection composed with symmetry | `ErasedKeyedCertificate.lean` and `ErasedEquivCertificate.lean`: unobserved-variable erasure composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed or equivariant symmetry certifies the retained tuple |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
 State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-arity
 `CONSTANT C <- Def` substitutions are covered across all certified checking projections and
 automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTION_CONSTRAINT`
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
-`ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`, and
-`ErasedKeyedCertificate`; state-only projections (`Field`, `Length`, `History`, `Age`, `AgeHistory`,
-`Ordered`, `Nested`, `Live`) fail closed when action constraints or action properties are present.
+`ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
+`ErasedKeyedCertificate`, and `ErasedEquivCertificate`; state-only projections (`Field`, `Length`,
+`History`, `Age`, `AgeHistory`, `Ordered`, `Nested`, `Live`) fail closed when action constraints
+or action properties are present.
 Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
 builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
@@ -310,36 +311,48 @@ representatives retain their real `tag` values for trace replay.
 
 ### Scope
 
-1. **Literal initialization and total transfers:** omitted variables must initialize to integer
-   (fitting TLC's 32-bit range), Boolean, or string literals, and every next-state binding on each
-   syntactic alternative must be a scalar literal, a whole-variable copy `v' = u` of a defined
-   current-state variable (dead copy cycles stay dead; observing one member retains the cycle), or
-   `UNCHANGED`.
-2. **Single-binding discipline:** conjunction sums binding counts per variable while disjunction,
+1. **Proved-total pure deterministic initializations and updates:** omitted variables may initialize
+   to and be updated by arbitrary pure, unprimed deterministic expressions over structured TLA+
+   values (scalars, records, functions, sets, sequences/tuples, conditionals, finite quantifiers,
+   `EXCEPT`, whole-variable copies including dead copy cycles, and `UNCHANGED`), provided the
+   shared `phase/sym_totality/` gate proves every initialization and branch update total,
+   error-free, and 32-bit overflow-free strictly from `Init`, `Next`, and preceding left-to-right
+   branch guards/bindings (never assuming checked invariants).
+2. **Iterative pruning of uncertifiable cones:** if a dead variable's initialization or update fails
+   totality or single-binding verification, that variable and every variable it transitively reads
+   are promoted back to live and remaining independent unobserved variables are re-checked, so one
+   partial or unbounded auxiliary variable never blocks erasing independent ghost state.
+3. **Single-binding discipline:** conjunction sums binding counts per variable while disjunction,
    `IF`, and `CASE` take the maximum, requiring at most one binding on every syntactic alternative.
    This rules out implicit equality guards such as `UNCHANGED tag /\ tag' = "idle"` that test old
    values without reading them syntactically.
-3. **Closed live cone:** guards, quantifier bounds, invariants, and retained updates seed and close
-   the live set across resolved calls, `LET` helpers, and conservatively scanned higher-order
-   operator actuals (including by-name and captured reads). Primed occurrences outside recognized
-   assignments count as reads.
+4. **Closed live cone:** guards, quantifier bounds, invariants, constraints, action properties, and
+   retained updates seed and close the live set across resolved calls, `LET` helpers, and
+   conservatively scanned higher-order operator actuals (including by-name and captured reads).
+   Primed occurrences outside recognized assignments count as reads.
 
 ### Lowered Rule & Lean Certificate
 
-`phase/erasure.rs` splits concrete state into retained core `C` and hidden tuple `Hidden H`, emitting
-every hidden variable's literal, retained-copy, or hidden-copy/frame transfer per normalized branch.
-Retained guards, updates, and observations are parameterized solely over `C` and branch-local
-witnesses. `ErasureCertificate.lean` proves hidden updates are total and unconstrained, constructs
-initialization and successor correspondence from every hidden representative, and discharges safety,
-stuttering safety, counterexample lifting, and deadlock preservation.
+`phase/erasure.rs` splits concrete state into retained core `C` and hidden tuple `Hidden H`,
+emitting each hidden variable's literal, retained-copy, hidden-copy/frame, or proved-total
+expression (`initExpr` / `updateExpr`) transfer per normalized branch. Retained guards, updates,
+and observations are parameterized solely over `C` and branch-local witnesses.
+`ErasureCertificate.lean` proves hidden updates are total and unconstrained, constructs
+initialization and successor correspondence from every hidden representative, and discharges
+safety, stuttering safety, counterexample lifting, and deadlock preservation. When automatic
+symmetry is also active, `phase/keyed/erasure.rs` (`ErasedKeyedCertificate.lean`) or fallback
+`phase/equiv_sym/` (`ErasedEquivCertificate.lean`) composes the same erasure projection with
+symmetry over the retained variable tuple.
 
 ### Refusals & Trusted Computing Base (TCB)
 
-- **Refusals:** non-literal hidden initializations, unknown or multi-binding hidden updates,
+- **Refusals:** partial, overflowing, empty-domain, primed-RHS, or multi-binding hidden updates,
   observable builtin effects, unresolved operator constants, recursive action expansion, read-scan
-  traversal above 100,000 nodes or depth 128, and observations outside invariants/deadlock.
-- **TCB:** HIR dependency and single-binding analysis, branch normalization, universal leaf
-  interpretation of retained HIR, and runtime `VIEW` fingerprinting.
+  traversal above 100,000 nodes or depth 128, and observations outside invariants/deadlock/supported
+  constraints and action properties.
+- **TCB:** HIR dependency and single-binding analysis, branch normalization, `sym_totality`
+  totality/overflow verification, universal leaf interpretation of retained HIR, and runtime `VIEW`
+  fingerprinting.
 
 ## Finite history projection
 

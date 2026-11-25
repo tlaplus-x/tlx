@@ -2,7 +2,7 @@
 
 use tlx_front::cfg::ConstBinding;
 use tlx_sema::hir::*;
-use tlx_value::{ops, Value};
+use tlx_value::Value;
 
 use crate::{env::Env, error::EResult, eval::Ctx};
 
@@ -154,6 +154,18 @@ impl InterpModel {
     pub(super) fn projected_value(&self, view: &Expr, values: &[Value], level: u32) -> EResult<Value> {
         if let Some(plan) = &self.ordered_projection {
             super::ordered::project(plan, values)
+        } else if let ExprKind::Tuple(es) = &*view.kind {
+            if es.iter().all(|e| matches!(&*e.kind, ExprKind::Var(_))) {
+                let parts: Vec<Value> = es
+                    .iter()
+                    .map(|e| match &*e.kind {
+                        ExprKind::Var(v) => values[v.idx()].clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                return Ok(Value::tuple(parts));
+            }
+            Ok(self.ip.eval(view, &Env::default(), &Ctx::state(values, level))?.normalize()?)
         } else {
             Ok(self.ip.eval(view, &Env::default(), &Ctx::state(values, level))?.normalize()?)
         }
@@ -172,14 +184,62 @@ impl InterpModel {
     /// which permutation represents its orbit. Internal sentinels may have
     /// different types from retained values; use the total structural order.
     pub(super) fn projected_orbit(&self, projected: Value) -> EResult<Value> {
-        let mut least = projected.clone();
-        for permutation in &self.symmetry {
-            let image = ops::permute(&projected, &|s| permutation.get(&s).cloned())?;
-            if tlx_value::order::try_total_cmp(&image, &least)?.is_lt() {
-                least = image;
+        let mut least: Option<Value> = None;
+        for permutation in &self.group.perms {
+            let Some(image) = permutation.apply(&projected)? else {
+                continue;
+            };
+            let current = least.as_ref().unwrap_or(&projected);
+            if tlx_value::order::try_total_cmp(&image, current)?.is_lt() {
+                least = Some(image);
             }
         }
-        Ok(least)
+        Ok(least.unwrap_or(projected))
+    }
+
+    /// Fast fingerprint for projected symmetry when `view` is a pure tuple of
+    /// retained state variables: compares permutations in-place via
+    /// `Group::least_perm` (building only the winning permutation's image) and
+    /// falls back to `projected_orbit` if TLC comparison encounters mixed types.
+    pub(super) fn projected_orbit_fp(&self, view: &Expr, vals: &[Value], level: u32) -> EResult<u64> {
+        if self.ordered_projection.is_none() {
+            if let ExprKind::Tuple(es) = &*view.kind {
+                if !es.is_empty() && es.iter().all(|e| matches!(&*e.kind, ExprKind::Var(_))) {
+                    let retained: Vec<Value> = es
+                        .iter()
+                        .map(|e| match &*e.kind {
+                            ExprKind::Var(v) => vals[v.idx()].clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let order: Vec<usize> = (0..retained.len()).collect();
+                    if let Ok(opt_p) = self.group.least_perm(&mut super::symmetry::StateVals::Given(&retained), &order) {
+                        let mut fps = Vec::with_capacity(retained.len());
+                        match opt_p {
+                            None => {
+                                for v in &retained {
+                                    fps.push(tlx_value::fingerprint::fingerprint(v)?);
+                                }
+                            }
+                            Some(p) => {
+                                let perm = &self.group.perms[p];
+                                for v in &retained {
+                                    let fp = match perm.apply(v)? {
+                                        Some(img) => tlx_value::fingerprint::fingerprint(&img)?,
+                                        None => tlx_value::fingerprint::fingerprint(v)?,
+                                    };
+                                    fps.push(fp);
+                                }
+                            }
+                        }
+                        return super::symmetry::combine_fps(&fps);
+                    }
+                }
+            }
+        }
+        let projected = self.projected_value(view, vals, level)?;
+        let canonical = self.projected_orbit(projected)?;
+        Ok(tlx_value::fingerprint::fingerprint(&canonical)?)
     }
 }
 

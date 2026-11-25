@@ -1,5 +1,5 @@
-//! Structural helpers, `Enumerator::target` preservation wrappers, branch
-//! splitting, and public forward-domain queries backed by [`SymNormalizer`].
+//! Structural helpers, `Enumerator::target` preservation wrappers, and public
+//! forward-domain queries backed by [`SymNormalizer`].
 
 use std::sync::Arc;
 
@@ -8,8 +8,8 @@ use tlx_front::cfg::Config;
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 
 use super::super::{
+    branches_with_if,
     domain::{Atom, Domain, Domains},
-    Branch,
 };
 use super::SymNormalizer;
 
@@ -143,83 +143,6 @@ pub(super) fn expr_syntactically_eq(a: &Expr, b: &Expr) -> bool {
     }
 }
 
-/// Split an action/init expression into disjunctive branches, splitting
-/// top-level `Or`, `And`, `Exists`, and `If` (including desugared `CASE ... OTHER`).
-pub(in crate::optimize::phase) fn split_branches(e: &Expr) -> Option<Vec<Branch>> {
-    fn split(e: &Expr, remaining: &mut usize, depth: usize) -> Option<Vec<Branch>> {
-        if *remaining == 0 || depth >= 128 {
-            return None;
-        }
-        *remaining -= 1;
-        match &*e.kind {
-            ExprKind::Or(es) => {
-                let mut out = Vec::new();
-                for e in es {
-                    out.extend(split(e, remaining, depth + 1)?);
-                    if out.len() > 512 {
-                        return None;
-                    }
-                }
-                Some(out)
-            }
-            ExprKind::And(es) => {
-                let mut out = vec![Branch { bounds: vec![], terms: vec![] }];
-                for e in es {
-                    let alternatives = split(e, remaining, depth + 1)?;
-                    if out.len().saturating_mul(alternatives.len()) > 512 {
-                        return None;
-                    }
-                    let mut combined = Vec::new();
-                    for a in &out {
-                        for b in &alternatives {
-                            if a.terms.len() + b.terms.len() > 512 || a.bounds.len() + b.bounds.len() > 128 {
-                                return None;
-                            }
-                            let mut branch = a.clone();
-                            branch.bounds.extend(b.bounds.iter().cloned());
-                            branch.terms.extend(b.terms.iter().cloned());
-                            combined.push(branch);
-                        }
-                    }
-                    out = combined;
-                }
-                Some(out)
-            }
-            ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
-                let mut out = split(body, remaining, depth + 1)?;
-                for b in &mut out {
-                    if bounds.len() + b.bounds.len() > 128 {
-                        return None;
-                    }
-                    let mut combined = bounds.clone();
-                    combined.append(&mut b.bounds);
-                    b.bounds = combined;
-                }
-                Some(out)
-            }
-            ExprKind::If { cond, then, els } => {
-                let mut left = split(then, remaining, depth + 1)?;
-                let right = split(els, remaining, depth + 1)?;
-                let neg = Expr::new(ExprKind::Builtin { op: B::Not, args: vec![cond.clone()] }, cond.span);
-                for b in &mut left {
-                    b.terms.insert(0, cond.clone());
-                }
-                let mut right = right;
-                for b in &mut right {
-                    b.terms.insert(0, neg.clone());
-                }
-                left.extend(right);
-                if left.len() > 512 {
-                    return None;
-                }
-                Some(left)
-            }
-            _ => Some(vec![Branch { bounds: vec![], terms: vec![e.clone()] }]),
-        }
-    }
-    split(e, &mut 100_000, 0)
-}
-
 /// Normalize `Init` and `Next` and infer forward may-value domains for every
 /// state variable, returning `(var_name, debug_domain)` pairs.
 ///
@@ -229,8 +152,8 @@ pub fn infer_var_domains(program: &Program, cfg: &Config, init: &Expr, next: &Ex
     let mut norm = SymNormalizer::with_config(program, cfg);
     let init_norm = norm.normalize(init)?;
     let next_norm = norm.normalize(next)?;
-    let init_branches = split_branches(&init_norm)?;
-    let next_branches = split_branches(&next_norm)?;
+    let init_branches = branches_with_if(&init_norm)?;
+    let next_branches = branches_with_if(&next_norm)?;
     let domains = Domains::infer(program, cfg, &init_branches, &next_branches)?;
     Some(program.vars.iter().zip(domains.vars.iter()).map(|(v, d)| (v.name.clone(), format_domain(d))).collect())
 }
@@ -242,8 +165,8 @@ pub fn proves_var_membership(program: &Program, cfg: &Config, init: &Expr, next:
     let init_norm = norm.normalize(init)?;
     let next_norm = norm.normalize(next)?;
     let set_norm = norm.normalize(type_set)?;
-    let init_branches = split_branches(&init_norm)?;
-    let next_branches = split_branches(&next_norm)?;
+    let init_branches = branches_with_if(&init_norm)?;
+    let next_branches = branches_with_if(&next_norm)?;
     let domains = Domains::infer(program, cfg, &init_branches, &next_branches)?;
     let dom = domains.vars.get(var.idx())?;
     Some(domains.belongs(dom, &set_norm))

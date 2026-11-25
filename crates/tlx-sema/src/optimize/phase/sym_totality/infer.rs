@@ -121,12 +121,25 @@ impl<'a> TotalityChecker<'a> {
                     self.collect_assignments(o, primed, vars, env, out, steps);
                 }
             }
-            ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
+            ExprKind::Quant { kind: QuantKind::Exists | QuantKind::Forall, bounds, body } => {
                 let mut local_env = env.clone();
                 if !self.bind_quant_bounds(bounds, false, vars, &mut local_env, steps) {
                     return;
                 }
                 self.collect_assignments(body, primed, vars, &local_env, out, steps);
+            }
+            ExprKind::Builtin { op: B::Implies, args } if args.len() == 2 => {
+                // `Enumerator::implies` tests `args[0]` and executes `args[1]` as an action.
+                let mut local_env = env.clone();
+                self.apply_fact_with_vars(&args[0], true, false, vars, &mut local_env);
+                self.collect_assignments(&args[1], primed, vars, &local_env, out, steps);
+            }
+            ExprKind::BoxAction { action, sub } if primed => {
+                self.collect_assignments(action, primed, vars, env, out, steps);
+                self.collect_unchanged(sub, vars, out);
+            }
+            ExprKind::AngleAction { action, .. } if primed => {
+                self.collect_assignments(action, primed, vars, env, out, steps);
             }
             ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 => {
                 if let Some(v) = target_var(&args[0], primed) {
@@ -135,12 +148,16 @@ impl<'a> TotalityChecker<'a> {
                 } else if let Some(v) = target_var(&args[1], primed) {
                     let s = self.infer_expr(&args[0], false, vars, env, steps);
                     out[v.idx()] = cap_shape(join_shape(&out[v.idx()], &s));
+                } else if may_hide_target(&args[0], primed, env) {
+                    out.fill(Shape::Top);
                 }
             }
             ExprKind::Builtin { op: B::In, args } if args.len() == 2 => {
                 if let Some(v) = target_var(&args[0], primed) {
                     let s = self.infer_set_elem(&args[1], false, vars, env, steps);
                     out[v.idx()] = cap_shape(join_shape(&out[v.idx()], &s));
+                } else if may_hide_target(&args[0], primed, env) {
+                    out.fill(Shape::Top);
                 }
             }
             ExprKind::Builtin { op: B::SubsetEq, args } if args.len() == 2 => {
@@ -148,11 +165,24 @@ impl<'a> TotalityChecker<'a> {
                     let (elem, finite, max_card) = self.infer_set_info(&args[1], false, vars, env, steps);
                     let s = if finite { Shape::Set { elem: Box::new(elem), finite: true, max_card } } else { Shape::Top };
                     out[v.idx()] = cap_shape(join_shape(&out[v.idx()], &s));
+                } else if may_hide_target(&args[0], primed, env) {
+                    out.fill(Shape::Top);
                 }
             }
             ExprKind::Builtin { op: B::Unchanged, args } if primed && args.len() == 1 => {
                 self.collect_unchanged(&args[0], vars, out);
             }
+            // Fail closed on remaining action constructs that `Enumerator::go_inner` can execute
+            // to assign variables (`A \cdot B`, unexpanded `LET`/`Apply`, lazy `FnApp`, by-name `Local`).
+            ExprKind::Builtin { op: B::Compose, .. } if primed => out.fill(Shape::Top),
+            ExprKind::Let { .. } | ExprKind::Apply { .. } => out.fill(Shape::Top),
+            ExprKind::FnApp { func, .. }
+                if matches!(&*func.kind, ExprKind::FnConstruct { .. } | ExprKind::Apply { .. } | ExprKind::Let { .. })
+                    || matches!(&*func.kind, ExprKind::Local(l) if !env.locals.contains_key(l)) =>
+            {
+                out.fill(Shape::Top);
+            }
+            ExprKind::Local(l) if !env.locals.contains_key(l) => out.fill(Shape::Top),
             _ => {}
         }
     }
@@ -168,7 +198,24 @@ impl<'a> TotalityChecker<'a> {
             _ => {}
         }
     }
+}
 
+/// True if `lhs` could resolve to an assignment target via `Enumerator::target`
+/// (`Let`, `Apply`, or a by-name `Local`, directly or inside `Prime`).
+fn may_hide_target(lhs: &Expr, primed: bool, env: &CheckEnv) -> bool {
+    let inner = if primed {
+        match &*lhs.kind {
+            ExprKind::Builtin { op: B::Prime, args } if args.len() == 1 => &args[0],
+            _ => lhs,
+        }
+    } else {
+        lhs
+    };
+    matches!(&*inner.kind, ExprKind::Let { .. } | ExprKind::Apply { .. })
+        || matches!(&*inner.kind, ExprKind::Local(l) if !env.locals.contains_key(l))
+}
+
+impl<'a> TotalityChecker<'a> {
     fn bind_quant_bounds(&self, bounds: &[Bound], in_prime: bool, vars: &[Shape], env: &mut CheckEnv, steps: &mut usize) -> bool {
         for b in bounds {
             let elem = self.infer_set_elem(&b.set, in_prime, vars, env, steps);

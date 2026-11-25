@@ -119,6 +119,137 @@ pub fn symmetry_certificate_with_spec(
     norm.attach_const_subst(output::render(program, &groups, &ctx, init, &forms))
 }
 
+/// Generate a connected `ErasedEquivRule` certificate composing unobserved-variable
+/// erasure with recursive equivariant symmetry over the exact retained-variable tuple.
+pub fn symmetry_projection_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[Vec<String>],
+    view: &Expr,
+) -> Option<String> {
+    let (retained, omitted) = super::parse_retained_view(program, view)?;
+    let (groups, all_keys) = validate_groups(groups)?;
+    let const_bindings = collect_const_bindings(program, cfg)?;
+    let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
+    let init_norm = norm.normalize(init)?;
+    let next_norm = norm.normalize(next)?;
+    let owned_spec = spec.try_map(|e| norm.normalize(e))?;
+    let norm_spec = owned_spec.as_spec();
+
+    let const_info = super::sym_totality::collect_const_info(program, cfg);
+    let totality =
+        super::sym_totality::TotalityChecker::with_const_info(program, &groups, &all_keys, const_info, &init_norm, &next_norm, None);
+    if !totality.check_all_with_spec(&init_norm, &next_norm, norm_spec, &omitted) {
+        return None;
+    }
+
+    let init_raw = super::branches_with_if(&init_norm)?;
+    let step_raw = super::branches_with_if(&next_norm)?;
+    if init_raw.is_empty() || step_raw.is_empty() {
+        return None;
+    }
+
+    let mut ctx = lower::LowerCtx::with_retained(program, &groups, &all_keys, &const_bindings, &totality, &retained);
+    let mut hidden_atoms: Vec<String> = Vec::new();
+
+    let mut init_branches = Vec::with_capacity(init_raw.len());
+    for b in &init_raw {
+        let hidden = extract_hidden_transfers(b, &omitted, false, &mut hidden_atoms)?;
+        let (bounds, body) = ctx.lower_erased_branch(b, &omitted, false)?;
+        init_branches.push(output::ErasedBranch { bounds, body, hidden });
+    }
+    let mut step_branches = Vec::with_capacity(step_raw.len());
+    for b in &step_raw {
+        let hidden = extract_hidden_transfers(b, &omitted, true, &mut hidden_atoms)?;
+        let (bounds, body) = ctx.lower_erased_branch(b, &omitted, true)?;
+        step_branches.push(output::ErasedBranch { bounds, body, hidden });
+    }
+
+    let lower_conj = |ctx: &mut lower::LowerCtx<'_>, es: &[Expr], action: bool| -> Option<String> {
+        let mut acc = String::from("(Form.truth true)");
+        for e in es {
+            let f = if action { ctx.lower_action_pred(e)? } else { ctx.lower_form(e, false)? };
+            acc = if acc == "(Form.truth true)" { f } else { format!("(Form.conj {acc} {f})") };
+        }
+        Some(acc)
+    };
+    let obs_form = lower_conj(&mut ctx, norm_spec.invariants, false)?;
+    let init_obs_form = lower_conj(&mut ctx, norm_spec.init_props, false)?;
+    let constraint_form = lower_conj(&mut ctx, norm_spec.constraints, false)?;
+    let action_constraint_form = lower_conj(&mut ctx, norm_spec.action_constraints, true)?;
+    let action_obs_form = lower_conj(&mut ctx, norm_spec.action_props, true)?;
+
+    // Refuse if any group in the product is never referenced by the retained spec.
+    let full_mask: GroupMask = ((1u32 << groups.len()) - 1) as GroupMask;
+    if ctx.used_groups != full_mask {
+        return None;
+    }
+
+    let erased = output::ErasedSpec {
+        retained_count: retained.len(),
+        omitted: &omitted,
+        init_branches: &init_branches,
+        step_branches: &step_branches,
+        hidden_atoms: &hidden_atoms,
+        obs: &obs_form,
+        init_obs: &init_obs_form,
+        constraint: &constraint_form,
+        action_constraint: &action_constraint_form,
+        action_obs: &action_obs_form,
+        constrained: spec.is_constrained(),
+    };
+    norm.attach_const_subst(output::render_erased(&groups, &ctx, init, &erased))
+}
+
+fn extract_hidden_transfers(
+    branch: &super::Branch,
+    omitted: &[VarId],
+    primed: bool,
+    hidden_atoms: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    use super::erasure::{branch_hidden_binding, HiddenBinding};
+    use crate::optimize::lean::literal;
+    let mut out = Vec::with_capacity(omitted.len());
+    for &v in omitted {
+        let bind = branch_hidden_binding(branch, v, primed)?;
+        let term = match bind {
+            HiddenBinding::Unchanged => {
+                let i = omitted.iter().position(|x| *x == v)?;
+                format!("h ⟨{i}, by decide⟩")
+            }
+            HiddenBinding::Assign { rhs, .. } => match &*rhs.kind {
+                ExprKind::Num(n) if i32::try_from(*n).is_ok() => format!("sem.number ({n})"),
+                ExprKind::Str(s) => format!("sem.string {}", literal(s)),
+                ExprKind::Bool(b) => format!("sem.boolean {b}"),
+                ExprKind::Var(u) if primed => {
+                    if let Some(i) = omitted.iter().position(|x| x == u) {
+                        format!("h ⟨{i}, by decide⟩")
+                    } else {
+                        let id = hidden_atoms.len();
+                        hidden_atoms.push(format!("Hidden update expr HIR: {rhs:#?}"));
+                        format!("sem.hiddenUpdate {id} s t ws h")
+                    }
+                }
+                _ if !primed => {
+                    let id = hidden_atoms.len();
+                    hidden_atoms.push(format!("Hidden init expr HIR: {rhs:#?}"));
+                    format!("sem.hiddenSeed {id} s ws")
+                }
+                _ => {
+                    let id = hidden_atoms.len();
+                    hidden_atoms.push(format!("Hidden update expr HIR: {rhs:#?}"));
+                    format!("sem.hiddenUpdate {id} s t ws h")
+                }
+            },
+        };
+        out.push(term);
+    }
+    Some(out)
+}
+
 pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, BTreeSet<Arc<str>>)> {
     if raw.is_empty() || raw.len() > 16 {
         return None;

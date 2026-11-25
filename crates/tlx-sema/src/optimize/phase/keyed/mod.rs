@@ -10,13 +10,12 @@ mod output;
 mod step;
 
 use super::{
-    binding,
     domain::{self, Atom, Domain, Domains, Locals},
     sym_groups::{comparable, group_mask_exact, independent, subst_local, validate_groups, ActionKeyRef, GroupInfo, GroupMask, KeyRef},
     sym_norm::SymNormalizer,
     unchanged, variable, Branch,
 };
-use crate::{builtins::Builtin as B, hir::*, Program};
+use crate::{hir::*, Program};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tlx_front::cfg::Config;
@@ -82,19 +81,6 @@ pub fn symmetry_certificate_with_spec(
     emit(program, cfg, init, next, spec, groups, vec![])
 }
 
-/// Certify erasure followed by symmetry for the exact installed variable tuple.
-pub fn symmetry_projection_certificate(
-    program: &Program,
-    cfg: &Config,
-    init: &Expr,
-    next: &Expr,
-    observations: &[Expr],
-    groups: &[Vec<String>],
-    view: &Expr,
-) -> Option<String> {
-    symmetry_projection_certificate_with_spec(program, cfg, init, next, super::CheckSpec::invariants_only(observations), groups, view)
-}
-
 /// Certify erasure followed by symmetry covering invariants, init properties,
 /// constraints, action constraints, and action properties.
 pub fn symmetry_projection_certificate_with_spec(
@@ -106,15 +92,7 @@ pub fn symmetry_projection_certificate_with_spec(
     groups: &[Vec<String>],
     view: &Expr,
 ) -> Option<String> {
-    let ExprKind::Tuple(values) = &*view.kind else { return None };
-    let retained = values.iter().map(|e| variable(e, false)).collect::<Option<Vec<_>>>()?;
-    if retained.windows(2).any(|pair| pair[0].0 >= pair[1].0) || retained.iter().any(|v| v.idx() >= program.vars.len()) {
-        return None;
-    }
-    let omitted: Vec<_> = (0..program.vars.len()).map(|i| VarId(i as u32)).filter(|v| !retained.contains(v)).collect();
-    if omitted.is_empty() {
-        return None;
-    }
+    let (_, omitted) = super::parse_retained_view(program, view)?;
     emit(program, cfg, init, next, spec, groups, omitted)
 }
 
@@ -133,8 +111,8 @@ fn emit(
     }
     let mut normalize = SymNormalizer::with_config(program, cfg);
     let initial = normalize.normalize(init)?;
-    let init_branches = keyed_branches(&initial)?;
-    let steps = keyed_branches(&normalize.normalize(next)?)?;
+    let init_branches = super::branches_with_if(&initial)?;
+    let steps = super::branches_with_if(&normalize.normalize(next)?)?;
     let norm = spec.try_map(|o| normalize.normalize(o))?;
     let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &init_branches, &steps)?;
@@ -317,80 +295,6 @@ fn classify_var(
         }
         _ => None,
     }
-}
-
-fn keyed_branches(e: &Expr) -> Option<Vec<Branch>> {
-    fn split(e: &Expr, remaining: &mut usize, depth: usize) -> Option<Vec<Branch>> {
-        if *remaining == 0 || depth >= 128 {
-            return None;
-        }
-        *remaining -= 1;
-        match &*e.kind {
-            ExprKind::Or(es) => {
-                let mut out = Vec::new();
-                for e in es {
-                    out.extend(split(e, remaining, depth + 1)?);
-                    if out.len() > 512 {
-                        return None;
-                    }
-                }
-                Some(out)
-            }
-            ExprKind::And(es) => {
-                let mut out = vec![Branch { bounds: vec![], terms: vec![] }];
-                for e in es {
-                    let alternatives = split(e, remaining, depth + 1)?;
-                    if out.len().saturating_mul(alternatives.len()) > 512 {
-                        return None;
-                    }
-                    let mut combined = Vec::new();
-                    for a in &out {
-                        for b in &alternatives {
-                            if a.terms.len() + b.terms.len() > 512 || a.bounds.len() + b.bounds.len() > 128 {
-                                return None;
-                            }
-                            let mut branch = a.clone();
-                            branch.bounds.extend(b.bounds.iter().cloned());
-                            branch.terms.extend(b.terms.iter().cloned());
-                            combined.push(branch);
-                        }
-                    }
-                    out = combined;
-                }
-                Some(out)
-            }
-            ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
-                let mut out = split(body, remaining, depth + 1)?;
-                for b in &mut out {
-                    if bounds.len() + b.bounds.len() > 128 {
-                        return None;
-                    }
-                    let mut combined = bounds.clone();
-                    combined.append(&mut b.bounds);
-                    b.bounds = combined;
-                }
-                Some(out)
-            }
-            ExprKind::If { cond, then, els } => {
-                let mut left = split(then, remaining, depth + 1)?;
-                let mut right = split(els, remaining, depth + 1)?;
-                let neg = Expr::new(ExprKind::Builtin { op: B::Not, args: vec![cond.clone()] }, cond.span);
-                for b in &mut left {
-                    b.terms.insert(0, cond.clone());
-                }
-                for b in &mut right {
-                    b.terms.insert(0, neg.clone());
-                }
-                left.extend(right);
-                if left.len() > 512 {
-                    return None;
-                }
-                Some(left)
-            }
-            _ => Some(vec![Branch { bounds: vec![], terms: vec![e.clone()] }]),
-        }
-    }
-    split(e, &mut 100_000, 0)
 }
 
 fn max_local_in_steps(steps: &[Branch], obs: &[Expr]) -> u32 {

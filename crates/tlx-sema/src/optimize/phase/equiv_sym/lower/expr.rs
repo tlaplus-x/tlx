@@ -27,10 +27,7 @@ impl LowerCtx<'_> {
                 Some(format!("(Expr.atom {id})"))
             }
             ExprKind::Var(v) => {
-                let idx = v.idx();
-                if idx >= self.program.vars.len() {
-                    return None;
-                }
+                let idx = self.var_lean_idx(*v)?;
                 if in_prime {
                     Some(format!("(Expr.primeVar ⟨{idx}, by decide⟩)"))
                 } else {
@@ -54,6 +51,11 @@ impl LowerCtx<'_> {
                 Some(format!("(Expr.seqLit [{}])", items.join(", ")))
             }
             ExprKind::SetEnum(es) => {
+                if let Some(cfg_set) = self.try_const_set_enum(es) {
+                    if self.try_group_set(&cfg_set).is_some_and(|(mask, _)| mask != 0) {
+                        return self.lower_cfg_value(&cfg_set);
+                    }
+                }
                 let items: Vec<_> = es.iter().map(|x| self.lower_expr_rec(x, allow_prime, in_prime)).collect::<Option<_>>()?;
                 Some(format!("(Expr.setEnum [{}])", items.join(", ")))
             }
@@ -540,6 +542,15 @@ impl LowerCtx<'_> {
         } else {
             self.charge(format!("(Expr.union {mapped})"))
         }
+    }
+
+    pub(super) fn try_const_set_enum(&self, es: &[Expr]) -> Option<CfgValue> {
+        let mut vals = Vec::with_capacity(es.len());
+        for e in es {
+            let ExprKind::Const(cid) = &*e.kind else { return None };
+            vals.push((*self.consts.get(cid)?).clone());
+        }
+        Some(CfgValue::Set(vals))
     }
 
     pub(super) fn try_group_set<'b>(&self, val: &'b CfgValue) -> Option<(GroupMask, Vec<&'b CfgValue>)> {
