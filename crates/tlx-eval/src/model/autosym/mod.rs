@@ -155,7 +155,7 @@ pub fn candidates(ip: &Arc<Interp>) -> Vec<Candidate> {
 
 /// The model values the declared SYMMETRY moves.
 fn declared_support(model: &InterpModel) -> HashSet<Sym> {
-    let mut out: HashSet<Sym> = model.symmetry.iter().flat_map(|p| p.keys().copied()).collect();
+    let mut out = model.group.moved_syms();
     if !out.is_empty() {
         return out;
     }
