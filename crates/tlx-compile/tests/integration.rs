@@ -37,6 +37,7 @@ mod set_family;
 mod structural_member;
 mod union_construction;
 mod union_of_ranges;
+mod union_record_except_lowering;
 mod union_scalar_fields;
 mod volatile;
 
@@ -75,6 +76,7 @@ fn all_test_files_registered() {
         "structural_member",
         "union_construction",
         "union_of_ranges",
+        "union_record_except_lowering",
         "union_scalar_fields",
         "value_store_runs",
         "value_store_switch",

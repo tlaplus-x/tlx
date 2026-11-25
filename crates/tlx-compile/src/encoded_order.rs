@@ -96,6 +96,8 @@ fn model_union(arms: &[Shape]) -> bool {
 enum Part<'a> {
     /// A single `u64` word of packed MSB-first scalars (compared directly via `WORDS`).
     PackedWord,
+    /// A single `u64` word holding a scalar presence bitset (compared via `SET`).
+    SetWord,
     /// A word-aligned child shape.
     Shape(&'a Shape),
 }
@@ -123,6 +125,22 @@ fn node_parts(s: &Shape) -> Option<(u64, Vec<Part<'_>>)> {
         Shape::Fcn { dom, range, witness, key_variants } if *witness != tlx_layout::FcnWitness::Dynamic && key_variants.is_empty() => {
             (PRODUCT, product_parts(std::iter::repeat_n(&**range, dom.len())))
         }
+        // A map over a small scalar key universe (1 presence bitset word)
+        // without a trailing dynamic witness word: TLC compares domain
+        // cardinality then sorted keys (`SET` on word 0), then values in key
+        // order (absent slots are zero in both operands, so `product_parts`
+        // compares present slots in ascending key order).
+        Shape::Map { key, range, witness }
+            if *witness != tlx_layout::FcnWitness::Dynamic
+                && key.is_scalar()
+                && layout::bitset_universe(key).is_some_and(|n| (1..=64).contains(&n)) =>
+        {
+            let n = layout::bitset_universe(key).unwrap() as usize;
+            let mut parts = Vec::with_capacity(1 + n);
+            parts.push(Part::SetWord);
+            parts.extend(product_parts(std::iter::repeat_n(&**range, n)));
+            (PRODUCT, parts)
+        }
         Shape::Union(arms) if homogeneous(arms) || model_union(arms) => (UNION, arms.iter().map(Part::Shape).collect()),
         _ => return None,
     })
@@ -135,6 +153,10 @@ pub(crate) fn plan(s: &Shape) -> Option<Arc<[u64]>> {
         match p {
             Part::PackedWord => {
                 out.extend([WORDS, 1, HEADER as u64, 0]);
+                Some(())
+            }
+            Part::SetWord => {
+                out.extend([SET, 1, HEADER as u64, 0]);
                 Some(())
             }
             Part::Shape(s) => {
@@ -168,6 +190,7 @@ impl<'a> CheckedPlan<'a> {
             let plan = plan.get(..span).filter(|_| span >= HEADER).ok_or("ordered iteration plan length mismatch")?;
             let (opcode, expected_width, children) = match part {
                 Part::PackedWord => (WORDS, 1usize, Vec::new()),
+                Part::SetWord => (SET, 1usize, Vec::new()),
                 Part::Shape(shape) => {
                     let (op, ch) = node_parts(shape).ok_or("ordered iteration shape has no ordering plan")?;
                     (op, layout::words(shape), ch)
@@ -434,6 +457,42 @@ mod tests {
         assert!(!order_safe(&shape));
         assert_eq!(layout::words(&shape), 3);
         assert_plan_matches_tlc(&shape);
+    }
+
+    #[test]
+    fn maps_and_record_unions_with_maps_follow_tlc_order() {
+        let int_map = Shape::Map {
+            key: Box::new(Shape::Int { lo: 1, hi: 3 }),
+            range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+            witness: tlx_layout::FcnWitness::Enumerated,
+        };
+        assert!(!order_safe(&int_map));
+        assert_plan_matches_tlc(&int_map);
+
+        // Map with a non-order_safe range (bitset) and atom keys.
+        let atoms = Shape::Atom(Arc::from(vec![Value::model_value("a"), Value::model_value("b")]));
+        let set_range = Shape::Set { elem: Box::new(Shape::Int { lo: 1, hi: 2 }), max_card: 2 };
+        let set_map = Shape::Map { key: Box::new(atoms.clone()), range: Box::new(set_range), witness: tlx_layout::FcnWitness::Enumerated };
+        assert_plan_matches_tlc(&set_map);
+
+        // Union of records where one arm carries a Map (Kafka message union pattern).
+        let msg_a =
+            Shape::Record(Arc::from(vec![(Sym::new("dest"), Shape::Int { lo: 1, hi: 2 }), (Sym::new("tag"), Shape::Int { lo: 0, hi: 0 })]));
+        let msg_b = Shape::Record(Arc::from(vec![
+            (Sym::new("dest"), atoms),
+            (Sym::new("epochs"), int_map),
+            (Sym::new("tag"), Shape::Int { lo: 1, hi: 1 }),
+        ]));
+        let union = Shape::Union(Arc::from(vec![msg_a, msg_b]));
+        assert_plan_matches_tlc(&union);
+
+        // Dynamic-witness maps stay boxed (trailing witness word must not affect order).
+        let dyn_map = Shape::Map {
+            key: Box::new(Shape::Int { lo: 1, hi: 2 }),
+            range: Box::new(Shape::Int { lo: 0, hi: 1 }),
+            witness: tlx_layout::FcnWitness::Dynamic,
+        };
+        assert!(plan(&dyn_map).is_none());
     }
 
     #[test]

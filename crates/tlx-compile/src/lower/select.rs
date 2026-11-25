@@ -118,34 +118,42 @@ impl Lowerer<'_> {
                 .collect();
             return Some(Expr::new(Ty::Int, ExprKind::UnionFieldInt { base: r, entries: entries.into() }));
         }
-        self.union_field_universe(r, arms.len(), &found)
+        self.union_field_joined(r, arms.len(), &found)
     }
 
-    /// `r.f` for a union of records whose arms store the field as an atom of
-    /// a *per-arm* universe: the layout gives each arm a universe as wide as
-    /// the atoms seen in that arm, so the same field arrives in as many
-    /// encodings as there are arms. Re-encode each arm's slot into the union
-    /// of those universes, which keeps the field encoded: a comparison or a
-    /// function application on it is then native, while the boxed `ValField`
-    /// fallback decodes the whole record and puts both back in the host
-    /// (the widest interpreter region of the Raft models).
-    fn union_field_universe(&mut self, r: Expr, arms: usize, found: &[Option<(FieldLoc, Shape)>]) -> Option<Expr> {
-        let mut univ: Vec<Value> = Vec::new();
-        for (_, s) in found.iter().flatten() {
-            match s {
-                Shape::Atom(u) => univ.extend(u.iter().cloned()),
-                _ => return None,
-            }
-        }
-        // One kind of atom only: model values and strings are each ordered
-        // by their symbol, but the two are not comparable with one another.
-        let model_values = univ.iter().all(|v| matches!(v, Value::ModelValue(_)));
-        if !model_values && !univ.iter().all(|v| matches!(v, Value::Str(_))) {
+    /// `r.f` for a union of records whose arms store the field with different
+    /// shapes (e.g. per-arm atom universes, `Int` in one arm and
+    /// `Union([Int, Atom])` in another, `Int` in some arms and `Atom` in
+    /// others, or sets/records of differing arm shapes): coerce each arm's
+    /// slot into the joined field shape and dispatch on the union tag.
+    /// Keeps the field encoded so downstream comparisons, applications,
+    /// `EXCEPT`s, and record literals stay native instead of cascading into
+    /// boxed `ValField` / `ValOp` / `Interp` host regions.
+    fn union_field_joined(&mut self, r: Expr, arms: usize, found: &[Option<(FieldLoc, Shape)>]) -> Option<Expr> {
+        const MAX_ARMS: usize = 32;
+        if arms > MAX_ARMS {
             return None;
         }
-        univ.sort();
-        univ.dedup();
-        let tsid = self.sid(&Shape::Atom(univ.into()));
+        let mut joined = Shape::Never;
+        for (_, s) in found.iter().flatten() {
+            joined = joined.join(s);
+        }
+        if matches!(joined, Shape::Dyn | Shape::Never | Shape::Ref(_))
+            || has_dyn_or_ref(&joined)
+            || tlx_layout::layout::words(&joined) > 4096
+        {
+            return None;
+        }
+        // Intern union arms before the union itself so `union_int` /
+        // `union_int_eq` (which use read-only `Typing::lookup`) always find
+        // every arm shape.
+        if let Shape::Union(u_arms) = &joined {
+            for a in u_arms.iter() {
+                self.sid(a);
+            }
+        }
+        let tsid = self.sid(&joined);
+        let mark = self.frame.snapshot();
         let (base, bind) = self.share(r);
         let tag = self.int_word(base.clone(), 0, arms as i64 - 1);
         let mut x = Expr::new(Ty::Enc(tsid), ExprKind::Fail("arm of a record union without the field".into()));
@@ -153,7 +161,18 @@ impl Lowerer<'_> {
             let Some((loc, shape)) = entry else { continue };
             let ssid = self.sid(shape);
             let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: base.clone(), loc: loc.offset_words(1) });
-            let value = if ssid == tsid { slot } else { self.recode(&slot, tsid)? };
+            let value = if ssid == tsid {
+                slot
+            } else if let Some(wrapped) = self.union_arm_coerce(&slot, tsid) {
+                wrapped
+            } else {
+                let c = self.coerce_enc(slot, tsid);
+                if c.ty != Ty::Enc(tsid) || matches!(&*c.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Enc(_) | Ty::Val)) {
+                    self.frame.restore(mark);
+                    return None;
+                }
+                c
+            };
             x = Expr::new(Ty::Enc(tsid), ExprKind::If(eq(tag.clone(), int_lit(i as i64)), value, x));
         }
         Some(let_in(bind, x))
@@ -167,7 +186,9 @@ impl Lowerer<'_> {
         if let Some((c, cenv)) = self.literal_component(func, arg, env) {
             return self.expr(&c, &cenv, st);
         }
+        let prev_lazy = std::mem::replace(&mut self.keep_lazy, true);
         let f = self.expr(func, env, st);
+        self.keep_lazy = prev_lazy;
         let f = self.encode_const_fn(f);
         if self.is_ref(f.ty) {
             let k = self.ref_expr(arg, env, st);
@@ -586,14 +607,19 @@ impl Lowerer<'_> {
     pub(super) fn except_path(&mut self, b: Expr, keys: &[hir::ExceptKey], val: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         let Ty::Enc(bsid) = b.ty else { return None };
         if keys.is_empty() {
-            if !self.preserves_lazy_into(val, env, self.typing.shape(bsid), sets::EAGER_DEPTH) {
-                return None;
-            }
-            // `@` is the old value of the selected slot.
+            // `@` is the old value of the selected slot. Bind `self.at` before
+            // checking `preserves_lazy_into` so `@` (e.g. `@ \o append_records`)
+            // sees the slot's encoding.
             let saved = self.at.replace(b);
-            let v = self.expr_into(val, env, st, bsid);
+            let ok = self.preserves_lazy_into(val, env, self.typing.shape(bsid), sets::EAGER_DEPTH);
+            let out = if ok {
+                let v = self.expr_into(val, env, st, bsid);
+                Some(self.coerce_enc(v, bsid))
+            } else {
+                None
+            };
             self.at = saved;
-            return Some(self.coerce_enc(v, bsid));
+            return out;
         }
         // Bind the base (and a computed key) once: both are used twice.
         let (b, bind_b) = self.share(b);
@@ -682,6 +708,15 @@ impl Lowerer<'_> {
     /// old value at the slot `key` selects.
     fn except_at(&mut self, b: Expr, key: Expr, keys: &[hir::ExceptKey], val: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         let Ty::Enc(bsid) = b.ty else { return None };
+        // A union key (e.g. `Int | Atom`) on an enumerated/dynamic `Fcn` may
+        // carry a non-integer value that TLC leaves unchanged rather than
+        // rejecting as a non-integral index; only `Tuple` / interval `Fcn`
+        // reject non-integers like `as_int` (`union_int`) does.
+        if matches!(self.shape_of(key.ty), Some(Shape::Union(_)))
+            && matches!(self.shape_of(b.ty), Some(Shape::Fcn { witness, .. }) if *witness != tlx_layout::FcnWitness::Interval)
+        {
+            return None;
+        }
         let (key, bind_k) = self.share(key);
         let (sel, elem_sid) = self.select(&b, &key)?;
         // `ExceptIndex` with `IndexMap::Table` leaves `b` unchanged on `-1`:
@@ -1105,14 +1140,26 @@ impl Lowerer<'_> {
                 if let (Some(Shape::Seq { elem: ea, max_len: ma }), Some(Shape::Seq { elem: eb, max_len: mb })) =
                     (self.shape_of(sa.ty).cloned(), self.shape_of(sb.ty).cloned())
                 {
-                    if ea == eb {
+                    let ej = if ea == eb { (*ea).clone() } else { ea.join(&eb) };
+                    if !matches!(ej, Shape::Dyn | Shape::Never | Shape::Ref(_)) && !has_dyn_or_ref(&ej) {
+                        if let Shape::Union(arms) = &ej {
+                            for arm in arms.iter() {
+                                self.sid(arm);
+                            }
+                        }
                         // Room for both operands.
                         let max_len = ma + mb;
-                        let sid = self.sid(&Shape::Seq { elem: ea.clone(), max_len });
+                        let sid = self.sid(&Shape::Seq { elem: Box::new(ej.clone()), max_len });
+                        let mark = self.frame.snapshot();
                         let (a2, b2) = (self.coerce_enc(sa, sid), self.coerce_enc(sb, sid));
-                        self.sid(&ea);
-                        let slot = SlotLayout::of(&ea);
-                        return Expr::new(Ty::Enc(sid), ExprKind::SeqConcat { a: a2, b: b2, slot, max_len: max_len as u32 });
+                        let ok = !matches!(&*a2.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Enc(_) | Ty::Val))
+                            && !matches!(&*b2.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Enc(_) | Ty::Val));
+                        if ok {
+                            self.sid(&ej);
+                            let slot = SlotLayout::of(&ej);
+                            return Expr::new(Ty::Enc(sid), ExprKind::SeqConcat { a: a2, b: b2, slot, max_len: max_len as u32 });
+                        }
+                        self.frame.restore(mark);
                     }
                 }
             }
@@ -1140,4 +1187,12 @@ impl Lowerer<'_> {
         let x = self.expr(x, env, st);
         self.val_op(B::Append, vec![s, x])
     }
+}
+
+fn has_dyn_or_ref(s: &Shape) -> bool {
+    let mut found = matches!(s, Shape::Dyn | Shape::Ref(_));
+    if !found {
+        s.for_each_child(|c| found |= has_dyn_or_ref(c));
+    }
+    found
 }

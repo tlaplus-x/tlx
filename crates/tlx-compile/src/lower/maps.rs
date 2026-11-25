@@ -184,8 +184,11 @@ impl Lowerer<'_> {
         } else {
             self.expr(&b.set, env, st)
         };
-        // The order only matters for errors, which the interpreter reports.
-        let (src, ety) = self.typed_iter_in(s, true);
+        // Preserve TLC iteration order whenever the body may create strings
+        // or perform volatile effects; otherwise order only matters for
+        // errors, which the interpreter reports.
+        let pure = !self.volatile_expr(body, env) && !self.expr_makes_strings(body, env);
+        let (src, ety) = self.typed_iter_in(s, pure);
         if !src.is_typed_source() {
             return None;
         }
