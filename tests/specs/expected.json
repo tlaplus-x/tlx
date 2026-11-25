@@ -2043,6 +2043,30 @@
   "result": "success",
   "violated": null
  },
+ "PH4": {
+  "depth": 1,
+  "distinct": 1,
+  "exit": 0,
+  "generated": 2,
+  "result": "success",
+  "violated": null
+ },
+ "PH5": {
+  "depth": 1,
+  "distinct": 1,
+  "exit": 75,
+  "generated": 1,
+  "result": "error",
+  "violated": null
+ },
+ "PH6": {
+  "depth": 1,
+  "distinct": 1,
+  "exit": 0,
+  "generated": 2,
+  "result": "success",
+  "violated": null
+ },
  "ParallelDeadlockDepth": {
   "depth": 3,
   "distinct": 192,

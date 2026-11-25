@@ -58,6 +58,7 @@ pub fn makes_strings(op: B) -> bool {
             | B::Concat
             | B::Tail
             | B::SubSeq
+            | B::ReplaceAllSubSeqs
             | B::ToJson
             | B::ToJsonArray
             | B::ToJsonObject

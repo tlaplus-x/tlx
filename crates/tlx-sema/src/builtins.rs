@@ -202,6 +202,9 @@ builtins! {
         FoldRightDomain = "SequencesExt" "FoldRightDomain" / 3 [Pure, Never, Arguments::Operator(1)],
         // SequencesExt.java (Java overrides that differ from the TLA+ definition).
         AllSubSeqs = "SequencesExt" "AllSubSeqs" / 1 [Pure, Never, Arguments::Values],
+        // SequencesExt.java `replaceAllSubSeq` (an `@Evaluation` override,
+        // with TLC's string algorithm for three strings).
+        ReplaceAllSubSeqs = "SequencesExt" "ReplaceAllSubSeqs" / 3 [Pure, Sequence, Arguments::Values],
         SelectInSubSeq = "SequencesExt" "SelectInSubSeq" / 4 [Pure, Never, Arguments::Operator(8)],
         SelectLastInSubSeq = "SequencesExt" "SelectLastInSubSeq" / 4 [Pure, Never, Arguments::Operator(8)],
         SetToSeq = "SequencesExt" "SetToSeq" / 1 [Pure, Never, Arguments::Values],
@@ -218,6 +221,9 @@ builtins! {
         // Statistics.java (an Apache Commons Math Chi-square goodness of fit
         // test); the module's own definition is `TRUE`.
         ChiSquare = "Statistics" "ChiSquare" / 3 [Pure, Never, Arguments::Values],
+        // Combinatorics.java `chse` (the module's `choose` definition goes
+        // through `factorial`, which overflows from 13! on).
+        Choose = "Combinatorics" "choose" / 2 [Pure, Never, Arguments::Values],
     }
     // Definitions whose `.tla` body is only a placeholder (`TRUE`, a constant
     // record, a bounded CHOOSE) while TLC evaluates them in Java. tlx does not
@@ -315,6 +321,7 @@ mod metadata_tests;
 pub const COMMUNITY_NATIVE_MODULES: &[&str] = &[
     "BagsExt",
     "CSV",
+    "Combinatorics",
     "DyadicRationals",
     "FiniteSetsExt",
     "Folds",
