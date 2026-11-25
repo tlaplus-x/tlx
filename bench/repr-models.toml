@@ -84,6 +84,11 @@ cfg = "bench/repr-configs/Zab.cfg"
 changes = { MaxTransactionNum = 1, MaxRestarts = 0, MaxTimeoutFailures = 0 }
 wrapper = "bench/repr-configs/ReprZab.tla"
 
+["bench/ReprEtcdRaft"]
+source = "ext/etcd-raft/MCetcdraft_3s_t2"
+cfg = "bench/repr-configs/EtcdRaft.cfg"
+changes = { MaxTermLimit = 1, RequestLimit = 1, ReconfigurationLimit = 0 }
+
 ["bench/ReprPaxosCommit"]
 source = "transaction_commit/PaxosCommit"
 cfg = "bench/repr-configs/ReprPaxosCommit.cfg"

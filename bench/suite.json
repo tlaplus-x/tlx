@@ -4642,6 +4642,28 @@
    }
   },
   {
+   "id": "ext/etcd-raft/Traceetcdraft",
+   "size": "medium",
+   "timeout_s": 300,
+   "category": [
+    "external",
+    "trace-validation"
+   ],
+   "runs": [
+    {
+     "mode": "default",
+     "workers": 1
+    },
+    {
+     "mode": "compile",
+     "workers": 1
+    }
+   ],
+   "expect": {
+    "source": "unpinned"
+   }
+  },
+  {
    "id": "ext/ccf/MCMultiNodeReads",
    "size": "large",
    "runs": [
@@ -4658,6 +4680,10 @@
      "args": [
       "-tlc"
      ]
+    },
+    {
+     "mode": "default",
+     "workers": 1
     }
    ],
    "timeout_s": 600,
@@ -4688,6 +4714,10 @@
      "args": [
       "-tlc"
      ]
+    },
+    {
+     "mode": "default",
+     "workers": 1
     }
    ],
    "timeout_s": 600,
@@ -4719,6 +4749,10 @@
      "args": [
       "-tlc"
      ]
+    },
+    {
+     "mode": "default",
+     "workers": 1
     }
    ],
    "expect": {
@@ -4746,6 +4780,10 @@
      "args": [
       "-tlc"
      ]
+    },
+    {
+     "mode": "default",
+     "workers": 1
     }
    ],
    "timeout_s": 600,
@@ -4758,6 +4796,374 @@
     "depth": 66
    },
    "tlc_1w_s": 743.53
+  },
+  {
+   "id": "ext/etcd-raft/MCetcdraft_3s_t2",
+   "size": "medium",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 600,
+   "note": "etcd Raft exhaustive model; non-equivariant SYMMETRY: counts exact at 1 worker only",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/etcd-raft/MCetcdraft_4s_t3_reconfig",
+   "size": "huge",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "etcd Raft exhaustive model with reconfiguration; non-equivariant SYMMETRY: counts exact at 1 worker only",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/alpha-zk/MC_tlx_Zab_new_big",
+   "size": "huge",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "ZooKeeper Zab, 2 restarts",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/mongo/MCOrderedTicketSemaphore",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "MongoDB ordered ticket semaphore",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/mongo/MCRangeDeletionsSecondaryNodes",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "MongoDB range deletions on secondary nodes",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/logless-reconfig/MCMongoStaticRaft",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "MongoDB logless reconfiguration: static Raft",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/logless-reconfig/MCMongoLoglessDynamicRaft",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "MongoDB logless reconfiguration: logless dynamic Raft",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/logless-reconfig/MCMongoRaftReconfig",
+   "size": "medium",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 600,
+   "note": "MongoDB Raft reconfiguration",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/elastic/Storage",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "Elasticsearch storage",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/elastic/consensus",
+   "size": "large",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "Elasticsearch cluster consensus",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/vanlightly-kafka/consumer_group_protocol_kip_848_v2",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "Kafka consumer group protocol (KIP-848)",
+   "expect": {
+    "result": "deadlock",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/vanlightly-kafka/kraft_kip_853_small",
+   "size": "large",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "Kafka KRaft (KIP-853), small bounds",
+   "expect": {
+    "result": "deadlock",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/vanlightly-bookkeeper/LedgerChaining",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "BookKeeper ledger chaining",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/paxosstore/TPaxos_p2_v2_n2",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "PaxosStore TPaxos",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
   },
   {
    "id": "bench/ReprRaft",
@@ -5109,6 +5515,28 @@
    ],
    "timeout_s": 120,
    "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "representation"
+   ],
+   "note": "Fixed reduced representation comparison; see bench/repr-models.toml for its original configuration."
+  },
+  {
+   "id": "bench/ReprEtcdRaft",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    }
+   ],
+   "timeout_s": 120,
+   "expect": {
+    "result": "success",
     "source": "unpinned"
    },
    "category": [
