@@ -46,11 +46,11 @@ negative mutation checks are explicit.
 | Finite history summary | `HistoryCertificate.lean`: seen-set + prefix-monitor summaries; Boolean hole feedback into guards, retained updates, event values and conditional transfers | Enabled (`-optimize`) |
 | Relative ages | `AgeCertificate.lean`: single logical clock, fixed-domain timestamp maps, keep/reset/erase transfers, capped deadlines, `Decision` trees, and `Test.select` finite/dynamic-bound filters and quantifiers | Enabled (`-optimize`) |
 | Combined age/history | `AgeHistoryCertificate.lean`: one relative-age clock and one finite history over a shared retained core, with `Decision` and `Test.select`/`Test.bind` continuations | Enabled (`-optimize`); falls back to standalone age or history when composition declines |
-| Ordered allocation | `OrderedCertificate.lean`: one scalar frontier, retained initial anchor, literal nonnegative increments, and rank-key equivalence | Enabled (`-optimize`) |
-| Nested ordered allocation | `NestedCertificate.lean` + `NestedRank.lean`: multiple independent frontier families across fixed records, tuples and finite-domain maps | Enabled (`-optimize`) |
-| Immutable live versions | `LiveCertificate.lean`: singleton-seeded append-only version table with explicit live-root payload feedback and ranked-table key equivalence | Enabled (`-optimize`) |
+| Ordered allocation | `OrderedCertificate.lean`: one scalar frontier, retained initial anchor, literal nonnegative increments, rank-key equivalence, and constrained action checks over retained core state | Enabled (`-optimize`) |
+| Nested ordered allocation | `NestedCertificate.lean` + `NestedRank.lean`: multiple independent frontier families across fixed records, tuples and finite-domain maps, with constrained action checks over retained core state | Enabled (`-optimize`) |
+| Immutable live versions | `LiveCertificate.lean`: singleton-seeded append-only version table with explicit live-root payload feedback, ranked-table key equivalence, and constrained action checks over retained core state | Enabled (`-optimize`) |
 | Sequence length | `LengthCertificate.lean`: multiple sequences, tuple/copy/append/conditional transfers, and current-length feedback | Enabled (`-optimize`) |
-| Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records or fixed-domain maps, masked reads, and kernel-checked (`decide`) liveness tables | Enabled (`-optimize`) |
+| Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records or fixed-domain maps, masked reads, kernel-checked (`decide`) liveness tables, and constrained action checks over both endpoints' retained phases and observed values | Enabled (`-optimize`) |
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–6 model values each, product order `<= 720`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
@@ -62,9 +62,13 @@ State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-
 automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTION_CONSTRAINT`
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
-`ErasedKeyedCertificate`, and `ErasedEquivCertificate`; state-only projections (`Field`, `Length`,
-`History`, `Age`, `AgeHistory`, `Ordered`, `Nested`, `Live`) fail closed when action constraints
-or action properties are present.
+`ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `OrderedCertificate`,
+`NestedCertificate`, and `LiveCertificate` when every action check factors through the retained
+representative. `Field` certifies checks whose unprimed and primed field reads are recorded, and
+records each such field as globally observed so its value survives at both endpoints. `Ordered`,
+`Nested`, and `Live` certify checks that read only retained core state, refusing any read of a
+projected allocation magnitude, rank pattern, or live-version table. `Length`, `History`, `Age`, and
+`AgeHistory` still fail closed when action constraints or action properties are present.
 Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
 builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
@@ -74,7 +78,23 @@ When `-optimize` runs, `InterpModel::project_state` tries projection families in
 unobserved variables, relative ages (including combined age/history), standalone finite history,
 phase-dependent fields, sequence lengths, and ordered allocation — and installs the first candidate
 that produces a connected certificate; an uncertified candidate never preempts a certified later
-rule.
+rule. Selection is certificate-based; it does not compare state counts between a reduced and an
+unreduced search. For the newly enabled action-check cases, however, a certified projection is
+additionally declined when a **bounded merge probe** finds no pair of distinct admitted states with
+the same projected key: a quotient that never identifies two reachable states cannot reduce the
+search, so a configuration whose `CONSTRAINT` or `ACTION_CONSTRAINT` prunes exactly the transitions
+the quotient would merge stays unreduced instead of claiming a reduction. Initial states and
+successors share one admission path: both budgets are charged while enumerating (at most 4,096
+admitted states and 65,536 enumerated states), each admitted state's projected key is compared as
+soon as it is generated (only unseen concrete states are queued), and the probe stops at the first
+witnessed merge. It is one deterministic BFS from `Init` under the same
+constraint/action-constraint admission as the search, it evaluates the candidate projection without
+installing it, and it suppresses `-stats` collection and restores the generated-state counter, so it
+changes no report. The bound is conservative in one direction: a merge beyond it is not observed and
+the projection declines. An evaluation error before a witness also declines the candidate, leaving
+the ordinary search to report the error. Configurations without action checks keep the plain
+certificate-based selection, and a projection whose merges do occur within the bound is installed
+exactly as before.
 
 ### Certificate goal and soundness boundary
 
@@ -509,7 +529,8 @@ Three connected emitters cover progressively richer allocation shapes:
 
 ### Lowered Rule & Lean Certificate
 
-- **`OrderedCertificate.lean`** lowers branches into `OrderedRule.Model`, projects the frontier to
+- **`OrderedCertificate.lean`** lowers branches, state constraints, and retained-core action checks
+  into `OrderedRule.Model`, projects the frontier to
   whether `frontier = initialValue` (preserving duplicate-sensitive `Cardinality({frontier,
   initialValue})`), and proves `runtime_key_equivalent` between formal projections and runtime rank
   keys. Proof review of an earlier uncertified analysis exposed a concrete soundness defect: an
@@ -525,6 +546,12 @@ Three connected emitters cover progressively richer allocation shapes:
   passing the raw table to semantic leaves), proves old live reads survive append and fresh reads
   yield the appended payload, and connects the retained ranked-table graph to the quotient key.
   Mathematical integer allocation may eliminate eventual 32-bit frontier overflow.
+- **Action checks (`Ordered`/`Nested`/`Live`):** an `ACTION_CONSTRAINT` or `[][A]_sub` action
+  `PROPERTY` is lowered only when neither its action nor its stuttering subscript mentions a
+  projected allocation, rank pattern, or live-version path. Each such predicate becomes one opaque
+  `sem.actionTest` atom over the retained core pair `(s.core, t.core)`, and the certificate proves
+  `ConstrainedCertificate` directly: `actionConstraint`/`actionObserve` are evaluated identically on
+  both endpoints because the projection preserves the retained core exactly.
 
 ### Refusals & Trusted Computing Base (TCB)
 
@@ -534,7 +561,9 @@ Three connected emitters cover progressively richer allocation shapes:
   whose handwritten 19,048-state TLC `VIEW` remains a future target rather than an automatic claim),
   cross-family comparisons, general arithmetic on identifiers, full version-table enumeration,
   arbitrary historical-version lookups, primed table reads, allocation identifiers inside history
-  payloads, numeric-dependent payload construction, and symmetry composition.
+  payloads, numeric-dependent payload construction, and symmetry composition. Action constraints and
+  action properties that read any projected allocation value, rank comparison, or live-version entry
+  (including a `[A]_vars` subscript over a projected variable) are refused.
 - **TCB:** HIR normalization, fixed-shape and forward domain inference, independent leaf
   interpretation, and the runtime structural rank-key walker (`ordered.rs`).
 
@@ -603,23 +632,42 @@ point:
 1. Seed liveness from guards, update expressions (scanned even for dead targets so evaluation errors
    are preserved), and invariants, restricting reads to a phase only after a recognized control
    guard has been evaluated (keeping by-name operator actuals in the callee's control context).
-2. Summarize recognized single-record or single-actor `EXCEPT` writes whose actor domain lies inside
+2. Seed liveness from unprimed and primed field reads in every `ACTION_CONSTRAINT` and
+   `[][A]_sub` action `PROPERTY`, retaining each read field in every phase and marking it globally
+   observed so the projected endpoint keeps the exact value the check reads.
+3. Summarize recognized single-record or single-actor `EXCEPT` writes whose actor domain lies inside
    the fixed map domain.
-3. Across every transition from phase `p` to `q`, propagate every field live in `q` that is not
+4. Across every transition from phase `p` to `q`, propagate every field live in `q` that is not
    overwritten back into `p`; the control field stays live in every phase.
 
 `phase/liveness/lean.rs` emits the explicit phase, masked-read, write, and observation tables into
 `GeneratedField`, and `FieldCertificate.lean` discharges read, frame, and observation liveness
 obligations via kernel-checked `decide` (never assuming liveness preservation) to prove
 initialization, successor lifting, invariant preservation, counterexample lifting, and deadlock
-correspondence.
+correspondence. `FieldRule.Model.actionConstraint` and `actionObserve` take both endpoints'
+retained cores, phase maps, and observed values, so a certified endpoint check is evaluated
+identically on `(s, t)` and on `(project s, project t)` without any triviality premise.
+
+An action-level field read keeps its keyed access in the emitted instance: the hole description
+records the endpoint, the field or phase slot, the source key expression, and the endpoint the key
+itself is evaluated in (for example
+`data field 1, source key Local(7); primed=false; key primed=false`), exactly as the state-read
+emitter records `source key`. Two predicates that differ only in which bound key they read
+(`r[i].mode = r[j].mode` versus `r[i].mode = r[i].mode`) therefore remain distinguishable in the
+generated certificate even though the projection retains the field for every key. So do the two
+prime scopes: `r'[idx].mode` reads the target map at the source `idx` (`key primed=false`), while
+`(r[idx])'.mode` primes the whole lookup and reads the target map at the target `idx`
+(`key primed=true`); when a step changes `idx` the predicates disagree, and each read is lowered
+against the endpoint it denotes.
 
 ### Refusals & Trusted Computing Base (TCB)
 
-- **Refusals:** nonconstant initial phases, primed projected reads, cross-actor or whole-record
-  uses, uncertain `EXCEPT` / `LET` aliasing, duplicate writes, unknown map domains, higher-order or
-  recursive action expansion, effectful actuals (even if unused), budget exhaustion, and symmetry
-  composition.
+- **Refusals:** nonconstant initial phases, primed projected reads in state predicates, cross-actor
+  or whole-record uses, uncertain `EXCEPT` / `LET` aliasing, duplicate writes, unknown map domains,
+  higher-order or recursive action expansion, effectful actuals (even if unused), budget exhaustion,
+  and symmetry composition. Action checks refuse whole-record or primed whole-record reads,
+  `UNCHANGED`/`ENABLED`/`@` shapes that would observe an erased field, angle (non-stuttering)
+  actions, and `[A]_sub` subscripts that mention the projected variable.
 - **TCB:** HIR call/`LET` expansion and alias checking, forward structural domain/totality
   inference, leaf interpretation over retained state and recorded field reads, and runtime `VIEW`
   evaluation.

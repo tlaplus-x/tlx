@@ -664,3 +664,463 @@ Inv == \A n \in Nodes : state[n] \in Nat
         },
     );
 }
+
+const ACT_FIELD_TLA: &str = r#"---- MODULE ActField ----
+EXTENDS Integers
+VARIABLE r, count
+Init == r = [pc |-> "idle", buf |-> 0] /\ count = 0
+Start == \E v \in {1, 2} :
+           /\ r.pc = "idle"
+           /\ r' = [r EXCEPT !.pc = "busy", !.buf = v]
+           /\ count' = IF count < 2 THEN count + 1 ELSE count
+Finish == /\ r.pc = "busy"
+          /\ r.buf > 0
+          /\ r' = [r EXCEPT !.pc = "idle"]
+          /\ count' = IF count < 2 THEN count + 1 ELSE count
+Next == Start \/ Finish
+Inv == r.pc \in {"idle", "busy"} /\ count <= 2
+StateLimit == count <= 2
+ActLimit == r.pc = "idle" => r'.pc = "busy"
+ActProp == [][ (r.pc = "idle") => (r'.pc = "busy") ]_<<count>>
+ActUnsupported == [][ r' = r \/ ~(r' = r) ]_<<count>>
+====
+"#;
+
+const ACT_FIELD_CFG: &str =
+    "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTRAINT StateLimit\nACTION_CONSTRAINT ActLimit\nPROPERTY ActProp\nCHECK_DEADLOCK FALSE\n";
+
+#[test]
+fn phase_field_projection_certifies_endpoint_action_checks_across_all_tiers() {
+    let dir = tlx_testkit::TempDir::with_spec("act-field", ACT_FIELD_TLA, ACT_FIELD_CFG);
+    let baseline = tlx_testkit::tlx_default!()
+        .check("ActField.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(baseline.code, 0, "{}", baseline.text());
+    let baseline_distinct = parse_distinct(&baseline.stdout).expect("baseline distinct count");
+
+    for tr in run_all_tiers(&dir, "ActField.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 0, "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("phase-field-projection"), "{tier}: {}", tr.run.text());
+        let reduced = parse_distinct(&tr.run.stdout).expect("reduced distinct count");
+        assert!(reduced < baseline_distinct, "{tier}: {reduced} !< {baseline_distinct}");
+        let mut found = false;
+        for entry in std::fs::read_dir(&tr.proof_dir).unwrap() {
+            let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+            if lean.contains("def constrainedAfter := (model sem).constrainedReduced")
+                && lean.contains("namespace TlxOptimization.GeneratedField")
+            {
+                for expected in [
+                    "def actionConstraint",
+                    "def actionObserve",
+                    "actionConstraint := actionConstraint sem",
+                    "actionObserve := actionObserve sem",
+                    "theorem constrained_certificate",
+                    "theorem admitted_deadlock_preserved",
+                ] {
+                    assert!(lean.contains(expected), "{tier}: missing {expected}");
+                }
+                assert!(!lean.contains("sorry"), "{tier}");
+                found = true;
+            }
+        }
+        assert!(found, "{tier}: expected a constrained GeneratedField certificate");
+    }
+
+    // The same specification with an action property that reads the whole
+    // record cannot be certified: the erased buffer would be observed at an
+    // arbitrary phase, so the projection must fail closed.
+    let refused_cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTRAINT StateLimit\nACTION_CONSTRAINT ActLimit\nPROPERTY ActUnsupported\nCHECK_DEADLOCK FALSE\n";
+    let refused = tlx_testkit::TempDir::with_spec("act-field-refused", ACT_FIELD_TLA, refused_cfg);
+    for tr in run_all_tiers(&refused, "ActField.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 0, "{tier}: {}", tr.run.text());
+        assert!(!tr.run.stdout.contains("phase-field-projection"), "{tier}: {}", tr.run.text());
+        for entry in std::fs::read_dir(&tr.proof_dir).unwrap() {
+            let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+            assert!(
+                !lean.contains("namespace TlxOptimization.GeneratedField"),
+                "{tier}: uncertifiable action checks must not install the field projection"
+            );
+        }
+    }
+}
+
+#[test]
+fn field_projection_lifts_violated_action_property_to_concrete_step() {
+    let spec = ACT_FIELD_TLA.replace(
+        "Next == Start \\/ Finish",
+        "Idle == /\\ r.pc = \"idle\"\n        /\\ count < 2\n        /\\ r' = r\n        /\\ count' = count + 1\nNext == Start \\/ Finish \\/ Idle",
+    );
+    let dir = tlx_testkit::TempDir::with_spec("act-field-bad", &spec, ACT_FIELD_CFG);
+    let tlc = tlx_testkit::tlx_default!()
+        .check("ActField.tla")
+        .args(["-tlc", "-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(tlc.code, 13, "{}", tlc.text());
+    for tr in run_all_tiers(&dir, "ActField.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 13, "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("phase-field-projection"), "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("Action property ActProp is violated."), "{tier}: {}", tr.run.text());
+        assert_eq!(trace_lines(&tr.run.stdout), trace_lines(&tlc.stdout), "{tier}: {}", tr.run.text());
+    }
+}
+
+const ACT_ORDERED_TLA: &str = r#"---- MODULE ActOrdered ----
+EXTENDS Naturals
+VARIABLE frontier, bit, tag
+Init == frontier = 1 /\ bit = FALSE /\ tag = 0
+Next == /\ frontier' = frontier + 1
+        /\ bit' = IF frontier = 1 THEN bit ELSE ~bit
+        /\ tag' = 1
+Inv == frontier \in Nat /\ bit \in BOOLEAN /\ tag \in {0, 1}
+StateLimit == bit \in BOOLEAN
+ActLimit == tag' >= tag
+ActProp == [][ tag' >= tag ]_tag
+ActPropViolated == [][ tag' = 0 ]_tag
+====
+"#;
+
+#[test]
+fn ordered_projection_certifies_retained_core_action_checks_across_all_tiers() {
+    let cfg =
+        "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTRAINT StateLimit\nACTION_CONSTRAINT ActLimit\nPROPERTY ActProp\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("act-ordered", ACT_ORDERED_TLA, cfg);
+    let mut counts: Option<Vec<String>> = None;
+    for tr in run_all_tiers(&dir, "ActOrdered.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 0, "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("ordered-allocation-projection"), "{tier}: {}", tr.run.text());
+        let normalized = tr.run.stdout.replace(" (optimization-reduced).", ".");
+        let result: Vec<String> = tlx_testkit::cli::counts(&normalized).into_iter().map(str::to_owned).collect();
+        assert!(!result.is_empty(), "{tier}: {}", tr.run.text());
+        if let Some(previous) = &counts {
+            assert_eq!(&result, previous, "{tier}");
+        } else {
+            counts = Some(result);
+        }
+        let mut found = false;
+        for entry in std::fs::read_dir(&tr.proof_dir).unwrap() {
+            let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+            if lean.contains("namespace TlxOptimization.GeneratedOrdered") {
+                assert!(lean.contains("def actionConstraint"), "{tier}");
+                assert!(lean.contains("actionObserve := actionObserve sem"), "{tier}");
+                assert!(lean.contains("theorem constrained_certificate"), "{tier}");
+                assert!(!lean.contains("sorry"), "{tier}");
+                found = true;
+            }
+        }
+        assert!(found, "{tier}: expected a constrained GeneratedOrdered certificate");
+    }
+
+    // A violated action property on a certified projection lifts the same
+    // concrete two-state counterexample as the unreduced interpreter.
+    let bad_cfg =
+        "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTRAINT StateLimit\nACTION_CONSTRAINT ActLimit\nPROPERTY ActPropViolated\nCHECK_DEADLOCK FALSE\n";
+    let bad = tlx_testkit::TempDir::with_spec("act-ordered-bad", ACT_ORDERED_TLA, bad_cfg);
+    let tlc = tlx_testkit::tlx_default!()
+        .check("ActOrdered.tla")
+        .args(["-tlc", "-interp", "-workers", "1"])
+        .dir(&bad)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(tlc.code, 13, "{}", tlc.text());
+    for tr in run_all_tiers(&bad, "ActOrdered.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 13, "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("ordered-allocation-projection"), "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("Action property ActPropViolated is violated."), "{tier}: {}", tr.run.text());
+        assert_eq!(trace_lines(&tr.run.stdout), trace_lines(&tlc.stdout), "{tier}: {}", tr.run.text());
+    }
+}
+
+const ACT_KEY_TLA: &str = r#"---- MODULE ActKey ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLE r, count
+Init == r = [k \in Actors |-> [id |-> k, mode |-> "idle", buf |-> 0]] /\ count = 0
+Start == \E k \in Actors :
+           /\ r[k].mode = "idle"
+           /\ r' = [r EXCEPT ![k].mode = "busy", ![k].buf = 1]
+           /\ count' = IF count < 1 THEN count + 1 ELSE count
+Finish == \E k \in Actors :
+            /\ r[k].mode = "busy"
+            /\ r[k].buf > 0
+            /\ r' = [r EXCEPT ![k].mode = "idle"]
+            /\ count' = count
+Next == Start \/ Finish
+Inv == /\ \A k \in Actors : r[k].mode \in {"idle", "busy"}
+       /\ count <= 1
+StateLimit == \A k \in Actors : r[k].mode \in {"idle", "busy"} /\ count <= 1
+ActTwo == \A i, j \in Actors : r[i].mode = r[j].mode
+ActSame == \A i, j \in Actors : r[i].mode = r[i].mode
+====
+"#;
+
+fn parse_generated(stdout: &str) -> Option<u64> {
+    for line in stdout.lines() {
+        if let Some(idx) = line.find(" states generated") {
+            let num = line[..idx].trim_end().rsplit(|c: char| !c.is_ascii_digit()).next()?;
+            if let Ok(v) = num.parse::<u64>() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Bound-key identifiers recorded in the emitted action-check hole descriptions.
+fn action_read_keys(lean: &str) -> Vec<u32> {
+    let mut keys = Vec::new();
+    for line in lean.lines().filter(|l| l.contains("actionConstraint HIR")) {
+        for key in line.split("source key").skip(1) {
+            let Some(idx) = key.find("LocalId(") else { continue };
+            let digits: String = key[idx + 8..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+            if let Ok(id) = digits.parse() {
+                keys.push(id);
+            }
+        }
+    }
+    keys
+}
+
+fn read_generated_field_certificate(proof_dir: &Path) -> Option<String> {
+    std::fs::read_dir(proof_dir)
+        .ok()?
+        .filter_map(|entry| {
+            let lean = std::fs::read_to_string(entry.ok()?.path().join("Optimization.lean")).ok()?;
+            lean.contains("namespace TlxOptimization.GeneratedField").then_some(lean)
+        })
+        .next()
+}
+
+#[test]
+fn field_action_checks_keep_the_bound_key_and_gate_their_gain_across_tiers() {
+    // `r[i].mode = r[j].mode` and `r[i].mode = r[i].mode` differ only in which
+    // bound key each field read addresses; the certificates must record it (the
+    // sema test compares the two instances). Here the same two configurations
+    // also pin the bounded merge probe: the one-key constraint admits states the
+    // projection merges, while the two-key constraint admits only the initial
+    // state, so no quotient can reduce it and the rule declines.
+    let cases = ["ActSame", "ActTwo"];
+    for constraint in cases {
+        let cfg = format!(
+            "INIT Init\nNEXT Next\nCONSTANT Actors = {{n1, n2}}\nINVARIANT Inv\nCONSTRAINT StateLimit\nACTION_CONSTRAINT {constraint}\nCHECK_DEADLOCK FALSE\n"
+        );
+        let dir = tlx_testkit::TempDir::with_spec(&format!("act-key-{constraint}"), ACT_KEY_TLA, &cfg);
+        let baseline = tlx_testkit::tlx_default!()
+            .check("ActKey.tla")
+            .args(["-interp", "-workers", "1", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        let baseline_counts: Vec<String> =
+            tlx_testkit::cli::counts(&baseline.stdout.replace(" (optimization-reduced).", ".")).into_iter().map(str::to_owned).collect();
+        for tr in run_all_tiers(&dir, "ActKey.tla", &["-optimize", "-noautosymmetry"], false) {
+            let tier = &tr.tier;
+            assert_eq!(tr.run.code, 0, "{constraint}/{tier}: {}", tr.run.text());
+            let reduced_counts: Vec<String> =
+                tlx_testkit::cli::counts(&tr.run.stdout.replace(" (optimization-reduced).", ".")).into_iter().map(str::to_owned).collect();
+            if constraint == "ActSame" {
+                assert!(tr.run.stdout.contains("phase-field-projection"), "{constraint}/{tier}: {}", tr.run.text());
+                assert_ne!(reduced_counts, baseline_counts, "{constraint}/{tier}: no gain: {}", tr.run.text());
+                let lean = read_generated_field_certificate(&tr.proof_dir).expect("constrained GeneratedField certificate");
+                let keys = action_read_keys(&lean);
+                assert_eq!(keys.len(), 2, "{constraint}/{tier}: {keys:?}");
+                assert_eq!(keys[0], keys[1], "{constraint}/{tier}: the same bound key must stay one read: {keys:?}");
+            } else {
+                assert!(!tr.run.stdout.contains("phase-field-projection"), "{constraint}/{tier}: {}", tr.run.text());
+                assert_eq!(reduced_counts, baseline_counts, "{constraint}/{tier}: {}", tr.run.text());
+            }
+        }
+    }
+}
+
+#[test]
+fn field_projection_zero_gain_action_constraint_keeps_counts_and_verdict() {
+    // The unchanged input and configuration are used for both arms: only the
+    // `-optimize` flag differs. Here `count' <= 1` never admits the transitions
+    // that would merge idle buffers, so the structurally applicable projection
+    // merges no admitted state. With action checks present the bounded merge
+    // probe declines it: the run must stay unreduced with identical counts.
+    let spec = ACT_FIELD_TLA.replace("ActLimit == r.pc = \"idle\" => r'.pc = \"busy\"", "ActLimit == count' <= 1");
+    assert_ne!(spec, ACT_FIELD_TLA, "zero-gain fixture must replace only ActLimit");
+    let dir = tlx_testkit::TempDir::with_spec("act-field-zero-gain", &spec, ACT_FIELD_CFG);
+    let baseline = tlx_testkit::tlx_default!()
+        .check("ActField.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(baseline.code, 0, "{}", baseline.text());
+    let baseline_counts: Vec<String> =
+        tlx_testkit::cli::counts(&baseline.stdout.replace(" (optimization-reduced).", ".")).into_iter().map(str::to_owned).collect();
+    assert_eq!((parse_generated(&baseline.stdout), parse_distinct(&baseline.stdout)), (Some(5), Some(3)), "{}", baseline.text());
+    for tr in run_all_tiers(&dir, "ActField.tla", &["-optimize", "-noautosymmetry"], false) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 0, "{tier}: {}", tr.run.text());
+        // The bounded merge probe finds no admitted pair with the same
+        // projected key, so the structurally applicable rule declines.
+        assert!(!tr.run.stdout.contains("phase-field-projection"), "{tier}: {}", tr.run.text());
+        assert!(!tr.run.stdout.contains("(optimization-reduced)"), "{tier}: {}", tr.run.text());
+        let reduced_counts: Vec<String> =
+            tlx_testkit::cli::counts(&tr.run.stdout.replace(" (optimization-reduced).", ".")).into_iter().map(str::to_owned).collect();
+        assert_eq!(reduced_counts, baseline_counts, "{tier}: {}", tr.run.text());
+    }
+}
+
+const FANOUT_TLA: &str = r#"---- MODULE Fanout ----
+EXTENDS Naturals
+VARIABLE r, tag
+Init == r = [mode |-> "idle", buf |-> 0] /\ tag = <<0,0,0,0,0>>
+Start == /\ r.mode = "idle"
+         /\ \E a,b,c,d,e \in 0..7:
+               /\ tag' = <<a,b,c,d,e>>
+               /\ \E n \in {0,1}: r' = [r EXCEPT !.mode = "busy", !.buf = n]
+Finish == /\ r.mode = "busy"
+          /\ r' = [r EXCEPT !.mode = "idle"]
+          /\ UNCHANGED tag
+Next == Start \/ Finish
+Edge == r'.mode \in {"busy","idle"} /\ tag = tag
+====
+"#;
+const FANOUT_CFG: &str = "INIT Init\nNEXT Next\nACTION_CONSTRAINT Edge\nCHECK_DEADLOCK FALSE\n";
+
+const INIT_MERGE_TLA: &str = r#"---- MODULE InitMerge ----
+EXTENDS Naturals
+VARIABLE r, tag
+Init == \E a,b,c \in 0..7:
+          \E n \in {0,1}: /\ tag = <<a,b,c>> /\ r = [mode |-> "idle", buf |-> n]
+Start == /\ r.mode = "idle"
+         /\ r' = [r EXCEPT !.mode = "busy", !.buf = 0]
+         /\ UNCHANGED tag
+Finish == /\ r.mode = "busy"
+          /\ r' = [r EXCEPT !.mode = "idle"]
+          /\ UNCHANGED tag
+Next == Start \/ Finish
+Inv == /\ \E a,b,c \in 0..7 : tag = <<a,b,c>>
+       /\ r.mode \in {"idle", "busy"}
+Edge == r'.mode \in {"busy", "idle"}
+====
+"#;
+
+const ERROR_PROBE_TLA: &str = r#"---- MODULE ErrorProbe ----
+EXTENDS Naturals
+VARIABLE r, tag
+Init == r = [mode |-> "idle", buf |-> 0] /\ tag = 0
+Start == /\ r.mode = "idle"
+         /\ r' = [r EXCEPT !.mode = "busy", !.buf = 1]
+         /\ tag' = 1 \div tag
+Finish == /\ r.mode = "busy"
+          /\ r' = [r EXCEPT !.mode = "idle"]
+          /\ UNCHANGED tag
+Next == Start \/ Finish
+Edge == r'.mode \in {"busy", "idle"}
+====
+"#;
+const ERROR_PROBE_CFG: &str = "INIT Init\nNEXT Next\nACTION_CONSTRAINT Edge\nCHECK_DEADLOCK FALSE\n";
+
+fn probe_model(name: &str, tla: &str, cfg: &str) -> (tlx_testkit::TempDir, tlx_eval::model::InterpModel) {
+    let dir = tlx_testkit::TempDir::with_spec(name, tla, cfg);
+    let program = tlx_sema::Program::load(&dir.join(format!("{name}.tla")), &[]).unwrap();
+    let cfg = tlx_front::cfg::parse_cfg(cfg).unwrap();
+    let model = tlx_eval::model::InterpModel::new(tlx_eval::Interp::new(program, cfg).unwrap()).unwrap();
+    (dir, model)
+}
+
+#[test]
+fn fanout_action_check_projection_is_not_declined_by_the_probe() {
+    // The first two admitted successors of the initial state differ only in the
+    // projected `buf` field, so the probe must witness the merge while it
+    // enumerates instead of exhausting its successor budget first.
+    let (_dir, mut model) = probe_model("Fanout", FANOUT_TLA, FANOUT_CFG);
+    let (rule, fields) = model.project_state().expect("the fan-out projection must be installed");
+    assert_eq!(rule, "phase-field-projection");
+    assert!(fields.iter().any(|f| f.contains("buf")), "{fields:?}");
+    assert!(model.projection_certificate().is_some());
+}
+
+#[test]
+fn probe_witnesses_a_merge_among_initial_states() {
+    // 1,024 initial states; the first two share `tag` and differ only in the
+    // erased `buf`, so the merge is witnessed during initial enumeration.
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nACTION_CONSTRAINT Edge\nCHECK_DEADLOCK FALSE\n";
+    let (_dir, mut model) = probe_model("InitMerge", INIT_MERGE_TLA, cfg);
+    let (rule, _) = model.project_state().expect("the initial merge must witness the projection");
+    assert_eq!(rule, "phase-field-projection");
+}
+
+#[test]
+fn probe_declines_before_an_evaluation_error_keeps_the_normal_search_report() {
+    // The first step divides by zero: the probe cannot witness a merge, so it
+    // declines and the ordinary search reports the evaluation error unchanged.
+    let (_dir, mut model) = probe_model("ErrorProbe", ERROR_PROBE_TLA, ERROR_PROBE_CFG);
+    assert!(model.project_state().is_none());
+    let dir = tlx_testkit::TempDir::with_spec("error-probe-run", ERROR_PROBE_TLA, ERROR_PROBE_CFG);
+    for optimize in [&[][..], &["-optimize"][..]] {
+        let run = tlx_testkit::tlx_default!()
+            .check("ErrorProbe.tla")
+            .args(["-interp", "-workers", "1", "-noautosymmetry"])
+            .args(optimize)
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 255, "{optimize:?}: {}", run.text());
+        assert!(run.stdout.contains("The second argument of \\div is 0."), "{optimize:?}: {}", run.text());
+        assert!(!run.stdout.contains("phase-field-projection"), "{optimize:?}: {}", run.text());
+    }
+}
+
+const WIDE_INIT_TLA: &str = r#"---- MODULE WideInit ----
+EXTENDS Naturals
+CONSTANT N
+VARIABLE r, setup
+Init == \E a, b, c, d \in 1..N :
+          /\ setup = <<a,b,c,d>>
+          /\ r = [mode |-> "idle", data |-> 0]
+Start == \E n \in {0, 1} : /\ r.mode = "idle"
+                             /\ r' = [r EXCEPT !.mode = "busy", !.data = n]
+                             /\ UNCHANGED setup
+Finish == /\ r.mode = "busy"
+          /\ r.data >= 0
+          /\ r' = [r EXCEPT !.mode = "idle"]
+          /\ UNCHANGED setup
+Next == Start \/ Finish
+Admit == setup = <<1,1,1,1>>
+Act == r.mode \in {"idle", "busy"}
+====
+"#;
+
+fn wide_init_cfg(n: u32) -> String {
+    format!("INIT Init\nNEXT Next\nCONSTANT N = {n}\nCONSTRAINT Admit\nACTION_CONSTRAINT Act\nCHECK_DEADLOCK FALSE\n")
+}
+
+#[test]
+fn probe_bounds_work_with_many_rejected_initial_candidates() {
+    // 16^4 initial candidates, one admitted by the state constraint. The probe
+    // streams initial states through `init_states_while`, checks admission and
+    // deduplication in the callback, and stops at its enumeration budget, so it
+    // neither retains the candidates nor claims a reduction it did not witness.
+    let cfg = wide_init_cfg(16);
+    let (_dir, mut model) = probe_model("WideInit", WIDE_INIT_TLA, &cfg);
+    let started = std::time::Instant::now();
+    assert!(model.project_state().is_none(), "65,536 rejected candidates must decline within the bound");
+    assert!(started.elapsed() < Duration::from_secs(20), "the probe must not enumerate unboundedly");
+}
+
+#[test]
+fn probe_installs_when_rejected_initial_candidates_fit_the_bound() {
+    // 3^4 candidates: the single admitted setup's four-state graph merges one
+    // idle pair, so the projection is witnessed and installed (4 -> 3 states).
+    let cfg = wide_init_cfg(3);
+    let (_dir, mut model) = probe_model("WideInit", WIDE_INIT_TLA, &cfg);
+    let (rule, fields) = model.project_state().expect("the admitted graph's merge must install the rule");
+    assert_eq!(rule, "phase-field-projection");
+    assert!(fields.iter().any(|f| f.contains("data")), "{fields:?}");
+}

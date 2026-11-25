@@ -44,6 +44,22 @@ pub fn on() -> bool {
     !cfg!(feature = "no-stats") && ON.load(Ordering::Relaxed)
 }
 
+/// Pause statistics collection around a bounded probe outside the search, so
+/// the probe's evaluations do not change a `-stats` report. Returns whether
+/// they were on, for [`resume`].
+pub fn suspend() -> bool {
+    let was_on = on();
+    ON.store(false, Ordering::Relaxed);
+    was_on
+}
+
+/// Resume collection paused by [`suspend`].
+pub fn resume(was_on: bool) {
+    if was_on {
+        ON.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Collect statistics from now on, timing one unit of work in
 /// `sample_every` (call at the start of the process: the time origin of
 /// `since_start`).

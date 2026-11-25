@@ -40,10 +40,12 @@ pub(super) fn emit(
     let observations = spec.invariants.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
     let init_obs = spec.init_props.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
     let constraints = spec.constraints.iter().map(|p| e.test(p, true)).collect::<Option<Vec<_>>>()?;
+    let action_constraints = spec.action_constraints.iter().map(|p| e.action_test(p)).collect::<Option<Vec<_>>>()?;
+    let action_obs = spec.action_props.iter().map(|p| e.action_test(p)).collect::<Option<Vec<_>>>()?;
     let constrained = spec.is_constrained();
     let mut out = String::from(include_str!("../../OrderedCertificate.lean"));
     out.push_str("\nnamespace TlxOptimization.GeneratedOrdered\nopen TlxOptimization OrderedRule\nnoncomputable section\nset_option linter.unusedVariables false\nattribute [local instance] Classical.propDecidable\n");
-    out.push_str("\n-- C contains exactly retained state; W contains independent local choices.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → W → Prop\n  observe : Nat → C → Prop\n");
+    out.push_str("\n-- C contains exactly retained state; W contains independent local choices.\nstructure Semantics (C W : Type) where\n  test : Nat → C → C → W → Prop\n  observe : Nat → C → Prop\n  actionTest : Nat → C → C → Prop\n");
     for (i, atom) in e.atoms.iter().enumerate() {
         writeln!(out, "def atom{i}HIR : String := {}", literal(atom)).unwrap();
     }
@@ -69,10 +71,14 @@ pub(super) fn emit(
     if constrained {
         writeln!(out, "def initObserve {params} (c : C) : Test := {}", fold(init_obs, "conj", "True")).unwrap();
         writeln!(out, "def constraint {params} (c : C) : Test := {}", fold(constraints, "conj", "True")).unwrap();
+        writeln!(out, "def actionConstraint {params} (c d : C) : Prop := {}", prop_fold(action_constraints)).unwrap();
+        writeln!(out, "def actionObserve {params} (c d : C) : Prop := {}", prop_fold(action_obs)).unwrap();
     }
     writeln!(out, "def model : OrderedRule.Model C (Nat × W) where\n  seed := {seed}\n  initial := initial sem\n  delta := delta\n  guard := guard sem\n  observe := observe sem").unwrap();
     if constrained {
-        out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+        out.push_str(
+            "  initObserve := initObserve sem\n  constraint := constraint sem\n  actionConstraint := actionConstraint sem\n  actionObserve := actionObserve sem\n",
+        );
     }
     let tail = "def before := (model sem).concrete\n\
          def after := (model sem).reduced\n\
@@ -173,6 +179,19 @@ impl Emitter {
             _ => return None,
         }
         Some(())
+    }
+
+    /// Lower an action check. Only the retained core state may be read: any
+    /// projected allocation value would make the check depend on the forgotten
+    /// magnitude, so it is refused.
+    fn action_test(&mut self, e: &Expr) -> Option<String> {
+        self.remaining = self.remaining.checked_sub(1)?;
+        if !self.independent(e) {
+            return None;
+        }
+        let i = self.atoms.len();
+        self.atoms.push(format!("{e:#?}"));
+        Some(format!("(sem.actionTest {i} c d)"))
     }
 
     fn test(&mut self, e: &Expr, observation: bool) -> Option<String> {
@@ -309,6 +328,12 @@ impl Emitter {
             .into(),
         )
     }
+}
+
+/// Conjoin action-level propositions. `Test` constructors are not used here:
+/// action checks are plain `Prop`s over the retained core pair.
+fn prop_fold(parts: Vec<String>) -> String {
+    parts.into_iter().rev().fold("True".to_owned(), |tail, head| format!("({head} ∧ {tail})"))
 }
 
 fn fold(tests: Vec<String>, op: &str, identity: &str) -> String {

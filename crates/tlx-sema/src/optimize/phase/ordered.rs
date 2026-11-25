@@ -78,7 +78,6 @@ pub fn ordered_projection_with_spec(
 }
 
 fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, spec: super::CheckSpec<'_>) -> Option<FieldProjection> {
-    let spec = spec.state_only()?;
     if !super::cfg_constants_supported(program, cfg) {
         return None;
     }

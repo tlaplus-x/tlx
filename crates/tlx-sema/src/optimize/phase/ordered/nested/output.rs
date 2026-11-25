@@ -4,6 +4,7 @@ use crate::optimize::lean::literal;
 use std::fmt::Write;
 
 impl Emitter<'_, '_> {
+    #[allow(clippy::too_many_arguments)] // combines seed/step transfers with the state, init, constraint and action check vectors
     pub(super) fn output(
         &self,
         seeds: &[Seed],
@@ -11,6 +12,8 @@ impl Emitter<'_, '_> {
         observation: &str,
         init_obs: &str,
         constraint: &str,
+        action_constraint: &str,
+        action_obs: &str,
         constrained: bool,
     ) -> super::super::super::OpenCert {
         let mut out = String::from(include_str!("../../../NestedRank.lean"));
@@ -50,12 +53,12 @@ impl Emitter<'_, '_> {
         if self.plan.history.is_some() {
             self.live_semantics(&mut out);
         } else {
-            out.push_str("structure Semantics (C W : Type) where\n  initial : Nat → C → W → Prop\n  test : Nat → C → C → W → Prop\n  observe : Nat → C → Prop\nvariable {C W : Type} (sem : Semantics C W)\n");
+            out.push_str("structure Semantics (C W : Type) where\n  initial : Nat → C → W → Prop\n  test : Nat → C → C → W → Prop\n  observe : Nat → C → Prop\n  actionTest : Nat → C → C → Prop\nvariable {C W : Type} (sem : Semantics C W)\n");
         }
         self.seeds(&mut out, seeds);
         self.cases(&mut out, cases);
         if self.plan.history.is_some() {
-            return self.live_model(out, seeds, cases, observation, init_obs, constraint, constrained);
+            return self.live_model(out, seeds, cases, observation, init_obs, constraint, action_constraint, action_obs, constrained);
         }
         writeln!(out, "def observe {{C W : Type}} (sem : Semantics C W) (c : C) : FamilyTest Family Slot Anchor := {observation}").unwrap();
         if constrained {
@@ -64,9 +67,15 @@ impl Emitter<'_, '_> {
             writeln!(out, "def constraint {{C W : Type}} (sem : Semantics C W) (c : C) : FamilyTest Family Slot Anchor := {constraint}")
                 .unwrap();
         }
+        if constrained {
+            writeln!(out, "def actionConstraint {{C W : Type}} (sem : Semantics C W) (c d : C) : Prop := {action_constraint}").unwrap();
+            writeln!(out, "def actionObserve {{C W : Type}} (sem : Semantics C W) (c d : C) : Prop := {action_obs}").unwrap();
+        }
         out.push_str("def model : NestedRule.Model C Family (BranchId × W) Slot Anchor where\n  layout := layout\n  initial := initial sem\n  seedValues := seedValues\n  delta := delta\n  transfers := transfers sem\n  guard := guard sem\n  observe := observe sem\n");
         if constrained {
-            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+            out.push_str(
+                "  initObserve := initObserve sem\n  constraint := constraint sem\n  actionConstraint := actionConstraint sem\n  actionObserve := actionObserve sem\n",
+            );
         }
         super::super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedNested", constrained, false, false)
     }

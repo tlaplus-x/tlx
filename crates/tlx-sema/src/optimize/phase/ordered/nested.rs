@@ -73,7 +73,9 @@ pub(super) fn emit(
     let observation = e.tests(spec.invariants, Mode::Observe)?;
     let init_obs = e.tests(spec.init_props, Mode::Observe)?;
     let constraint = e.tests(spec.constraints, Mode::Observe)?;
-    Some(e.output(&seeds, &cases, &observation, &init_obs, &constraint, spec.is_constrained()))
+    let action_constraint = e.action_tests(spec.action_constraints)?;
+    let action_obs = e.action_tests(spec.action_props)?;
+    Some(e.output(&seeds, &cases, &observation, &init_obs, &constraint, &action_constraint, &action_obs, spec.is_constrained()))
 }
 
 struct Context<'a> {

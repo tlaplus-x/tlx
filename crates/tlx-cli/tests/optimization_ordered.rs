@@ -161,10 +161,28 @@ fn constrained_ordered_rule_emits_constrained_certificate() {
 }
 
 #[test]
-fn unsupported_certificate_observations_refuse_the_ordered_rule() {
+fn ordered_rule_certifies_retained_action_checks_and_refuses_projected_reads() {
+    // An action check over retained core state is certified alongside the
+    // projection instead of refusing it.
     let source = SPEC.replace("====", "ActLimit == bit' \\in BOOLEAN\n====");
     let cfg_str = format!("{CFG}ACTION_CONSTRAINT ActLimit\n");
     let dir = tlx_testkit::TempDir::with_spec("ordered-action-constraint", &source, &cfg_str);
+    let program = tlx_sema::Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
+    let cfg = tlx_front::cfg::parse_cfg(&cfg_str).unwrap();
+    let mut model = tlx_eval::model::InterpModel::new(tlx_eval::Interp::new(program, cfg).unwrap()).unwrap();
+    let (rule, fields) = model.project_state().expect("ordered projection with a retained-core action constraint");
+    assert_eq!(rule, "ordered-allocation-projection");
+    assert!(fields.iter().any(|f| f.contains("frontier")), "{fields:?}");
+    let cert = model.projection_certificate().expect("constrained ordered certificate");
+    assert!(cert.contains("namespace TlxOptimization.GeneratedOrdered"));
+    assert!(cert.contains("def actionConstraint"));
+    assert!(cert.contains("theorem constrained_certificate"));
+
+    // An action check that reads the projected allocation magnitude still
+    // fails closed: the forgotten frontier value would change its verdict.
+    let source = SPEC.replace("====", "ActLimit == frontier' > frontier\n====");
+    let cfg_str = format!("{CFG}ACTION_CONSTRAINT ActLimit\n");
+    let dir = tlx_testkit::TempDir::with_spec("ordered-action-frontier", &source, &cfg_str);
     let program = tlx_sema::Program::load(&dir.join("Allocation.tla"), &[]).unwrap();
     let cfg = tlx_front::cfg::parse_cfg(&cfg_str).unwrap();
     let mut model = tlx_eval::model::InterpModel::new(tlx_eval::Interp::new(program, cfg).unwrap()).unwrap();

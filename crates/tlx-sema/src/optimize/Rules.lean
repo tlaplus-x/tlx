@@ -264,6 +264,39 @@ theorem constrainedOfStatePreds {S A : Type}
     · intro _ _; exact haAS (p s) y
     · intro _ t _ _; exact hbAS s t
 
+/- Projection-wide action correspondence. Once a base certificate is known,
+   the constrained obligations follow from the four projection equalities: a
+   reduced edge's concrete successor and its projection equality are supplied
+   by `base.next`, and rewriting by that equality transfers the predicates in
+   either direction. Each projection family proves its own equalities. -/
+theorem constrainedOfProjectedAction {S A : Type}
+    {b : ConstrainedSystem S} {a : ConstrainedSystem A} {p : S → A}
+    (base : Certificate b.toSystem a.toSystem p)
+    (hInit : ∀ s, b.initSafe s ↔ a.initSafe (p s))
+    (hCons : ∀ s, b.constraint s ↔ a.constraint (p s))
+    (hAction : ∀ s t, b.actionConstraint s t ↔ a.actionConstraint (p s) (p t))
+    (hSafe : ∀ s t, b.actionSafe s t ↔ a.actionSafe (p s) (p t)) :
+    ConstrainedCertificate b a p := by
+  refine ⟨base.initial, base.next, base.observe, hInit, hCons, ?_, ?_⟩
+  · intro s x
+    constructor
+    · rintro ⟨hnext, hcons, haction⟩
+      obtain ⟨t, hstep, hproject⟩ := (base.next s x).mp hnext
+      subst hproject
+      exact ⟨t, hstep, (hCons t).mpr hcons, (hAction s t).mpr haction, rfl⟩
+    · rintro ⟨t, hstep, hcons, haction, hproject⟩
+      subst hproject
+      exact ⟨(base.next s (p t)).mpr ⟨t, hstep, rfl⟩, (hCons t).mp hcons, (hAction s t).mp haction⟩
+  · intro s x
+    constructor
+    · intro hall hnext
+      obtain ⟨t, hstep, hproject⟩ := (base.next s x).mp hnext
+      subst hproject
+      exact (hSafe s t).mp (hall t hstep rfl)
+    · intro hall t hstep hproject
+      subst hproject
+      exact (hSafe s t).mpr (hall ((base.next s (p t)).mpr ⟨t, hstep, rfl⟩))
+
 theorem admitted_reachable_forward {S A : Type}
     {b : ConstrainedSystem S} {a : ConstrainedSystem A} {p : S → A}
     (c : ConstrainedCertificate b a p) {s} (h : AdmittedReachable b s) :

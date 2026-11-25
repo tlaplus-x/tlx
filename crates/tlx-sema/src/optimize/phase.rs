@@ -774,7 +774,6 @@ pub fn phase_projection_with_spec(
     next: &Expr,
     spec: CheckSpec<'_>,
 ) -> Option<FieldProjection> {
-    let spec = spec.state_only()?;
     if !cfg_constants_supported(program, cfg) {
         return None;
     }

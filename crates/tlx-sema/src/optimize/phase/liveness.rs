@@ -58,6 +58,12 @@ pub(super) fn derive(
     for e in spec.all_state_preds() {
         a.read(e, phases, None)?;
     }
+    // Action checks preserve both endpoints of a step. A projected field they
+    // read is retained in every phase and stays observed, so the masked
+    // representative keeps the exact value the check needs.
+    for e in spec.action_constraints.iter().chain(spec.action_props.iter()) {
+        a.action(e)?;
+    }
     let mut edges = Vec::new();
     for branch in steps {
         let transfer = a.transfer(&binding(branch, var, true)?, branch)?;
@@ -108,6 +114,15 @@ pub(super) fn derive(
     let projection = a.view(program)?;
     let cert = lean::emit(&a, initial, steps, spec);
     Some((projection, cert))
+}
+
+fn mentions_var(e: &Expr, var: VarId) -> bool {
+    if matches!(&*e.kind, ExprKind::Var(v) if *v == var) {
+        return true;
+    }
+    let mut found = false;
+    visit::children(e, &mut |c| found |= mentions_var(c, var));
+    found
 }
 
 impl Analysis<'_> {
@@ -218,6 +233,112 @@ impl Analysis<'_> {
                 visit::children(e, &mut |child| {
                     valid &= self.read(child, context, actor).is_some();
                 });
+                if !valid {
+                    return None;
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// Recognize a field of the projected variable under an action-level read.
+    /// Returns the field, the key expression of a keyed read, whether the field
+    /// is read from the target endpoint, and whether the key itself is evaluated
+    /// in the target endpoint.
+    ///
+    /// Both flags are needed. `r'[idx]` reads the target map at the *source*
+    /// `idx`, while `(r[idx])'` primes the whole lookup, so it reads the target
+    /// map at the *target* `idx`; the two predicates differ when `idx` changes.
+    /// The key must also be carried through lowering because the same field read
+    /// by two different bound keys is a different predicate.
+    fn action_field<'e>(&self, e: &'e Expr) -> Option<(&'e str, Option<&'e Expr>, bool, bool)> {
+        fn unprime(e: &Expr) -> (&Expr, bool) {
+            if let ExprKind::Builtin { op: B::Prime, args } = &*e.kind {
+                if let [inner] = args.as_slice() {
+                    return (inner, true);
+                }
+            }
+            (e, false)
+        }
+        let ExprKind::Field { record, field } = &*e.kind else { return None };
+        let (record, lookup_primed) = unprime(record);
+        if self.keys.is_none() && variable(record, false) == Some(self.var) {
+            return Some((field, None, lookup_primed, false));
+        }
+        if self.keys.is_some() {
+            if let ExprKind::FnApp { func, args } = &*record.kind {
+                let [key] = args.as_slice() else { return None };
+                let (func, map_primed) = unprime(func);
+                if variable(func, false) == Some(self.var) {
+                    // A double prime has no single-endpoint meaning here.
+                    if lookup_primed && map_primed {
+                        return None;
+                    }
+                    return Some((field, Some(key), lookup_primed || map_primed, lookup_primed));
+                }
+            }
+        }
+        None
+    }
+
+    /// Action predicates read both endpoints (`s` and `t`). Every field they
+    /// read must be preserved in every phase; whole-record, `UNCHANGED` and
+    /// `ENABLED` shapes are refused because the projection cannot justify them.
+    fn action(&mut self, e: &Expr) -> Option<()> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        if let Some((field, key, _, _)) = self.action_field(e) {
+            let live = self.live.get_mut(field)?;
+            live.extend(self.phases.iter().cloned());
+            // Reads inside the key expression are reads too.
+            if let Some(key) = key {
+                self.action(key)?;
+            }
+            return Some(());
+        }
+        if let ExprKind::Builtin { op: B::In, args } = &*e.kind {
+            if args.len() == 2
+                && variable(&args[0], false) == Some(self.var)
+                && self.domains.belongs(&self.domains.vars[self.var.idx()], &args[1])
+            {
+                return Some(());
+            }
+        }
+        match &*e.kind {
+            ExprKind::Var(v) if *v == self.var => return None,
+            // The subscript of `[A]_sub` must be retained exactly, or the
+            // stuttering disjunct would not factor through the projection.
+            ExprKind::BoxAction { action, sub } => {
+                if mentions_var(sub, self.var) {
+                    return None;
+                }
+                return self.action(action);
+            }
+            ExprKind::AngleAction { .. } | ExprKind::At => return None,
+            ExprKind::Builtin { op: B::Enabled, .. } => return None,
+            ExprKind::Builtin { op: B::Unchanged, args } => {
+                if args.iter().any(|a| mentions_var(a, self.var)) {
+                    return None;
+                }
+                for a in args {
+                    self.action(a)?;
+                }
+                return Some(());
+            }
+            ExprKind::Builtin { op: B::Prime, args } => {
+                if args.iter().any(|a| mentions_var(a, self.var)) {
+                    return None;
+                }
+                for a in args {
+                    self.action(a)?;
+                }
+                return Some(());
+            }
+            _ => {
+                let mut valid = true;
+                visit::children(e, &mut |child| valid &= self.action(child).is_some());
                 if !valid {
                     return None;
                 }

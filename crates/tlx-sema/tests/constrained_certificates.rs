@@ -412,6 +412,296 @@ fn fixture_live_constrained() -> String {
     .unwrap()
 }
 
+fn fixture_field_action_certificate() -> String {
+    let (p, cfg) = fixture_field_action_constrained();
+    let (inv, c, ac, ap) =
+        ([def_expr(&p, "Inv")], [def_expr(&p, "StateLimit")], [def_expr(&p, "ActLimit")], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &c, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("field projection with action checks")
+        .certificate
+        .unwrap()
+}
+
+fn fixture_field_action_constrained() -> (Program, Config) {
+    let tla = r#"---- MODULE FieldAction ----
+EXTENDS Integers
+VARIABLE r, count
+Init == r = [pc |-> "idle", buf |-> 0] /\ count = 0
+Next == \/ /\ r.pc = "idle"
+           /\ \E v \in {1, 2} : /\ r' = [r EXCEPT !.pc = "busy", !.buf = v]
+                               /\ count' = count + 1
+        \/ /\ r.pc = "busy"
+           /\ r.buf > 0
+           /\ r' = [r EXCEPT !.pc = "idle"]
+           /\ count' = count + 1
+Inv == r.pc \in {"idle", "busy"} /\ count <= 2
+StateLimit == count <= 2
+ActLimit == r.pc = "idle" => r'.pc = "busy"
+ActProp == [][ (r.pc = "busy") => (r'.pc = "idle") ]_<<count>>
+ActUnsupported == [][ r' = r ]_<<count>>
+====
+"#;
+    load("FieldAction", tla, "INIT Init\nNEXT Next\nINVARIANT Inv\n")
+}
+
+fn fixture_ordered_action_constrained() -> String {
+    let tla = r#"---- MODULE OrdAction ----
+EXTENDS Naturals
+VARIABLE frontier, bit
+Init == frontier = 1 /\ bit = FALSE
+Next == frontier' = frontier + 1 /\ bit' = IF frontier = 1 THEN bit ELSE ~bit
+Inv == frontier \in Nat /\ bit \in BOOLEAN
+StateLimit == bit \in BOOLEAN
+ActLimit == bit' \in BOOLEAN
+ActProp == [][ bit' \in BOOLEAN ]_bit
+====
+"#;
+    let (p, cfg) = load("OrdAction", tla, "INIT Init\nNEXT Next\nINVARIANT Inv\n");
+    let (inv, c, ac, ap) =
+        ([def_expr(&p, "Inv")], [def_expr(&p, "StateLimit")], [def_expr(&p, "ActLimit")], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &c, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    ordered_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("ordered projection should certify core-only action checks")
+        .certificate
+        .unwrap()
+}
+
+fn fixture_nested_action_constrained() -> String {
+    let tla = include_str!("../../../proofs/ordered/Nested.tla")
+        .replace("CONSTANT Actors", "CONSTANT Actors, a1, a2\nDefaultActors == {a1, a2}")
+        .replace("VARIABLES frontier, serial, records", "VARIABLES frontier, serial, records, mode")
+        .replace("Init == /\\ frontier = 1", "Init == /\\ mode = FALSE\n        /\\ frontier = 1")
+        .replace("![a].ready = TRUE]", "![a].ready = TRUE]\n              /\\ mode' = mode")
+        .replace("/\\ UNCHANGED <<frontier, serial>>", "/\\ UNCHANGED <<frontier, serial, mode>>")
+        .replace(
+            "=============================================================================",
+            "Lim == mode \\in BOOLEAN\nActLimit == mode' \\in BOOLEAN\nActProp == [][mode' \\in BOOLEAN]_mode\n=============================================================================",
+        );
+    let cfg_src = "INIT Init\nNEXT Next\nCONSTANTS\n  a1 = a1\n  a2 = a2\n  Actors <- DefaultActors\nINVARIANT Inv\n";
+    let (p, cfg) = load("Nested", &tla, cfg_src);
+    let (inv, lim, ac, ap) = ([def_expr(&p, "Inv")], [def_expr(&p, "Lim")], [def_expr(&p, "ActLimit")], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &lim, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    ordered_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("nested projection should certify retained-only action checks")
+        .certificate
+        .unwrap()
+}
+
+fn fixture_live_action_constrained() -> String {
+    let tla = include_str!("../../../proofs/ordered/LiveVersions.tla")
+        .replace("VARIABLES frontier, held, versions, flag, observed", "VARIABLES frontier, held, versions, flag, observed, mode")
+        .replace("Init == /\\ frontier = 1", "Init == /\\ mode = FALSE\n        /\\ frontier = 1")
+        .replace("/\\ UNCHANGED <<held, observed>>", "/\\ UNCHANGED <<held, observed, mode>>")
+        .replace("/\\ UNCHANGED <<frontier, versions, flag>>", "/\\ UNCHANGED <<frontier, versions, flag, mode>>")
+        .replace("/\\ UNCHANGED <<frontier, versions, flag, observed>>", "/\\ UNCHANGED <<frontier, versions, flag, observed, mode>>")
+        .replace(
+            "=============================================================================",
+            "Lim == mode \\in BOOLEAN\nActLimit == mode' \\in BOOLEAN\nActProp == [][mode' \\in BOOLEAN]_mode\n=============================================================================",
+        );
+    let cfg_src = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANT Inv\n";
+    let (p, cfg) = load("LiveVersions", &tla, cfg_src);
+    let (inv, lim, ac, ap) = ([def_expr(&p, "Inv")], [def_expr(&p, "Lim")], [def_expr(&p, "ActLimit")], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &lim, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    ordered_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("live-version projection should certify retained-only action checks")
+        .certificate
+        .unwrap()
+}
+
+const ACTOR_KEY_TLA: &str = r#"---- MODULE ActKey ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLE r, count
+Init == r = [k \in Actors |-> [id |-> k, mode |-> "idle", buf |-> 0]] /\ count = 0
+Start == \E k \in Actors :
+           /\ r[k].mode = "idle"
+           /\ r' = [r EXCEPT ![k].mode = "busy", ![k].buf = 1]
+           /\ count' = IF count < 1 THEN count + 1 ELSE count
+Finish == \E k \in Actors :
+            /\ r[k].mode = "busy"
+            /\ r[k].buf > 0
+            /\ r' = [r EXCEPT ![k].mode = "idle"]
+            /\ count' = count
+Next == Start \/ Finish
+Inv == /\ \A k \in Actors : r[k].mode \in {"idle", "busy"}
+       /\ count <= 1
+StateLimit == \A k \in Actors : r[k].mode \in {"idle", "busy"} /\ count <= 1
+ActTwo == \A i, j \in Actors : r[i].mode = r[j].mode
+ActSame == \A i, j \in Actors : r[i].mode = r[i].mode
+ActProp == [][ \A i \in Actors : r'[i].mode \in {"idle", "busy"} ]_<<count>>
+ActData == \A i, j \in Actors : r[i].id = r[j].id
+ActDataSame == \A i, j \in Actors : r[i].id = r[i].id
+====
+"#;
+
+/// Bound-key locals recorded in the emitted action-check hole descriptions.
+fn action_read_keys(cert: &str) -> Vec<u32> {
+    let mut keys = Vec::new();
+    for line in cert.lines().filter(|l| l.contains("actionConstraint HIR")) {
+        for key in line.split("source key").skip(1) {
+            let Some(idx) = key.find("LocalId(") else { continue };
+            // The Lean string literal escapes the debug text, so the identifier
+            // follows the escaped newline and indentation.
+            let digits: String = key[idx + 8..].chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+            if let Ok(id) = digits.parse() {
+                keys.push(id);
+            }
+        }
+    }
+    keys
+}
+
+fn fixture_field_actor_key(constraint: &str) -> Option<String> {
+    let (p, cfg) = load("ActKey", ACTOR_KEY_TLA, "INIT Init\nNEXT Next\nCONSTANT Actors = {n1, n2}\nINVARIANT Inv\n");
+    let (inv, lim, ac, ap) =
+        ([def_expr(&p, "Inv")], [def_expr(&p, "StateLimit")], [def_expr(&p, constraint)], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &lim, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("keyed field action checks should keep the projection applicable")
+        .certificate
+}
+
+#[test]
+fn field_action_reads_record_the_bound_key() {
+    let two = fixture_field_actor_key("ActTwo").expect("two-key action constraint certificate");
+    let same = fixture_field_actor_key("ActSame").expect("single-key action constraint certificate");
+    assert_constrained_lean(&two, "GeneratedField");
+    assert_constrained_lean(&same, "GeneratedField");
+
+    // `r[i].mode = r[j].mode` reads the phase at two different bound keys, while
+    // `r[i].mode = r[i].mode` reads the same key twice. The projection retains
+    // the field for every key, so both certificates prove the endpoint theorem;
+    // only the recorded key distinguishes the generated instance.
+    let two_keys = action_read_keys(&two);
+    let same_keys = action_read_keys(&same);
+    assert_eq!(two_keys.len(), 2, "two-key predicate must record both reads: {two_keys:?}");
+    assert_ne!(two_keys[0], two_keys[1], "distinct bound keys must be recorded distinctly: {two_keys:?}");
+    assert_eq!(same_keys.len(), 2, "single-key predicate must record both reads: {same_keys:?}");
+    assert_eq!(same_keys[0], same_keys[1], "the same bound key must be recorded twice: {same_keys:?}");
+    assert_ne!(two_keys, same_keys, "the two predicates must not lower to interchangeable certificates");
+
+    // The primed keyed action property reads the target endpoint's phase map.
+    let observe_atoms: Vec<&str> = two.lines().filter(|l| l.contains("actionObserve HIR")).collect();
+    assert_eq!(observe_atoms.len(), 1, "the primed action property must lower to one atom");
+    let atom = observe_atoms[0];
+    assert!(atom.contains("= phase'"), "primed keyed reads must address the target endpoint: {atom:.300}");
+    assert!(atom.contains("source key"), "primed keyed reads must record their bound key: {atom:.300}");
+
+    // The same distinction holds for a data field read through the bound key.
+    let data_two = fixture_field_actor_key("ActData").expect("two-key data action constraint certificate");
+    let data_same = fixture_field_actor_key("ActDataSame").expect("single-key data action constraint certificate");
+    let two_data = action_read_keys(&data_two);
+    let same_data = action_read_keys(&data_same);
+    assert_eq!(two_data.len(), 2, "{two_data:?}");
+    assert_ne!(two_data[0], two_data[1], "distinct bound keys must stay distinct on data reads: {two_data:?}");
+    assert_eq!(same_data[0], same_data[1], "the same bound key must stay one read: {same_data:?}");
+    assert!(data_two.lines().any(|l| l.contains("data field")), "data-field reads keep their slot");
+}
+
+const PRIME_SCOPE_TLA: &str = r#"---- MODULE PrimeScope ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLE r, idx, count
+Init == r = [k \in Actors |-> [id |-> k, mode |-> "idle", buf |-> 0]] /\ idx = 1 /\ count = 0
+Start == \E k \in Actors :
+           /\ r[k].mode = "idle"
+           /\ r' = [r EXCEPT ![k].mode = "busy", ![k].buf = 1]
+           /\ UNCHANGED <<idx>>
+           /\ count' = IF count < 1 THEN count + 1 ELSE count
+Finish == \E k \in Actors :
+            /\ r[k].mode = "busy"
+            /\ r[k].buf > 0
+            /\ r' = [r EXCEPT ![k].mode = "idle"]
+            /\ UNCHANGED <<idx>>
+            /\ count' = count
+Advance == /\ idx = 1
+           /\ idx' = 2
+           /\ UNCHANGED <<r, count>>
+Next == Start \/ Finish \/ Advance
+Inv == /\ \A k \in Actors : r[k].mode \in {"idle", "busy"}
+       /\ count <= 1
+StateLimit == \A k \in Actors : r[k].mode \in {"idle", "busy"} /\ count <= 1
+ActOuterKey == r'[idx].id = 1
+ActWholeLookup == r[idx]'.id = 1
+====
+"#;
+
+fn fixture_prime_scope(constraint: &str) -> Option<String> {
+    let (p, cfg) = load("PrimeScope", PRIME_SCOPE_TLA, "INIT Init\nNEXT Next\nCONSTANT Actors = {1, 2}\nINVARIANT Inv\n");
+    let (inv, lim, ac) = ([def_expr(&p, "Inv")], [def_expr(&p, "StateLimit")], [def_expr(&p, constraint)]);
+    let spec = CheckSpec { invariants: &inv, constraints: &lim, action_constraints: &ac, ..CheckSpec::default() };
+    phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("prime-scoped keyed action checks should keep the projection applicable")
+        .certificate
+}
+
+#[test]
+fn field_action_keys_record_their_prime_scope() {
+    // `r'[idx].id` reads the target map at the source index, while
+    // `r[idx]'.id` primes the whole lookup and reads the target map at the
+    // target index. When `Advance` changes `idx` from 1 to 2 the two
+    // predicates disagree, so they must not lower to the same instance.
+    let outer = fixture_prime_scope("ActOuterKey").expect("source-key certificate");
+    let whole = fixture_prime_scope("ActWholeLookup").expect("whole-lookup certificate");
+    assert_constrained_lean(&outer, "GeneratedField");
+    assert_constrained_lean(&whole, "GeneratedField");
+    let outer_atoms: Vec<&str> = outer.lines().filter(|l| l.contains("actionConstraint HIR")).collect();
+    let whole_atoms: Vec<&str> = whole.lines().filter(|l| l.contains("actionConstraint HIR")).collect();
+    assert_eq!(outer_atoms.len(), 1, "one action atom");
+    assert_eq!(whole_atoms.len(), 1, "one action atom");
+    for atom in [outer_atoms[0], whole_atoms[0]] {
+        assert!(atom.contains("source key"), "the key is recorded: {atom:.300}");
+    }
+    assert!(outer_atoms[0].contains("primed=true; key primed=false"), "r'[idx] keeps the source index: {:.300}", outer_atoms[0]);
+    assert!(whole_atoms[0].contains("primed=true; key primed=true"), "r[idx]' reads the target index: {:.300}", whole_atoms[0]);
+    assert_ne!(outer_atoms[0], whole_atoms[0], "the two prime scopes must not lower to one instance");
+}
+
+#[test]
+fn field_projection_certifies_action_checks_and_refuses_whole_record_reads() {
+    let (p, cfg) = fixture_field_action_constrained();
+    let (inv, c, ac, ap) =
+        ([def_expr(&p, "Inv")], [def_expr(&p, "StateLimit")], [def_expr(&p, "ActLimit")], [action_prop_expr(&p, "ActProp")]);
+    let spec = CheckSpec { invariants: &inv, constraints: &c, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    let proj = phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("field projection should certify endpoint action checks");
+    assert_eq!(proj.fields, vec!["r.buf".to_string()]);
+    let cert = proj.certificate.expect("constrained field certificate");
+    assert_constrained_lean(&cert, "GeneratedField");
+    assert!(cert.contains("def actionConstraint"));
+    assert!(cert.contains("def actionObserve"));
+    assert!(cert.contains("actionConstraint := actionConstraint sem"));
+    assert!(cert.contains("actionObserve := actionObserve sem"));
+
+    // A whole-record primed read cannot be certified: it would observe the
+    // erased buffer value at an arbitrary phase.
+    let bad = [action_prop_expr(&p, "ActUnsupported")];
+    let bad_spec = CheckSpec { invariants: &inv, constraints: &c, action_constraints: &ac, action_props: &bad, ..CheckSpec::default() };
+    assert!(phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), bad_spec).is_none());
+}
+
+#[test]
+fn ordered_nested_and_live_projections_certify_retained_core_action_checks() {
+    let ordered = fixture_ordered_action_constrained();
+    assert_constrained_lean(&ordered, "GeneratedOrdered");
+    assert!(ordered.contains("def actionConstraint"));
+    assert!(ordered.contains("sem.actionTest"));
+    assert!(ordered.contains("actionObserve := actionObserve sem"));
+
+    let nested = fixture_nested_action_constrained();
+    assert_constrained_lean(&nested, "GeneratedNested");
+    assert!(nested.contains("def actionConstraint"));
+    assert!(nested.contains("actionConstraint := actionConstraint sem"));
+    assert!(nested.contains("actionObserve := actionObserve sem"));
+
+    let live = fixture_live_action_constrained();
+    assert_constrained_lean(&live, "GeneratedLive");
+    assert!(live.contains("def actionConstraint"));
+    assert!(live.contains("actionConstraint := actionConstraint sem"));
+    assert!(live.contains("actionObserve := actionObserve sem"));
+}
+
 fn fixture_erasure_const_nat() -> (Program, Config, String) {
     let tla = r#"---- MODULE ConstSubstNat ----
 EXTENDS Naturals
@@ -578,7 +868,7 @@ fn erasure_and_erased_keyed_certify_constrained_and_refuse_observed_subscript() 
 }
 
 #[test]
-fn state_projections_certify_state_constraints_and_refuse_action_checks() {
+fn state_constraints_certify_and_sequence_projection_still_refuses_action_checks() {
     let (fp, fcfg, field_proj) = fixture_field_constrained();
     assert_constrained_lean(field_proj.certificate.as_deref().unwrap(), "GeneratedField");
     let (finv, reads_buf, fact) = ([def_expr(&fp, "Inv")], [def_expr(&fp, "ConstraintReadsBuf")], [def_expr(&fp, "ActLimit")]);
@@ -590,14 +880,18 @@ fn state_projections_certify_state_constraints_and_refuse_action_checks() {
         CheckSpec { invariants: &finv, constraints: &reads_buf, ..CheckSpec::default() },
     )
     .is_none());
-    assert!(phase_projection_with_spec(
+    // An endpoint action check over the retained control field is now certified.
+    let action_proj = phase_projection_with_spec(
         &fp,
         &fcfg,
         &def_expr(&fp, "Init"),
         &def_expr(&fp, "Next"),
         CheckSpec { invariants: &finv, action_constraints: &fact, ..CheckSpec::default() },
     )
-    .is_none());
+    .expect("field projection with a control-field action constraint");
+    let action_cert = action_proj.certificate.as_deref().unwrap();
+    assert_constrained_lean(action_cert, "GeneratedField");
+    assert!(action_cert.contains("def actionConstraint"));
 
     let (sp, scfg, seq_proj) = fixture_sequence_constrained();
     assert_constrained_lean(seq_proj.certificate.as_deref().unwrap(), "GeneratedLength");
@@ -888,6 +1182,57 @@ fn large_const_subst_scales_to_512_and_refuses_above_cap_and_handles_marker_lite
     assert!(cons_markers.contains("\ndef constSubstDeclared (i : Fin ConstSubstCount) : String :=\n"));
 }
 
+/// The shipped `proofs/field/ActionChecks.tla` certificate, so the published
+/// example's negative audit is part of the regression instead of a manual step.
+fn fixture_shipped_action_checks() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cfg_src = std::fs::read_to_string(root.join("proofs/field/ActionChecks.cfg")).unwrap();
+    let program = Program::load(&root.join("proofs/field/ActionChecks.tla"), &[]).unwrap();
+    let cfg = parse_cfg(&cfg_src).unwrap();
+    let (inv, lim, ac, ap) = (
+        [def_expr(&program, "Inv")],
+        [def_expr(&program, "StateLimit")],
+        [def_expr(&program, "ActLimit")],
+        [action_prop_expr(&program, "ActProp")],
+    );
+    let spec = CheckSpec { invariants: &inv, constraints: &lim, action_constraints: &ac, action_props: &ap, ..CheckSpec::default() };
+    phase_projection_with_spec(&program, &cfg, &def_expr(&program, "Init"), &def_expr(&program, "Next"), spec)
+        .expect("the shipped ActionChecks projection")
+        .certificate
+        .expect("the shipped ActionChecks certificate")
+}
+
+/// A certificate whose only data field is dead in every phase, so clearing the
+/// write table is sound and the audit's frame mutation must be scoped out.
+const INIT_MERGE_TLA: &str = r#"---- MODULE InitMerge ----
+EXTENDS Naturals
+VARIABLE r, tag
+Init == \E a,b,c \in 0..7:
+          \E n \in {0,1}: /\ tag = <<a,b,c>> /\ r = [mode |-> "idle", buf |-> n]
+Start == /\ r.mode = "idle"
+         /\ r' = [r EXCEPT !.mode = "busy", !.buf = 0]
+         /\ UNCHANGED tag
+Finish == /\ r.mode = "busy"
+          /\ r' = [r EXCEPT !.mode = "idle"]
+          /\ UNCHANGED tag
+Next == Start \/ Finish
+Inv == /\ \E a,b,c \in 0..7 : tag = <<a,b,c>>
+       /\ r.mode \in {"idle", "busy"}
+Edge == r'.mode \in {"busy", "idle"}
+====
+"#;
+
+fn fixture_init_merge_certificate() -> String {
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nACTION_CONSTRAINT Edge\nCHECK_DEADLOCK FALSE\n";
+    let (p, cfg) = load("InitMerge", INIT_MERGE_TLA, cfg);
+    let (inv, ac) = ([def_expr(&p, "Inv")], [def_expr(&p, "Edge")]);
+    let spec = CheckSpec { invariants: &inv, action_constraints: &ac, ..CheckSpec::default() };
+    phase_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("initial-state merge keeps the projection applicable")
+        .certificate
+        .expect("initial-state merge certificate")
+}
+
 #[test]
 #[ignore = "requires lean on PATH; verifies all constrained certificate families sequentially with proofs/check_generated.py --negative"]
 fn verify_all_constrained_certificate_families_with_lean_negative() {
@@ -910,6 +1255,13 @@ fn verify_all_constrained_certificate_families_with_lean_negative() {
         ("History", fixture_history_constrained()),
         ("Age", fixture_age_constrained().certificate.unwrap()),
         ("Ordered", fixture_ordered_constrained()),
+        ("FieldAction", fixture_field_action_certificate()),
+        ("ActionChecks", fixture_shipped_action_checks()),
+        ("InitMerge", fixture_init_merge_certificate()),
+        ("FieldActorKey", fixture_field_actor_key("ActTwo").unwrap()),
+        ("OrderedAction", fixture_ordered_action_constrained()),
+        ("NestedAction", fixture_nested_action_constrained()),
+        ("LiveAction", fixture_live_action_constrained()),
         ("AgeHistory", fixture_age_history_constrained()),
         ("Nested", fixture_nested_constrained()),
         ("Live", fixture_live_constrained()),

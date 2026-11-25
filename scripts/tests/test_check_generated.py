@@ -21,7 +21,7 @@ spec.loader.exec_module(checker)
 
 
 class LeanConcurrency(unittest.TestCase):
-    def test_jobs_caps_positive_checks_and_mutations_together(self):
+    def test_jobs_caps_positive_checks_mutations_and_field_probe_together(self):
         # Only scheduling is under test; fake Lean accepts the original and
         # rejects each mutation with the same diagnostic contract as Lean.
         source = "\n".join([
@@ -32,33 +32,63 @@ class LeanConcurrency(unittest.TestCase):
             "def after := (model sem).reduced",
             "end TlxOptimization.GeneratedHistory",
         ]) + "\n"
+        # A generated field certificate carries one extra scheduling path: the
+        # dead-to-live probe that decides whether the write-table mutation
+        # applies. It must queue behind the same --jobs bound as everything else.
+        field_source = "\n".join([
+            "def mask (p : K → P) (v : K → F → V) : K → F → V :=",
+            "  fun k f => if m.live (p k) f then v k f else m.missing",
+            "def seed (c : C) (b : B) (w : W) : State C K P F V :=",
+            "  s = m.project (m.seed c b w)",
+            "def advance (s : State C K P F V) (d : C) (b : B) (w : W) : State C K P F V :=",
+            "  t = m.project (m.advance s t.1 b w)",
+            "    fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
+            "namespace TlxOptimization.GeneratedField",
+            "def model : FieldRule.Model C Key Phase Field V BranchId W where",
+            "  readsActor := readsActor",
+            "  writes := writes",
+            "  readsGlobal := readsGlobal",
+            "def after := (model sem).reduced",
+            "end TlxOptimization.GeneratedField",
+        ]) + "\n"
         for jobs in (1, 2):
             with self.subTest(jobs=jobs), TemporaryDirectory() as tmp:
-                paths = [Path(tmp) / name for name in ("Fast.lean", "Slow.lean")]
+                paths = [Path(tmp) / name for name in ("Field.lean", "Fast.lean")]
                 for path in paths:
-                    path.write_text(source)
+                    path.write_text(field_source if path.name == "Field.lean" else source)
                 lock = threading.Lock()
-                mutation_started = threading.Event()
-                active = peak = positives = negatives = 0
+                active = peak = positives = negatives = probes = 0
 
                 def invoke(lean, path):
-                    nonlocal active, peak, positives, negatives
+                    nonlocal active, peak, positives, negatives, probes
+                    probe = path.name == "Probe.lean"
                     broken = path.name == "Broken.lean"
                     with lock:
                         active += 1
                         peak = max(peak, active)
-                        positives += not broken
-                        negatives += broken
+                        if probe:
+                            probes += 1
+                        else:
+                            positives += not broken
+                            negatives += broken
                     try:
-                        if broken:
-                            mutation_started.set()
-                        elif path.name == "Slow.lean" and jobs > 1:
-                            self.assertTrue(mutation_started.wait(2))
+                        if probe:
+                            # Stay in flight long enough for the field worker's
+                            # mutation batch to start. If the probe bypasses the
+                            # pool, that batch plus this probe exceeds --jobs.
+                            time.sleep(0.4)
+                            return subprocess.CompletedProcess([], 0, "true\n")
                         time.sleep(0.02)
-                        output = "error: unsolved goals" if broken else "\n".join(
-                            f"'TlxOptimization.GeneratedHistory.{name}' does not depend on any axioms"
+                        if broken:
+                            return subprocess.CompletedProcess([], 1, "error: unsolved goals")
+                        text = path.read_text()
+                        namespace = (
+                            "GeneratedField" if "namespace TlxOptimization.GeneratedField" in text
+                            else "GeneratedHistory")
+                        output = "\n".join(
+                            f"'TlxOptimization.{namespace}.{name}' does not depend on any axioms"
                             for name in checker.THEOREMS)
-                        return subprocess.CompletedProcess([], int(broken), output)
+                        return subprocess.CompletedProcess([], 0, output)
                     finally:
                         with lock:
                             active -= 1
@@ -70,8 +100,9 @@ class LeanConcurrency(unittest.TestCase):
                      patch.object(checker, "invoke", side_effect=invoke), \
                      contextlib.redirect_stdout(io.StringIO()):
                     checker.main()
-                self.assertEqual((positives, negatives, active), (2, 8, 0))
+                self.assertEqual((positives, probes, negatives, active), (2, 1, 12, 0))
                 self.assertLessEqual(peak, jobs)
+
 
 
 if __name__ == "__main__":

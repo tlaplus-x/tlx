@@ -20,6 +20,26 @@ impl Emitter<'_, '_> {
         }
         Some(out)
     }
+    pub(super) fn action_tests(&mut self, es: &[Expr]) -> Option<String> {
+        let mut out = "(True)".to_owned();
+        for e in es {
+            let test = self.action_test(e)?;
+            out = format!("({out} ∧ {test})");
+        }
+        Some(out)
+    }
+
+    /// Lower an action check over the retained core state. Any read of a
+    /// projected allocation or live-version value is refused.
+    pub(super) fn action_test(&mut self, e: &Expr) -> Option<String> {
+        if !self.independent(e) {
+            return None;
+        }
+        let i = self.atoms.len();
+        self.atoms.push(format!("Action-level HIR: {e:#?}; only retained leaf values"));
+        Some(format!("(sem.actionTest {i} c d)"))
+    }
+
     fn test(&mut self, e: &Expr, mode: Mode) -> Option<String> {
         let out = self.test_inner(e, mode)?;
         bounded(out)

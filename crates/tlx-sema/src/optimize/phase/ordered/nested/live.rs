@@ -70,7 +70,7 @@ impl Emitter<'_, '_> {
     pub(super) fn live_semantics(&self, out: &mut String) {
         let h = self.plan.history.as_ref().unwrap();
         writeln!(out, "def historyFamily : Family := ⟨{}, by decide⟩", h.family).unwrap();
-        out.push_str("abbrev Reads (V : Type) := Reference (Slot historyFamily) (Anchor historyFamily) → Option V\nstructure Semantics (C W V : Type) where\n  fallback : V\n  initial : Nat → C → W → Prop\n  test : Nat → C → C → W → Reads V → Prop\n  observe : Nat → C → Reads V → Prop\n  seedPayload : Nat → C → W → V\n  payload : Nat → C → C → W → Reads V → V\nvariable {C W V : Type} (sem : Semantics C W V)\n");
+        out.push_str("abbrev Reads (V : Type) := Reference (Slot historyFamily) (Anchor historyFamily) → Option V\nstructure Semantics (C W V : Type) where\n  fallback : V\n  initial : Nat → C → W → Prop\n  test : Nat → C → C → W → Reads V → Prop\n  observe : Nat → C → Reads V → Prop\n  actionTest : Nat → C → C → Prop\n  seedPayload : Nat → C → W → V\n  payload : Nat → C → C → W → Reads V → V\nvariable {C W V : Type} (sem : Semantics C W V)\n");
     }
 
     #[allow(clippy::too_many_arguments)] // combines live-version seed/step payloads and state-level check strings in one emitter pass
@@ -82,6 +82,8 @@ impl Emitter<'_, '_> {
         observation: &str,
         init_obs: &str,
         constraint: &str,
+        action_constraint: &str,
+        action_obs: &str,
         constrained: bool,
     ) -> super::super::super::OpenCert {
         let h = self.plan.history.as_ref().unwrap();
@@ -110,9 +112,15 @@ impl Emitter<'_, '_> {
             writeln!(out, "def initObserve {{C W V : Type}} (sem : Semantics C W V) (c : C) (reads : Reads V) : FamilyTest Family Slot Anchor := {init_obs}").unwrap();
             writeln!(out, "def constraint {{C W V : Type}} (sem : Semantics C W V) (c : C) (reads : Reads V) : FamilyTest Family Slot Anchor := {constraint}").unwrap();
         }
+        if constrained {
+            writeln!(out, "def actionConstraint {{C W V : Type}} (sem : Semantics C W V) (c d : C) : Prop := {action_constraint}").unwrap();
+            writeln!(out, "def actionObserve {{C W V : Type}} (sem : Semantics C W V) (c d : C) : Prop := {action_obs}").unwrap();
+        }
         out.push_str("def model : LiveRule.Model C Family (BranchId × W) V Slot Anchor where\n  layout := layout\n  family := historyFamily\n  initial := initial sem\n  seedValues := seedValues\n  seedPayload := seedPayload sem\n  tick := tick\n  delta := delta\n  historyDelta := historyDelta\n  transfers := transfers sem\n  guard := guard sem\n  payload := payload sem\n  observe := observe sem\n");
         if constrained {
-            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+            out.push_str(
+                "  initObserve := initObserve sem\n  constraint := constraint sem\n  actionConstraint := actionConstraint sem\n  actionObserve := actionObserve sem\n",
+            );
         }
         let tail = include_str!("certificate.lean").replace("rankKey", "runtimeKey");
         super::super::super::OpenCert::new(out, &tail, "GeneratedLive", constrained, false, false)
