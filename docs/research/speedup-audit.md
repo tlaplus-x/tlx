@@ -176,8 +176,10 @@ count say that the liveness phase ran, not that each property in it is correct:
   and no `count_problems` entry.
 
 What would close the remaining gap: a probe per property shape that makes each configured property
-false and checks that the violation is reported (this audit ran one such probe, for the `[]`-shaped
-`V!Spec` of `MCPaxosSmall`, and it was detected in both modes), or validating each liveness
+false and checks that the violation is reported (this audit ran such probes for the `[]`-shaped
+`V!Spec` of `MCPaxosSmall` and, in a follow-up diagnostic, for all three conjuncts of
+`MCParReach`'s `Refines == R!Spec` — `R!Init`, `[][R!Next]_R!vars`, and `WF_R!vars(R!Next)` — all
+detected in both `default` and `-tlc` modes, matching TLC), or validating each liveness
 counterexample against TLC. All 13 rows expect `success`, so a dropped or mistranslated property
 would not show up in their verdicts.
 
@@ -249,7 +251,7 @@ from a different machine than every TLC baseline in the store, and no ratio may 
 | 9 | ext/cassandra/Accord_baseline__deep_chain -compile 1w | 146.60x | 1.111 / 7.568 | 162.878 | 179712 / 179712 | none | supported (F2) |
 | 10 | ext/cassandra/Accord_baseline__deep_chain default 1w | 146.21x | 1.114 / 1.285 | 162.878 | 179712 / 179712 | none | supported (duplicate of #9) |
 | 11 | bench/ReprRaftMongo -compile 1w -tlc | 132.22x | 0.491 / 1.898 | 64.921 | 12003 / 12003 | unknown | supported (F2) |
-| 12 | MisraReachability/MCParReach default 1w | 111.74x | 0.109 / 0.310 | 12.180 | 393 / 393 | none | pending (no phase run) |
+| 12 | MisraReachability/MCParReach default 1w | 111.74x | 0.109 / 0.310 | 12.180 | 393 / 393 | none | supported (phase attributed, 2.2) |
 | 13 | MultiCarElevator/ElevatorLivenessMedium default 1w | 109.12x | 0.165 / 1.045 | 18.005 | 4122 / 4122 | none | supported (F2) |
 
 The `recorded optimizations (tlx)` column is the record's own statement, byte for byte the cell the
@@ -296,13 +298,16 @@ number, and records only that the published size depends on the TLC machine.
 (75.855 s and 12.180 s) are 9.5 s and 31 ms *per distinct state*. Both configurations are ordinary
 safety-sized models whose cost in TLC is serial, which the store shows directly:
 
-* The same key at 16 workers is **slower** than at one worker: 102.672 s against 75.855 s, with
-  `cpu_s / wall_s` = 1.19 (about one core busy), where `MCBoulanger` (243.75 s -> 29.588 s) and
-  `MCRaftMongo` (3551.468 s -> 449.796 s) use 12.6-14.0 cores at the same worker count. TLC gains
-  nothing from 16 workers here, so its time is not search work.
-* The tlx side of the comparison is search: the census recorded with the row reports 84 evaluations
-  and 0.0145 s of estimated search-thread time, and the whole run is a property-checked search over
-  the same 8 states (the row's recorded warm-up is 0.207 s against 0.096 s timed).
+* The same keys at 16 workers are **slower** than at one worker: `MCReachable` takes 102.672 s
+  against 75.855 s (`cpu_s / wall_s` = 1.19, about one core busy), and `MCParReach` takes
+  41.972 s against 12.180 s (`cpu_s / wall_s` = 1.72), where `MCBoulanger` (243.75 s -> 29.588 s)
+  and `MCRaftMongo` (3551.468 s -> 449.796 s) use 12.6-14.0 cores at the same worker count. TLC
+  gains nothing from 16 workers on either model, so its time is not search parallelism.
+* The tlx side of the comparison is search: the census recorded with `MCReachable` reports 84
+  evaluations and 0.0145 s of estimated search-thread time over the same 8 states (recorded warm-up
+  0.207 s against 0.096 s timed), and `MCParReach`'s recorded census reports 6,949 evaluations and
+  0.004383 s of estimated search-thread time over the same 393 states (recorded warm-up 0.310 s
+  against 0.109 s timed).
 * The configurations are the unusual part: `Succ <- ConnectedToSomeButNotAll` substitutes a
   `CHOOSE succ \in [Nodes -> SUBSET Nodes] : ...` over a 65536-function space, and
   `Seq <- LimitedSeq` bounds `Seq(Nodes)` for `ExistsPath`; four of `MCReachable`'s invariants
@@ -330,15 +335,61 @@ profile above, the record's 75.855 s is per-state evaluation of those invariants
 `ExistsPath` over the configured `Seq`, and the `Succ` substitution), not search parallelism and not
 the liveness tableau.
 
-Two limits on that reading: the diagnostic ran on this workstation, not on the collecting instance,
-so it attributes *phases* and does not re-measure the published number; and the reduced run drops
-the `PROPERTY` as well as the invariants, so it bounds the invariants' share from below (the
-original log's own timestamps place the property check under a second). `MCParReach` was not run;
-its `PROPERTY` is `R!Spec`, the same `[]`-shaped safety specification as `MCReachable`'s
-`Termination` is not, so its 12.180 s is plausibly the same per-state cost on 393 states, but this
-audit did not verify that. The *ratio* itself is a real end-to-end difference either way (TLC really
-takes ~76 s on this configuration on the collecting instance); what is now established is that TLC
-spends it evaluating the model's constant-heavy invariants per state.
+Two limits on that reading: the diagnostic ran on a local workstation, not on the collecting cloud
+instance, so it attributes *phases* and does not re-measure the published `2026-10-11` number; and
+the reduced `MCReachable` run drops the `PROPERTY` as well as the invariants, so it bounds the
+invariants' share from below (the original log's own timestamps place the property check under a
+second).
+
+A follow-up bounded serial diagnostic on `MCParReach` (same single-JVM `-workers 1` methodology via
+`scripts/tlc.py ... --allow-local-heavy` on a Linux x86_64 workstation — attributing phases only,
+with no cross-machine ratio against the `2026-10-11` `SA5.4XLARGE32` cloud record) records each
+configuration's phase split on the same 393 distinct / 747 generated / depth-18 state space:
+
+| `MCParReach` diagnostic variant (workstation, TLC `-workers 1`) | wall s | startup/init | search | post-search temporal |
+|---|---:|---:|---:|---:|
+| Original `MCParReach.cfg` (`INVARIANT Inv`, `PROPERTY Refines`, `SPECIFICATION Spec`) | 21.884 | ~5 s | ~15 s | < 1 s (`00s`) |
+| `PROPERTY Refines` only (dropping `INVARIANT Inv`) | 22.339 | ~5 s | ~16 s | < 1 s (`00s`) |
+| `INVARIANT Inv` only (dropping `PROPERTY Refines`) | 7.389 | ~4 s | ~3 s | n/a |
+| `INVARIANT Inv` + safety-only `R!Init /\ [][R!Next]_R!vars` (no `WF_R!vars(R!Next)`) | 11.808 | ~7 s | ~4 s | n/a |
+| Pure search (`INIT Init`, `NEXT Next`, no invariant or property) | 8.521 | ~5 s | ~3 s | n/a |
+| Full `Inv` + `Refines` with `Succ <- FixedSucc` control (same 2-successor outdegree) | 1.679 | ~1 s | < 1 s | < 1 s (`00s`) |
+
+Unlike `MCReachable` (where `ReachableFrom`-based invariants dominate), `ParReach!Inv` does not
+reference `Succ` or `Reachable` and adds no measurable cost (`22.339 s` without `Inv` vs.
+`21.884 s` with it). `Refines == R!Spec` (`R!Init /\ [][R!Next]_R!vars /\ WF_R!vars(R!Next)`) is
+the expensive part: the full property raises the run from `7.389 s` (`INVARIANT Inv` alone) to
+`21.884 s`, a `14.495 s` difference between configurations. It arrives in two whole-run steps, and
+the wall-time gaps do not split them into phases — the timestamp columns do:
+
+* Adding the safety conjuncts `R!Init /\ [][R!Next]_R!vars` to `INVARIANT Inv` increases wall time
+  by `4.419 s` (`7.389 s` -> `11.808 s`), of which roughly `3 s` accrues in startup/init
+  (`~4 s` -> `~7 s`) and only about `1 s` in search (`~3 s` -> `~4 s`). The `4.419 s` is therefore
+  not the per-step cost of the action property.
+* Adding `WF_R!vars(R!Next)` on top increases wall time by a further `10.076 s`
+  (`11.808 s` -> `21.884 s`), which the timestamps place almost entirely in search
+  (`~4 s` -> `~15 s`). That run also enables TLC's temporal graph and evaluates the concrete
+  specification's per-process fairness conditions alongside the abstract fairness obligation, so
+  the `10.076 s` is an end-to-end difference, not a measurement of the abstract obligation alone.
+
+The post-search temporal check itself finishes in `00s` (< 1 s) in both property runs. Replacing
+`Succ <- ConnectedToSomeButNotAll` with a direct 2-successor constant function
+(`FixedSucc == [n \in Nodes |-> {Root, SecondNode}]`, producing the same 393/747/depth-18 state
+space) drops total TLC runtime from `21.884 s` to `1.679 s` (startup/init `~5 s` -> `~1 s`), so the
+substitution dominates the run as a whole. Its consumers are startup `ASSUME SuccAssump`, `Next`
+(`b(self)`), and in-search evaluation of `R!Next` inside `PROPERTY Refines`; the run-level
+`FixedSucc` comparison establishes their combined cost, not the share of each call site.
+
+Cross-checking `tlx` (`default` and `-tlc`) on `MCParReach` reproduces `393` distinct / `747`
+generated / depth `18`, and falsifying each conjunct of `Refines == R!Spec` — `R!Init`,
+`[][R!Next]_R!vars` (via `RBad!Spec` with `vrootBad == IF marked = {} THEN vrootBar ELSE {}`), and
+`WF_R!vars(R!Next)` (checking unmodified `Refines` against `SpecNoFair == Init /\ [][Next]_vars`) —
+is detected in both `default` and `-tlc` modes with exact TLC parity (exit 13: init property
+violation, action property violation at `Reachable` line 109 with trace length 3, and
+`Temporal property Refines was violated`). The *ratios* on both `MisraReachability` rows are real
+end-to-end differences on the collecting instance; what is now established is that TLC spends its
+time on repeated constant-heavy `Succ`/`ReachableFrom` evaluation (in `MCReachable`'s invariants
+and in `MCParReach`'s `ASSUME`/`Next`/in-search `R!Spec` evaluation).
 
 ## 3. Proposed bounded repeat protocol
 
@@ -370,11 +421,11 @@ time at the recorded times, and most of it is dominated by four rows):
   bounds and reproducible as declared `SYMMETRY` (and on `main` every applied reduction now requires a connected compiler-generated Lean certificate, `proof: "generated-lean"`).
 * It does not claim the large ratios are fabricated. `ElevatorLivenessLarge`, `RaftMongoT4`,
   `MCRaftMongo` and `Accord` are genuine end-to-end differences on the same inputs and counts
-  (`MCReachable` too, now that its TLC phase is attributed).
-* It does claim that the six rows whose recorded warm-up is 3.4-6.8x the timed value, the two
-  reduction rows, and `MCParReach` (whose phase was not attributed) are not yet evidence for the
-  *size* of the number they publish, and that the missing TLC repeats (F1) and the unverified
-  per-property correctness (F5) are the two items to fix first.
+  (`MCReachable` and `MCParReach` too, now that their TLC phases are attributed).
+* It does claim that the six rows whose recorded warm-up is 3.4-6.8x the timed value and the two
+  reduction rows are not yet evidence for the *size* of the number they publish, and that the
+  missing TLC repeats (F1) and the unverified per-property correctness (F5) are the two items to
+  fix first.
 
 ## Appendix: published rows whose records name an optimization
 

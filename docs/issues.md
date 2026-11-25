@@ -70,6 +70,5 @@ Keep their samples visible and repeat measurements before using them to establis
 
 The [audit of ratios above 100x](research/speedup-audit.md) identifies further validation work:
 repeated TLC measurements on the same instance, explicit cache conditions, comparable runs with
-and without automatic reduction, and per-property correctness checks. `MCParReach` still lacks
-phase attribution. Matching counts and a log line announcing liveness checking do not prove that
-every temporal property was translated correctly.
+and without automatic reduction, and per-property correctness checks. Matching counts and a log line
+announcing liveness checking do not prove that every temporal property was translated correctly.
