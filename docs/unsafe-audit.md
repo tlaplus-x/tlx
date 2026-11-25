@@ -31,7 +31,7 @@ Locations name files and functions (line numbers drift).
 | # | Location | What | Invariant relied on | Status |
 |---|---|---|---|---|
 | 1 | `tlx-value/src/intern.rs`: `write_entry`, `entry`, `Sym::from_id` | append-only segmented table, read without a lock | an entry is initialized once under its shard lock before publishing a `Sym`; `unsafe Sym::from_id` requires an existing published symbol; safe `Sym::try_from_id` locks every shard before checking NEXT, so it waits for allocated but unwritten ids; segment pointers use Release/Acquire | Safety contracts; concurrent interning and checked-publication tests |
-| 2 | `tlx-layout/src/dynval.rs`: `lookup_unchecked`; `layout.rs`: `decode_unchecked`, `Layout::decode_state_unchecked`; `layout_tree.rs`: `LayoutNode::decode_unchecked`, `transcode_unchecked`; `permute.rs`: `apply_unchecked` | trusted raw words become `Value`/`Sym` | active Dyn handles originate in this process's `intern`, or tables restored in symbol-then-Dyn order, and are published through synchronization; unchecked recursive decoding preserves this contract for active child slots | unsafe raw entry points with Safety contracts; safe lookup/decode/permute/transcode reject invalid handles before materializing a value; `raw_handles` tests and Miri |
+| 2 | `tlx-layout/src/dynval.rs`: `lookup_unchecked`; `layout.rs`: `decode_unchecked`, `Layout::decode_state_unchecked`; `layout_tree/mod.rs`: `LayoutNode::decode_unchecked`, `transcode_unchecked`; `permute.rs`: `apply_unchecked` | trusted raw words become `Value`/`Sym` | active Dyn handles originate in this process's `intern`, or tables restored in symbol-then-Dyn order, and are published through synchronization; unchecked recursive decoding preserves this contract for active child slots | unsafe raw entry points with Safety contracts; safe lookup/decode/permute/transcode reject invalid handles before materializing a value; `raw_handles` tests and Miri |
 
 ### tlx-runtime
 
@@ -239,7 +239,7 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-front/src/parse.rs` | reviewed | One compatible allocator installed before parsing (row 23). |
 | `crates/tlx-layout/src/dynval.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-layout/src/layout.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
-| `crates/tlx-layout/src/layout_tree.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
+| `crates/tlx-layout/src/layout_tree/mod.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-layout/src/permute.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-runtime/src/explore/checkpoint/recover.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/explore/checkpoint/write.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |

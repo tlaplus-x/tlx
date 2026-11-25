@@ -490,3 +490,258 @@ fn transcode_checks_bitset_cardinality() {
         }
     }
 }
+
+/// Property test: `LayoutNode::cmp_tlc_words` agrees with `tlx_value::order::cmp_tlc`
+/// across random shapes (scalars, packed sub-word composites, bitsets, sorted-array
+/// sets, functions, maps, sequences, records, tuples, unions, dynamic witnesses, and
+/// `Dyn`) whenever it returns `Some`, and returns `None` whenever `cmp_tlc` errors.
+#[test]
+fn cmp_tlc_words_matches_cmp_tlc_random() {
+    let mut rng = Rng::new(0x517c_c1b7_2722_0a95);
+    let mut compared_some = 0usize;
+    let mut compared_none = 0usize;
+    let mut tlc_errs = 0usize;
+    for _ in 0..2500 {
+        let s = shape(&mut rng, 0);
+        let node = LayoutNode::new(&s);
+        let w = node.words();
+        let mut samples: Vec<(Value, Vec<u64>)> = Vec::new();
+        for _ in 0..12 {
+            let v = value(&mut rng, &s, 0);
+            let mut enc = vec![0u64; w];
+            if node.encode(&v, &mut enc).is_ok() {
+                let dec = node.decode(&enc);
+                samples.push((dec, enc));
+            }
+        }
+        for (va, wa) in &samples {
+            for (vb, wb) in &samples {
+                let got = node.cmp_tlc_words(wa, wb);
+                let want = tlx_value::order::cmp_tlc(va, vb);
+                match (got, want) {
+                    (Some(g), Ok(w)) => {
+                        assert_eq!(g, w, "cmp_tlc_words mismatch for {va} vs {vb} in {s:?}");
+                        compared_some += 1;
+                    }
+                    (Some(g), Err(e)) => {
+                        panic!("cmp_tlc_words returned Some({g:?}) where cmp_tlc errored ({e:?}) for {va} vs {vb} in {s:?}");
+                    }
+                    (None, Ok(_)) => compared_none += 1,
+                    (None, Err(_)) => tlc_errs += 1,
+                }
+            }
+        }
+    }
+    assert!(compared_some > 50_000, "expected broad word-level coverage, got {compared_some}");
+    assert!(compared_none > 0 || tlc_errs > 0, "expected Dyn/incomparable fallbacks");
+}
+
+/// Targeted edge cases for `LayoutNode::cmp_tlc_words`: packed sub-word scalars,
+/// mixed typed/untyped/string atoms, multi-word bitsets, sorted-array sets of
+/// non-word-ordered elements, dynamic-witness functions/maps, reversed-order
+/// unions, `Ref` store handles, and malformed inputs.
+#[test]
+fn cmp_tlc_words_edge_cases() {
+    use std::cmp::Ordering;
+    use tlx_layout::store::StoreRef;
+
+    let check_all = |s: &Shape, vals: &[Value], require_some_on_ok: bool| {
+        let node = LayoutNode::new(s);
+        let encs: Vec<Vec<u64>> = vals
+            .iter()
+            .map(|v| {
+                let mut w = vec![0u64; node.words()];
+                node.encode(v, &mut w).unwrap_or_else(|m| panic!("encode {v} in {s:?}: {m:?}"));
+                w
+            })
+            .collect();
+        for (va, wa) in vals.iter().zip(&encs) {
+            for (vb, wb) in vals.iter().zip(&encs) {
+                let got = node.cmp_tlc_words(wa, wb);
+                let want = tlx_value::order::cmp_tlc(va, vb);
+                match (got, want) {
+                    (Some(g), Ok(w)) => assert_eq!(g, w, "{va} vs {vb} in {s:?}"),
+                    (None, Err(_)) => {}
+                    (None, Ok(w)) if !require_some_on_ok => {
+                        let _ = w;
+                    }
+                    (g, w) => panic!("mismatch for {va} vs {vb} in {s:?}: got {g:?}, want {w:?}"),
+                }
+            }
+        }
+    };
+
+    // 1. Mixed typed model values + untyped model value + strings (standalone and packed in Record).
+    let mut mixed_atoms = vec![
+        Value::model_value("a_1"),
+        Value::model_value("a_2"),
+        Value::model_value("b_1"),
+        Value::model_value("plain"),
+        Value::str("s1"),
+        Value::str("s2"),
+    ];
+    mixed_atoms.sort();
+    let mixed_shape = Shape::Atom(Arc::from(mixed_atoms.clone()));
+    check_all(&mixed_shape, &mixed_atoms, true);
+
+    let mut rec_fields =
+        vec![(Sym::new("a"), Shape::Bool), (Sym::new("b"), mixed_shape.clone()), (Sym::new("c"), Shape::Int { lo: -2, hi: 2 })];
+    rec_fields.sort_by_key(|f| f.0);
+    let packed_rec = Shape::Record(Arc::from(rec_fields));
+    assert_eq!(LayoutNode::new(&packed_rec).words(), 1, "expected sub-word packed record");
+    let rec_vals: Vec<Value> = [false, true]
+        .into_iter()
+        .flat_map(|b| {
+            mixed_atoms.iter().flat_map(move |m| {
+                [-2, 0, 2].into_iter().map(move |n| {
+                    Value::record(vec![(Sym::new("a"), Value::Bool(b)), (Sym::new("b"), m.clone()), (Sym::new("c"), Value::Int(n))])
+                })
+            })
+        })
+        .collect();
+    check_all(&packed_rec, &rec_vals, true);
+
+    // 2. Multi-word bitset (130 elements -> 3 words) with differing and equal cardinalities.
+    let big_bitset = Shape::Set { elem: Box::new(Shape::Int { lo: 0, hi: 129 }), max_card: 130 };
+    assert_eq!(LayoutNode::new(&big_bitset).words(), 3);
+    let bs_vals: Vec<Value> =
+        [vec![], vec![0], vec![64], vec![129], vec![1, 120], vec![2, 70], vec![0, 64, 129], vec![0, 65, 128], vec![1, 64, 128]]
+            .into_iter()
+            .map(|xs| Value::set_from(xs.into_iter().map(Value::Int).collect()).unwrap())
+            .collect();
+    check_all(&big_bitset, &bs_vals, true);
+
+    // 3. Sorted-array set of bitsets (raw word order != TLC order: {2, 3} has smaller bitmask than {1, 4}).
+    let inner_set = Shape::Set { elem: Box::new(Shape::Int { lo: 0, hi: 12 }), max_card: 13 };
+    assert!(inner_set.cardinality().unwrap() > tlx_layout::shape::MAX_BITSET_UNIVERSE);
+    let outer_set = Shape::Set { elem: Box::new(inner_set), max_card: 3 };
+    let s14 = Value::set_from(vec![Value::Int(1), Value::Int(4)]).unwrap();
+    let s23 = Value::set_from(vec![Value::Int(2), Value::Int(3)]).unwrap();
+    let s0 = Value::set_from(vec![Value::Int(0)]).unwrap();
+    let outer_vals: Vec<Value> = [
+        vec![],
+        vec![s14.clone()],
+        vec![s23.clone()],
+        vec![s14.clone(), s23.clone()],
+        vec![s0.clone(), s23.clone()],
+        vec![s0.clone(), s14.clone()],
+    ]
+    .into_iter()
+    .map(|xs| Value::set_from(xs).unwrap())
+    .collect();
+    check_all(&outer_set, &outer_vals, true);
+
+    // 4. Dynamic-witness Fcn and Map (trailing witness word must not affect TLC order).
+    let dyn_fcn = Shape::Fcn {
+        dom: Arc::from(vec![Value::Int(1), Value::Int(2)]),
+        range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+        witness: FcnWitness::Dynamic,
+        key_variants: Arc::from([]),
+    };
+    let fcn_vals = vec![
+        Value::tuple(vec![Value::Int(0), Value::Int(1)]),
+        Value::fcn_rcd_from_pairs(vec![(Value::Int(1), Value::Int(0)), (Value::Int(2), Value::Int(1))]).unwrap(),
+        Value::tuple(vec![Value::Int(1), Value::Int(0)]),
+        Value::fcn_rcd_from_pairs(vec![(Value::Int(1), Value::Int(1)), (Value::Int(2), Value::Int(0))]).unwrap(),
+    ];
+    check_all(&dyn_fcn, &fcn_vals, true);
+
+    let dyn_map = Shape::Map {
+        key: Box::new(Shape::Int { lo: 1, hi: 3 }),
+        range: Box::new(Shape::Int { lo: 0, hi: 2 }),
+        witness: FcnWitness::Dynamic,
+    };
+    let map_vals = vec![
+        Value::tuple(vec![]),
+        Value::empty_fcn(),
+        Value::tuple(vec![Value::Int(1)]),
+        Value::fcn_rcd_from_pairs(vec![(Value::Int(1), Value::Int(1))]).unwrap(),
+        Value::fcn_rcd_from_pairs(vec![(Value::Int(2), Value::Int(0))]).unwrap(),
+        Value::tuple(vec![Value::Int(0), Value::Int(2)]),
+        Value::fcn_rcd_from_pairs(vec![(Value::Int(1), Value::Int(0)), (Value::Int(3), Value::Int(1))]).unwrap(),
+    ];
+    check_all(&dyn_map, &map_vals, true);
+
+    // 5. Unions: reversed arm order ([Bool, Atom(untyped MV)]), [Record, Tuple], [Record, Seq], [Bool, Int].
+    let bool_or_mv = Shape::Bool.join(&Shape::Atom(Arc::from(vec![Value::model_value("none")])));
+    check_all(&bool_or_mv, &[Value::FALSE, Value::TRUE, Value::model_value("none")], true);
+
+    let rec1 = Shape::Record(Arc::from(vec![(Sym::new("a"), Shape::Int { lo: 0, hi: 1 })]));
+    let tup1 = Shape::Tuple(Arc::from(vec![Shape::Int { lo: 0, hi: 1 }]));
+    let rec_or_tup = rec1.join(&tup1);
+    check_all(
+        &rec_or_tup,
+        &[
+            Value::record(vec![(Sym::new("a"), Value::Int(0))]),
+            Value::record(vec![(Sym::new("a"), Value::Int(1))]),
+            Value::tuple(vec![Value::Int(0)]),
+            Value::tuple(vec![Value::Int(1)]),
+        ],
+        true,
+    );
+
+    let seq2 = Shape::Seq { elem: Box::new(Shape::Int { lo: 0, hi: 1 }), max_len: 2 };
+    let rec_or_seq = rec1.join(&seq2);
+    check_all(
+        &rec_or_seq,
+        &[
+            Value::record(vec![(Sym::new("a"), Value::Int(0))]),
+            Value::tuple(vec![]),
+            Value::tuple(vec![Value::Int(0)]),
+            Value::tuple(vec![Value::Int(0), Value::Int(1)]),
+        ],
+        true,
+    );
+
+    let bool_or_int = Shape::Bool.join(&Shape::Int { lo: 0, hi: 1 });
+    check_all(&bool_or_int, &[Value::FALSE, Value::TRUE, Value::Int(0), Value::Int(1)], true);
+
+    // 6. Store Ref handles.
+    let store = StoreRef::new(usize::MAX);
+    let ref_shape = Shape::Ref(store);
+    check_all(
+        &ref_shape,
+        &[
+            Value::Int(-5),
+            Value::Int(7),
+            Value::model_value("mv"),
+            Value::set_from(vec![Value::Int(1), Value::Int(4)]).unwrap(),
+            Value::set_from(vec![Value::Int(2), Value::Int(3)]).unwrap(),
+        ],
+        true,
+    );
+
+    // 6b. Mixed-key Map admitting incomparable key pairs (e.g. <<p1, t_A>> vs <<p1, "x">>)
+    // must return None so SYMMETRY falls back to TLC's key-comparison semantics.
+    let mut procs = vec![Value::model_value("p1"), Value::model_value("p2")];
+    procs.sort();
+    let mut mixed_tag = vec![Value::model_value("t_A"), Value::str("x")];
+    mixed_tag.sort();
+    let mixed_key_map = Shape::Map {
+        key: Box::new(Shape::Tuple(Arc::from(vec![Shape::Atom(Arc::from(procs)), Shape::Atom(Arc::from(mixed_tag))]))),
+        range: Box::new(Shape::Bool),
+        witness: FcnWitness::Enumerated,
+    };
+    let mixed_map_node = LayoutNode::new(&mixed_key_map);
+    let m1 = Value::fcn_rcd_from_pairs(vec![
+        (Value::tuple(vec![Value::model_value("p1"), Value::model_value("t_A")]), Value::TRUE),
+        (Value::tuple(vec![Value::model_value("p2"), Value::str("x")]), Value::TRUE),
+    ])
+    .unwrap();
+    let m2 = Value::fcn_rcd_from_pairs(vec![
+        (Value::tuple(vec![Value::model_value("p1"), Value::str("x")]), Value::TRUE),
+        (Value::tuple(vec![Value::model_value("p2"), Value::model_value("t_A")]), Value::TRUE),
+    ])
+    .unwrap();
+    let (mut w1, mut w2) = (vec![0u64; mixed_map_node.words()], vec![0u64; mixed_map_node.words()]);
+    mixed_map_node.encode(&m1, &mut w1).unwrap();
+    mixed_map_node.encode(&m2, &mut w2).unwrap();
+    assert_eq!(mixed_map_node.cmp_tlc_words(&w1, &w2), None);
+
+    // 7. Short/malformed slices return None without panicking.
+    let seq_node = LayoutNode::new(&seq2);
+    assert_eq!(seq_node.cmp_tlc_words(&[], &[]), None);
+    assert_eq!(seq_node.cmp_tlc_words(&[99, 0], &[0, 0]), None);
+    assert_eq!(LayoutNode::new(&Shape::Never).cmp_tlc_words(&[], &[]), None);
+    assert_eq!(LayoutNode::new(&Shape::Bool).cmp_tlc_words(&[0], &[1]), Some(Ordering::Less));
+}

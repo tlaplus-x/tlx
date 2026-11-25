@@ -409,9 +409,9 @@ impl EncModel {
         let fp = match (symmetry, view) {
             (_, Some(view)) if base.has_projected_symmetry() => Fingerprint::View(view),
             // VIEW with SYMMETRY: TLC takes the VIEW of the orbit's least
-            // state in its value order, which encodings do not preserve:
-            // that state is chosen by value, then its encoding permuted.
-            (Some(group), Some(view)) => Fingerprint::SymView { group, view },
+            // state in TLC's value order (`base.var_order`), found directly on
+            // encoded words with fallback to by-value selection when needed.
+            (Some(group), Some(view)) => Fingerprint::SymView { group, order: base.var_order(layout.vars.len()).to_vec(), view },
             (Some(group), None) if !base.has_view() => Fingerprint::Symmetry { group, order: symmetry_order(&layout) },
             (None, Some(view)) if !has_symmetry => Fingerprint::View(view),
             _ if base.has_view_or_symmetry() => Fingerprint::Values,
@@ -427,7 +427,7 @@ impl EncModel {
         let pure_invariants = !base.invariant_names().is_empty() && !super::speculate::invariants_volatile(&base);
         match fp {
             Fingerprint::Symmetry { .. } => notes.push("symmetry: permuting encodings".into()),
-            Fingerprint::SymView { .. } => notes.push("symmetry: least state by value, VIEW of its permuted encoding".into()),
+            Fingerprint::SymView { .. } => notes.push("symmetry: least state on encodings, VIEW of its permuted encoding".into()),
             _ => {}
         }
         // Fingerprints computed here (on encodings): the interpreter need

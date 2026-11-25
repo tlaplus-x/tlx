@@ -129,10 +129,11 @@ pub(super) enum Fingerprint {
     /// VIEW's encoding.
     View(View),
     /// VIEW with SYMMETRY: the fingerprint of the VIEW (as in `View`) of
-    /// the least state of the orbit in TLC's value order, chosen by value
-    /// (`InterpModel::least_perm`) and permuted on the encoding with that
-    /// element's plans (`group`, as in `Symmetry`).
-    SymView { group: Vec<Vec<PermPlan>>, view: View },
+    /// the least state of the orbit in TLC's value order (`order` = TLC's
+    /// variable order), chosen directly on encoded words (`LayoutNode::cmp_tlc_words`)
+    /// with fallback to `InterpModel::least_perm` when a compared variable
+    /// cannot be ordered on words.
+    SymView { group: Vec<Vec<PermPlan>>, order: Vec<usize>, view: View },
     /// By value: the interpreter's (reduced) fingerprint, for a VIEW or
     /// SYMMETRY not handled on encodings (states are decoded for it).
     Values,
@@ -142,8 +143,9 @@ thread_local! {
     /// Scratch buffers of `EncModel::view_fp`: the extended state and the
     /// VIEW's encoding.
     static VIEW_BUF: RefCell<(Vec<u64>, Vec<u64>)> = const { RefCell::new((Vec::new(), Vec::new())) };
-    /// The permuted encoding of `sym_view_fp`.
-    static PERM_BUF: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// Scratch buffers of `sym_view_fp`: the best permuted encoding so far and
+    /// the candidate permutation's encoding.
+    static PERM_BUF: RefCell<(Vec<u64>, Vec<u64>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 impl EncModel {
@@ -182,7 +184,7 @@ impl EncModel {
                 }
                 Ok(orbit_fp(group, order, &self.layout, words, self.sem.as_ref()))
             }
-            Fingerprint::SymView { group, view } => self.sym_view_fp(group, view, words, level),
+            Fingerprint::SymView { group, order, view } => self.sym_view_fp(group, order, view, words, level),
             Fingerprint::Words | Fingerprint::Values => Ok(match &self.sem {
                 Some(sem) => sem.fp_state(&self.layout, words),
                 None => fp_words(words),
@@ -264,10 +266,26 @@ impl EncModel {
 
     /// Fingerprint of the VIEW of the least state of the SYMMETRY orbit of
     /// the state `words` (see `Fingerprint::SymView`).
-    fn sym_view_fp(&self, group: &[Vec<PermPlan>], v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
+    fn sym_view_fp(&self, group: &[Vec<PermPlan>], order: &[usize], v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
         if self.paranoid {
             self.check_permutations(group, words);
         }
+        let word_res = PERM_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            let (best_buf, cand_buf) = &mut *b;
+            let least = self.least_perm_words(group, order, words, best_buf, cand_buf)?;
+            if self.paranoid {
+                self.check_sym_view_least(group, words, least, best_buf);
+            }
+            Some(match least {
+                None => self.view_fp(v, words, level),
+                Some(_) => self.view_fp(v, best_buf, level),
+            })
+        });
+        if let Some(fp) = word_res {
+            return fp;
+        }
+        // Fallback: decode variables lazily and delegate to `InterpModel::least_perm`.
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
         let decode = |i: usize| unsafe { self.layout.node(i).decode_unchecked(&words[self.layout.offsets[i]..]) };
@@ -278,7 +296,8 @@ impl EncModel {
             return self.view_fp(v, words, level);
         };
         PERM_BUF.with(|b| {
-            let mut buf = b.borrow_mut();
+            let mut b = b.borrow_mut();
+            let buf = &mut b.0;
             buf.resize(words.len(), 0);
             for (i, plan) in group[p].iter().enumerate() {
                 let r = self.layout.var_range(i);
@@ -286,8 +305,142 @@ impl EncModel {
                 // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
                 unsafe { plan.apply_unchecked(&words[r.clone()], &mut buf[r]) };
             }
-            self.view_fp(v, &buf, level)
+            self.view_fp(v, buf, level)
         })
+    }
+
+    /// Select the TLC-least orbit representative directly on encoded words,
+    /// comparing variables in `order` (TLC's variable order) and permuting
+    /// each variable lazily only while earlier variables tie.
+    ///
+    /// Returns `Some(None)` if `words` itself is least, `Some(Some(p))` if
+    /// `group[p]` is least (with the full permuted encoding written into
+    /// `best_buf`), or `None` if any compared variable could not be ordered
+    /// on words (`Dyn`, incomparable union arms, etc.) and must fall back to
+    /// `InterpModel::least_perm`.
+    fn least_perm_words(
+        &self,
+        group: &[Vec<PermPlan>],
+        order: &[usize],
+        words: &[u64],
+        best_buf: &mut Vec<u64>,
+        cand_buf: &mut Vec<u64>,
+    ) -> Option<Option<usize>> {
+        debug_assert_eq!(order.len(), self.layout.vars.len());
+        best_buf.resize(words.len(), 0);
+        cand_buf.resize(words.len(), 0);
+        let mut best: Option<usize> = None;
+        let mut best_computed: usize = 0;
+
+        'perm: for (pi, plans) in group.iter().enumerate() {
+            for (k, &i) in order.iter().enumerate() {
+                let r = self.layout.var_range(i);
+                let plan_id = plans[i].is_identity();
+                if plan_id && best.is_none_or(|bp| group[bp][i].is_identity()) {
+                    // Identity vs identity on a non-Dyn/Ref variable is always Equal.
+                    if best.is_some() && k == best_computed {
+                        best_buf[r.clone()].copy_from_slice(&words[r]);
+                        best_computed += 1;
+                    }
+                    continue;
+                }
+                // Never apply a non-identity plan to a Dyn/Ref-bearing variable
+                // during candidate comparison: doing so would permanently intern
+                // or freeze losing permutations into `dynval` or the value store.
+                if self.layout.node(i).has_dyn_or_ref() {
+                    return None;
+                }
+                let cand_var: &[u64] = if plan_id {
+                    &words[r.clone()]
+                } else {
+                    // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                    unsafe { plans[i].apply_unchecked(&words[r.clone()], &mut cand_buf[r.clone()]) };
+                    &cand_buf[r.clone()]
+                };
+                let best_var: &[u64] = match best {
+                    None => &words[r.clone()],
+                    Some(bp) => {
+                        if k == best_computed {
+                            if group[bp][i].is_identity() {
+                                best_buf[r.clone()].copy_from_slice(&words[r.clone()]);
+                            } else {
+                                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                                unsafe { group[bp][i].apply_unchecked(&words[r.clone()], &mut best_buf[r.clone()]) };
+                            }
+                            best_computed += 1;
+                        }
+                        &best_buf[r.clone()]
+                    }
+                };
+                match self.layout.node(i).cmp_tlc_words(cand_var, best_var)? {
+                    std::cmp::Ordering::Greater => continue 'perm,
+                    std::cmp::Ordering::Equal => {}
+                    std::cmp::Ordering::Less => {
+                        for &j in &order[..=k] {
+                            if plans[j].is_identity() {
+                                let rj = self.layout.var_range(j);
+                                cand_buf[rj.clone()].copy_from_slice(&words[rj]);
+                            }
+                        }
+                        std::mem::swap(best_buf, cand_buf);
+                        best = Some(pi);
+                        best_computed = k + 1;
+                        continue 'perm;
+                    }
+                }
+            }
+        }
+
+        if let Some(bp) = best {
+            for &i in &order[best_computed..] {
+                let r = self.layout.var_range(i);
+                if group[bp][i].is_identity() {
+                    best_buf[r.clone()].copy_from_slice(&words[r]);
+                } else {
+                    // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                    unsafe { group[bp][i].apply_unchecked(&words[r.clone()], &mut best_buf[r]) };
+                }
+            }
+        }
+        Some(best)
+    }
+
+    /// Paranoid: word-level `least_perm_words` agrees with `InterpModel::least_perm`
+    /// on the chosen orbit representative and its permuted words.
+    fn check_sym_view_least(&self, group: &[Vec<PermPlan>], words: &[u64], word_least: Option<usize>, best_buf: &[u64]) {
+        // SAFETY: the matching encoder/program produced these words.
+        // Active Dyn handles were published before this call.
+        let decode = |i: usize| unsafe { self.layout.node(i).decode_unchecked(&words[self.layout.offsets[i]..]) };
+        let mut vals = StateVals::decoded(self.layout.vars.len(), &decode);
+        let want = self.base.least_perm(&mut vals);
+        drop(vals);
+        match want {
+            Ok(interp_least) if interp_least == word_least => {}
+            other => {
+                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                let st = unsafe { self.layout.decode_state_unchecked(words) };
+                mismatch(format_args!(
+                    "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter: {other:?}\ncompiled:    Ok({word_least:?})",
+                    state_list(&self.base, &[st])
+                ));
+            }
+        }
+        if let Some(p) = word_least {
+            let mut want_words = vec![0u64; words.len()];
+            for (i, plan) in group[p].iter().enumerate() {
+                let r = self.layout.var_range(i);
+                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                unsafe { plan.apply_unchecked(&words[r.clone()], &mut want_words[r]) };
+            }
+            if best_buf != want_words.as_slice() {
+                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                let st = unsafe { self.layout.decode_state_unchecked(words) };
+                mismatch(format_args!(
+                    "VIEW+SYMMETRY permuted words (perm {p}) on state\n{}\nexpected: {want_words:?}\ngot:      {best_buf:?}",
+                    state_list(&self.base, &[st])
+                ));
+            }
+        }
     }
 
     /// Paranoid: each permutation plan applied to `words` gives the

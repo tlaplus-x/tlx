@@ -12,6 +12,8 @@
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
+mod order;
+
 use crate::dynval;
 use crate::layout::{same_domain, sorted_set, FieldLayout, FieldLoc, MapDims, Miss, SlotLayout};
 use crate::shape::{
@@ -29,6 +31,8 @@ pub struct LayoutNode {
     card: Option<u64>,
     /// Whether this node or any child carries a trailing dynamic witness word.
     has_dynamic_witness: bool,
+    /// Precomputed TLC-order and handle-presence facts (`order.rs`).
+    order: order::OrderFacts,
     kind: Kind,
     /// All values of a compound shape with a bitset universe, by rank
     /// (built on first use by `universe_value`).
@@ -240,7 +244,8 @@ impl LayoutNode {
                 (words, Kind::Union { arms, base })
             }
         };
-        LayoutNode { words, card, has_dynamic_witness, kind, values: OnceLock::new() }
+        let order = order::OrderFacts::of(&kind, card);
+        LayoutNode { words, card, has_dynamic_witness, order, kind, values: OnceLock::new() }
     }
 
     /// Whether this node or any child carries a trailing dynamic witness word.
