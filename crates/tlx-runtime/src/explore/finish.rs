@@ -106,9 +106,19 @@ pub(super) fn finalize<'m, M: Model>(
     let (outcome, trace, trace_note) = failure_report(model, &shared, &logs, failure, results);
     let resume = resumable.then(|| keep_resume(&shared, &stats, &base_outdegree, opts, logs, outs));
     report_memory(&shared, meters, mem, resume.is_some(), logs_spilled);
-    // The search ended (it was not killed): its checkpoint goes.
+    // The search ended (it was not killed): its checkpoint goes, unless the
+    // model stopped on a recoverable resource limit (e.g. value-store budget)
+    // or is restarting after a layout miss (later attempts may replace it or
+    // stop on a resource limit).
+    let interrupted = matches!(&outcome, Outcome::Error(e) if model.caps().interrupts(e));
     if let Some(c) = &opts.checkpoint {
-        c.finish();
+        let keep = model.caps().keep_checkpoint();
+        if keep {
+            c.keep_last();
+        }
+        if keep || !interrupted {
+            c.finish();
+        }
     }
     // The search's structures (fingerprint set, queues, archive, trace
     // logs) are not needed by liveness: freed before it builds its graph.

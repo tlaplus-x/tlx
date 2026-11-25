@@ -76,6 +76,22 @@ pub trait StateCodec<S>: Sync {
         Ok(())
     }
 
+    /// Rewrite any process-local handles in encoded state `src` into their
+    /// store-independent checkpoint representation before writing to disk.
+    /// Returns `src` directly without copying when no rewriting is needed.
+    fn checkpoint_words<'a>(&self, src: &'a [u64], _buf: &'a mut Vec<u64>) -> &'a [u64] {
+        src
+    }
+
+    /// Validate checkpoint words `src` and rewrite any store-independent
+    /// checkpoint handles for this run before they enter the trusted queue or
+    /// archive. Returns `src` directly without copying when no rewriting is
+    /// needed.
+    fn recover_words<'a>(&self, src: &'a [u64], _buf: &'a mut Vec<u64>) -> Result<&'a [u64], String> {
+        self.validate(src)?;
+        Ok(src)
+    }
+
     /// Decode words known to come from this codec's encoder.
     ///
     /// # Safety

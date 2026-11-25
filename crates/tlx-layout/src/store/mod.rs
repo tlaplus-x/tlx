@@ -1,8 +1,7 @@
 //! The run-owned value store of the compiled tier's `Ref` slots
 //! (docs/value-store.md §1): behind `TLX_VALUE_STORE`, the slots whose
-//! speculated shape has a `Dyn` part (the driver's `enc::driver` also
-//! turns the store off for checkpoints and `TLX_ESCAPE`, which have no
-//! store format / replace its layout).
+//! speculated shape has a `Dyn` part (the driver's `enc::driver` turns the
+//! store off when `TLX_ESCAPE` replaces its layout).
 //!
 //! A *handle* (`u64`, the word of a `Ref` slot) is either an immediate
 //! scalar (strings and model values by `Sym` id, Booleans, integers of at
@@ -36,6 +35,7 @@
 
 mod ops;
 mod order;
+mod ser;
 
 #[cfg(test)]
 mod tests;
@@ -573,17 +573,21 @@ impl Store {
     }
 
     /// The elements of a set handle as handles, in normalized order (an
-    /// interval's are materialized once). None: not a set node.
+    /// interval's are materialized once). None: not a set node, or a non-empty
+    /// interval whose endpoints do not fit immediate integer handles.
     pub fn set_elems(&self, s: u64) -> Option<&[u64]> {
         let node = self.node(s)?;
         match &node.body {
             Body::Set(es) => Some(es),
-            Body::Interval(lo, hi) => Some(node.elems.get_or_init(|| {
+            Body::Interval(lo, hi) => {
                 if hi < lo {
-                    return Box::new([]);
+                    return Some(&[]);
                 }
-                (*lo..=*hi).map(|i| int_handle(i).expect("interval of immediate integers")).collect()
-            })),
+                if int_handle(*lo).is_none() || int_handle(*hi).is_none() {
+                    return None;
+                }
+                Some(node.elems.get_or_init(|| (*lo..=*hi).map(|i| int_handle(i).expect("interval of immediate integers")).collect()))
+            }
             _ => None,
         }
     }

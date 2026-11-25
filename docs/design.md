@@ -26,8 +26,8 @@ Where each topic is documented (every topic has one home):
 
 The [rule-based optimizer](optimization.md) is documented separately from execution-tier lowering.
 Two other documents cover experimental or bounded subjects: the value store
-([value-store.md](value-store.md)) is off by default (`TLX_VALUE_STORE`, no reclamation or
-checkpoint format), and unimplemented default-mode search reductions (sleep sets, partial-order
+([value-store.md](value-store.md)) is off by default (`TLX_VALUE_STORE`, no reclamation
+yet), and unimplemented default-mode search reductions (sleep sets, partial-order
 reduction, bounded and swarm search, bitstate storage, incremental re-checking;
 [reductions.md](reductions.md) section 5) together with earlier state-representation surveys were
 archived outside current documentation.

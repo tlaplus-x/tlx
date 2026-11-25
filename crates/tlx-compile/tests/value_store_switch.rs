@@ -1,10 +1,10 @@
 //! The value store with the switch on (`TLX_VALUE_STORE=1`,
 //! docs/configuration.md; it is off by default): a run with a `Dyn` slot
-//! keeps its values in the store, the two paths that stay special behave as
-//! `docs/value-store.md` documents (a full budget is a hard error naming the
-//! way out; checkpoints keep `Dyn` values, so the store is off when they are
-//! asked for and the run takes no checkpoint when only the default interval
-//! is on), and a run whose slots all have fixed shapes stores nothing.
+//! keeps its values in the store, a full budget is a hard error naming the
+//! way out, default and explicit checkpoints persist `model-store` and
+//! recover cleanly (including multi-run recovery in one process where each
+//! `Store` allocates a fresh uid), and a run whose slots all have fixed
+//! shapes stores nothing.
 //!
 //! The switch itself (its values, the unset default, the interaction with
 //! `TLX_ESCAPE`) is parsed in `tlx_compile::settings` and tested there: this
@@ -13,8 +13,11 @@
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use tlx_runtime::{AfterCommit, CheckpointConfig, Checkpointer, Options, Outcome};
+use tlx_compile::enc::{check_from, Checked};
+use tlx_runtime::io::{Spill, SpillConfig};
+use tlx_runtime::{AfterCommit, CheckpointConfig, Checkpointer, Options, Outcome, Recovery};
 use tlx_testkit::spec::{load, run_mode, Mode};
+use tlx_testkit::TempDir;
 
 /// A bag keyed by records with a sequence field: the key universe has no
 /// fixed bound, so the slot's shape has a `Dyn` part and the store holds
@@ -76,17 +79,10 @@ fn options() -> Options {
 }
 
 /// The checkpointer of a run that takes checkpoints (or, with `explicit`
-/// false, one that holds only TLC's default interval).
-fn checkpointer(explicit: bool) -> Arc<Checkpointer> {
-    let every = (!explicit).then(|| Duration::from_secs(30 * 60));
-    Checkpointer::new(CheckpointConfig {
-        every,
-        every_states: None,
-        after: AfterCommit::Continue,
-        identity: Vec::new(),
-        report: None,
-        explicit,
-    })
+/// false, one that holds TLC's default interval or a state trigger).
+fn checkpointer(explicit: bool, every_states: Option<u64>, after: AfterCommit) -> Arc<Checkpointer> {
+    let every = (!explicit && every_states.is_none()).then(|| Duration::from_secs(30 * 60));
+    Checkpointer::new(CheckpointConfig { every, every_states, after, identity: Vec::new(), report: None, explicit })
 }
 
 #[test]
@@ -147,22 +143,112 @@ fn a_full_store_is_a_hard_error_naming_the_way_out() {
 }
 
 #[test]
-fn explicit_checkpoints_keep_dyn_values() {
+fn default_interval_keeps_the_store_and_takes_checkpoints() {
+    store_on_environment();
     let want = interpreted(BAG);
-    let opts = Options { checkpoint: Some(checkpointer(true)), ..options() };
+    let md = TempDir::new("value-store-default-ck");
+    // `explicit: false` models a non-explicit checkpointer (like TLC's default
+    // timer); triggering by states proves the driver does not strip it.
+    let ck = checkpointer(false, Some(250), AfterCommit::Continue);
+    let opts = Options {
+        checkpoint: Some(ck.clone()),
+        spill: Spill::new(SpillConfig { dir: Some(md.path().to_path_buf()), reused: false, ..Default::default() }),
+        ..options()
+    };
     let (m, got) = compiled(BAG, &opts).unwrap();
     assert_eq!(got, want);
-    assert!(m.value_store().is_none(), "the store must be off when checkpoints are asked for");
+    let store = m.value_store().expect("the default checkpoint interval keeps the store");
+    assert!(store.stats().nodes > 0, "the run stored no values");
+    assert!(ck.count() >= 1, "expected at least one checkpoint, got {}", ck.count());
 }
 
 #[test]
-fn the_default_checkpoint_interval_keeps_the_store_and_takes_no_checkpoints() {
+fn explicit_checkpoint_and_repeated_in_process_recovery_preserve_results() {
+    store_on_environment();
     let want = interpreted(BAG);
-    let ck = checkpointer(false);
-    let opts = Options { checkpoint: Some(ck.clone()), ..options() };
-    let (m, got) = compiled(BAG, &opts).unwrap();
-    assert_eq!(got, want);
-    let store = m.value_store().expect("the default interval keeps the store");
-    assert!(store.stats().nodes > 0, "the run stored no values");
-    assert_eq!(ck.count(), 0, "the run must not take a checkpoint");
+    let md = TempDir::new("value-store-inproc-recover");
+    let spill = |reused: bool| Spill::new(SpillConfig { dir: Some(md.path().to_path_buf()), reused, ..Default::default() });
+
+    // Run 1: stop right after the first checkpoint (keeps checkpoint on disk).
+    let ck1 = checkpointer(true, Some(300), AfterCommit::Stop(1));
+    let opts1 = Options { checkpoint: Some(ck1.clone()), spill: spill(false), ..options() };
+    let model1 = load(BAG, CFG);
+    model1.ip.set_run_config(1, false);
+    let Checked::Compiled(m1, _) = check_from(Arc::new(model1), &opts1, 16, None).unwrap() else {
+        panic!("expected compiled run");
+    };
+    assert_eq!(ck1.count(), 1);
+    let uid1 = m1.value_store().expect("store 1").uid();
+    assert!(md.path().join("checkpoint/model-store").is_file(), "missing model-store");
+
+    // Run 2 (same process!): recover into a fresh Store uid, take a second
+    // checkpoint (exercising incremental archive linking), and stop.
+    let rec1 = Recovery::open(md.path()).unwrap();
+    let ck2 = checkpointer(true, Some(300), AfterCommit::Stop(1));
+    let opts2 = Options { checkpoint: Some(ck2.clone()), spill: spill(true), ..options() };
+    let model2 = load(BAG, CFG);
+    model2.ip.set_run_config(1, false);
+    let Checked::Compiled(m2, _) = check_from(Arc::new(model2), &opts2, 16, Some(&rec1)).unwrap() else {
+        panic!("expected compiled recovery 1");
+    };
+    assert_eq!(ck2.count(), 1);
+    let uid2 = m2.value_store().expect("store 2").uid();
+    assert_ne!(uid2, uid1, "recovered run must allocate a fresh store uid");
+
+    // Run 3 (same process!): recover again and finish to completion.
+    let rec2 = Recovery::open(md.path()).unwrap();
+    let ck3 = checkpointer(true, None, AfterCommit::Continue);
+    let opts3 = Options { checkpoint: Some(ck3), spill: spill(true), ..options() };
+    let model3 = load(BAG, CFG);
+    model3.ip.set_run_config(1, false);
+    let Checked::Compiled(m3, r3) = check_from(Arc::new(model3), &opts3, 16, Some(&rec2)).unwrap() else {
+        panic!("expected compiled recovery 2");
+    };
+    assert!(matches!(r3.outcome, Outcome::Ok), "{:?}", r3.outcome);
+    let uid3 = m3.value_store().expect("store 3").uid();
+    assert_ne!(uid3, uid1);
+    assert_ne!(uid3, uid2);
+    assert_eq!((r3.stats.generated, r3.stats.distinct, r3.stats.depth), want);
+    assert_eq!(m3.bailouts.get(), 0, "recovered action runs fell back to the interpreter");
+}
+
+#[test]
+fn recovery_rejects_budget_overflow_and_corrupt_model_store() {
+    store_on_environment();
+    let md = TempDir::new("value-store-bad-recover");
+    let ck = checkpointer(true, Some(300), AfterCommit::Stop(1));
+    let opts = Options {
+        checkpoint: Some(ck),
+        spill: Spill::new(SpillConfig { dir: Some(md.path().to_path_buf()), reused: false, ..Default::default() }),
+        ..options()
+    };
+    let model = load(BAG, CFG);
+    model.ip.set_run_config(1, false);
+    let Checked::Compiled(m1, _) = check_from(Arc::new(model), &opts, 16, None).unwrap() else {
+        panic!("expected compiled run");
+    };
+    let store_bytes = m1.value_store().expect("store").stats().node_bytes as usize;
+    assert!(store_bytes > 1024);
+
+    // Tighter -maxmem than the checkpointed store is rejected cleanly.
+    let rec = Recovery::open(md.path()).unwrap();
+    let tight_opts = Options {
+        maxmem: store_bytes / 2,
+        spill: Spill::new(SpillConfig { dir: Some(md.path().to_path_buf()), reused: true, ..Default::default() }),
+        ..options()
+    };
+    let model2 = load(BAG, CFG);
+    model2.ip.set_run_config(1, false);
+    let err = match check_from(Arc::new(model2), &tight_opts, 16, Some(&rec)) {
+        Err(e) => e,
+        Ok(_) => panic!("budget overflow during recovery must fail"),
+    };
+    assert!(err.contains("exceeds its budget"), "{err}");
+
+    // Truncating model-store is rejected cleanly on Recovery::open.
+    let store_path = md.path().join("checkpoint/model-store");
+    let raw = std::fs::read(&store_path).unwrap();
+    std::fs::write(&store_path, &raw[..raw.len() / 2]).unwrap();
+    let open_err = Recovery::open(md.path()).unwrap_err();
+    assert!(open_err.contains("corrupt checkpoint") || open_err.contains("truncated"), "{open_err}");
 }

@@ -87,6 +87,9 @@ impl Recovery {
         for name in &m.model_files {
             let mut f = In::open(cdir.join(format!("model-{name}")), K_MODEL)?;
             let data = f.chunk()?.unwrap_or_default();
+            if f.chunk()?.is_some() {
+                return Err(format!("{}: unexpected data", f.path.display()));
+            }
             model_files.push((name.clone(), data));
         }
         Ok(Recovery { dir: cdir, metadir, m, model_files })
@@ -349,6 +352,7 @@ fn read_archive<S>(
 ) -> Result<(), String> {
     let Some(mut f) = rec.stream(&format!("archive-{w}"), K_ARCHIVE) else { return Ok(()) };
     let mut prev = XorPrev::new(words);
+    let mut scratch = Vec::new();
     let bad = || format!("corrupt archive-{w}");
     while let Some(c) = f.chunk()? {
         relieve();
@@ -364,8 +368,8 @@ fn read_archive<S>(
                     return Err(bad());
                 }
                 let fp = get_xor(b, &mut pos, &mut prev);
-                codec.ok_or_else(&bad)?.validate(&prev.words).map_err(|e| format!("{}: {e}", bad()))?;
-                seed.archive_words(prev.log, fp, depth, &prev.words);
+                let recovered = codec.ok_or_else(&bad)?.recover_words(&prev.words, &mut scratch).map_err(|e| format!("{}: {e}", bad()))?;
+                seed.archive_words(prev.log, fp, depth, recovered);
             }
             seed.spill();
         }
@@ -437,6 +441,7 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
     let level = m.level;
     let bad = |what: &str| format!("corrupt queue ({what})");
     let mut prev = XorPrev::new(m.words);
+    let mut scratch = Vec::new();
     let mut sorter: Option<QueueSorter<'_>> = None;
     let mut saw_unpositioned = false;
     // The trace-log entries of the states queued and their positions in BFS
@@ -507,15 +512,15 @@ fn read_queue<M: Model>(shared: &Shared<'_, M>, seed: &mut Local<'_, '_, M::Stat
                 n += 1;
                 if words {
                     let fp = get_xor(&c, &mut at, &mut prev);
-                    codec.expect("checked above").validate(&prev.words).map_err(|e| bad(&e))?;
+                    let recovered = codec.expect("checked above").recover_words(&prev.words, &mut scratch).map_err(|e| bad(&e))?;
                     if sorting {
-                        sorter.as_mut().expect("initialized above").push_words(pos, prev.log, fp, &prev.words)?;
+                        sorter.as_mut().expect("initialized above").push_words(pos, prev.log, fp, recovered)?;
                     } else {
                         if ordered {
                             places.push((prev.log, pos));
                         }
                         let sealed = seed.sealed_blocks();
-                        seed.push_words(prev.log, fp, level, &prev.words);
+                        seed.push_words(prev.log, fp, level, recovered);
                         if shared.opts.spill.enabled() && seed.sealed_blocks() != sealed {
                             relieve_and_spill(shared, seed)?;
                         }

@@ -1,6 +1,7 @@
-//! Binary serialization of shapes, layouts and the `Dyn` interner for
-//! checkpoint/recover (docs/scale.md §9.2), on top of
-//! `tlx_value::ser` (same streams, same framing).
+//! Binary serialization of shapes, layouts, the `Dyn` interner and the
+//! `Ref` value store for checkpoint/recover (docs/scale.md §9.2,
+//! docs/value-store.md §7), on top of `tlx_value::ser` (same streams, same
+//! framing).
 //!
 //! A shape is a tag byte and its payload:
 //!
@@ -128,8 +129,8 @@ pub fn write_shape(w: &mut Writer, s: &Shape) {
             write_shapes(w, arms);
         }
         Shape::Dyn => w.u8(S_DYN),
-        // (Runs with a value store take no checkpoints.)
-        Shape::Ref(_) => panic!("value store shapes are not serialized"),
+        // (`Speculation::shapes` keeps `Shape::Dyn` and maps to `Shape::Ref` via `store_mode`.)
+        Shape::Ref(_) => panic!("value store shapes are not serialized directly"),
     }
 }
 
@@ -274,4 +275,15 @@ pub fn read_dyn_table(r: &mut Reader<'_>) -> DecodeResult<Vec<Vec<tlx_value::Val
         out.push(vals);
     }
     Ok(out)
+}
+
+/// Write a `Store` snapshot (`model-store`, docs/value-store.md §7).
+pub fn write_store(w: &mut Writer, store: &crate::store::Store) -> Result<(), String> {
+    store.write_snapshot(w)
+}
+
+/// Read and validate a `Store` snapshot written by `write_store`, allocating a
+/// fresh process-unique store id and enforcing `budget`.
+pub fn read_store(r: &mut Reader<'_>, budget: usize) -> Result<Arc<crate::store::Store>, String> {
+    crate::store::Store::read_snapshot(r, budget)
 }
