@@ -109,8 +109,15 @@ impl<'a> Analyzer<'a> {
             B::FoldFunctionOnSet => self.fold_function_on_set(arg(0), arg(1), arg(2), arg(3), span),
             B::FoldBag => self.fold_bag(arg(0), arg(1), arg(2), span),
             B::MapThenFoldSet => self.map_then_fold_set(arg(0), arg(1), arg(2), arg(3), arg(4), span),
-            // Sequence folds iterate by index: no order of model values.
-            B::FoldSeq | B::FoldLeft | B::FoldLeftDomain => self.fold_by_index(arg(0), arg(1), arg(2), span),
+            // Sequence folds iterate by index on sequences; `FoldSeq` delegates
+            // to `FoldFunction`, so non-sequence domains depend on key order.
+            B::FoldSeq => {
+                if arg(2).dom().mask() != 0 {
+                    self.fold_order(&arg(0), arg(2).dom().mask(), "FoldSeq", span);
+                }
+                self.fold_by_index(arg(0), arg(1), arg(2), span)
+            }
+            B::FoldLeft | B::FoldLeftDomain => self.fold_by_index(arg(0), arg(1), arg(2), span),
             B::FoldRight | B::FoldRightDomain => self.fold_right(arg(0), arg(1), arg(2), span),
             // Graphs: structural.
             B::GraphSimplePath | B::UGraphSimplePath => Sh::set(Sh::seq(Sh::any(arg(0).mask()))),
@@ -205,7 +212,9 @@ impl<'a> Analyzer<'a> {
     fn map_then_fold_set(&mut self, op: Sh, base: Sh, map: Sh, set_op: Sh, set: Sh, span: Span) -> Sh {
         let el = set.elems();
         self.fold_order(&op, el.mask(), "MapThenFoldSet", span);
-        self.apply_ops(&set_op, vec![Sh::set(el.clone())], span);
+        if !(self.all_commutative(&op) && self.all_chooses_first(&set_op)) {
+            self.apply_ops(&set_op, vec![Sh::set(el.clone())], span);
+        }
         let x = self.apply_ops(&map, vec![el], span);
         self.fold(&op, base, x, span)
     }

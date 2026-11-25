@@ -1030,6 +1030,33 @@ impl<'a> TotalityChecker<'a> {
                     None
                 }
             }
+            (B::FoldSet, [op_lam, base, set]) => self.check_fold_set(op_lam, base, set, allow_prime, in_prime, env, steps),
+            (B::FoldFunction, [op_lam, base, fun]) => self.check_fold_function(op_lam, base, fun, allow_prime, in_prime, env, steps),
+            (B::FoldFunctionOnSet, [op_lam, base, fun, indices]) => {
+                self.check_fold_function_on_set(op_lam, base, fun, indices, allow_prime, in_prime, env, steps)
+            }
+            (B::MapThenFoldSet, [op_lam, base, f_lam, choose_lam, set, ..]) if args.len() == 5 || args.len() == 6 => {
+                self.check_map_then_fold_set(op_lam, base, f_lam, choose_lam, set, args.get(5), allow_prime, in_prime, env, steps)
+            }
+            (B::FoldSeq, [op_lam, base, seq]) => {
+                if self.is_definitely_seq(seq, in_prime, env) {
+                    self.check_seq_fold(op_lam, base, seq, false, false, false, allow_prime, in_prime, env, steps)
+                } else {
+                    self.check_fold_function(op_lam, base, seq, allow_prime, in_prime, env, steps)
+                }
+            }
+            (B::FoldLeft, [op_lam, base, seq]) => {
+                self.check_seq_fold(op_lam, base, seq, false, false, true, allow_prime, in_prime, env, steps)
+            }
+            (B::FoldRight, [op_lam, seq, base]) => {
+                self.check_seq_fold(op_lam, base, seq, true, false, false, allow_prime, in_prime, env, steps)
+            }
+            (B::FoldLeftDomain, [op_lam, base, seq]) => {
+                self.check_seq_fold(op_lam, base, seq, false, true, true, allow_prime, in_prime, env, steps)
+            }
+            (B::FoldRightDomain, [op_lam, seq, base]) => {
+                self.check_seq_fold(op_lam, base, seq, true, true, false, allow_prime, in_prime, env, steps)
+            }
             _ => None,
         }
     }
@@ -1078,7 +1105,14 @@ impl<'a> TotalityChecker<'a> {
     /// Recursive finite enumerability + verified `<= i32::MAX` cardinality bound.
     /// Explicitly rejects `Nat`, `Int`, `STRING`, `Seq(S)`, `SUBSET Nat`, `SUBSET (1..31)`,
     /// and any set whose cardinality is not bounded by `i32::MAX`.
-    fn check_enumerable_set(&self, s: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> Option<(Shape, u32)> {
+    pub(super) fn check_enumerable_set(
+        &self,
+        s: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<(Shape, u32)> {
         if *steps == 0 {
             return None;
         }

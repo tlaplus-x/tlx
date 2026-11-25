@@ -46,6 +46,40 @@ impl<'a> Analyzer<'a> {
         Sh::any(acc.mask())
     }
 
+    /// Whether every operator in `op` is known to be commutative and associative.
+    pub(super) fn all_commutative(&self, op: &Sh) -> bool {
+        let ops = op.ops();
+        !ops.is_empty() && ops.iter().all(|o| self.commutative(o))
+    }
+
+    /// Whether every operator in `op` is the order-independent arbitrary
+    /// selector `LAMBDA s : CHOOSE x \in s : TRUE` (matching `Interp::chooses_first`).
+    pub(super) fn all_chooses_first(&self, op: &Sh) -> bool {
+        let ops = op.ops();
+        !ops.is_empty() && ops.iter().all(|o| self.chooses_first_op(o))
+    }
+
+    fn chooses_first_op(&self, o: &OpVal) -> bool {
+        let body_ok = |params: &[LocalId], body: &Expr| -> bool {
+            let [s] = params else { return false };
+            matches!(
+                &*body.kind,
+                ExprKind::Choose { vars: BoundVars::Many(vs), set: Some(cset), body: cpred }
+                    if vs.len() == 1
+                        && matches!(&*cset.kind, ExprKind::Local(l) if l == s)
+                        && matches!(&*cpred.kind, ExprKind::Bool(true))
+            )
+        };
+        match o {
+            OpVal::Lambda(e) => shape::lambda_parts(e).is_some_and(|(ps, body)| body_ok(ps, body)),
+            OpVal::Def(d) => {
+                let def = &self.ip.prog.defs[d.idx()];
+                matches!(&def.kind, DefKind::Op(body) if def.builtin.is_none() && body_ok(&def.params, body))
+            }
+            OpVal::Builtin(_) => false,
+        }
+    }
+
     /// Whether `o` is known to be commutative and associative: `+`, `*`,
     /// `\cup`, `\cap`, `/\`, `\/`, or a two-parameter operator or LAMBDA
     /// applying one of them to its parameters.

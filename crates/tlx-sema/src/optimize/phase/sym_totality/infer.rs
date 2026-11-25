@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tlx_front::cfg::CfgValue;
 
+use super::super::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, Shape, TotalityChecker, MAX_I32_U32, MAX_STEPS, MAX_STR_SET, MAX_UNMOVED_SET};
 use crate::{builtins::Builtin as B, hir::*};
@@ -692,8 +693,173 @@ impl<'a> TotalityChecker<'a> {
             (B::Pow, [a, b]) => {
                 arith_bin_shape(self.infer_expr(a, in_prime, vars, env, steps), self.infer_expr(b, in_prime, vars, env, steps), arith_pow)
             }
+            (B::FoldSet, [op_lam, base, set]) => {
+                let Some(ac) = classify_ac_op(op_lam) else { return Shape::Top };
+                let base_s = self.infer_expr(base, in_prime, vars, env, steps);
+                let (elem_s, finite, max_card) = self.infer_set_info(set, in_prime, vars, env, steps);
+                if !finite {
+                    return Shape::Top;
+                }
+                self.infer_ac_fold_shape(ac, &base_s, &elem_s, max_card)
+            }
+            (B::FoldFunction, [op_lam, base, fun]) => {
+                let Some(ac) = classify_ac_op(op_lam) else { return Shape::Top };
+                let base_s = self.infer_expr(base, in_prime, vars, env, steps);
+                let fun_s = self.infer_expr(fun, in_prime, vars, env, steps);
+                let Some((dom, range, max_dom)) = fn_dom_range(&fun_s) else { return Shape::Top };
+                let max_card = max_dom.or_else(|| shape_universe_size(&dom, self.groups));
+                self.infer_ac_fold_shape(ac, &base_s, &range, max_card)
+            }
+            (B::FoldFunctionOnSet, [op_lam, base, fun, indices]) => {
+                let Some(ac) = classify_ac_op(op_lam) else { return Shape::Top };
+                let base_s = self.infer_expr(base, in_prime, vars, env, steps);
+                let fun_s = self.infer_expr(fun, in_prime, vars, env, steps);
+                let (_, finite, max_card) = self.infer_set_info(indices, in_prime, vars, env, steps);
+                if !finite {
+                    return Shape::Top;
+                }
+                let Some((_, range, _)) = fn_dom_range(&fun_s) else { return Shape::Top };
+                self.infer_ac_fold_shape(ac, &base_s, &range, max_card)
+            }
+            (B::MapThenFoldSet, [op_lam, base, f_lam, choose_lam, set, ..]) if args.len() == 5 || args.len() == 6 => {
+                let Some(ac) = classify_ac_op(op_lam) else { return Shape::Top };
+                if !is_chooses_first_lambda(choose_lam) {
+                    return Shape::Top;
+                }
+                let ExprKind::Lambda { params, body } = &*f_lam.kind else { return Shape::Top };
+                let [p] = params.as_slice() else { return Shape::Top };
+                let base_s = self.infer_expr(base, in_prime, vars, env, steps);
+                let (elem_s, finite, max_card) = self.infer_set_info(set, in_prime, vars, env, steps);
+                if !finite {
+                    return Shape::Top;
+                }
+                let mut local_env = env.clone();
+                local_env.bind_local(*p, elem_s, None);
+                let mapped_s = self.infer_expr(body, in_prime, vars, &local_env, steps);
+                self.infer_ac_fold_shape(ac, &base_s, &mapped_s, max_card)
+            }
+            (B::FoldSeq, [op_lam, base, seq]) => {
+                let seq_s = self.infer_expr(seq, in_prime, vars, env, steps);
+                if is_seq_shape(&seq_s) {
+                    self.infer_seq_fold_shape(op_lam, base, seq, false, false, in_prime, vars, env, steps)
+                } else {
+                    let Some(ac) = classify_ac_op(op_lam) else { return Shape::Top };
+                    let base_s = self.infer_expr(base, in_prime, vars, env, steps);
+                    let Some((dom, range, max_dom)) = fn_dom_range(&seq_s) else { return Shape::Top };
+                    let max_card = max_dom.or_else(|| shape_universe_size(&dom, self.groups));
+                    self.infer_ac_fold_shape(ac, &base_s, &range, max_card)
+                }
+            }
+            (B::FoldLeft, [op_lam, base, seq]) => self.infer_seq_fold_shape(op_lam, base, seq, false, true, in_prime, vars, env, steps),
+            (B::FoldRight, [op_lam, seq, base]) => self.infer_seq_fold_shape(op_lam, base, seq, false, false, in_prime, vars, env, steps),
+            (B::FoldLeftDomain, [op_lam, base, seq]) => {
+                self.infer_seq_fold_shape(op_lam, base, seq, true, true, in_prime, vars, env, steps)
+            }
+            (B::FoldRightDomain, [op_lam, seq, base]) => {
+                self.infer_seq_fold_shape(op_lam, base, seq, true, false, in_prime, vars, env, steps)
+            }
             _ => Shape::Top,
         }
+    }
+
+    fn infer_ac_fold_shape(&self, ac: AcOpKind, base: &Shape, elem: &Shape, max_card: Option<u32>) -> Shape {
+        if matches!(base, Shape::Bottom) {
+            return Shape::Bottom;
+        }
+        if max_card == Some(0) || matches!(elem, Shape::Bottom) {
+            return base.clone();
+        }
+        match ac {
+            AcOpKind::IntAdd | AcOpKind::IntMul => match (base, elem, max_card) {
+                (Shape::Int(Some(b_bounds)), Shape::Int(Some(e_bounds)), Some(c)) => {
+                    Shape::Int(super::folds::ac_int_fold_bounds(ac, *b_bounds, *e_bounds, c))
+                }
+                (Shape::Int(_), Shape::Int(_), _) => Shape::Int(None),
+                _ => Shape::Top,
+            },
+            AcOpKind::SetCup => match (base, elem) {
+                (Shape::Set { elem: be, finite: bf, max_card: bc }, Shape::Set { elem: ee, finite: ef, max_card: ec }) => {
+                    let joined = join_shape(be, ee);
+                    let card = max_card
+                        .and_then(|c| ec.and_then(|e| bc.and_then(|b| c.checked_mul(e)?.checked_add(b))))
+                        .or_else(|| shape_universe_size(&joined, self.groups))
+                        .filter(|&v| v <= MAX_I32_U32);
+                    Shape::Set { elem: Box::new(joined), finite: *bf && *ef, max_card: card }
+                }
+                _ => Shape::Top,
+            },
+            AcOpKind::SetCap => match (base, elem) {
+                (Shape::Set { elem: be, finite: bf, max_card: bc }, Shape::Set { finite: ef, .. }) => {
+                    Shape::Set { elem: be.clone(), finite: *bf && *ef, max_card: *bc }
+                }
+                _ => Shape::Top,
+            },
+            AcOpKind::BoolAnd | AcOpKind::BoolOr => {
+                if is_bool_shape(base) && is_bool_shape(elem) {
+                    Shape::Bool
+                } else {
+                    Shape::Top
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn infer_seq_fold_shape(
+        &self,
+        op_lam: &Expr,
+        base: &Expr,
+        seq: &Expr,
+        on_domain: bool,
+        acc_first: bool,
+        in_prime: bool,
+        vars: &[Shape],
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Shape {
+        let ExprKind::Lambda { params, body } = &*op_lam.kind else { return Shape::Top };
+        let [p0, p1] = params.as_slice() else { return Shape::Top };
+        let seq_s = self.infer_expr(seq, in_prime, vars, env, steps);
+        let Some((elem_s, _, max_len)) = seq_elem_bounds(&seq_s) else { return Shape::Top };
+        let item_s = if on_domain {
+            match max_len {
+                Some(0) => Shape::Bottom,
+                Some(hi) if hi <= MAX_I32_U32 => Shape::Int(Some((1, hi as i32))),
+                _ => Shape::Int(None),
+            }
+        } else {
+            elem_s
+        };
+        let mut acc = self.infer_expr(base, in_prime, vars, env, steps);
+        if max_len == Some(0) {
+            return acc;
+        }
+        let iters = max_len.map_or(16, |n| n.min(64));
+        let (acc_param, item_param) = if acc_first { (*p0, *p1) } else { (*p1, *p0) };
+        let mut converged = false;
+        for _ in 0..iters {
+            let mut local_env = env.clone();
+            local_env.bind_local(acc_param, acc.clone(), None);
+            local_env.bind_local(item_param, item_s.clone(), None);
+            let next = self.infer_expr(body, in_prime, vars, &local_env, steps);
+            let joined = cap_shape(join_shape(&acc, &next));
+            if joined == acc {
+                converged = true;
+                break;
+            }
+            acc = joined;
+        }
+        if !converged && max_len.is_none_or(|n| n > 64) {
+            acc = widen_shape(&acc);
+            let mut local_env = env.clone();
+            local_env.bind_local(acc_param, acc.clone(), None);
+            local_env.bind_local(item_param, item_s, None);
+            let next = self.infer_expr(body, in_prime, vars, &local_env, steps);
+            if !shape_leq(&next, &acc) {
+                return Shape::Top;
+            }
+        }
+        acc
     }
 
     fn infer_set_info(&self, set: &Expr, in_prime: bool, vars: &[Shape], env: &CheckEnv, steps: &mut usize) -> (Shape, bool, Option<u32>) {
@@ -1110,7 +1276,7 @@ impl<'a> TotalityChecker<'a> {
                 if let Some(ov) = env.fn_app_overrides.get(&key) {
                     return Some(ov.clone());
                 }
-                let fs = env.var_overrides.get(&(key.0, key.1)).cloned().unwrap_or_else(|| vars[key.0.idx()].clone());
+                let fs = self.read_place(func, in_prime, vars, env)?;
                 Some(fn_app_range(&fs))
             }
             _ => None,

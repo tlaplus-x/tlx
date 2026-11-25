@@ -52,7 +52,7 @@ negative mutation checks are explicit.
 | Sequence length | `LengthCertificate.lean`: multiple sequences, tuple/copy/append/conditional transfers, and current-length feedback | Enabled (`-optimize`) |
 | Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records or fixed-domain maps, masked reads, and kernel-checked (`decide`) liveness tables | Enabled (`-optimize`) |
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–6 model values each, product order `<= 720`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
-| Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`) | Enabled in default mode when `KeyedCertificate` declines and no `CHOOSE` over keys is used |
+| Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean` and `ErasedEquivCertificate.lean`: unobserved-variable erasure composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed or equivariant symmetry certifies the retained tuple |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
@@ -250,8 +250,12 @@ order (`KeyedCertificate.lean`, then fallback `EquivSymCertificate.lean`, or
   slot writes (`SlotExpr`), without `CHOOSE` over keys.
 - **`EquivSymCertificate.lean` (`phase/equiv_sym/`):** fallback when `KeyedCertificate` declines
   (for example on key-valued maps `[K1 -> K2]`, nested maps, multi-key message records, bounded
-  sequences or tuples of keys, general finite sets, set comprehensions, `KSubset`, or
-  `IsInjective`) and no `CHOOSE` over keys is present.
+  sequences or tuples of keys, general finite sets, set comprehensions, `KSubset`, `IsInjective`,
+  commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`
+  and recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds over `+`, `*`, `\cup`, `\cap`, `/\`, `\/`, or
+  index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`)
+  and no non-fold `CHOOSE` over keys is present. `FoldBag` and non-CA/overflowing/out-of-domain
+  folds fail closed.
 - **`ChooseSymCertificate.lean` (`phase/choose_sym/`):** certifies `CHOOSE`-bearing models whose
   selections are (1) unique-witness key choices (`x = target`, `ChooseOne`, or inductively proved
   at-most-one active key in a key set or Boolean flag map), (2) projected uniform/constant-value
