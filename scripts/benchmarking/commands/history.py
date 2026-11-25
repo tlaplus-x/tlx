@@ -1,5 +1,5 @@
 """`bench.py compare` and `bench.py history-report`: two history files compared,
-and one history file's speedups over TLC.
+and one history file's speedups and peak-memory reduction over TLC.
 
 `benchmarking/cli.py` owns the parser and `scripts/bench.py` dispatches; the two
 passes live here (CODE-03), and the records they read are rendered and compared
@@ -11,9 +11,15 @@ by `benchmarking/report.py`. The helpers that stay in the entry point
 import json, os, sys
 
 from benchmarking import models as bench_models
+from benchmarking.records import peak_rss
 from benchmarking.report import TLC_MODE, compare_runs, report_markdown
 from tlxlib import geomean
 
+
+def geomean_text(values, unit='×'):
+    """A geometric-mean cell, `-` when no pair carries the metric."""
+    values = [value for value in values if value]
+    return f"{geomean(values):7.2f}{unit}" if values else f"{'-':>8}"
 
 
 def cmd_compare(a):
@@ -68,36 +74,42 @@ def cmd_history_report(a):
     if a.tlc_baseline:
         bh, base = bench.load_tlc_baseline(a.tlc_baseline)
         print(f"TLC side: {os.path.basename(bench.history_path(a.tlc_baseline))} (TLC {bh.get('tla2tools', {}).get('short')} on {bh.get('machine')})")
-        tlcs = {k: {"min": r["wall_s"], "cpu": [r.get("cpu_s")], "result": r.get("result")} for k, r in base.items()}
+        tlcs = {k: {"min": r["wall_s"], "cpu": [r.get("cpu_s")], "maxrss_mib": r.get("maxrss_mib"),
+                    "tlc_samples": r.get("tlc_samples"), "result": r.get("result")}
+                for k, r in base.items()}
     else:
         tlcs = {(r["model"], r["workers"]): r for r in runs.values() if r["mode"] == TLC_MODE}
     if not tlcs:
         sys.exit("no TLC runs in this history file (bench.py run --tlc, or pass --tlc-baseline)")
-    # (tier, model, mode, workers, TLC wall, tlx wall, TLC CPU, tlx CPU)
+    # (tier, model, mode, workers, TLC wall, tlx wall, TLC CPU, tlx CPU, TLC RSS, tlx RSS)
     rows = []
     for r in runs.values():
         tr = tlcs.get((r["model"], r["workers"]))
         if r["mode"] == TLC_MODE or not tr or not bench.ok_result(r) or not bench.ok_result(tr):
             continue
         cpu = min((c for c in r["cpu"] if c), default=None)
-        rows.append((r["tier"], r["model"], r["mode"], r["workers"], tr["min"], r["min"], tr["cpu"][0], cpu))
-    print("\nspeedup = TLC time / tlx time, geometric mean (wall: min wall time; cpu: min user+sys)")
-    print(f"{'tier':<12} {'mode':<8} {'workers':>7} {'runs':>5} {'wall':>8} {'cpu':>8}")
+        rows.append((r["tier"], r["model"], r["mode"], r["workers"], tr["min"], r["min"], tr["cpu"][0], cpu,
+                     peak_rss(tr), peak_rss(r)))
+    print("\nspeedup = TLC time / tlx time, geometric mean (wall: min wall time; cpu: min user+sys; "
+          "rss: median peak RSS)")
+    print(f"{'tier':<12} {'mode':<8} {'workers':>7} {'runs':>5} {'wall':>8} {'cpu':>8} {'rss':>8}")
     groups = {}
-    for t, k, mode, w, tw, xw, tc, xc in rows:
-        groups.setdefault((t, mode, w), []).append((tw / xw, tc / xc if tc and xc else None))
+    for t, k, mode, w, tw, xw, tc, xc, trss, xrss in rows:
+        groups.setdefault((t, mode, w), []).append(
+            (tw / xw, tc / xc if tc and xc else None, trss / xrss if trss and xrss else None))
     order = lambda g: (list(bench_models.TIERS).index(g[0]) if g[0] in bench_models.TIERS else len(bench_models.TIERS), g[1], g[2])
     for g in sorted(groups, key=order):
         xs = groups[g]
-        print(f"{g[0]:<12} {g[1]:<8} {g[2]:>7} {len(xs):>5} {geomean([x for x, _ in xs]):7.2f}× {geomean([c for _, c in xs]):7.2f}×")
+        print(f"{g[0]:<12} {g[1]:<8} {g[2]:>7} {len(xs):>5} {geomean_text([x for x, _, _ in xs])} "
+              f"{geomean_text([c for _, c, _ in xs])} {geomean_text([r for _, _, r in xs])}")
     for mode in sorted({r[2] for r in rows}):
         # Each model once (models recur across tiers).
         one = {}
-        for t, k, md, w, tw, xw, tc, xc in rows:
+        for t, k, md, w, tw, xw, tc, xc, trss, xrss in rows:
             if md == mode and w == 1:
-                one[k] = (tw / xw, tc / xc if tc and xc else None)
-        print(f"{'all models':<12} {mode:<8} {1:>7} {len(one):>5} {geomean([x for x, _ in one.values()]):7.2f}× "
-              f"{geomean([c for _, c in one.values()]):7.2f}×")
+                one[k] = (tw / xw, tc / xc if tc and xc else None, trss / xrss if trss and xrss else None)
+        print(f"{'all models':<12} {mode:<8} {1:>7} {len(one):>5} {geomean_text([x for x, _, _ in one.values()])} "
+              f"{geomean_text([c for _, c, _ in one.values()])} {geomean_text([r for _, _, r in one.values()])}")
     one = {}
     for t, k, mode, w, tw, xw, *_ in rows:
         if mode == "compile" and w == 1:

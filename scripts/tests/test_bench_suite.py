@@ -740,8 +740,8 @@ class RunBench(unittest.TestCase):
         return {"result": result, "distinct": distinct, "generated": distinct * 2, "depth": 3,
                 "wall_s": 1.0, "cpu_s": 1.0, "maxrss_mib": 8.0, **over}
 
-    def run_bench(self, samples, modes="tlc"):
-        a = argparse.Namespace(external=None, models="A", tiers="", per_tier=0, modes=modes, workers="", tlc=False,
+    def run_bench(self, samples, modes="tlc", *, tlc=False):
+        a = argparse.Namespace(external=None, models="A", tiers="", per_tier=0, modes=modes, workers="", tlc=tlc,
                                tlc_workers="", tlc_timeout=0, timeout=30, repeat=len(samples), resume=False, stats=False, out=self.out)
         made = []
 
@@ -751,10 +751,20 @@ class RunBench(unittest.TestCase):
             made.append(args)
             return {**samples[len(made) - 1], "compatibility": "-tlc" in args}
 
-        with patch.object(bench_models, "oracle", return_value={"A": self.model}), \
-             patch.object(bench, "tlx", side_effect=fake), contextlib.redirect_stdout(io.StringIO()) as output:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(bench_models, "oracle", return_value={"A": self.model}))
+            stack.enter_context(patch.object(bench, "tlx", side_effect=fake))
+            if tlc:
+                # The cache-miss collector's record; test_bench_measurement owns
+                # that each fresh collection really measures the child's RSS.
+                stack.enter_context(patch.object(bench, "tlc", return_value={
+                    "wall_s": 1.0, "cpu_s": 1.0, "maxrss_mib": 8.0, "result": "success",
+                    "distinct": 5, "generated": 10, "depth": 3}))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             bench.run_bench(a, "/fake/tlx")
         runs = read(self.out)["runs"]
+        if tlc:
+            return runs, output.getvalue(), made
         key, = runs  # `--models` selects the "custom" tier.
         self.assertEqual(key, f"custom:A:{modes}:1w")
         return runs[key], output.getvalue(), made
@@ -822,6 +832,18 @@ print('10 states generated, 5 distinct states found, 0 states left on queue.')
         r, out, _ = self.run_bench([self.sample(), self.sample()])
         self.assertNotIn("count_problems", r)
         self.assertNotIn("differs from TLC", out)
+
+    def test_each_sample_keeps_its_peak_rss(self):
+        # history-report pairs this list with TLC's, so every sample's peak RSS
+        # has to reach the history file, not only the aggregate counts.
+        r, _, _ = self.run_bench([self.sample(), self.sample(maxrss_mib=10.0)])
+        self.assertEqual(r["rss_mib"], [8.0, 10.0])
+
+    def test_a_tlc_run_keeps_its_peak_rss_in_the_history_row(self):
+        # A fresh `run --tlc` collection is only usable as a memory baseline if
+        # the collector's peak RSS survives the history serialization.
+        runs, _, _ = self.run_bench([self.sample()], modes="compile", tlc=True)
+        self.assertEqual(runs["custom:A:tlc:1w"]["rss_mib"], [8.0])
 
     def test_a_reduced_default_run_checks_its_result_only(self):
         # The positive case: without -tlc the search is reduced, so differing

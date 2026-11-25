@@ -311,9 +311,9 @@ def tlx(m, args, timeout, exe=None, env=None, wrap=(), raw=False):
 @bench_budget.model_pass
 def _collect_tlc(m, workers, timeout):
     """One run of TLC on model `m` with `workers` (and the model's simulation
-    flags, seed 1): the parsed result with wall and CPU time.
+    flags, seed 1): the parsed result with wall and CPU time and peak RSS.
 
-    The CPU time is this child's own wait4 usage. A process-wide
+    The CPU time and peak RSS are this child's own wait4 usage. A process-wide
     RUSAGE_CHILDREN delta around the call would fold in every other child
     reaped meanwhile, and bench_ttfr runs its lanes in parallel (HARNESS-09)."""
     from tlc import tlc_cmd
@@ -327,9 +327,11 @@ def _collect_tlc(m, workers, timeout):
         p = run_proc(cmd, timeout, cwd=cwd, rusage=True, raise_timeout=False, start_new_session=True)
     r = bench_measure.result_of(p, timeout)
     if not p.timed_out:
-        # (This child's own CPU; a timed-out run is recorded without it, as
-        # before: the record's cpu is unmeasured rather than a partial number.)
+        # (This child's own CPU and peak RSS; a timed-out run is recorded
+        # without them, as before: the record's usage is unmeasured rather
+        # than a partial number.)
         r["cpu_s"] = bench_measure.cpu_seconds(p.rusage)
+        r["maxrss_mib"] = bench_measure.rss_mib(p.rusage)
     return r
 
 

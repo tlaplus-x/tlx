@@ -34,21 +34,25 @@ Core design and architecture:
 [docs/reductions.md](docs/reductions.md) explain these mechanisms and the guarded interpreter
 fallback.
 
-The initial benchmark snapshot shows a **9.27× median speedup over TLC in single-worker
-default mode**, across 184 completed configurations with matching TLC baselines.
+The initial benchmark snapshot shows a **9.27× median speedup and a 6.98× median peak-memory
+reduction over TLC in single-worker default mode**, across 168 completed configurations with
+matching TLC baselines.
 
-| Execution mode | Workers | Matched configurations | Median TLC / tlx wall time |
-|---|---:|---:|---:|
-| Default | 1 | 184 | **9.27×** |
-| Compiled | 1 | 51 | **7.30×** |
-| Compiled | 16 | 23 | **11.14×** |
+| Execution mode | Workers | Matched configurations | Median TLC / tlx wall time | Median TLC / tlx peak RSS |
+|---|---:|---:|---:|---:|
+| Default | 1 | 168 | **9.27×** | **6.98×** |
+| Compiled | 1 | 51 | **7.30×** | **8.32×** |
+| Compiled | 16 | 22 | **11.36×** | **6.57×** |
 
 These measurements use Tencent SA5.4XLARGE32 instances (AMD EPYC 9754, 16 vCPU, 32 GB),
 one warm-up and three timed tlx repetitions. Times exclude the warm-up: the timed samples are
 separate process runs that follow a discarded warm-up whose native cache may be reused across
 the batch, rather than isolated per configuration, so the discarded run is not a cold-cache
 measurement. Each ratio uses the same input, machine class and worker count as its TLC baseline,
-and the report names, per row, the optimization the tlx record states - a row that states one
+and the memory ratio pairs the same two records' stored median peak RSS (`metrics.rss_mib`), so a
+value above one means tlx used less peak memory; a record without a measurement is excluded
+rather than read as a zero-byte footprint. The report names, per row, the optimization the tlx
+record states - a row that states one
 ran with it, so its counts are those of that reduced search; the row does not assert what the
 TLC side was configured with. The mode cohorts differ, and the measurements compare complete
 implementations (separate from later Lean gating and `-optimize` projections) rather than

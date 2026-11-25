@@ -37,6 +37,15 @@ one; `none` requires every sample to record an empty list, and a sample without 
 `unknown`). Historical markdown is retained as source material and is
 not updated. `bench.py table` now regenerates the fixed report without running measurements.
 
+The report publishes peak resident memory beside time: `## Summary` carries each cohort's
+`Median TLC / tlx RSS` and `RSS range`, and every per-model table pairs the tlx row's `RSS MiB`
+with the baseline's `TLC RSS MiB` and the `TLC / tlx RSS` ratio. Both sides are the stored
+`metrics.rss_mib` (the median of that run's finite positive timed samples), so a ratio is
+published only when both records carry a positive measurement; a missing or zero value stays
+`—`, never a zero-byte footprint. The import, the report and `history-report` share that reader,
+so a legacy history's timed `samples[*].maxrss_mib` and a `tlcbase` run's scalar `maxrss_mib`
+name the same statistic.
+
 New TLC baselines can collect repeated process runs, for example on a cloud instance:
 
 ```sh
@@ -88,7 +97,7 @@ Other subcommands (details in the script header):
 scripts/bench.py tiers                               # tiers and chosen models
 scripts/bench.py run --tlc                           # every tier with tlx, TLC measured on the same machine -> bench/history/<commit>.json
 scripts/bench.py report                              # regenerate the fixed public report
-scripts/bench.py history-report <commit>              # inspect one historical file on stdout
+scripts/bench.py history-report <commit>              # inspect one historical file on stdout (wall, CPU and RSS speedups)
 scripts/bench.py compare <A> <B> --metric cpu        # regression check between two history files
 scripts/bench.py ab --bin a=PATH --bin b=PATH --models X,Y --repeat 10
                                                      # interleaved A/B of two tlx binaries (min/median CPU and wall, peak RSS)
@@ -160,8 +169,10 @@ external checkout stays untouched; the wrapper's extra constraint must be invari
 model's symmetries, or the counts stop being comparable.
 
 `history-report FILE --markdown` prints the per-model table, geometric means per tier and per TLC time
-bucket, and the models where `-compile` 1w is less than 3x faster than TLC. The cloud instances
-receive `third_party/external` (`cloud_verify.py --bench "run --external ..."`, see
+bucket, and the models where `-compile` 1w is less than 3x faster than TLC. Without `--markdown`,
+it prints the geometric-mean `wall`, `cpu` and `rss` speedups per tier and mode; `rss` is TLC peak
+RSS over tlx peak RSS, and `-` marks a row whose history or TLC entry records no measurement. The
+cloud instances receive `third_party/external` (`cloud_verify.py --bench "run --external ..."`, see
 [cloud-verification.md](cloud-verification.md) section 3).
 
 Time to first result: `ttfr --bin base=OLD --bin new=NEW [--once base] [--external small]
