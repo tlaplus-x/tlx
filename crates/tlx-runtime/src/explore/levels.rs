@@ -2,6 +2,12 @@
 //! level k (stealing from each other), then meet at a barrier before any
 //! starts level k + 1, so that every state is reached by a shortest path (as
 //! in TLC's BFS). Narrow levels are expanded by a single worker.
+//!
+//! The states a worker claimed are not lost to the barrier when it is
+//! descheduled: near the end of a parallel level its block is staged for
+//! stealing (`super::frontier`), and a worker that finds nothing left to
+//! claim expands those states before it waits here. A narrow level expanded
+//! by one worker alone stages nothing: its peers are waiting here anyway.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -262,9 +268,13 @@ impl CostEstimate {
 
 impl<M: Model> WorkerState<'_, '_, M> {
     /// Expand tasks of the current level until none is left or the search
-    /// stops. Returns the number of tasks expanded.
-    pub(super) fn expand_level(&mut self) -> u64 {
+    /// stops. Returns the number of tasks expanded. `stealing`: the level is
+    /// expanded in parallel, so the blocks this worker claims are staged for
+    /// the others to steal the states of (`Local::share`); a narrow level it
+    /// expands alone keeps them private.
+    pub(super) fn expand_level(&mut self, stealing: bool) -> u64 {
         let shared = self.shared;
+        self.local.share(stealing);
         self.order_level();
         let mut n = 0;
         while self.proceed() {
@@ -309,7 +319,7 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
         let solo = levels.solo.load(Ordering::SeqCst);
         if solo == NO_SOLO {
             let start = Instant::now();
-            let n = w.expand_level();
+            let n = w.expand_level(true);
             levels.busy_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::SeqCst);
             levels.expanded.fetch_add(n, Ordering::SeqCst);
             if shared.order.is_some() {
@@ -330,7 +340,7 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             let mut mark = Instant::now();
             let mut since_mark = 0;
             loop {
-                since_mark += w.expand_level();
+                since_mark += w.expand_level(false);
                 w.resolve();
                 let width = w.local.next_len();
                 let end = width == 0 || shared.control().stopped();

@@ -583,7 +583,7 @@ fn run_worker_in<'s, 'm, M: Model>(
     } else {
         // Exact BFS: level after level, each in FIFO order.
         loop {
-            w.expand_level();
+            w.expand_level(false);
             if shared.control().stopped() || w.local.next_len() == 0 {
                 break;
             }
