@@ -387,6 +387,9 @@ impl<'a> TotalityChecker<'a> {
                             && shape_has_safe_set_cards(&r, self.groups)
                     })
                 }
+                (B::IsABag | B::BagIn | B::SqSubseteq, _) => {
+                    self.check_bag_form(*op, args, allow_prime, in_prime, env, steps).unwrap_or(false)
+                }
                 (B::Unchanged, [a]) if allow_prime && !in_prime => {
                     let Some(s0) = self.check_expr(a, true, false, env, steps) else { return false };
                     let Some(s1) = self.check_expr(a, true, true, env, steps) else { return false };
@@ -572,8 +575,14 @@ impl<'a> TotalityChecker<'a> {
                     let (_, origin) = self.bound_elem_info(&b.set, in_prime, &local_env);
                     match &b.vars {
                         BoundVars::Many(ids) => {
+                            let dom_except = super::bags::dom_cup_singleton(&b.set);
                             for &id in ids {
                                 local_env.bind_local(id, elem.clone(), origin.clone());
+                                if origin.is_none() {
+                                    if let Some((f, excl)) = dom_except {
+                                        local_env.bind_local_dom_except(id, f.clone(), in_prime, excl.clone());
+                                    }
+                                }
                                 doms.push(elem.clone());
                                 max_dom = max_dom.and_then(|a| a.checked_mul(c)).filter(|&v| v <= MAX_I32_U32);
                             }
@@ -598,6 +607,9 @@ impl<'a> TotalityChecker<'a> {
                 let fs = self.check_expr(func, allow_prime, in_prime, env, steps)?;
                 let arg_shapes = args.iter().map(|a| self.check_expr(a, allow_prime, in_prime, env, steps)).collect::<Option<Vec<_>>>()?;
                 let key_shape = if arg_shapes.len() == 1 { arg_shapes[0].clone() } else { Shape::Tuple(arg_shapes) };
+                if matches!(fs, Shape::Bottom) || matches!(key_shape, Shape::Bottom) {
+                    return Some(Shape::Bottom);
+                }
                 // Fast exact checks:
                 if args.len() == 1 {
                     if let ExprKind::Str(field) = &*args[0].kind {
@@ -605,15 +617,25 @@ impl<'a> TotalityChecker<'a> {
                             return field_of_shape_total(&fs, field);
                         }
                     }
-                    // Proven `x \in DOMAIN f` (or `x \in 1..Len(seq)`) via DomOrigin:
-                    if let ExprKind::Local(l) = &*args[0].kind {
-                        if let Some((orig_expr, orig_prime)) = env.local_dom.get(l) {
-                            if expr_struct_eq(func, in_prime, orig_expr, *orig_prime) && fnapp_index_valid_for(&fs, &key_shape, self.groups)
-                            {
-                                if let Some((_, range, _)) = fn_dom_range(&fs) {
-                                    return Some(range);
-                                }
+                    // Proven `x \in DOMAIN f` (or `x \in 1..Len(seq)`) via DomOrigin or `proven_in_dom`:
+                    let proven_dom = match &*args[0].kind {
+                        ExprKind::Local(l) => env
+                            .local_dom
+                            .get(l)
+                            .is_some_and(|(orig_expr, orig_prime)| expr_struct_eq(func, in_prime, orig_expr, *orig_prime)),
+                        _ => false,
+                    } || env
+                        .proven_in_dom
+                        .iter()
+                        .any(|(k, f, fp)| expr_struct_eq(&args[0], in_prime, k, *fp) && expr_struct_eq(func, in_prime, f, *fp));
+                    if proven_dom && fnapp_index_valid_for(&fs, &key_shape, self.groups) {
+                        if let Some(key) = fn_app_place(func, args, in_prime) {
+                            if let Some(ov) = env.fn_app_overrides.get(&key) {
+                                return Some(ov.clone());
                             }
+                        }
+                        if let Some((_, range, _)) = fn_dom_range(&fs) {
+                            return Some(range);
                         }
                     }
                     if let Shape::Tuple(ts) = &fs {
@@ -786,7 +808,10 @@ impl<'a> TotalityChecker<'a> {
                 | B::Gt
                 | B::Ge
                 | B::IsFiniteSet
-                | B::IsInjective,
+                | B::IsInjective
+                | B::IsABag
+                | B::BagIn
+                | B::SqSubseteq,
                 _,
             ) => self.check_form(e, allow_prime, in_prime, env, steps).then_some(Shape::Bool),
             (B::Boolean, []) => Some(Shape::Set { elem: Box::new(Shape::Bool), finite: true, max_card: Some(2) }),
@@ -920,6 +945,7 @@ impl<'a> TotalityChecker<'a> {
                 Some(Shape::Int(Some((0, max_c as i32))))
             }
             (B::Len, [s]) => match self.check_expr(s, allow_prime, in_prime, env, steps)? {
+                Shape::Bottom => Some(Shape::Bottom),
                 Shape::Tuple(ts) => i32::try_from(ts.len()).ok().map(|n| Shape::Int(Some((n, n)))),
                 Shape::Seq { min_len, max_len: Some(hi), .. } if hi <= MAX_I32_U32 => {
                     Some(Shape::Int(Some((min_len.min(MAX_I32_U32) as i32, hi as i32))))
@@ -1057,7 +1083,7 @@ impl<'a> TotalityChecker<'a> {
             (B::FoldRightDomain, [op_lam, seq, base]) => {
                 self.check_seq_fold(op_lam, base, seq, true, true, false, allow_prime, in_prime, env, steps)
             }
-            _ => None,
+            _ => self.check_bag_builtin(op, args, allow_prime, in_prime, env, steps),
         }
     }
 

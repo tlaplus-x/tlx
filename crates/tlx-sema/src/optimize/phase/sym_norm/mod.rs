@@ -655,7 +655,12 @@ impl<'a> SymNormalizer<'a> {
                     let pred_lam = self.expand_op_arg_arity(pred, 1, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
                     return Some(Expr::new(ExprKind::Builtin { op, args: vec![seq, pred_lam] }, span));
                 }
-                (B::FoldSet | B::FoldFunction | B::FoldSeq | B::FoldLeft | B::FoldLeftDomain, [op_arg, base, coll]) => {
+                (B::BagOfAll, [f_arg, bag]) => {
+                    let f_lam = self.expand_op_arg_arity(f_arg, 1, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
+                    let bag = self.expand(bag, env, op_env, cur_except, lex_at, depth + 1)?;
+                    return Some(Expr::new(ExprKind::Builtin { op, args: vec![f_lam, bag] }, span));
+                }
+                (B::FoldSet | B::FoldFunction | B::FoldSeq | B::FoldLeft | B::FoldLeftDomain | B::FoldBag, [op_arg, base, coll]) => {
                     let op_lam = self.expand_op_arg_arity(op_arg, 2, true, env, op_env, cur_except, lex_at, span, depth + 1)?;
                     let base = self.expand(base, env, op_env, cur_except, lex_at, depth + 1)?;
                     let coll = self.expand(coll, env, op_env, cur_except, lex_at, depth + 1)?;
