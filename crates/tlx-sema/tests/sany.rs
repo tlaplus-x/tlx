@@ -128,6 +128,94 @@ fn instances() {
     let m = "---- MODULE M ----\nF(a, b) == a\nINSTANCE C\n====\n";
     let es = load(&[("M", m), ("C", cmod)]).err().unwrap();
     assert!(es.iter().any(|e| e.contains("An operator must be substituted for symbol 'F', and it must have arity 1.")), "{es:?}");
+
+    // Operator-valued instance parameters: arity and level checks match SANY.
+    let hmod = "---- MODULE H ----\nCONSTANT F(_)\nVARIABLE v\nD(a) == F(a)\nBad == F(v')\n====\n";
+    let ok = "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE x\nInc(z) == z + 1\nI(G(_)) == INSTANCE H WITH F <- G, v <- x\nA == I(Inc)!D(1) + I(LAMBDA z : z + 2)!D(3)\n====\n";
+    assert!(load(&[("M", ok), ("H", hmod)]).is_ok());
+
+    let bad_val = "---- MODULE M ----\nVARIABLE x\nI(G(_)) == INSTANCE H WITH F <- G, v <- x\nA == I(1)!D(1)\n====\n";
+    let es = load(&[("M", bad_val), ("H", hmod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("in a position an operator is required")), "{es:?}");
+
+    let bad_arity = "---- MODULE M ----\nVARIABLE x\nAdd(a, b) == a\nI(G(_)) == INSTANCE H WITH F <- G, v <- x\nA == I(Add)!D(1)\n====\n";
+    let es = load(&[("M", bad_arity), ("H", hmod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Expected arity 1 but found operator of arity 2.")), "{es:?}");
+
+    let bad_lam = "---- MODULE M ----\nVARIABLE x\nI(G(_)) == INSTANCE H WITH F <- G, v <- x\nA == I(LAMBDA a, b : a)!D(1)\n====\n";
+    let es = load(&[("M", bad_lam), ("H", hmod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Lambda expression with arity 2")), "{es:?}");
+
+    let bad_level = "---- MODULE M ----\nVARIABLE x\nPrime(a) == a'\nI(G(_)) == INSTANCE H WITH F <- G, v <- x\nA == I(Prime)!Bad\n====\n";
+    let es = load(&[("M", bad_level), ("H", hmod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("The permitted level of argument 1 of the operator argument 1")), "{es:?}");
+
+    let c0 = "---- MODULE C0 ----\nCONSTANT c\nD == c\n====\n";
+    let lam_for_val = "---- MODULE M ----\nI(p) == INSTANCE C0 WITH c <- p\nA == I(LAMBDA a : a)!D\n====\n";
+    let es = load(&[("M", lam_for_val), ("C0", c0)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("LAMBDA expression used where an expression is required.")), "{es:?}");
+
+    // Nested parameterized instance with wrong operator arity is rejected.
+    let mid = "---- MODULE Mid ----\nCONSTANT k\nJ(G(_)) == INSTANCE H WITH F <- G, v <- k\n====\n";
+    let bad_nested = "---- MODULE M ----\nVARIABLE x\nAdd(a, b) == a\nI(p) == INSTANCE Mid WITH k <- p\nA == I(x)!J(Add)!D(1)\n====\n";
+    let es = load(&[("M", bad_nested), ("Mid", mid), ("H", hmod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Expected arity 1 but found operator of arity 2.")), "{es:?}");
+
+    // Qualified operator arguments from parameterized instances: bare `S!Read`
+    // has full signature (prefix + own formals), while `S(1)!Pair` with a
+    // selector argument is rejected by SANY.
+    let src = "---- MODULE Source ----\nCONSTANT k\nRead == k\nPair(v) == <<v, k>>\n====\n";
+    let tgt = "---- MODULE Target ----\nCONSTANT F(_)\nResult == F(1)\n====\n";
+    let ok_qual_op =
+        "---- MODULE M ----\nS(n) == INSTANCE Source WITH k <- n\nI(H(_)) == INSTANCE Target WITH F <- H\nA == I(S!Read)!Result\n====\n";
+    assert!(load(&[("M", ok_qual_op), ("Source", src), ("Target", tgt)]).is_ok());
+
+    let bad_sel_arg =
+        "---- MODULE M ----\nS(n) == INSTANCE Source WITH k <- n\nI(H(_)) == INSTANCE Target WITH F <- H\nA == I(S(1)!Pair)!Result\n====\n";
+    let es = load(&[("M", bad_sel_arg), ("Source", src), ("Target", tgt)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Selector `S' should not have argument(s).")), "{es:?}");
+
+    let bad_qual_arity =
+        "---- MODULE M ----\nS(n) == INSTANCE Source WITH k <- n\nI(H(_)) == INSTANCE Target WITH F <- H\nA == I(S!Pair)!Result\n====\n";
+    let es = load(&[("M", bad_qual_arity), ("Source", src), ("Target", tgt)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Expected arity 1 but found operator of arity 2.")), "{es:?}");
+
+    // Inherited operator from declaration-free extended module through parameterized
+    // instance has full public signature (prefix + own formals); labeled expression
+    // S!Read!HERE keeps S's parameter; value operand S!Read + 1 rejects missing arg.
+    let pure = "---- MODULE Pure ----\nEXTENDS Naturals\nTwice(v) == v + v\n====\n";
+    let src_ext = "---- MODULE SourceExt ----\nEXTENDS Pure\nCONSTANT k\nRead == HERE::k\n====\n";
+    let tgt2 = "---- MODULE Target2 ----\nCONSTANT F(_, _)\nVal == F(10, 3)\n====\n";
+    let ok_reexport = "---- MODULE M ----\nS(p) == INSTANCE SourceExt WITH k <- p\nC(G(_, _)) == INSTANCE Target2 WITH F <- G\nI(H(_)) == INSTANCE Target WITH F <- H\nA == C(S!Twice)!Val\nB == I(S!Read!HERE)!Result\n====\n";
+    assert!(load(&[("M", ok_reexport), ("SourceExt", src_ext), ("Pure", pure), ("Target2", tgt2), ("Target", tgt)]).is_ok());
+
+    let bad_reexport_arity = "---- MODULE M ----\nS(p) == INSTANCE SourceExt WITH k <- p\nI(H(_)) == INSTANCE Target WITH F <- H\nA == I(S!Twice)!Result\n====\n";
+    let es = load(&[("M", bad_reexport_arity), ("SourceExt", src_ext), ("Pure", pure), ("Target", tgt)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Expected arity 1 but found operator of arity 2.")), "{es:?}");
+
+    let bad_val_operand = "---- MODULE M ----\nEXTENDS Naturals\nS(n) == INSTANCE Source WITH k <- n\nA == S!Read + 1\n====\n";
+    let es = load(&[("M", bad_val_operand), ("Source", src)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("instance `S` expects 1 argument(s)")), "{es:?}");
+
+    // Level bounds on CONSTANT / VARIABLE substitutions of parameterized
+    // instances must be enforced at the call site when the definition uses them.
+    let sub_mod = "---- MODULE SubMod ----\nCONSTANT c(_)\nVARIABLE v\nTest == c(0) = v\nUnused == v = 0\n====\n";
+    let bad_op_sub_level = "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE x\nIx(G(_)) == INSTANCE SubMod WITH c <- G, v <- x\nRead(a) == x + a\nInv == Ix(Read)!Test\n====\n";
+    let es = load(&[("M", bad_op_sub_level), ("SubMod", sub_mod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Level error in applying operator Test:")), "{es:?}");
+
+    let ok_unused_sub_level = "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE x\nIx(G(_)) == INSTANCE SubMod WITH c <- G, v <- x\nRead(a) == x + a\nInv == Ix(Read)!Unused\n====\n";
+    assert!(load(&[("M", ok_unused_sub_level), ("SubMod", sub_mod)]).is_ok());
+
+    let val_mod = "---- MODULE ValMod ----\nCONSTANT c\nVARIABLE v\nTestC == c = v\nTestV == v = 0\n====\n";
+    let bad_val_sub_level =
+        "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE x\nIx(p) == INSTANCE ValMod WITH c <- p, v <- x\nInv == Ix(x)!TestC\n====\n";
+    let es = load(&[("M", bad_val_sub_level), ("ValMod", val_mod)]).err().unwrap();
+    assert!(es.iter().any(|e| e.contains("Level error in applying operator TestC:")), "{es:?}");
+
+    let ok_split_cv =
+        "---- MODULE M ----\nEXTENDS Naturals\nVARIABLE x\nIx(p) == INSTANCE ValMod WITH c <- p, v <- p\nInv == Ix(x)!TestV\n====\n";
+    assert!(load(&[("M", ok_split_cv), ("ValMod", val_mod)]).is_ok());
 }
 
 #[test]
@@ -286,4 +374,59 @@ fn modules() {
     // Circular dependencies.
     let es = load(&[("A", "---- MODULE A ----\nEXTENDS B\n====\n"), ("B", "---- MODULE B ----\nEXTENDS A\n====\n")]).err().unwrap();
     assert!(es[0].contains("Circular dependency among .tla files"), "{es:?}");
+}
+
+#[test]
+fn instance_op_level_forwarding() {
+    // Forwarding a qualified operator's constant-level parameter bound through
+    // a LET helper (both captured-op and captured-arg forms) or SelectSeq must
+    // reject state-level arguments, matching SANY.
+    let bounds_const = "---- MODULE Bounds ----\nCONSTANT candidate\nVARIABLE limit\nKeep == candidate <= limit\n====\n";
+    let bounds_var = "---- MODULE Bounds ----\nVARIABLE candidate, limit\nKeep == candidate <= limit\n====\n";
+    rejects(
+        &format!(
+            "{bounds_const}\
+             ---- MODULE Batch ----\nCONSTANT Filter(_)\nPick(s) == LET Apply(a) == Filter(a) IN Apply(s)\n====\n\
+             S(i) == INSTANCE Bounds WITH candidate <- i, limit <- x\n\
+             B(P(_)) == INSTANCE Batch WITH Filter <- P\n\
+             Op == B(S!Keep)!Pick(x)"
+        ),
+        "exceeds the maximum level allowed by the operator",
+    );
+    rejects(
+        &format!(
+            "{bounds_const}\
+             ---- MODULE Batch ----\nCONSTANT Filter(_)\nPick(s) == LET Apply(F(_)) == F(s) IN Apply(Filter)\n====\n\
+             S(i) == INSTANCE Bounds WITH candidate <- i, limit <- x\n\
+             B(P(_)) == INSTANCE Batch WITH Filter <- P\n\
+             Op == B(S!Keep)!Pick(x)"
+        ),
+        "exceeds the maximum level allowed by the operator",
+    );
+    let seq_reject = load(&[(
+        "M",
+        &format!(
+            "---- MODULE M ----\nEXTENDS Naturals, Sequences\n{bounds_const}\
+             ---- MODULE Batch ----\nCONSTANT Filter(_)\nPick(s) == SelectSeq(s, Filter)\n====\n\
+             VARIABLE x\n\
+             S(i) == INSTANCE Bounds WITH candidate <- i, limit <- x\n\
+             B(P(_)) == INSTANCE Batch WITH Filter <- P\n\
+             Op == B(S!Keep)!Pick(<<x, x + 1>>)\n===="
+        ),
+    )])
+    .err()
+    .expect("SelectSeq with constant-level predicate on state sequence must fail");
+    assert!(seq_reject.iter().any(|e| e.contains("exceeds the maximum level allowed by the operator")), "{seq_reject:?}");
+    load(&[(
+        "M",
+        &format!(
+            "---- MODULE M ----\nEXTENDS Naturals, Sequences\n{bounds_var}\
+             ---- MODULE Batch ----\nCONSTANT Filter(_)\nPick(s) == SelectSeq(s, Filter)\n====\n\
+             VARIABLE x\n\
+             S(i) == INSTANCE Bounds WITH candidate <- i, limit <- x\n\
+             B(P(_)) == INSTANCE Batch WITH Filter <- P\n\
+             Op == B(S!Keep)!Pick(<<x, x + 1>>)\n===="
+        ),
+    )])
+    .expect("SelectSeq with variable-substituted predicate on state sequence must pass");
 }

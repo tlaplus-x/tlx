@@ -873,6 +873,102 @@
   "result": "error",
   "violated": null
  },
+ "InstEnabledAlias": {
+  "depth": null,
+  "distinct": null,
+  "exit": 12,
+  "generated": null,
+  "result": "safety failure",
+  "violated": "Inv"
+ },
+ "InstNested": {
+  "depth": 6,
+  "distinct": 6,
+  "exit": 0,
+  "generated": 7,
+  "result": "success",
+  "violated": null
+ },
+ "InstOpChoose": {
+  "depth": 2,
+  "distinct": 2,
+  "exit": 12,
+  "generated": 3,
+  "result": "safety failure",
+  "violated": "Inv"
+ },
+ "InstOpParam": {
+  "depth": 4,
+  "distinct": 4,
+  "exit": 0,
+  "generated": 5,
+  "result": "success",
+  "violated": null
+ },
+ "InstOpSubForward": {
+  "depth": null,
+  "distinct": null,
+  "exit": 150,
+  "generated": null,
+  "result": "error",
+  "violated": null
+ },
+ "InstOpSubLevel": {
+  "depth": null,
+  "distinct": null,
+  "exit": 150,
+  "generated": null,
+  "result": "error",
+  "violated": null
+ },
+ "InstOpSubSelectSeq": {
+  "depth": null,
+  "distinct": null,
+  "exit": 150,
+  "generated": null,
+  "result": "error",
+  "violated": null
+ },
+ "InstOpSubSelectSeqOk": {
+  "depth": 128,
+  "distinct": 128,
+  "exit": 0,
+  "generated": 129,
+  "result": "success",
+  "violated": null
+ },
+ "InstPassOp": {
+  "depth": 1,
+  "distinct": 1,
+  "exit": 0,
+  "generated": 2,
+  "result": "success",
+  "violated": null
+ },
+ "InstPassOpArity": {
+  "depth": null,
+  "distinct": null,
+  "exit": 150,
+  "generated": null,
+  "result": "error",
+  "violated": null
+ },
+ "InstPassOpReexport": {
+  "depth": 1,
+  "distinct": 1,
+  "exit": 0,
+  "generated": 2,
+  "result": "success",
+  "violated": null
+ },
+ "InstPassOpValue": {
+  "depth": null,
+  "distinct": null,
+  "exit": 150,
+  "generated": null,
+  "result": "error",
+  "violated": null
+ },
  "JA1": {
   "depth": 15,
   "distinct": 3410,

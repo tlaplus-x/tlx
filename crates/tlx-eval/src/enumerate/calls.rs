@@ -13,10 +13,11 @@ impl<'a> Enumerator<'a> {
     /// definition: expand the definition.
     pub(super) fn apply_const(&mut self, c: &ConstId, args: &[Expr], e: &Expr, env: &Env, k: &Cont) -> EResult<bool> {
         let ip: &'a Arc<Interp> = self.ip;
-        // An operator constant replaced by a definition in the cfg is
-        // expanded like the definition itself.
+        // An operator constant replaced by a definition or builtin in the cfg
+        // is expanded like that operator itself.
         match ip.const_op_ref(*c) {
             Some(OpRef::Def(d)) => self.go_call(d, args, e, env, k),
+            Some(OpRef::Builtin(b)) => self.go_builtin(b, args, e, env, k),
             _ => self.test(e, env, k),
         }
     }
@@ -27,12 +28,23 @@ impl<'a> Enumerator<'a> {
         let ip: &'a Arc<Interp> = self.ip;
         match env.lookup(*l) {
             Some(Binding::Op(OpVal::Ref(OpRef::Def(d)))) => self.go_call(*d, args, e, env, k),
+            Some(Binding::Op(OpVal::Ref(OpRef::Builtin(b)))) => self.go_builtin(*b, args, e, env, k),
+            Some(Binding::Op(OpVal::Ref(OpRef::Const(c)))) => self.apply_const(c, args, e, env, k),
             Some(Binding::Op(OpVal::Lambda { params, body, env: lenv })) => {
                 let env2 = ip.bind_params(params, args, env, &self.cx(), lenv.clone(), true, false)?;
                 self.go(body, &env2, k)
             }
             _ => self.test(e, env, k),
         }
+    }
+
+    /// Enumerate builtin operator `op` applied to `args` (when reached through
+    /// an operator parameter or constant override) so action builtins such as
+    /// `\in`, `=`, `\subseteq`, `UNCHANGED`, `=>`, and `\cdot` keep their
+    /// action-enumeration semantics.
+    pub(super) fn go_builtin(&mut self, op: B, args: &[Expr], e: &Expr, env: &Env, k: &Cont) -> EResult<bool> {
+        let call = Expr::new(ExprKind::Builtin { op, args: args.to_vec() }, e.span);
+        self.go(&call, env, k)
     }
 
     /// A `Local` bound to a call-by-name expression: enumerate that

@@ -93,6 +93,12 @@ pub(super) struct Summary {
     /// `(f, j, p)`: the argument at position p is passed to argument j of
     /// the operator argument at position f.
     arg_params: Vec<(usize, usize, usize)>,
+    /// `(f, j, p)`: the argument at position p is passed to argument j of
+    /// captured (free) operator parameter `f` (e.g. `LET Apply(a) == F(a)`).
+    free_arg_params: Vec<(LocalId, usize, usize)>,
+    /// `(f, j, p)`: captured (free) parameter `p` is passed to argument j of
+    /// the operator argument at position `f` (e.g. `LET Apply(F(_)) == F(s)`).
+    bound_arg_free: Vec<(usize, usize, LocalId)>,
     /// Per parameter: whether the operator is non-Leibniz in it.
     nonleibniz: Vec<bool>,
     /// Dependencies on the enclosing definitions' parameters (LET definitions,
@@ -109,6 +115,8 @@ impl Summary {
             max: vec![TEMPORAL; n],
             min_max: vec![Vec::new(); n],
             arg_params: Vec::new(),
+            free_arg_params: Vec::new(),
+            bound_arg_free: Vec::new(),
             nonleibniz: vec![false; n],
             free: Info::default(),
         }
@@ -155,6 +163,22 @@ fn builtin_spec(b: Builtin) -> (&'static str, u8, u8, bool) {
     }
 }
 
+/// SANY's `arg_params` `(op_pos, op_arg_pos, param_pos)` for operator-taking
+/// standard and community module built-ins, matching their TLA+ definitions.
+fn builtin_arg_params(b: Builtin) -> Vec<(usize, usize, usize)> {
+    use Builtin as B;
+    match b {
+        B::SelectSeq => vec![(1, 0, 0)],
+        B::SortSeq => vec![(1, 0, 0), (1, 1, 0)],
+        B::SelectInSubSeq | B::SelectLastInSubSeq => vec![(3, 0, 0), (3, 0, 1), (3, 0, 2)],
+        B::FoldFunction | B::FoldFunctionOnSet | B::FoldSeq => vec![(0, 0, 2)],
+        B::FoldBag => vec![(0, 0, 1), (0, 0, 2)],
+        B::FoldRight | B::FoldRightDomain => vec![(0, 0, 1)],
+        B::MapThenFoldSet => vec![(0, 0, 2), (0, 0, 3), (2, 0, 3)],
+        _ => Vec::new(),
+    }
+}
+
 fn builtin_summary(b: Builtin, n: usize) -> Summary {
     let (_, level, max, w) = builtin_spec(b);
     Summary {
@@ -162,7 +186,9 @@ fn builtin_summary(b: Builtin, n: usize) -> Summary {
         weights: vec![w; n],
         max: vec![max; n],
         min_max: vec![Vec::new(); n],
-        arg_params: Vec::new(),
+        arg_params: builtin_arg_params(b),
+        free_arg_params: Vec::new(),
+        bound_arg_free: Vec::new(),
         nonleibniz: vec![!w; n],
         free: Info::default(),
     }
@@ -211,11 +237,19 @@ impl Checker<'_> {
         }
         self.in_progress[d.idx()] = true;
         self.stack.push(d);
-        let info = match &def.kind {
+        let mut info = match &def.kind {
             DefKind::Pending => Info::default(),
             DefKind::Op(e) => self.expr(e),
             DefKind::Fn { bounds, body } => self.binder("$RecursiveFcnSpec", bounds, body, TEMPORAL, true, def.span),
         };
+        for (se, max) in &self.p.def_subst_bounds[d.idx()] {
+            let saved_errors = self.errors.len();
+            let si = self.expr(se);
+            self.errors.truncate(saved_errors);
+            for &p in &si.params {
+                constrain(&mut info.cons, p, *max);
+            }
+        }
         let s = Arc::new(self.summarize(&def.params, info));
         self.stack.pop();
         self.in_progress[d.idx()] = false;
@@ -236,6 +270,10 @@ impl Checker<'_> {
             .collect();
         let pos = |l: &LocalId| params.iter().position(|p| p == l);
         let arg_params = info.arg_params.iter().filter_map(|(f, j, p)| Some((pos(f)?, *j, pos(p)?))).collect();
+        let free_arg_params =
+            info.arg_params.iter().filter_map(|(f, j, p)| if pos(f).is_none() { Some((*f, *j, pos(p)?)) } else { None }).collect();
+        let bound_arg_free =
+            info.arg_params.iter().filter_map(|(f, j, p)| if pos(p).is_none() { Some((pos(f)?, *j, *p)) } else { None }).collect();
         let nonleibniz = params.iter().map(|p| info.nonleibniz.contains(p)).collect();
         let level = info.level;
         let mut free = info;
@@ -247,7 +285,7 @@ impl Checker<'_> {
         }
         free.arg_cons.retain(|(p, _), _| !params.contains(p));
         free.arg_params.retain(|(f, _, p)| !params.contains(f) && !params.contains(p));
-        Summary { level, weights, max, min_max, arg_params, nonleibniz, free }
+        Summary { level, weights, max, min_max, arg_params, free_arg_params, bound_arg_free, nonleibniz, free }
     }
 
     /// The summary of an operator argument (`OpArg` / `LAMBDA`), if known.
@@ -291,6 +329,22 @@ impl Checker<'_> {
                 for &q in &pi.params {
                     constrain(&mut out.cons, q, max);
                 }
+            }
+        }
+        for &(g, j, p) in &s.free_arg_params {
+            let Some(pi) = infos.get(p) else { continue };
+            for &q in &pi.params {
+                out.arg_params.insert((g, j, q));
+            }
+            let e = out.arg_cons.entry((g, j)).or_insert(pi.level);
+            *e = (*e).max(pi.level);
+        }
+        for &(f, j, p) in &s.bound_arg_free {
+            let Some(fa) = args.get(f) else { continue };
+            if let ExprKind::OpArg(OpRef::Param(g)) = &*fa.kind {
+                out.arg_params.insert((*g, j, p));
+            } else if let Some(fs) = self.op_summary(fa) {
+                constrain(&mut out.cons, p, fs.max(j));
             }
         }
         for (i, (a, ai)) in args.iter().zip(infos).enumerate() {
@@ -644,6 +698,8 @@ impl Checker<'_> {
                     max: vec![ACTION, 1],
                     min_max: vec![Vec::new(); 2],
                     arg_params: Vec::new(),
+                    free_arg_params: Vec::new(),
+                    bound_arg_free: Vec::new(),
                     nonleibniz: vec![true; 2],
                     free: Info::default(),
                 };
@@ -658,6 +714,8 @@ impl Checker<'_> {
                     max: vec![1, ACTION],
                     min_max: vec![Vec::new(); 2],
                     arg_params: Vec::new(),
+                    free_arg_params: Vec::new(),
+                    bound_arg_free: Vec::new(),
                     nonleibniz: vec![true; 2],
                     free: Info::default(),
                 };
@@ -697,13 +755,19 @@ impl Program {
                 .collect();
             decls.sort();
             let params = self.ctxs[ctx].inst_params.clone();
-            let vals: Vec<Expr> = params.into_iter().map(|(n, a)| Expr::new(ExprKind::Local(self.new_local(n, a, span)), span)).collect();
+            let vals: Vec<Expr> = params
+                .into_iter()
+                .map(|(n, a)| {
+                    let l = self.new_local(n, a, span);
+                    self.local_ref(l, span)
+                })
+                .collect();
             let mname = self.mods[target].name.clone();
             // SANY: anything can be substituted for the constants of a
             // constant module.
             let constant = self.is_constant_module(target, &mut Vec::new());
             for (name, arity, var) in decls {
-                if let Ok(e) = self.substitute(ctx, &vals, &name, arity, Vec::new(), span) {
+                if let Ok(e) = self.substitute(ctx, &vals, &name, arity, var, Vec::new(), span) {
                     substs.push((ctx, e, var, name, mname.clone(), span, !constant || var));
                 }
             }
@@ -711,17 +775,16 @@ impl Program {
             for u in &ast.units {
                 if let tlx_front::ast::Unit::Assume { body, .. } = u {
                     let mut env = super::Env::new(ctx, target);
-                    for v in &vals {
-                        if let ExprKind::Local(l) = &*v.kind {
-                            env.inst_locals.push(*l);
-                        }
-                    }
+                    env.inst_args = vals.clone();
                     if let Ok(e) = self.expr(&mut env, body) {
                         inst_assumes.push((ctx, e));
                     }
                 }
             }
         }
+        // Resolve any definitions queued while expanding substitutions (e.g.
+        // a LET INSTANCE inside a WITH expression).
+        self.drain_worklist();
 
         let n = self.defs.len();
         let mut c = Checker {
@@ -911,7 +974,7 @@ impl Program {
     /// variables and none of its definitions (nor those of the modules it
     /// extends or instantiates) can be above constant level, i.e. it uses no
     /// action or temporal operators.
-    fn is_constant_module(&mut self, m: super::ModIdx, seen: &mut Vec<super::ModIdx>) -> bool {
+    pub(super) fn is_constant_module(&mut self, m: super::ModIdx, seen: &mut Vec<super::ModIdx>) -> bool {
         if seen.contains(&m) {
             return true;
         }

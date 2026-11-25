@@ -143,17 +143,29 @@ impl Lowerer<'_> {
             OpRef::Def(d) => Some(d),
             OpRef::Const(c) => match self.ip.const_op_ref(c) {
                 Some(OpRef::Def(d)) => Some(d),
+                Some(OpRef::Builtin(b)) => {
+                    let call = hir::Expr::new(H::Builtin { op: b, args: args.to_vec() }, e.span);
+                    return self.path_count(&call, env, st);
+                }
                 _ => None,
             },
             OpRef::Param(l) => match env.lookup(l, &self.ip.prog) {
                 Some(LBind::Op(LOp::Ref(OpRef::Def(d)))) => Some(d),
+                Some(LBind::Op(LOp::Ref(OpRef::Builtin(b)))) => {
+                    let call = hir::Expr::new(H::Builtin { op: b, args: args.to_vec() }, e.span);
+                    return self.path_count(&call, env, st);
+                }
+                Some(LBind::Op(LOp::Ref(OpRef::Const(c)))) => return self.count_apply(e, OpRef::Const(c), args, env, st),
                 Some(LBind::Op(LOp::Lambda(params, body, lenv))) => {
                     let env2 = self.bind_params(&params, args, env, lenv)?;
                     return self.path_count(&body, &env2, &st.deeper());
                 }
                 _ => None,
             },
-            OpRef::Builtin(_) => None,
+            OpRef::Builtin(b) => {
+                let call = hir::Expr::new(H::Builtin { op: b, args: args.to_vec() }, e.span);
+                return self.path_count(&call, env, st);
+            }
         };
         let Some(d) = target else { return Ok(self.test_count(e, env, st)) };
         let ip = self.ip;
