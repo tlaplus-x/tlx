@@ -31,8 +31,21 @@ pub(super) fn emit(
     let observations = spec.invariants.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
     let init_obs = spec.init_props.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
     let constraints = spec.constraints.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let action_constraints =
+        spec.action_constraints.iter().map(|o| e.action_leaf(o, "actionConstraint", &mut observed)).collect::<Option<Vec<_>>>()?;
+    let action_props = spec.action_props.iter().map(|o| e.action_leaf(o, "actionObserve", &mut observed)).collect::<Option<Vec<_>>>()?;
     e.validate(&cases, &observed)?;
-    Some(e.output(seeds, cases, observed.global, observations, init_obs, constraints, spec.is_constrained()))
+    Some(e.output(
+        seeds,
+        cases,
+        observed.global,
+        observations,
+        init_obs,
+        constraints,
+        action_constraints,
+        action_props,
+        spec.is_constrained(),
+    ))
 }
 
 struct Emitter<'a, 'd> {

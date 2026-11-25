@@ -218,6 +218,10 @@ structure Model (C F W : Type) (I A : F → Type) where
   observe : C → FamilyTest F I A
   initObserve : C → FamilyTest F I A := fun _ => .pure True
   constraint : C → FamilyTest F I A := fun _ => .pure True
+  -- Action checks that the retained core state determines completely. They
+  -- cannot inspect the projected rank pattern or retained payloads.
+  actionConstraint : C → C → Prop := fun _ _ => True
+  actionObserve : C → C → Prop := fun _ _ => True
 
 namespace Model
 variable {C F W : Type} {I A : F → Type} (m : Model C F W I A)
@@ -349,12 +353,12 @@ theorem deadlock_preserved (s : m.State) :
   · intro noStep ⟨t, ht⟩
     exact noStep ⟨m.project t, (m.certificate.next s (m.project t)).mpr ⟨t, ht, rfl⟩⟩
 
-def constrainedConcrete : ConstrainedSystem m.State where
+noncomputable def constrainedConcrete : ConstrainedSystem m.State where
   toSystem := m.concrete
   initSafe s := (m.initObserve s.1).eval m.layout s.2
   constraint s := (m.constraint s.1).eval m.layout s.2
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint s t := m.actionConstraint s.1 t.1
+  actionSafe s t := m.actionObserve s.1 t.1
 
 theorem initSafe_related (s t : m.State) (same : m.related s t) :
     m.constrainedConcrete.initSafe s ↔ m.constrainedConcrete.initSafe t := by
@@ -368,18 +372,55 @@ theorem constraint_related (s t : m.State) (same : m.related s t) :
   rw [same.1]
   exact FamilyTest.congr m.layout s.2 t.2 same.2 _
 
+theorem related_symm {s t : m.State} (h : m.related s t) : m.related t s :=
+  ⟨h.1.symm, fun f => ⟨fun i j => ((h.2 f).1 i j).symm, fun i => ((h.2 f).2 i).symm⟩⟩
+
+theorem actionConstraint_related (s t u v : m.State) (hs : m.related s t) (hu : m.related u v) :
+    m.constrainedConcrete.actionConstraint s u ↔ m.constrainedConcrete.actionConstraint t v := by
+  change m.actionConstraint s.1 u.1 ↔ m.actionConstraint t.1 v.1
+  rw [hs.1, hu.1]
+
+theorem actionObserve_related (s t u v : m.State) (hs : m.related s t) (hu : m.related u v) :
+    m.constrainedConcrete.actionSafe s u ↔ m.constrainedConcrete.actionSafe t v := by
+  change m.actionObserve s.1 u.1 ↔ m.actionObserve t.1 v.1
+  rw [hs.1, hu.1]
+
 noncomputable def constrainedReduced : ConstrainedSystem (Quotient m.equivalence) where
   toSystem := m.reduced
   initSafe a := Quotient.liftOn a m.constrainedConcrete.initSafe (fun s t h => propext (m.initSafe_related s t h))
   constraint a := Quotient.liftOn a m.constrainedConcrete.constraint (fun s t h => propext (m.constraint_related s t h))
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint a b := Quotient.liftOn₂ a b m.constrainedConcrete.actionConstraint
+    (fun a₁ b₁ a₂ b₂ ha hb => propext (m.actionConstraint_related a₁ a₂ b₁ b₂ ha hb))
+  actionSafe a b := Quotient.liftOn₂ a b m.constrainedConcrete.actionSafe
+    (fun a₁ b₁ a₂ b₂ ha hb => propext (m.actionObserve_related a₁ a₂ b₁ b₂ ha hb))
+
+theorem initObserve_project (s : m.State) :
+    m.constrainedConcrete.initSafe s ↔ m.constrainedReduced.initSafe (m.project s) := Iff.rfl
+
+theorem constraint_project (s : m.State) :
+    m.constrainedConcrete.constraint s ↔ m.constrainedReduced.constraint (m.project s) := Iff.rfl
+
+theorem actionConstraint_project (s t : m.State) :
+    m.constrainedConcrete.actionConstraint s t ↔
+      m.constrainedReduced.actionConstraint (m.project s) (m.project t) := by
+  change m.actionConstraint s.1 t.1 ↔
+    Quotient.liftOn₂ (m.project s) (m.project t) m.constrainedConcrete.actionConstraint
+      (fun a₁ b₁ a₂ b₂ ha hb => propext (m.actionConstraint_related a₁ a₂ b₁ b₂ ha hb))
+  unfold project Quotient.liftOn₂ Quotient.lift₂ Quotient.lift
+  rfl
+
+theorem actionObserve_project (s t : m.State) :
+    m.constrainedConcrete.actionSafe s t ↔
+      m.constrainedReduced.actionSafe (m.project s) (m.project t) := by
+  change m.actionObserve s.1 t.1 ↔
+    Quotient.liftOn₂ (m.project s) (m.project t) m.constrainedConcrete.actionSafe
+      (fun a₁ b₁ a₂ b₂ ha hb => propext (m.actionObserve_related a₁ a₂ b₁ b₂ ha hb))
+  unfold project Quotient.liftOn₂ Quotient.lift₂ Quotient.lift
+  rfl
 
 theorem constrained_certificate :
     ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
-  constrainedOfStatePreds m.certificate
-    (fun _ => Iff.rfl) (fun _ => Iff.rfl)
-    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
-
+  constrainedOfProjectedAction m.certificate
+    m.initObserve_project m.constraint_project m.actionConstraint_project m.actionObserve_project
 end Model
 end TlxOptimization.NestedRule

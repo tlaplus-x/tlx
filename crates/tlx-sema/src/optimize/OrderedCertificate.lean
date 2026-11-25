@@ -90,6 +90,10 @@ structure Model (C W : Type) where
   observe : C → Test
   initObserve : C → Test := fun _ => .pure True
   constraint : C → Test := fun _ => .pure True
+  -- Action checks that the retained core state determines completely. They
+  -- cannot inspect the projected allocation magnitude or its phase.
+  actionConstraint : C → C → Prop := fun _ _ => True
+  actionObserve : C → C → Prop := fun _ _ => True
 
 namespace Model
 variable {C W : Type} (m : Model C W)
@@ -179,21 +183,36 @@ def constrainedConcrete : ConstrainedSystem (State C m.seed) where
   toSystem := m.concrete
   initSafe s := (m.initObserve s.2).concrete m.seed s.1.val
   constraint s := (m.constraint s.2).concrete m.seed s.1.val
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint s t := m.actionConstraint s.2 t.2
+  actionSafe s t := m.actionObserve s.2 t.2
 
 def constrainedReduced : ConstrainedSystem (Bool × C) where
   toSystem := m.reduced
   initSafe s := (m.initObserve s.2).reduced s.1
   constraint s := (m.constraint s.2).reduced s.1
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint s t := m.actionConstraint s.2 t.2
+  actionSafe s t := m.actionObserve s.2 t.2
+
+theorem initObserve_project (s : State C m.seed) :
+    m.constrainedConcrete.initSafe s ↔ m.constrainedReduced.initSafe (m.project s) :=
+  Test.commutes (m.initObserve s.2) m.seed s.1.val
+
+theorem constraint_project (s : State C m.seed) :
+    m.constrainedConcrete.constraint s ↔ m.constrainedReduced.constraint (m.project s) :=
+  Test.commutes (m.constraint s.2) m.seed s.1.val
+
+-- Action checks only see retained core components, which projection preserves.
+theorem actionConstraint_project (s t : State C m.seed) :
+    m.constrainedConcrete.actionConstraint s t ↔
+      m.constrainedReduced.actionConstraint (m.project s) (m.project t) := Iff.rfl
+
+theorem actionObserve_project (s t : State C m.seed) :
+    m.constrainedConcrete.actionSafe s t ↔
+      m.constrainedReduced.actionSafe (m.project s) (m.project t) := Iff.rfl
 
 theorem constrained_certificate :
     ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
-  constrainedOfStatePreds m.certificate
-    (fun _ => Test.commutes _ _ _)
-    (fun _ => Test.commutes _ _ _)
-    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
+  constrainedOfProjectedAction m.certificate
+    m.initObserve_project m.constraint_project m.actionConstraint_project m.actionObserve_project
 end Model
 end TlxOptimization.OrderedRule

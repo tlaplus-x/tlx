@@ -13,6 +13,8 @@ impl Emitter<'_, '_> {
         observations: Vec<String>,
         init_obs: Vec<String>,
         constraints: Vec<String>,
+        action_constraints: Vec<String>,
+        action_props: Vec<String>,
         constrained: bool,
     ) -> super::super::super::OpenCert {
         let keys = self.a.keys.map_or(1, |keys| keys.len());
@@ -47,7 +49,7 @@ impl Emitter<'_, '_> {
             .unwrap();
         }
         self.tables(&mut out, &cases, &observed);
-        out.push_str("-- C excludes the projected record/map; inputs contain only recorded field reads.\n-- Source lowering, domains, totality, leaf interpretation and runtime remain trusted.\nstructure Semantics (C V W : Type) where\n  missing : V\n  initial : Nat → C → W → Prop\n  seedValue : Nat → C → W → Key → V\n  actor : Nat → W → Key\n  test : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → Prop\n  value : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → V\n  observe : Nat → C → (Key → Phase) → (Key → Field → V) → Prop\n");
+        out.push_str("-- C excludes the projected record/map; inputs contain only recorded field reads.\n-- Source lowering, domains, totality, leaf interpretation and runtime remain trusted.\nstructure Semantics (C V W : Type) where\n  missing : V\n  initial : Nat → C → W → Prop\n  seedValue : Nat → C → W → Key → V\n  actor : Nat → W → Key\n  test : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → Prop\n  value : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → V\n  observe : Nat → C → (Key → Phase) → (Key → Field → V) → Prop\n  actionTest : Nat → C → C → (Key → Phase) → (Key → Phase) → (Key → Field → V) → (Key → Field → V) → Prop\n");
         let params = "{C V W : Type} (sem : Semantics C V W)";
         writeln!(out, "variable {params}").unwrap();
         self.seeds(&mut out, params, &seeds);
@@ -67,10 +69,22 @@ impl Emitter<'_, '_> {
                 conjunction(&constraints)
             )
             .unwrap();
+            writeln!(
+                out,
+                "def actionConstraint {params} (c d : C) (p q : Key → Phase) (input input' : Key → Field → V) : Prop := {}",
+                conjunction(&action_constraints)
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "def actionObserve {params} (c d : C) (p q : Key → Phase) (input input' : Key → Field → V) : Prop := {}",
+                conjunction(&action_props)
+            )
+            .unwrap();
         }
         out.push_str("def model : FieldRule.Model C Key Phase Field V BranchId W where\n  missing := sem.missing\n  live := live\n  source := source\n  target := target\n  readsActor := readsActor\n  readsGlobal := readsGlobal\n  writes := writes\n  observed := observed\n  actorLive := by decide\n  globalLive := by decide\n  frameLive := by decide\n  observedLive := by decide\n  actor := fun b w => actor sem (b, w)\n  initial := fun c b w => initial sem c (b, w)\n  seedPhase := fun _ b _ _ => seedPhase b\n  seedValue := fun c b w k f => seedValue sem c (b, w) k f\n  guard := fun b c d w p input => guard sem c d (b, w) p input\n  value := fun b c d w p input f => value sem c d (b, w) p input f\n  observe := observe sem\n");
         if constrained {
-            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n");
+            out.push_str("  initObserve := initObserve sem\n  constraint := constraint sem\n  actionConstraint := actionConstraint sem\n  actionObserve := actionObserve sem\n");
         }
         super::super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedField", constrained, false, false)
     }

@@ -29,6 +29,12 @@ structure Model (C K P F V B W : Type) where
   observe : C → (K → P) → (K → F → V) → Prop
   initObserve : C → (K → P) → (K → F → V) → Prop := fun _ _ _ => True
   constraint : C → (K → P) → (K → F → V) → Prop := fun _ _ _ => True
+  -- Action checks see both endpoints' retained phases and observed values.
+  -- The default is the vacuous predicate used by unconstrained checks.
+  actionConstraint : C → C → (K → P) → (K → P) → (K → F → V) → (K → F → V) → Prop :=
+    fun _ _ _ _ _ _ => True
+  actionObserve : C → C → (K → P) → (K → P) → (K → F → V) → (K → F → V) → Prop :=
+    fun _ _ _ _ _ _ => True
 
 namespace Model
 variable {C K P F V B W : Type} (m : Model C K P F V B W)
@@ -173,22 +179,54 @@ def constrainedConcrete : ConstrainedSystem (State C K P F V) where
   toSystem := m.concrete
   initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
   constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint s t :=
+    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+  actionSafe s t :=
+    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
 
 def constrainedReduced : ConstrainedSystem (State C K P F V) where
   toSystem := m.reduced
   initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
   constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
-  actionConstraint _ _ := True
-  actionSafe _ _ := True
+  actionConstraint s t :=
+    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+  actionSafe s t :=
+    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+
+-- Projection keeps the retained core, the phase map and every observed value,
+-- so both action checks are unchanged on the projected pair.
+theorem actionConstraint_project (s t : State C K P F V) :
+    m.constrainedConcrete.actionConstraint s t ↔
+      m.constrainedReduced.actionConstraint (m.project s) (m.project t) := by
+  change m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2) ↔
+    m.actionConstraint s.1 t.1 s.2.1 t.2.1
+      (m.observations (m.mask s.2.1 s.2.2)) (m.observations (m.mask t.2.1 t.2.2))
+  rw [m.observations_mask, m.observations_mask]
+
+theorem actionObserve_project (s t : State C K P F V) :
+    m.constrainedConcrete.actionSafe s t ↔
+      m.constrainedReduced.actionSafe (m.project s) (m.project t) := by
+  change m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2) ↔
+    m.actionObserve s.1 t.1 s.2.1 t.2.1
+      (m.observations (m.mask s.2.1 s.2.2)) (m.observations (m.mask t.2.1 t.2.2))
+  rw [m.observations_mask, m.observations_mask]
+
+theorem initObserve_project (s : State C K P F V) :
+    m.constrainedConcrete.initSafe s ↔ m.constrainedReduced.initSafe (m.project s) := by
+  change m.initObserve s.1 s.2.1 (m.observations s.2.2) ↔
+    m.initObserve s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2))
+  rw [m.observations_mask]
+
+theorem constraint_project (s : State C K P F V) :
+    m.constrainedConcrete.constraint s ↔ m.constrainedReduced.constraint (m.project s) := by
+  change m.constraint s.1 s.2.1 (m.observations s.2.2) ↔
+    m.constraint s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2))
+  rw [m.observations_mask]
 
 theorem constrained_certificate :
     ConstrainedCertificate m.constrainedConcrete m.constrainedReduced m.project :=
-  constrainedOfStatePreds m.certificate
-    (fun s => by change _ ↔ m.initObserve s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2)); rw [m.observations_mask]; rfl)
-    (fun s => by change _ ↔ m.constraint s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2)); rw [m.observations_mask]; rfl)
-    (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial) (fun _ _ => trivial)
+  constrainedOfProjectedAction m.certificate
+    m.initObserve_project m.constraint_project m.actionConstraint_project m.actionObserve_project
 end Model
 end
 end TlxOptimization.FieldRule

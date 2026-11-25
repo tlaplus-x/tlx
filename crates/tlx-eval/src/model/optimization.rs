@@ -1,12 +1,25 @@
 //! Apply frontend state-reduction proofs through the existing VIEW machinery.
 
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::Ordering;
+
 use tlx_front::cfg::ConstBinding;
 use tlx_sema::hir::*;
 use tlx_value::Value;
 
 use crate::{env::Env, error::EResult, eval::Ctx};
 
-use super::{behavior, Behavior, InterpModel};
+use super::{behavior, Behavior, FpMode, InterpModel, State};
+
+/// One admitted state's verdict in the merge probe (`projection_merges`).
+enum ProbeStep {
+    /// Two distinct admitted states share a projected key.
+    Merge,
+    /// Admitted, not a merge (possibly a duplicate concrete state).
+    Continue,
+    /// Budget exhausted or evaluation failed before a witness.
+    Decline,
+}
 
 impl InterpModel {
     fn cfg_constants_allow_certification(&self) -> bool {
@@ -34,7 +47,168 @@ impl InterpModel {
         }
     }
 
-    /// Forget proved irrelevant values in fingerprints, retaining concrete
+    /// Bound on the merge probe: admitted states and enumerated states (initial
+    /// states plus generated successors). Both budgets are charged during
+    /// enumeration, so no batch is queued before its states are checked.
+    const MERGE_PROBE_STATES: usize = 4096;
+    const MERGE_PROBE_ENUM: usize = 65_536;
+
+    /// Whether the candidate projection identifies at least two distinct
+    /// admitted states within a bounded exploration.
+    ///
+    /// A certified projection that merges no admitted state cannot reduce the
+    /// search, so a rule whose action-check support made it applicable declines
+    /// instead of installing a reduction that changes nothing. Initial states
+    /// and successors share one admission path, both budgets are charged while
+    /// enumerating, and every admitted state's projected key is compared as soon
+    /// as it is generated (only unseen concrete states are queued), so a merge
+    /// in a large fan-out is witnessed before the enumeration budget runs out.
+    /// The bound is conservative in one direction: a merge beyond it is not
+    /// observed and the projection declines. An evaluation error before a
+    /// witness also declines the candidate, leaving the ordinary search to
+    /// report the error. The probe suppresses `-stats` collection and restores
+    /// the generated-state counter, so it changes no report.
+    fn projection_merges(&self, projection: &tlx_sema::optimize::FieldProjection) -> bool {
+        let mut reduced = self.clone();
+        reduced.view = Some(projection.view.clone());
+        reduced.ordered_projection = projection.ordered.clone().map(std::sync::Arc::new);
+        reduced.state_projection = true;
+        reduced.fp_mode = FpMode::Reduced;
+        let plain = self.with_fp_mode(FpMode::Plain);
+        let generated = self.ip.composed_states.load(Ordering::Relaxed);
+        let stats_on = tlx_runtime::stats::suspend();
+        let merges = self.merge_probe(&plain, &reduced, &projection.view);
+        tlx_runtime::stats::resume(stats_on);
+        self.ip.composed_states.store(generated, Ordering::Relaxed);
+        merges
+    }
+
+    #[allow(clippy::too_many_arguments)] // one admission path shared by initial states and successors
+    fn probe_admit(
+        plain: &InterpModel,
+        reduced: &InterpModel,
+        view: &Expr,
+        s: State,
+        parent: Option<&State>,
+        keys: &mut HashMap<u64, u64>,
+        seen: &mut HashSet<u64>,
+        queue: &mut VecDeque<State>,
+        admitted: &mut usize,
+        enumerated: &mut usize,
+    ) -> ProbeStep {
+        use tlx_runtime::Model;
+        *enumerated += 1;
+        if *enumerated > Self::MERGE_PROBE_ENUM {
+            return ProbeStep::Decline;
+        }
+        match plain.constraint(&s) {
+            Ok(true) => {}
+            Ok(false) => return ProbeStep::Continue,
+            Err(_) => return ProbeStep::Decline,
+        }
+        if let Some(parent) = parent {
+            match plain.action_constraint(parent, &s) {
+                Ok(true) => {}
+                Ok(false) => return ProbeStep::Continue,
+                Err(_) => return ProbeStep::Decline,
+            }
+        }
+        *admitted += 1;
+        if *admitted > Self::MERGE_PROBE_STATES {
+            return ProbeStep::Decline;
+        }
+        let projected = match reduced.projected_value(view, &s.vals, s.level) {
+            Ok(v) => v,
+            Err(_) => return ProbeStep::Decline,
+        };
+        let key = match tlx_value::fingerprint::fingerprint(&projected) {
+            Ok(k) => k,
+            Err(_) => return ProbeStep::Decline,
+        };
+        match keys.get(&key) {
+            Some(&full) if full != s.fp => return ProbeStep::Merge,
+            Some(_) => {}
+            None => {
+                keys.insert(key, s.fp);
+            }
+        }
+        if seen.insert(s.fp) {
+            queue.push_back(s);
+        }
+        ProbeStep::Continue
+    }
+
+    fn merge_probe(&self, plain: &InterpModel, reduced: &InterpModel, view: &Expr) -> bool {
+        use tlx_runtime::Model;
+        let mut queue = VecDeque::new();
+        let mut seen = HashSet::new();
+        let mut keys: HashMap<u64, u64> = HashMap::new();
+        let mut enumerated = 0usize;
+        let mut admitted = 0usize;
+        let mut witness = false;
+        let mut decline = false;
+        let init = plain.init_states_while(&mut |s| match Self::probe_admit(
+            plain,
+            reduced,
+            view,
+            s,
+            None,
+            &mut keys,
+            &mut seen,
+            &mut queue,
+            &mut admitted,
+            &mut enumerated,
+        ) {
+            ProbeStep::Merge => {
+                witness = true;
+                false
+            }
+            ProbeStep::Decline => {
+                decline = true;
+                false
+            }
+            ProbeStep::Continue => true,
+        });
+        if witness {
+            return true;
+        }
+        if decline || init.is_err() {
+            return false;
+        }
+        while let Some(s) = queue.pop_front() {
+            let result = plain.successors(&s, &mut |t, _| match Self::probe_admit(
+                plain,
+                reduced,
+                view,
+                t,
+                Some(&s),
+                &mut keys,
+                &mut seen,
+                &mut queue,
+                &mut admitted,
+                &mut enumerated,
+            ) {
+                ProbeStep::Merge => {
+                    witness = true;
+                    false
+                }
+                ProbeStep::Decline => {
+                    decline = true;
+                    false
+                }
+                ProbeStep::Continue => true,
+            });
+            if witness {
+                return true;
+            }
+            if decline || result.is_err() {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Forget proved irrelevant values in fingerprints, retaining concrete    /// Forget proved irrelevant values in fingerprints, retaining concrete
     /// values and original actions for execution and counterexample replay.
     /// Certified mathematical allocation may eliminate eventual overflow.
     /// Safety only. Existing VIEWs and symmetry exclude automatic projection.
@@ -75,6 +249,17 @@ impl InterpModel {
         }));
         for (rule, candidate) in candidates {
             let Some(projection) = candidate else { continue };
+            if projection.certificate.is_none() {
+                continue;
+            }
+            // The projections this rule change newly enables with action checks
+            // additionally require that the quotient actually merges admitted
+            // states: one that merges nothing cannot reduce the search. Rules
+            // that already supported action checks keep their selection.
+            let newly_enabled = matches!(rule, "phase-field-projection" | "ordered-allocation-projection");
+            if newly_enabled && spec.has_action_checks() && !self.projection_merges(&projection) {
+                continue;
+            }
             let Some(certificate) = projection.certificate else { continue };
             self.projection_certificate = Some(certificate.into());
             self.ordered_projection = projection.ordered.map(Into::into);

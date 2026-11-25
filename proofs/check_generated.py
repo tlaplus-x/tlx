@@ -119,6 +119,33 @@ def replace_gen_regex(gen_block, pattern, repl, path, label):
     return gen_block[:m.start()] + repl(m) + gen_block[m.end():]
 
 
+def field_write_can_break_frame(lean, path, source, lean_pool=None):
+    """Whether clearing the write table can violate `frameLive`.
+    `frameLive` needs `live (target b) f = true -> live (source b) f = true`; only a
+    dead-to-live write (`live (target b) f` and not `live (source b) f`) makes
+    clearing `writes` unsound. Instance-level frame mutations on a certificate
+    without such a transition would be accepted by Lean, so scope them out.
+    """
+    probe = source + (
+        "\n#eval decide (∃ (b : TlxOptimization.GeneratedField.BranchId)"
+        " (f : TlxOptimization.GeneratedField.Field),"
+        " TlxOptimization.GeneratedField.live (TlxOptimization.GeneratedField.target b) f = true ∧"
+        " TlxOptimization.GeneratedField.live (TlxOptimization.GeneratedField.source b) f = false)\n")
+    with tempfile.TemporaryDirectory(prefix="tlx-frame-probe-") as tmp:
+        probe_path = Path(tmp) / "Probe.lean"
+        probe_path.write_text(probe)
+        # Schedule through the shared Lean pool so the probe cannot exceed --jobs
+        # while positive checks and mutations are already running.
+        result = (lean_pool.submit(invoke, lean, probe_path).result()
+                  if lean_pool is not None else invoke(lean, probe_path))
+    if result.returncode:
+        raise RuntimeError(f"{path}: frame probe failed:\n{result.stdout}")
+    values = [line.strip() for line in result.stdout.splitlines() if line.strip() in {"true", "false"}]
+    if len(values) != 1:
+        raise RuntimeError(f"{path}: frame probe did not decide the finite-table condition:\n{result.stdout}")
+    return values[0] == "true"
+
+
 def verify(lean, path, negative, lean_pool=None):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
@@ -341,16 +368,25 @@ def verify(lean, path, negative, lean_pool=None):
                 add_preamble_mutation(before, after, label)
 
             if namespace == "GeneratedField":
+                # A dead-to-live write is the frame obligation's sharpest case:
+                # abandoning the write must break `advance_commutes`, not just
+                # the read tables.
+                add_preamble_mutation(
+                    "fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
+                    "fun k f => if k = a ∧ False then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
+                    "exposed a dead-to-live write to the concrete state",
+                )
                 add_gen_decl_mutation(
                     r"^  readsActor := readsActor$",
                     lambda _: "  readsActor := fun _ _ => true",
                     "read dead actor fields",
                 )
-                add_gen_decl_mutation(
-                    r"^  writes := writes$",
-                    lambda _: "  writes := fun _ _ => false",
-                    "exposed dead framed fields",
-                )
+                if field_write_can_break_frame(lean, path, preamble + ns_open + gen_block + ns_close + suffix, lean_pool):
+                    add_gen_decl_mutation(
+                        r"^  writes := writes$",
+                        lambda _: "  writes := fun _ _ => false",
+                        "exposed dead framed fields",
+                    )
                 add_gen_decl_mutation(
                     r"^  readsGlobal := readsGlobal$",
                     lambda _: "  readsGlobal := fun _ _ => true",
@@ -407,7 +443,7 @@ def verify(lean, path, negative, lean_pool=None):
                 rejected = invoke(lean, bad)
             if rejected.returncode == 0 or not any(
                 marker in rejected.stdout for marker in
-                ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal", "error: invalid `▸` notation")
+                ("error: Tactic", "error: 'change' tactic failed", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal", "error: invalid `▸` notation")
             ):
                 raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
             return {"change": label, "diagnostic": rejected.stdout}

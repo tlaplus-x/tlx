@@ -17,6 +17,97 @@ impl Emitter<'_, '_> {
         })
     }
 
+    /// Lower one action check over both endpoints. Field reads become the
+    /// explicit `p`/`q` phase and `input`/`input'` observed-value inputs; the
+    /// whole predicate is a single opaque `sem.actionTest` atom.
+    pub(super) fn action_leaf(&mut self, e: &Expr, kind: &str, reads: &mut Reads) -> Option<String> {
+        let mut next = max_local(e).checked_add(1)?;
+        let mut holes = vec![];
+        let masked = self.action_mask(e, reads, &mut next, &mut holes, false)?;
+        let id = self.atoms.len();
+        self.atoms.push(format!("{kind} HIR: {masked:#?}\nRecord holes: {holes:#?}"));
+        Some(format!("(sem.actionTest {id} c d p q input input')"))
+    }
+
+    /// Lower an action read. `ambient` says the enclosing read already selects
+    /// the target endpoint (the key of a whole-lookup prime, or a key that is
+    /// itself read through the target map), so an unprimed field read inside it
+    /// still addresses the target endpoint.
+    fn action_mask(&self, e: &Expr, reads: &mut Reads, next: &mut u32, holes: &mut Vec<String>, ambient: bool) -> Option<Expr> {
+        if let Some((field, key, map_primed, key_primed)) = self.a.action_field(e) {
+            if map_primed && ambient {
+                return None;
+            }
+            let primed = map_primed || ambient;
+            let slot = if field == self.a.control {
+                if primed { "phase'" } else { "phase" }.to_owned()
+            } else {
+                let f = self.fields.iter().position(|x| &**x == field)?;
+                reads.global[f] = true;
+                format!("data field {f}")
+            };
+            // The key identifies which endpoint slot the read addresses and in
+            // which endpoint it is evaluated; without both, two different keyed
+            // reads would lower to the same atom.
+            let key_scope = ambient || key_primed;
+            if key_primed && ambient {
+                return None;
+            }
+            let key = match key {
+                Some(key) => Some(self.action_mask(key, reads, next, holes, key_scope)?),
+                None => None,
+            };
+            let local = LocalId(*next);
+            *next = next.checked_add(1)?;
+            holes.push(format!("{local:?} = {slot}, source key {key:#?}; primed={primed}; key primed={key_scope}"));
+            return Some(Expr::new(ExprKind::Local(local), e.span));
+        }
+        if let ExprKind::Builtin { op: B::In, args } = &*e.kind {
+            if args.len() == 2
+                && variable(&args[0], false) == Some(self.a.var)
+                && self.a.domains.belongs(&self.a.domains.vars[self.a.var.idx()], &args[1])
+            {
+                return Some(Expr::new(ExprKind::Bool(true), e.span));
+            }
+        }
+        if matches!(&*e.kind, ExprKind::Var(v) if *v == self.a.var) {
+            return None;
+        }
+        if let ExprKind::BoxAction { action, sub } = &*e.kind {
+            if mentions(sub, self.a.var) {
+                return None;
+            }
+            let action = self.action_mask(action, reads, next, holes, ambient)?;
+            return Some(Expr::new(ExprKind::BoxAction { action, sub: sub.clone() }, e.span));
+        }
+        if let ExprKind::Builtin { op: B::Unchanged, args } = &*e.kind {
+            // The analysis admits `UNCHANGED` only over retained values, where
+            // no projected field needs a hole.
+            if args.iter().any(|a| mentions(a, self.a.var)) {
+                return None;
+            }
+            return Some(e.clone());
+        }
+        if matches!(&*e.kind, ExprKind::AngleAction { .. } | ExprKind::At) || matches!(&*e.kind, ExprKind::Builtin { op: B::Enabled, .. }) {
+            return None;
+        }
+        if let ExprKind::Builtin { op: B::Prime, args } = &*e.kind {
+            if args.iter().any(|a| mentions(a, self.a.var)) {
+                return None;
+            }
+        }
+        let mut result = e.clone();
+        let mut valid = true;
+        visit::children_mut(&mut result, &mut |child| {
+            if let Some(e) = self.action_mask(child, reads, next, holes, ambient) {
+                *child = e;
+            } else {
+                valid = false;
+            }
+        });
+        valid.then_some(result)
+    }
+
     fn mask(
         &self,
         e: &Expr,
