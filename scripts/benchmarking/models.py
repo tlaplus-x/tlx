@@ -56,7 +56,7 @@ MESSAGE_MODELS = {
 }
 
 
-def stress_models(ids):
+def stress_models(ids, *, stage=True):
     """Fixed configurations, independent of the ordinary corpus's TLC times."""
     out = {}
     selected_repr = [k for k in ids if k.startswith("bench/Repr")]
@@ -72,21 +72,42 @@ def stress_models(ids):
             configurations = tomllib.load(stream)
         known = {m["id"]: m for m in corpus.models(float("inf"))}
         known.update({m["id"]: m for m in corpus.external_models(corpus.EXTERNAL_TIERS)})
+        examples_present = os.path.isdir(os.path.join(corpus.EX, "specifications"))
         for k in selected_repr:
             if k not in configurations:
                 sys.exit(f"unknown representation configuration {k}")
             c = configurations[k]
-            m = known[c["source"]]
-            tla = m["tla"]
-            if c.get("wrapper"):
-                stage = os.path.join(ROOT, "target", "bench-models", k.split("/")[1])
-                os.makedirs(stage, exist_ok=True)
-                for name in os.listdir(os.path.dirname(tla)):
-                    if name.endswith(".tla"):
-                        shutil.copyfile(os.path.join(os.path.dirname(tla), name), os.path.join(stage, name))
-                tla = os.path.join(stage, os.path.basename(c["wrapper"]))
-                shutil.copyfile(os.path.join(ROOT, c["wrapper"]), tla)
-            out[k] = {"id": k, "tla": tla, "cfg": os.path.join(ROOT, c["cfg"]), "features": [], "flags": [], "tlc": {}}
+            cfg_path = os.path.join(ROOT, c["cfg"])
+            if not os.path.isfile(cfg_path):
+                raise SystemExit(f"{cfg_path} is not in this checkout: the reduced representation "
+                                 "configurations are missing; restore the tracked bench/repr-models.toml and bench/repr-configs/")
+            wrapper_path = os.path.join(ROOT, c["wrapper"]) if c.get("wrapper") else None
+            if wrapper_path and not os.path.isfile(wrapper_path):
+                raise SystemExit(f"{wrapper_path} is not in this checkout: the reduced representation "
+                                 "configurations are missing; restore the tracked bench/repr-models.toml and bench/repr-configs/")
+            source_id = c["source"]
+            if source_id in known:
+                tla = known[source_id]["tla"]
+            elif not source_id.startswith(EXTERNAL_PREFIX) and not examples_present:
+                tla = os.path.join(corpus.EX, "specifications", source_id + ".tla")
+            else:
+                sys.exit(f"unknown representation source {source_id} for {k}")
+            if wrapper_path:
+                stage_dir = os.path.join(ROOT, "target", "bench-models", k.split("/")[1])
+                staged_tla = os.path.join(stage_dir, os.path.basename(c["wrapper"]))
+                if stage:
+                    if not os.path.isfile(tla):
+                        raise SystemExit(
+                            f"{k}: missing upstream source {tla}; fetch external corpora with scripts/fetch-external.py"
+                        )
+                    source_dir = os.path.dirname(tla)
+                    os.makedirs(stage_dir, exist_ok=True)
+                    for name in os.listdir(source_dir):
+                        if name.endswith(".tla"):
+                            shutil.copyfile(os.path.join(source_dir, name), os.path.join(stage_dir, name))
+                    shutil.copyfile(wrapper_path, staged_tla)
+                tla = staged_tla
+            out[k] = {"id": k, "tla": tla, "cfg": cfg_path, "features": [], "flags": [], "tlc": {}}
     for k, tla in {**LIVENESS_MODELS, **MESSAGE_MODELS}.items():
         if k in ids:
             out[k] = {"id": k, "tla": os.path.join(TP, *tla), "cfg": os.path.join(ROOT, "bench", "stress", k.split("/")[1] + ".cfg"),
@@ -102,16 +123,26 @@ def stress_models(ids):
     if "bench/FlexibleRaftReduced5" in ids:
         # Stage the wrapper beside the upstream module without modifying the
         # shared external checkout; both TLC and tlx resolve EXTENDS locally.
-        stage = os.path.join(ROOT, "target", "bench-models", "FlexibleRaftReduced5")
-        os.makedirs(stage, exist_ok=True)
-        shutil.copyfile(os.path.join(TP, "external", "vanlightly-raft", "flexible-raft", "FlexibleRaft.tla"),
-                        os.path.join(stage, "FlexibleRaft.tla"))
-        for name in ("FlexibleRaftReduced5.tla", "FlexibleRaftReduced5.cfg"):
-            shutil.copyfile(os.path.join(ROOT, "bench", "stress", name), os.path.join(stage, name))
+        tracked = [os.path.join(ROOT, "bench", "stress", name)
+                   for name in ("FlexibleRaftReduced5.tla", "FlexibleRaftReduced5.cfg")]
+        for path in tracked:
+            if not os.path.isfile(path):
+                raise SystemExit(f"bench/FlexibleRaftReduced5: missing tracked stress input {path}")
+        stage_dir = os.path.join(ROOT, "target", "bench-models", "FlexibleRaftReduced5")
+        upstream = os.path.join(TP, "external", "vanlightly-raft", "flexible-raft", "FlexibleRaft.tla")
+        if stage:
+            if not os.path.isfile(upstream):
+                raise SystemExit(
+                    f"bench/FlexibleRaftReduced5: missing upstream source {upstream}; fetch external corpora with scripts/fetch-external.py"
+                )
+            os.makedirs(stage_dir, exist_ok=True)
+            shutil.copyfile(upstream, os.path.join(stage_dir, "FlexibleRaft.tla"))
+            for path in tracked:
+                shutil.copyfile(path, os.path.join(stage_dir, os.path.basename(path)))
         out["bench/FlexibleRaftReduced5"] = {
             "id": "bench/FlexibleRaftReduced5",
-            "tla": os.path.join(stage, "FlexibleRaftReduced5.tla"),
-            "cfg": os.path.join(stage, "FlexibleRaftReduced5.cfg"),
+            "tla": os.path.join(stage_dir, "FlexibleRaftReduced5.tla"),
+            "cfg": os.path.join(stage_dir, "FlexibleRaftReduced5.cfg"),
             "features": [], "flags": [], "tlc": {},
         }
     if "MultiPaxos-SMR/MultiPaxos_MC" in ids:
@@ -167,7 +198,7 @@ def oracle_tlc_args(m):
     return list(m.get("tlc_args") or [])
 
 
-def oracle(ids=()):
+def oracle(ids=(), *, stage=True):
     """The corpus oracle (corpus/out/tlc.json), plus the external models
     (`ext/<repo>/<name>`, corpus/external.json) that `ids` names: with their
     TLC oracle result (corpus/out/tlc-ext.json) where there is one, else
@@ -175,22 +206,23 @@ def oracle(ids=()):
     none; `run --tlc` measures TLC on the same machine instead), plus the
     fixed stress configurations named by `ids`, even without an oracle."""
     ext = [i for i in ids if i.startswith(EXTERNAL_PREFIX)]
-    d = load_oracle()
-    for k, m in stress_models(ids).items():
+    d = dict(load_oracle())
+    for k, m in stress_models(ids, stage=stage).items():
         d.setdefault(k, m)
     if ext:
-        d.update(load_oracle(ids=ext))
         from corpus import EXTERNAL_TIERS, external_models
         from oracle import issue
-        single = load_oracle(ids=ext, oracles=["tlc-ext-1w"])
-        for m in external_models(EXTERNAL_TIERS):
-            if m["id"] in ext:
-                if m.get("asymmetric_symmetry") and single.get(m["id"], {}).get("provenance", {}).get("workers") == 1:
-                    d[m["id"]] = single[m["id"]]
-                entry = {**d.get(m["id"], {}), **m, "tlc": d.get(m["id"], {}).get("tlc", {})}
-                if problem := issue(entry):
-                    entry.update(tlc={}, oracle_error=problem)
-                d[m["id"]] = entry
+        manifest_ext = {m["id"]: m for m in external_models(EXTERNAL_TIERS) if m["id"] in ext}
+        cached_ext = load_oracle(ids=list(manifest_ext)) if manifest_ext else {}
+        single = load_oracle(ids=list(manifest_ext), oracles=["tlc-ext-1w"]) if manifest_ext else {}
+        for mid, m in manifest_ext.items():
+            cached = cached_ext.get(mid, {})
+            if m.get("asymmetric_symmetry") and single.get(mid, {}).get("provenance", {}).get("workers") == 1:
+                cached = single[mid]
+            entry = {**cached, **m, "tlc": cached.get("tlc", {})}
+            if problem := issue(entry):
+                entry.update(tlc={}, oracle_error=problem)
+            d[mid] = entry
     # The declared run layout is the tracked manifest's, not the cached row's.
     for k, m in list(d.items()):
         if fields := declared_run_fields(k):
@@ -277,7 +309,8 @@ def scale_models(ids):
     """{id: model} of `scale`: bench/<name> (SCALE_CFGS) or an exhaustive
     model of the Examples manifests (any runtime)."""
     import corpus
-    known = {m["id"]: m for m in corpus.models(float("inf"))}
+    known = ({m["id"]: m for m in corpus.models(float("inf"))}
+             if any(mid not in SCALE_CFGS for mid in ids) else {})
     out = {}
     for k in ids:
         if k in SCALE_CFGS:

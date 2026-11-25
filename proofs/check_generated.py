@@ -2,6 +2,7 @@
 """Explicitly verify generated rule certificates; never called by tlx check."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -12,6 +13,48 @@ import subprocess
 import tempfile
 
 
+ROOT = Path(__file__).resolve().parent.parent
+SUPPORTED_NAMESPACES = (
+    "GeneratedHistory",
+    "GeneratedOrdered",
+    "GeneratedErasure",
+    "GeneratedAge",
+    "GeneratedAgeHistory",
+    "GeneratedLength",
+    "GeneratedField",
+    "GeneratedPipeline",
+    "GeneratedSymmetry",
+    "GeneratedEquivSymmetry",
+    "GeneratedChooseSymmetry",
+    "GeneratedNested",
+    "GeneratedLive",
+    "GeneratedErasedSymmetry",
+)
+# Representative tracked specifications covering every supported generated
+# certificate namespace when check_generated.py is invoked without explicit files.
+DEFAULT_CASES = (
+    ("GeneratedErasure", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedHistory", "check", "proofs/history/Feedback.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    (
+        "GeneratedOrdered",
+        "check",
+        "crates/tlx-cli/tests/fixtures/optimization_ordered/HiddenAnchor.tla",
+        "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
+        ("-interp", "-optimize", "-noautosymmetry"),
+        (12,),
+    ),
+    ("GeneratedAge", "check", "proofs/age/FilteredAge.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedAgeHistory", "check", "proofs/age/DependentHistory.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedLength", "check", "proofs/length/Length.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedField", "check", "proofs/field/Phase.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedPipeline", "optimize", "proofs/counter/Counter.tla", None, (), (0,)),
+    ("GeneratedSymmetry", "check", "proofs/symmetry/Keyed.tla", None, ("-interp",), (0,)),
+    ("GeneratedEquivSymmetry", "check", "proofs/symmetry/KeyValMaps.tla", None, ("-interp",), (0,)),
+    ("GeneratedChooseSymmetry", "check", "proofs/symmetry/ChooseSym.tla", None, ("-interp",), (0,)),
+    ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedLive", "check", "proofs/ordered/LiveVersions.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedErasedSymmetry", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize"), (0,)),
+)
 THEOREMS = {
     "certificate", "optimization_correct", "specification_correct",
     "counterexample_lifts", "deadlock_preserved",
@@ -27,15 +70,16 @@ def invoke(lean, path):
     )
 
 
-def verify(lean, path, negative):
+def verify(lean, path, negative, lean_pool=None):
     # Check the exact standalone bytes without a checkout-specific import path.
     source = path.read_text()
-    namespaces = [name for name in ("GeneratedHistory", "GeneratedOrdered", "GeneratedErasure", "GeneratedAge", "GeneratedAgeHistory", "GeneratedLength", "GeneratedField", "GeneratedPipeline", "GeneratedSymmetry", "GeneratedEquivSymmetry", "GeneratedChooseSymmetry", "GeneratedNested", "GeneratedLive", "GeneratedErasedSymmetry")
+    namespaces = [name for name in SUPPORTED_NAMESPACES
                   if f"namespace TlxOptimization.{name}\n" in source]
     if len(namespaces) != 1:
         raise RuntimeError(f"{path}: expected one supported generated certificate")
     namespace = namespaces[0]
-    result = invoke(lean, path)
+    result = (lean_pool.submit(invoke, lean, path).result()
+              if lean_pool is not None else invoke(lean, path))
     if result.returncode:
         raise RuntimeError(f"{path}: Lean failed:\n{result.stdout}")
     axioms = {}
@@ -207,7 +251,8 @@ def verify(lean, path, negative):
                  "def after := { (model sem).reduced with safe := fun _ => True }",
                  "changed reduced observation")
             )
-        for before, after, label in changes:
+        def check_mutation(change):
+            before, after, label = change
             if source.count(before) != 1:
                 raise RuntimeError(f"{path}: negative test no longer targets one expression: {label}")
             with tempfile.TemporaryDirectory(prefix="tlx-generated-proof-") as tmp:
@@ -219,7 +264,12 @@ def verify(lean, path, negative):
                 ("error: Tactic", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal")
             ):
                 raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
-            mutations.append({"change": label, "diagnostic": rejected.stdout})
+            return {"change": label, "diagnostic": rejected.stdout}
+
+        if lean_pool is not None:
+            mutations = list(lean_pool.map(check_mutation, changes))
+        else:
+            mutations = [check_mutation(change) for change in changes]
     print(f"PASS: {path} ({len(theorems)} theorem audits, {len(mutations)} rejected mutations)")
     return {
         "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -230,20 +280,100 @@ def verify(lean, path, negative):
     }
 
 
+def find_lean(requested):
+    lean = shutil.which(requested)
+    if lean is None and requested == "lean":
+        candidate = Path.home() / ".elan" / "bin" / "lean"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            lean = str(candidate)
+    if lean is None:
+        return None
+    return os.path.abspath(lean)  # Preserve an elan dispatcher's invoked name.
+
+
+def find_tlx(requested):
+    if requested:
+        path = Path(requested)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.resolve())
+        found = shutil.which(requested)
+        return os.path.abspath(found) if found else None
+    for rel in ("target/test-release/tlx", "target/release/tlx", "target/debug/tlx"):
+        candidate = ROOT / rel
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    found = shutil.which("tlx")
+    return os.path.abspath(found) if found else None
+
+
+def generate_default_certificates(tlx, workdir):
+    generated = []
+    covered = set()
+    for namespace, subcommand, spec_rel, inline_cfg, extra_args, ok_codes in DEFAULT_CASES:
+        spec = ROOT / spec_rel
+        case_dir = workdir / namespace
+        case_dir.mkdir(parents=True, exist_ok=True)
+        if subcommand == "optimize":
+            out_dir = case_dir / "out"
+            cmd = [tlx, "optimize", str(spec), "-output", str(out_dir), *extra_args]
+            result = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, check=False)
+            if result.returncode not in ok_codes:
+                raise RuntimeError(f"{namespace}: tlx optimize failed ({result.returncode}):\n{result.stdout}")
+            cert = out_dir / "Optimization.lean"
+        else:
+            proof_dir = case_dir / "proofs"
+            cmd = [tlx, "check", str(spec)]
+            if inline_cfg is not None:
+                cfg_path = case_dir / "Model.cfg"
+                cfg_path.write_text(inline_cfg)
+                cmd.extend(["-config", str(cfg_path)])
+            cmd.extend(["-proofdir", str(proof_dir), *extra_args])
+            result = subprocess.run(cmd, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, check=False)
+            if result.returncode not in ok_codes:
+                raise RuntimeError(f"{namespace}: tlx check failed ({result.returncode}):\n{result.stdout}")
+            certs = sorted(proof_dir.glob("*/Optimization.lean"))
+            if len(certs) != 1:
+                raise RuntimeError(f"{namespace}: expected 1 generated certificate under {proof_dir}, found {len(certs)}\n{result.stdout}")
+            cert = certs[0]
+        if f"namespace TlxOptimization.{namespace}\n" not in cert.read_text():
+            raise RuntimeError(f"{namespace}: generated {cert} does not contain expected namespace TlxOptimization.{namespace}")
+        covered.add(namespace)
+        generated.append(cert)
+    missing = set(SUPPORTED_NAMESPACES) - covered
+    if missing:
+        raise RuntimeError(f"default certificate suite does not cover namespaces: {sorted(missing)}")
+    return generated
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", type=Path, nargs="+")
+    parser.add_argument("files", type=Path, nargs="*", help="generated Optimization.lean files (omit to generate and verify all supported certificate families)")
     parser.add_argument("--lean", default="lean")
+    parser.add_argument("--tlx", default="", help="tlx binary used to generate certificates when no files are given")
+    parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 4), help="parallel Lean verifications (default: min(cpus, 4))")
     parser.add_argument("--negative", action="store_true", help="also require deliberately broken proofs to fail")
     parser.add_argument("--report", type=Path, help="write a JSON receipt after all checks pass")
     args = parser.parse_args()
-    lean = shutil.which(args.lean)
+    lean = find_lean(args.lean)
     if lean is None:
         parser.error(f"Lean executable not found: {args.lean}")
-    lean = os.path.abspath(lean)  # Preserve an elan dispatcher's invoked name.
     try:
         version = subprocess.run([lean, "--version"], capture_output=True, text=True, timeout=30, check=True).stdout.strip()
-        results = [verify(lean, p.resolve(), args.negative) for p in args.files]
+        with tempfile.TemporaryDirectory(prefix="tlx-generated-suite-") as tmp:
+            if args.files:
+                paths = [p.resolve() for p in args.files]
+            else:
+                tlx = find_tlx(args.tlx)
+                if tlx is None:
+                    raise RuntimeError("tlx binary not found; build with `cargo build --profile test-release -p tlx-cli` or pass --tlx")
+                paths = generate_default_certificates(tlx, Path(tmp))
+            workers = max(1, args.jobs)
+            if workers == 1:
+                results = [verify(lean, p, args.negative) for p in paths]
+            else:
+                with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as outer_pool, \
+                     ThreadPoolExecutor(max_workers=workers) as lean_pool:
+                    results = list(outer_pool.map(lambda p: verify(lean, p, args.negative, lean_pool), paths))
         if args.report:
             args.report.write_text(json.dumps({"lean": version, "trust_level": 0, "results": results}, indent=2) + "\n")
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
