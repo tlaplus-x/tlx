@@ -53,14 +53,28 @@ use view::View;
 
 /// Lowered Init (None if it is interpreted) and actions (None for each
 /// interpreted one), with a note on each that could not be lowered.
-fn lower_init_and_actions(lw: &mut Lowerer, base: &InterpModel, notes: &mut Vec<String>) -> (Option<ActionFn>, Vec<Option<ActionFn>>) {
+/// Actions whose shape dependencies did not change are imported from `reuse`.
+fn lower_init_and_actions(
+    lw: &mut Lowerer,
+    base: &InterpModel,
+    mut reuse: Option<&mut super::cache::ReuseSession<'_>>,
+    notes: &mut Vec<String>,
+) -> (Option<ActionFn>, Vec<Option<ActionFn>>, u64) {
     let init = lw.lower_init(base.init_expr()).map_err(|e| notes.push(format!("Init interpreted: {}", e.0))).ok();
+    let mut reused = 0u64;
     let actions = base
         .actions()
         .iter()
-        .map(|a| lw.lower_action(a).map_err(|e| notes.push(format!("action {} interpreted: {}", a.name, e.0))).ok())
+        .enumerate()
+        .map(|(i, a)| {
+            if let Some(f) = reuse.as_deref_mut().and_then(|r| r.reuse_action(i, lw)) {
+                reused += 1;
+                return Some(f);
+            }
+            lw.lower_action(a).map_err(|e| notes.push(format!("action {} interpreted: {}", a.name, e.0))).ok()
+        })
         .collect();
-    (init, actions)
+    (init, actions, reused)
 }
 
 /// Error message of a run stopped by a layout miss.
@@ -222,11 +236,105 @@ pub struct EncModel {
 
 impl EncModel {
     pub fn new(base: Arc<InterpModel>, layout: Arc<Layout>, def_shapes: Vec<(DefId, Shape)>, settings: &Settings) -> EncModel {
+        Self::new_with_cache(base, layout, def_shapes, settings, None)
+    }
+
+    pub(super) fn new_with_cache(
+        base: Arc<InterpModel>,
+        layout: Arc<Layout>,
+        def_shapes: Vec<(DefId, Shape)>,
+        settings: &Settings,
+        mut cache: Option<&mut super::cache::CompileCache>,
+    ) -> EncModel {
         let lowering_start = std::time::Instant::now();
         let ip = base.ip.clone();
         let mut lw = Lowerer::with_typing(&ip, Typing::with_defs(layout.clone(), &def_shapes));
         let mut notes = Vec::new();
-        let (init, actions) = lower_init_and_actions(&mut lw, &base, &mut notes);
+        let live = &base.live;
+        let total_invariants = base.invariant_exprs().len()
+            + base.constraint_exprs().len()
+            + live.state_atoms.iter().filter(|a| matches!(a, StateAtom::Pred(_))).count();
+        let total_aprops = base.action_property_exprs().len() + base.action_constraint_exprs().len() + live.action_atoms.len();
+        let mut reuse = cache
+            .as_deref()
+            .and_then(|c| c.begin(&mut lw, &layout.vars, &def_shapes, base.actions().len(), total_invariants, total_aprops));
+        let (init, actions, reused_actions) = lower_init_and_actions(&mut lw, &base, reuse.as_mut(), &mut notes);
+        let mut reused_preds = 0u64;
+        let mut invariants: Vec<PredFn> = Vec::with_capacity(total_invariants);
+        for (e, n) in base.invariant_exprs().iter().zip(base.invariant_names()) {
+            let idx = invariants.len();
+            if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_invariant(idx, &mut lw)) {
+                reused_preds += 1;
+                invariants.push(p);
+            } else {
+                invariants.push(lw.lower_pred(n, e));
+            }
+        }
+        let mut aprops: Vec<PredFn> = Vec::with_capacity(total_aprops);
+        for (e, n) in base.action_property_exprs().iter().zip(base.action_property_names()) {
+            let idx = aprops.len();
+            if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_aprop(idx, &mut lw)) {
+                reused_preds += 1;
+                aprops.push(p);
+            } else {
+                aprops.push(lw.lower_trans_pred(n, e));
+            }
+        }
+        let constraint_at = invariants.len();
+        for (k, e) in base.constraint_exprs().iter().enumerate() {
+            let idx = invariants.len();
+            if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_invariant(idx, &mut lw)) {
+                reused_preds += 1;
+                invariants.push(p);
+            } else {
+                invariants.push(lw.lower_pred(&format!("constraint_{k}"), e));
+            }
+        }
+        let action_constraint_at = aprops.len();
+        for (k, e) in base.action_constraint_exprs().iter().enumerate() {
+            let idx = aprops.len();
+            if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_aprop(idx, &mut lw)) {
+                reused_preds += 1;
+                aprops.push(p);
+            } else {
+                aprops.push(lw.lower_trans_pred(&format!("action_constraint_{k}"), e));
+            }
+        }
+        let live_state = live
+            .state_atoms
+            .iter()
+            .enumerate()
+            .map(|(k, a)| match a {
+                StateAtom::Pred(a) => {
+                    let idx = invariants.len();
+                    if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_invariant(idx, &mut lw)) {
+                        reused_preds += 1;
+                        invariants.push(p);
+                    } else {
+                        invariants.push(lw.lower_pred_in(&format!("live_state_{k}"), &a.expr, &a.env, false));
+                    }
+                    Some(invariants.len() - 1)
+                }
+                StateAtom::EnabledVia(..) => None,
+            })
+            .collect();
+        let live_action = aprops.len();
+        for (k, a) in live.action_atoms.iter().enumerate() {
+            let idx = aprops.len();
+            if let Some(p) = reuse.as_mut().and_then(|r| r.reuse_aprop(idx, &mut lw)) {
+                reused_preds += 1;
+                aprops.push(p);
+            } else {
+                aprops.push(lw.lower_pred_in(&format!("live_action_{k}"), &a.expr, &a.env, true));
+            }
+        }
+        drop(reuse);
+        if reused_actions > 0 {
+            stats::add_count("actions reused from IR cache", reused_actions);
+        }
+        if reused_preds > 0 {
+            stats::add_count("predicates reused from IR cache", reused_preds);
+        }
         let mut exec_ok: Vec<bool> = actions
             .iter()
             .map(|a| {
@@ -237,35 +345,6 @@ impl EncModel {
             })
             .collect();
         let prints: Vec<bool> = actions.iter().map(|a| a.as_ref().is_some_and(|f| lw.stmt_volatile(&f.body))).collect();
-        let mut invariants: Vec<PredFn> =
-            base.invariant_exprs().iter().zip(base.invariant_names()).map(|(e, n)| lw.lower_pred(n, e)).collect();
-        let mut aprops: Vec<PredFn> =
-            base.action_property_exprs().iter().zip(base.action_property_names()).map(|(e, n)| lw.lower_trans_pred(n, e)).collect();
-        let constraint_at = invariants.len();
-        for (k, e) in base.constraint_exprs().iter().enumerate() {
-            invariants.push(lw.lower_pred(&format!("constraint_{k}"), e));
-        }
-        let action_constraint_at = aprops.len();
-        for (k, e) in base.action_constraint_exprs().iter().enumerate() {
-            aprops.push(lw.lower_trans_pred(&format!("action_constraint_{k}"), e));
-        }
-        let live = &base.live;
-        let live_state = live
-            .state_atoms
-            .iter()
-            .enumerate()
-            .map(|(k, a)| match a {
-                StateAtom::Pred(a) => {
-                    invariants.push(lw.lower_pred_in(&format!("live_state_{k}"), &a.expr, &a.env, false));
-                    Some(invariants.len() - 1)
-                }
-                StateAtom::EnabledVia(..) => None,
-            })
-            .collect();
-        let live_action = aprops.len();
-        for (k, a) in live.action_atoms.iter().enumerate() {
-            aprops.push(lw.lower_pred_in(&format!("live_action_{k}"), &a.expr, &a.env, true));
-        }
         if let Some(name) = tlx_base::diag::ir_dump() {
             super::diag::dump_ir(&name, tlx_base::diag::ir_dump_raw(), &actions, invariants.iter().chain(&aprops), &lw.typing.funcs);
         }
@@ -299,10 +378,24 @@ impl EncModel {
             None
         } else if let Ok(verified) = &verified {
             let mixed = settings.mixed.then_some(crate::native_plan::Mixed { oracle: &lw, force: settings.mixed_force, loops: true });
-            native::build(verified, &base, settings, mixed, &mut notes)
+            #[cfg(feature = "jit")]
+            let jit_cache = cache.as_deref_mut().map(|c| &mut c.jit);
+            #[cfg(feature = "jit")]
+            {
+                native::build(verified, &base, settings, mixed, jit_cache, &mut notes)
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                native::build(verified, &base, settings, mixed, &mut notes)
+            }
         } else {
             None
         };
+        if verified.is_ok() {
+            if let Some(c) = cache {
+                c.update(&base, &lw, &def_shapes, &actions, &invariants, &aprops);
+            }
+        }
         let irreversible_actions =
             settings.escape.then(|| actions.iter().map(|a| a.as_ref().is_some_and(|f| lw.stmt_volatile_beyond_output(&f.body))).collect());
         let typing = lw.into_typing();

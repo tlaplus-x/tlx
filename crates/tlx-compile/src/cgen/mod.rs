@@ -29,6 +29,7 @@ mod expr;
 mod region;
 mod stmt;
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -70,6 +71,11 @@ pub struct CGen<'a> {
     /// File-scope constant arrays.
     statics: String,
     nstatic: usize,
+    /// Deduplication tables for file-scope static arrays (rollback-safe via `*_keys`).
+    static_u64_dedup: HashMap<Vec<u64>, String>,
+    static_u64_keys: Vec<Vec<u64>>,
+    static_arr_dedup: HashMap<(&'static str, Vec<String>, &'static str), String>,
+    static_arr_keys: Vec<(&'static str, Vec<String>, &'static str)>,
     // Per-function state.
     /// Declarations of the function-scope buffers.
     bufs: String,
@@ -77,8 +83,10 @@ pub struct CGen<'a> {
     /// Counter for fresh local names.
     ntmp: usize,
     temps: Vec<Ty>,
-    /// Inside `ENABLED`: the flag to set and label to jump to on `Emit`.
-    enabled: Option<(String, String)>,
+    /// Inside `ENABLED`: regions see the local scratch next state.
+    in_enabled: bool,
+    /// Redirect `Stmt::Emit` to `{ flag = 1; goto label; }` (inside `ENABLED` or `Stmt::Then::first`).
+    emit_target: Option<(String, String)>,
     /// Which compiled functions (`Typing::funcs`) are native.
     fn_native: Vec<bool>,
     /// Generating the body of a compiled function.
@@ -126,11 +134,16 @@ impl<'a> CGen<'a> {
             verified,
             statics: String::new(),
             nstatic: 0,
+            static_u64_dedup: HashMap::new(),
+            static_u64_keys: Vec::new(),
+            static_arr_dedup: HashMap::new(),
+            static_arr_keys: Vec::new(),
             bufs: String::new(),
             nbuf: 0,
             ntmp: 0,
             temps: Vec::new(),
-            enabled: None,
+            in_enabled: false,
+            emit_target: None,
             fn_native: Vec::new(),
             in_fn: false,
             mixed: None,
@@ -541,17 +554,31 @@ impl<'a> CGen<'a> {
         self.nstatic - 1
     }
 
-    /// Define a static constant array (`empty` initializes an empty one).
-    fn static_array(&mut self, name: &str, cty: &str, items: &[String], empty: &str) {
+    /// Define (or reuse an identical) static constant array (`empty` initializes an empty one).
+    fn static_array(&mut self, prefix: &str, cty: &'static str, items: &[String], empty: &'static str) -> String {
+        let key = (cty, items.to_vec(), empty);
+        if let Some(existing) = self.static_arr_dedup.get(&key) {
+            return existing.clone();
+        }
+        let name = format!("{prefix}{}", self.fresh_static());
         let init = if items.is_empty() { empty.to_string() } else { items.join(", ") };
         writeln!(self.statics, "static const {cty} {name}[{}] = {{{init}}};", items.len().max(1)).unwrap();
+        self.static_arr_dedup.insert(key.clone(), name.clone());
+        self.static_arr_keys.push(key);
+        name
     }
 
-    /// A static constant word array.
+    /// A static constant word array (deduplicated across the translation unit).
     fn static_words(&mut self, w: &[u64]) -> String {
+        let key = w.to_vec();
+        if let Some(existing) = self.static_u64_dedup.get(&key) {
+            return existing.clone();
+        }
         let name = format!("k{}", self.fresh_static());
-        let items: Vec<String> = w.iter().map(|x| format!("{x}ULL")).collect();
-        self.static_array(&name, "uint64_t", &items, "0");
+        let init = if w.is_empty() { "0".to_string() } else { w.iter().map(|x| format!("{x}ULL")).collect::<Vec<_>>().join(", ") };
+        writeln!(self.statics, "static const uint64_t {name}[{}] = {{{init}}};", w.len().max(1)).unwrap();
+        self.static_u64_dedup.insert(key.clone(), name.clone());
+        self.static_u64_keys.push(key);
         name
     }
 

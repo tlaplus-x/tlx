@@ -563,6 +563,12 @@ pub enum Stmt {
     Branches(Vec<Stmt>),
     /// Continue with `then` if `cond` holds, else stop.
     Guard { cond: Expr, then: Box<Stmt> },
+    /// Evaluate `cond` once and run `then` if true, else `els`.
+    If { cond: Expr, then: Box<Stmt>, els: Box<Stmt> },
+    /// Run deterministic `first` (at most one `Emit`, guaranteeing `assigned`
+    /// are set at every `Emit`), then run `rest` with `s1` carrying those
+    /// assignments. Factors CPS join points without duplicating `rest`.
+    Then { first: Box<Stmt>, assigned: Vec<bool>, rest: Box<Stmt> },
     /// Bind `temp` and continue.
     Let { temp: Temp, value: Expr, body: Box<Stmt> },
     /// For each element of `set` bind `bind`, run `body`. Elements come in
@@ -850,12 +856,28 @@ impl Expr {
 }
 
 impl Stmt {
+    /// Whether this statement reaches `Stmt::Emit` at most once on any run
+    /// (so `Stmt::Then` can redirect `Emit` to a single join point without
+    /// duplicating `rest`).
+    pub fn is_deterministic(&self) -> bool {
+        match self {
+            Stmt::Stop | Stmt::Emit | Stmt::Error(_) => true,
+            Stmt::Guard { then, .. } | Stmt::Let { body: then, .. } | Stmt::Assign { body: then, .. } => then.is_deterministic(),
+            Stmt::If { then, els, .. } => then.is_deterministic() && els.is_deterministic(),
+            Stmt::Then { first, rest, .. } => first.is_deterministic() && rest.is_deterministic(),
+            Stmt::Branches(_) | Stmt::ForEach { .. } | Stmt::Repeat { .. } | Stmt::Count(_) | Stmt::Compose { .. } => false,
+        }
+    }
+
     /// The expression this statement evaluates itself (before running any
     /// sub-statement), if any.
     pub fn expr(&self) -> Option<&Expr> {
         match self {
-            Stmt::Stop | Stmt::Emit | Stmt::Branches(_) | Stmt::Error(_) | Stmt::Count(_) | Stmt::Compose { .. } => None,
+            Stmt::Stop | Stmt::Emit | Stmt::Branches(_) | Stmt::Error(_) | Stmt::Count(_) | Stmt::Compose { .. } | Stmt::Then { .. } => {
+                None
+            }
             Stmt::Guard { cond: e, .. }
+            | Stmt::If { cond: e, .. }
             | Stmt::Let { value: e, .. }
             | Stmt::ForEach { set: e, .. }
             | Stmt::Assign { value: e, .. }
@@ -872,10 +894,13 @@ impl Stmt {
     }
 
     /// `expr` with mutable access.
-    fn expr_mut(&mut self) -> Option<&mut Expr> {
+    pub(crate) fn expr_mut(&mut self) -> Option<&mut Expr> {
         match self {
-            Stmt::Stop | Stmt::Emit | Stmt::Branches(_) | Stmt::Error(_) | Stmt::Count(_) | Stmt::Compose { .. } => None,
+            Stmt::Stop | Stmt::Emit | Stmt::Branches(_) | Stmt::Error(_) | Stmt::Count(_) | Stmt::Compose { .. } | Stmt::Then { .. } => {
+                None
+            }
             Stmt::Guard { cond: e, .. }
+            | Stmt::If { cond: e, .. }
             | Stmt::Let { value: e, .. }
             | Stmt::ForEach { set: e, .. }
             | Stmt::Assign { value: e, .. }
@@ -892,11 +917,19 @@ impl Stmt {
     }
 
     /// `for_each_sub_stmt` with mutable access.
-    fn for_each_sub_stmt_mut(&mut self, f: &mut dyn FnMut(&mut Stmt)) {
+    pub(crate) fn for_each_sub_stmt_mut(&mut self, f: &mut dyn FnMut(&mut Stmt)) {
         match self {
             Stmt::Stop | Stmt::Emit | Stmt::Error(_) | Stmt::Count(_) => {}
             Stmt::Branches(bs) => bs.iter_mut().for_each(f),
             Stmt::Guard { then: b, .. } | Stmt::Let { body: b, .. } | Stmt::ForEach { body: b, .. } | Stmt::Assign { body: b, .. } => f(b),
+            Stmt::If { then, els, .. } => {
+                f(then);
+                f(els);
+            }
+            Stmt::Then { first, rest, .. } => {
+                f(first);
+                f(rest);
+            }
             Stmt::Compose { first, second, paths, .. } => {
                 f(first);
                 f(second);
@@ -920,6 +953,11 @@ impl Stmt {
     /// Distinct assignment masks at emits, in traversal order. None means
     /// an invalid variable/mask; the verifier checks this before execution.
     pub fn emitted_assignments(&self, nvars: usize) -> Option<Vec<Vec<bool>>> {
+        self.emitted_assignments_from(&vec![false; nvars])
+    }
+
+    /// Distinct assignment masks at emits starting from `initial`.
+    pub fn emitted_assignments_from(&self, initial: &[bool]) -> Option<Vec<Vec<bool>>> {
         fn walk(s: &Stmt, mask: &mut [bool], out: &mut Vec<Vec<bool>>) -> bool {
             match s {
                 Stmt::Emit => {
@@ -933,6 +971,22 @@ impl Stmt {
                     let old = std::mem::replace(slot, true);
                     let ok = walk(body, mask, out);
                     mask[*var as usize] = old;
+                    ok
+                }
+                Stmt::Then { first, assigned, rest } => {
+                    if assigned.len() != mask.len() {
+                        return false;
+                    }
+                    let Some(first_masks) = first.emitted_assignments_from(mask) else { return false };
+                    if first_masks.is_empty() {
+                        return true;
+                    }
+                    let old = mask.to_vec();
+                    for (a, b) in mask.iter_mut().zip(assigned) {
+                        *a |= *b;
+                    }
+                    let ok = walk(rest, mask, out);
+                    mask.copy_from_slice(&old);
                     ok
                 }
                 Stmt::Compose { paths, .. } => {
@@ -959,7 +1013,8 @@ impl Stmt {
             }
         }
         let mut out = Vec::new();
-        walk(self, &mut vec![false; nvars], &mut out).then_some(out)
+        let mut mask = initial.to_vec();
+        walk(self, &mut mask, &mut out).then_some(out)
     }
 
     /// Call `f` on every direct sub-statement (in order).
@@ -968,6 +1023,14 @@ impl Stmt {
             Stmt::Stop | Stmt::Emit | Stmt::Error(_) | Stmt::Count(_) => {}
             Stmt::Branches(bs) => bs.iter().for_each(f),
             Stmt::Guard { then: b, .. } | Stmt::Let { body: b, .. } | Stmt::ForEach { body: b, .. } | Stmt::Assign { body: b, .. } => f(b),
+            Stmt::If { then, els, .. } => {
+                f(then);
+                f(els);
+            }
+            Stmt::Then { first, rest, .. } => {
+                f(first);
+                f(rest);
+            }
             Stmt::Compose { first, second, paths, .. } => {
                 f(first);
                 f(second);

@@ -53,7 +53,7 @@ impl Kind {
         let mut s = cx.module.make_signature();
         let n = match self {
             Kind::Init => 2,
-            Kind::Action => 3,
+            Kind::Action => 4,
             Kind::Invariant => 3,
             Kind::ActionProperty => 4,
             Kind::Func(i) => {
@@ -190,8 +190,11 @@ pub(crate) struct Gen<'c, 't, 'f> {
     /// Representation and current value of each IR temporary.
     pub(super) temps: Vec<Ty>,
     pub(super) vals: Vec<Option<Value>>,
-    /// Inside `ENABLED`: the block to jump to on `Emit`.
-    pub(super) enabled: Option<Block>,
+    /// Inside `ENABLED`: mixed-mode regions run in `RegionCtx::Action`.
+    pub(super) in_enabled: bool,
+    /// Redirect `Stmt::Emit` to `block`; when the flag is true (`ENABLED`),
+    /// pass `1` as the block argument.
+    pub(super) emit_target: Option<(Block, bool)>,
     /// Path counters of `Repeat`s.
     pub(super) counts: HashMap<u32, Variable>,
     sigs: HashMap<usize, SigRef>,
@@ -219,6 +222,8 @@ pub(crate) struct Gen<'c, 't, 'f> {
     /// Possible effects generated so far (checks, failures, calls,
     /// emits): see `Gen::for_bitset`.
     pub(super) effects: usize,
+    /// Module-local global value pointing to the `var_offsets` byte-offset table.
+    pub(super) var_offsets_gv: Option<cranelift_codegen::ir::GlobalValue>,
 }
 
 impl<'c, 't, 'f> Gen<'c, 't, 'f> {
@@ -241,10 +246,7 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
                 (h, hcx) = (p[0], p[1]);
                 s1 = local_state(&mut b);
             }
-            Kind::Action => {
-                (h, hcx, s0) = (p[0], p[1], p[2]);
-                s1 = local_state(&mut b);
-            }
+            Kind::Action => (h, hcx, s0, s1) = (p[0], p[1], p[2], p[3]),
             Kind::Invariant => (h, hcx, s0) = (p[0], p[1], p[2]),
             Kind::ActionProperty => (h, hcx, s0, s1) = (p[0], p[1], p[2], p[3]),
             Kind::Func(_) => {
@@ -273,7 +275,8 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
             stop,
             temps: Vec::new(),
             vals: Vec::new(),
-            enabled: None,
+            in_enabled: false,
+            emit_target: None,
             counts: HashMap::new(),
             sigs: HashMap::new(),
             fn_refs: HashMap::new(),
@@ -287,6 +290,7 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
             spec: 1,
             bounds: HashMap::new(),
             effects: 0,
+            var_offsets_gv: None,
         };
         if matches!(kind, Kind::Init) {
             let s1 = g.s1;

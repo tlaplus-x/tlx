@@ -122,7 +122,7 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
         let table = self.cx.regions.as_ref().expect("regions in mixed mode only").table;
         let r = &table.regions[rid as usize];
         use crate::enc::mixed::RegionCtx;
-        let context = if self.enabled.is_some() {
+        let context = if self.in_enabled {
             RegionCtx::Action
         } else {
             match self.kind {

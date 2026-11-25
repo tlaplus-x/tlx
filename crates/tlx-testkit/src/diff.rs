@@ -1179,6 +1179,8 @@ pub fn stmt_kinds(s: &Stmt, out: &mut BTreeSet<&'static str>) {
         Stmt::Emit => "Emit",
         Stmt::Branches(_) => "Branches",
         Stmt::Guard { .. } => "Guard",
+        Stmt::If { .. } => "IfStmt",
+        Stmt::Then { .. } => "Then",
         Stmt::Let { .. } => "LetStmt",
         Stmt::ForEach { .. } => "ForEach",
         Stmt::Assign { .. } => "Assign",

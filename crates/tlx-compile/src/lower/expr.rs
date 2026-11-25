@@ -608,6 +608,11 @@ impl Lowerer<'_> {
             if let Some(x) = self.recursive_call(d, &params, &body, &base, args, env, st, into) {
                 return Some(x);
             }
+            if mode == SetMode::Exact {
+                if let Some(x) = self.helper_call(d, &params, &body, &base, args, env, st, into) {
+                    return Some(x);
+                }
+            }
         }
         if let Some(d) = def {
             // RECURSIVE operators that do not compile to a function are
@@ -772,7 +777,7 @@ impl Lowerer<'_> {
 
     /// `e` denotes a function definition (see `fn_def_of`) with constant
     /// domains: passing it by name cannot skip an error.
-    fn is_lazy_fn_ref(&self, e: &hir::Expr, env: &LEnv) -> bool {
+    pub(super) fn is_lazy_fn_ref(&self, e: &hir::Expr, env: &LEnv) -> bool {
         let Some((d, denv)) = self.fn_def_of(e, env) else { return false };
         let DefKind::Fn { bounds, .. } = &self.ip.prog.defs[d.idx()].kind else { return false };
         let benv = self.def_env(d, &denv);
@@ -938,7 +943,7 @@ impl Lowerer<'_> {
 
     /// A record or tuple literal (behind definitions / by-name arguments):
     /// projections of it select components without building it.
-    fn is_product_literal(&self, e: &hir::Expr, env: &LEnv) -> bool {
+    pub(super) fn is_product_literal(&self, e: &hir::Expr, env: &LEnv) -> bool {
         self.peel(e, env).is_some_and(|(p, _)| matches!(&*p.kind, H::Record(_) | H::Tuple(_)))
     }
 
@@ -1112,7 +1117,7 @@ fn contains_interp(e: &Expr) -> bool {
 
 /// Number of references to local `l` in `e`, including the bodies of the
 /// LET definitions of `e` (each lowered where it is applied).
-fn local_uses(prog: &tlx_sema::Program, e: &hir::Expr, l: LocalId) -> usize {
+pub(super) fn local_uses(prog: &tlx_sema::Program, e: &hir::Expr, l: LocalId) -> usize {
     let mut n = matches!(&*e.kind, H::Local(x) if *x == l) as usize;
     if let H::Let { defs, .. } = &*e.kind {
         for d in defs {

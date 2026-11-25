@@ -225,11 +225,13 @@ impl CGen<'_> {
                 // The action over a scratch next state (shadowing `s1`).
                 let n = self.fresh();
                 let (flag, label) = (format!("en{n}"), format!("en{n}_done"));
-                let saved = self.enabled.replace((flag.clone(), label.clone()));
+                let saved_en = std::mem::replace(&mut self.in_enabled, true);
+                let saved_target = self.emit_target.replace((flag.clone(), label.clone()));
                 let assigned = std::mem::replace(&mut self.assigned, vec![false; self.ty.layout.vars.len()]);
                 let mut body = String::new();
                 let r = self.stmt(s, 2, &mut body);
-                self.enabled = saved;
+                self.in_enabled = saved_en;
+                self.emit_target = saved_target;
                 self.assigned = assigned;
                 r?;
                 let words = self.ty.layout.words.max(1);
@@ -353,9 +355,8 @@ impl CGen<'_> {
             }
             IndexMap::Table(t) => {
                 let Ty::Enc(_) = arg.ty else { return no("boxed function argument") };
-                let tbl = format!("tbl{}", self.fresh_static());
                 let items: Vec<String> = t.iter().map(|x| x.to_string()).collect();
-                self.static_array(&tbl, "int32_t", &items, "-1");
+                let tbl = self.static_array("tbl", "int32_t", &items, "-1");
                 let a = self.expr(arg)?;
                 Ok(format!("({{ uint64_t i_ = ({a})[0]; int64_t a_ = i_ < {} ? {tbl}[i_] : -1; if (a_ < 0) {{ {miss} }} a_; }})", t.len()))
             }

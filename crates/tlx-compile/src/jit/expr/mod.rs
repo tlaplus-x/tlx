@@ -219,12 +219,12 @@ impl Gen<'_, '_, '_> {
             ExprKind::Var(i) => {
                 let Ty::Enc(_) = e.ty else { return no("boxed variable read") };
                 let s0 = self.s0;
-                self.offset(s0, self.cx.ty.var_offset(*i as usize))
+                self.var_ptr(s0, *i as usize)
             }
             ExprKind::NextVar(i) => {
                 let Ty::Enc(_) = e.ty else { return no("boxed variable read") };
                 let s1 = self.s1;
-                self.offset(s1, self.cx.ty.var_offset(*i as usize))
+                self.var_ptr(s1, *i as usize)
             }
             ExprKind::Temp(t) => self.temp(*t)?,
             ExprKind::Not(x) => {
@@ -379,10 +379,12 @@ impl Gen<'_, '_, '_> {
                 self.zero(sp, words);
                 let (j, r) = self.join();
                 let saved_s1 = std::mem::replace(&mut self.s1, sp);
-                let saved_en = self.enabled.replace(j);
+                let saved_en = std::mem::replace(&mut self.in_enabled, true);
+                let saved_target = self.emit_target.replace((j, true));
                 let res = self.stmt(s);
                 self.s1 = saved_s1;
-                self.enabled = saved_en;
+                self.in_enabled = saved_en;
+                self.emit_target = saved_target;
                 res?;
                 let z = self.iconst(0);
                 self.b.ins().jump(j, &[z.into()]);
