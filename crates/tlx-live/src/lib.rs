@@ -28,7 +28,7 @@ pub use tlc::{
 
 /// Temporal formula over pre-evaluated atoms (no `Next` operator: TLA+
 /// formulas are stuttering-invariant).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ltl {
     True,
     False,
@@ -286,6 +286,16 @@ impl Bits {
         }
     }
 
+    /// Like [`Bits::from_words`], reusing an owned multi-word slice without
+    /// reallocating.
+    pub fn from_boxed_words(w: Box<[u64]>) -> Self {
+        match &*w {
+            [] => Bits::new(),
+            [x] => Bits::from_u64(*x),
+            _ => Bits(Repr::Heap(w)),
+        }
+    }
+
     /// The set containing exactly `indices`.
     #[cfg(test)]
     fn from_indices(indices: impl IntoIterator<Item = u32>) -> Self {
@@ -476,20 +486,31 @@ pub fn check_lasso_within(
 ///
 /// This is TLC's `LiveExprNode.evalOnLasso`, which TLC uses to tell which
 /// properties a counterexample violates (`Liveness.findViolatedProperties`).
-pub fn eval_lasso(prop: &Ltl, states: &[Bits], steps: &[Bits], cycle: usize) -> bool {
+pub fn eval_lasso<B1: std::borrow::Borrow<Bits>, B2: std::borrow::Borrow<Bits>>(
+    prop: &Ltl,
+    states: &[B1],
+    steps: &[B2],
+    cycle: usize,
+) -> bool {
     assert!(cycle < states.len() && states.len() == steps.len(), "a lasso with a cycle");
     eval_at(prop, states, steps, cycle, 0)
 }
 
-fn eval_at(f: &Ltl, states: &[Bits], steps: &[Bits], cycle: usize, pos: usize) -> bool {
+fn eval_at<B1: std::borrow::Borrow<Bits>, B2: std::borrow::Borrow<Bits>>(
+    f: &Ltl,
+    states: &[B1],
+    steps: &[B2],
+    cycle: usize,
+    pos: usize,
+) -> bool {
     // From a position in the prefix, `[]` and `<>` range over the rest of
     // the prefix and the whole cycle; from one in the cycle, over the cycle.
     let from = |pos: usize| if pos < cycle { pos } else { cycle };
     match f {
         Ltl::True => true,
         Ltl::False => false,
-        Ltl::State(i) => states[pos].get(*i),
-        Ltl::Action(i) => steps[pos].get(*i),
+        Ltl::State(i) => states[pos].borrow().get(*i),
+        Ltl::Action(i) => steps[pos].borrow().get(*i),
         Ltl::Not(x) => !eval_at(x, states, steps, cycle, pos),
         Ltl::And(xs) => xs.iter().all(|x| eval_at(x, states, steps, cycle, pos)),
         Ltl::Or(xs) => xs.iter().any(|x| eval_at(x, states, steps, cycle, pos)),

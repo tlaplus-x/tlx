@@ -48,36 +48,10 @@
    "reason": "TLC command-line option -continue (outside the contract)"
   },
   {
-   "id": "ExamplesLiveHourClockTest",
-   "result": "timeout",
-   "reason": "tlx-live's tableau (Automaton::for_negation) for ClockSettles == \\E n \\in 1..12 : <>[](hr = n) grows exponentially with the 12 []<> conjuncts of the negation (12 s, TLC 0.3 s): a timeout under load",
-   "flaky": true
-  },
-  {
    "id": "Github648Test",
    "result": "success",
    "reason": "RandomElement in the spec: counts depend on TLC's random seed (TLC itself varies between runs)",
    "flaky": true
-  },
-  {
-   "id": "Github757Test",
-   "result": "unknown",
-   "reason": "TLC's -dumpTrace formats of state files (outside the contract)"
-  },
-  {
-   "id": "Github766SimulateTest",
-   "result": "unknown",
-   "reason": "TLC's -dumpTrace formats of state files (outside the contract)"
-  },
-  {
-   "id": "Github766Test",
-   "result": "unknown",
-   "reason": "TLC's -dumpTrace formats of state files (outside the contract)"
-  },
-  {
-   "id": "Github858Test",
-   "result": "unknown",
-   "reason": "TLC error, tlx unknown (Error: Error: more than one input files:  and EWD998.tla)"
   },
   {
    "id": "InvParameterizedATest",

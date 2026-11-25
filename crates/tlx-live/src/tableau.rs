@@ -248,8 +248,22 @@ impl Builder<'_> {
         // Keep the expansion buffer charged while its entries are interned.
         let scratch = budget.parts + parts.capacity() * std::mem::size_of::<Partial>();
         let mut ids = Vec::new();
-        for p in parts {
+        for mut p in parts {
             let acc: Vec<bool> = self.evs.iter().map(|&(ev, g)| !p.old.contains(&ev) || p.old.contains(&g)).collect();
+            // `Always(h)` in `next` expands `h` at the next position too, so a
+            // separate `h` in `next` is redundant (`[]<>g` otherwise forks `2^k`
+            // equivalent obligation sets `{[]<>g}` vs `{[]<>g, <>g}`).
+            let subsumed: Vec<Id> = p
+                .next
+                .iter()
+                .filter_map(|&id| match self.nodes[id as usize] {
+                    Node::Always(h) if p.next.contains(&h) => Some(h),
+                    _ => None,
+                })
+                .collect();
+            for h in subsumed {
+                p.next.remove(&h);
+            }
             let key = (p.lits, p.next, acc);
             let id = match self.by_key.get(&key) {
                 Some(&id) => id,
@@ -372,5 +386,11 @@ mod tests {
         let a = Automaton::for_negation(&Ltl::Always(Box::new(Ltl::State(0))));
         assert_eq!(a.num_acc, 1);
         assert!(!a.init.is_empty());
+        // ¬(<>[]p0 \/ <>[]p1 \/ <>[]p2) = []<>¬p0 /\ []<>¬p1 /\ []<>¬p2:
+        // next-obligation subsumption expands one obligation set (2^3 = 8
+        // states, one per acceptance combination, instead of 2 * 2^3 = 16).
+        let prop = Ltl::Or((0..3).map(|i| Ltl::Eventually(Box::new(Ltl::Always(Box::new(Ltl::State(i)))))).collect());
+        let a = Automaton::for_negation(&prop);
+        assert_eq!(a.states.len(), 8);
     }
 }

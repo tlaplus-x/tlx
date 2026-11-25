@@ -90,6 +90,486 @@ def suite_dir(fetch=True):
 
 # ---- extracting the cases from the JUnit sources -------------------------------------------------
 
+_JAVA_ESCAPES = {'"': '"', "\\": "\\", "'": "'", "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f"}
+_JAVA_SEPARATORS = frozenset({"File.separator", "FileUtil.separator", "java.io.File.separator"})
+_JAVA_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*")
+_JAVA_NEW_ARR_RE = re.compile(r"new\s+String\s*\[\s*\]\s*\{")
+_JAVA_EXIT_RE = re.compile(r"((?:EC\.)?ExitStatus\.\w+|\d+)")
+_JAVA_UNICODE_ESC_RE = re.compile(r"(?<!\\)(?:\\\\)*\\u+[0-9a-fA-F]{4}")
+
+
+def _skip_java_ws(text, i):
+    """Advance `i` past whitespace and `/* ... */` or `// ...` Java comments.
+    Returns `(pos, ok)` where `ok=False` marks an unterminated block comment or
+    a JLS §3.3 Unicode escape inside a comment whose token boundary is ambiguous."""
+    n = len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0 or _JAVA_UNICODE_ESC_RE.search(text[i + 2:end]):
+                return n, False
+            i = end + 2
+        elif text.startswith("//", i):
+            end = text.find("\n", i + 2)
+            comment = text[i + 2:] if end < 0 else text[i + 2:end]
+            if _JAVA_UNICODE_ESC_RE.search(comment):
+                return n, False
+            i = n if end < 0 else end + 1
+        else:
+            break
+    return i, True
+
+
+def _skip_java_quoted(text, i):
+    """Advance `i` past a Java text block (`\"\"\"...\"\"\"`), string literal, or char
+    literal. Returns `(pos, ok)`."""
+    n = len(text)
+    if text.startswith('"""', i):
+        j = i + 3
+        while j < n and text[j] in " \t\f":
+            j += 1
+        if j < n and text[j] in "\r\n":
+            j += 2 if text.startswith("\r\n", j) else 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                elif text.startswith('"""', j):
+                    q = 3
+                    while j + q < n and text[j + q] == '"' and q < 5:
+                        q += 1
+                    return j + q, True
+                else:
+                    j += 1
+            return n, False
+    quote = text[i]
+    j = i + 1
+    while j < n and text[j] != quote:
+        if text[j] in "\r\n":
+            return n, False
+        j += 2 if text[j] == "\\" else 1
+    if j >= n:
+        return n, False
+    return j + 1, True
+
+
+def _scan_java_string_expr(text, i):
+    """Scan one `+`-concatenated Java string literal / `File.separator` expression,
+    stopping before a top-level `,`, `)`, or `}`. Returns `(val, ok, pos)`."""
+    n = len(text)
+    buf = []
+    ok_lit = True
+    has_val = expect_plus = False
+    brace_depth = paren_depth = 0
+    while i < n:
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= n:
+            return "", False, n
+        ch = text[i]
+        if ch in ",)}" and brace_depth == 0 and paren_depth == 0:
+            break
+        if ch == "{":
+            ok_lit = False
+            brace_depth += 1
+            i += 1
+        elif ch == "}":
+            brace_depth -= 1
+            i += 1
+        elif ch == "(":
+            ok_lit = False
+            paren_depth += 1
+            i += 1
+        elif ch == ")":
+            paren_depth -= 1
+            i += 1
+        elif ch == '"':
+            if text.startswith('"""', i):
+                j, ok = _skip_java_quoted(text, i)
+                if not ok:
+                    return "", False, n
+                ok_lit = False
+                i = j
+                continue
+            j = i + 1
+            lit = []
+            while j < n and text[j] != '"':
+                if text[j] in "\r\n":
+                    return "", False, n
+                if text[j] == "\\":
+                    j += 1
+                    if j >= n or text[j] in "\r\n":
+                        return "", False, n
+                    esc = _JAVA_ESCAPES.get(text[j])
+                    if esc is None:
+                        ok_lit = False
+                    else:
+                        lit.append(esc)
+                else:
+                    lit.append(text[j])
+                j += 1
+            if j >= n:
+                return "", False, n
+            if brace_depth == 0 and paren_depth == 0:
+                if expect_plus:
+                    ok_lit = False
+                buf.append("".join(lit))
+                has_val = expect_plus = True
+            i = j + 1
+        elif ch == "'":
+            ok_lit = False
+            i, ok = _skip_java_quoted(text, i)
+            if not ok:
+                return "", False, n
+        elif ch == "+" and brace_depth == 0 and paren_depth == 0:
+            if not expect_plus:
+                ok_lit = False
+            expect_plus = False
+            i += 1
+        else:
+            m = _JAVA_IDENT_RE.match(text, i)
+            if m:
+                ident = re.sub(r"\s+", "", m.group(0))
+                nxt, ok = _skip_java_ws(text, m.end())
+                if not ok:
+                    return "", False, n
+                if brace_depth == 0 and paren_depth == 0 and not expect_plus and ident in _JAVA_SEPARATORS and (nxt >= n or text[nxt] != "("):
+                    buf.append("/")
+                    has_val = expect_plus = True
+                else:
+                    ok_lit = False
+                i = m.end()
+            else:
+                ok_lit = False
+                i += 1
+    if not has_val or not expect_plus or not ok_lit:
+        return "", False, i
+    return "".join(buf), True, i
+
+
+def scan_java_string_array(text, i):
+    """Scan a `new String[] { ... }` initializer starting just after `{`.
+
+    Consumes quoted string literals and Java escapes, skips comments only between
+    tokens, folds `+` concatenations of string literals and `File.separator` /
+    `FileUtil.separator`, and stops at the matching unquoted `}`. Any unsupported
+    escape or non-literal expression sets `nonlit=True`. Returns `(args, nonlit, pos)`.
+    """
+    n = len(text)
+    args = []
+    nonlit = False
+    while i < n:
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= n:
+            return [], True, n
+        if text[i] == "}":
+            return ([] if nonlit else args), nonlit, i + 1
+        val, ok_elem, i = _scan_java_string_expr(text, i)
+        if not ok_elem:
+            nonlit = True
+        elif not nonlit:
+            args.append(val)
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= n:
+            return [], True, n
+        if text[i] == ",":
+            i += 1
+        elif text[i] != "}":
+            return [], True, n
+    return [], True, n
+
+
+def parse_java_args(raw):
+    """Extract literal CLI arguments from the body of a `new String[] { ... }` initializer."""
+    if not raw:
+        return [], False
+    args, nonlit, pos = scan_java_string_array(raw + "}", 0)
+    if pos != len(raw) + 1:
+        return [], True
+    return args, nonlit
+
+
+def _starts_string_expr(text, i):
+    if i < len(text) and text[i] == '"':
+        return True
+    m = _JAVA_IDENT_RE.match(text, i)
+    return bool(m and re.sub(r"\s+", "", m.group(0)) in _JAVA_SEPARATORS)
+
+
+def _next_java_ident(text, i):
+    """Read an identifier starting at `i` (after skipping ws/comments). Returns `(ident, end, ok)`."""
+    i, ok = _skip_java_ws(text, i)
+    if not ok or i >= len(text) or not (text[i].isalpha() or text[i] in "_$"):
+        return None, i, ok
+    j = i + 1
+    while j < len(text) and (text[j].isalnum() or text[j] in "_$"):
+        j += 1
+    return text[i:j], j, True
+
+
+def _find_class_super_call(text, cls, body_start):
+    """Locate `super(` inside a constructor of `cls` starting right after the
+    class body's opening `{`. Skips comments, strings, text blocks, nested
+    classes, and methods outside `cls`'s constructors. Returns `(pos, ok)` where
+    `pos` is immediately after `(` (or `None` if no constructor calls `super(`)
+    and `ok=False` if lexical ambiguity (e.g. a comment Unicode escape) occurred."""
+    n = len(text)
+    i = body_start
+    depth = 1
+    in_ctor = False
+    ctor_depth = 0
+    while i < n and depth > 0:
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= n:
+            return None, ok
+        ch = text[i]
+        if ch in ('"', "'"):
+            i, ok = _skip_java_quoted(text, i)
+            if not ok:
+                return None, False
+        elif ch == "{":
+            depth += 1
+            i += 1
+        elif ch == "}":
+            depth -= 1
+            if in_ctor and depth < ctor_depth:
+                in_ctor = False
+            i += 1
+        elif ch.isalpha() or ch in "_$":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] in "_$"):
+                j += 1
+            ident = text[i:j]
+            if depth == 1 and ident == cls:
+                k, ok = _skip_java_ws(text, j)
+                if not ok:
+                    return None, False
+                if k < n and text[k] == "(":
+                    # Advance past parameter list `(...)` and optional `throws ...` to `{`.
+                    pdepth = 1
+                    k += 1
+                    while k < n and pdepth > 0:
+                        k, ok = _skip_java_ws(text, k)
+                        if not ok or k >= n:
+                            return None, False
+                        if text[k] in ('"', "'"):
+                            k, ok = _skip_java_quoted(text, k)
+                            if not ok:
+                                return None, False
+                        elif text[k] == "(":
+                            pdepth += 1
+                            k += 1
+                        elif text[k] == ")":
+                            pdepth -= 1
+                            k += 1
+                        else:
+                            k += 1
+                    while k < n:
+                        k, ok = _skip_java_ws(text, k)
+                        if not ok or k >= n:
+                            return None, False
+                        if text[k] == "{":
+                            depth += 1
+                            in_ctor = True
+                            ctor_depth = depth
+                            i = k + 1
+                            break
+                        if text[k] == ";":
+                            i = k + 1
+                            break
+                        if text[k] in ('"', "'"):
+                            k, ok = _skip_java_quoted(text, k)
+                            if not ok:
+                                return None, False
+                        else:
+                            k += 1
+                    else:
+                        return None, False
+                    continue
+            elif in_ctor and depth == ctor_depth and ident == "super":
+                k, ok = _skip_java_ws(text, j)
+                if not ok:
+                    return None, False
+                if k < n and text[k] == "(":
+                    return k + 1, True
+            i = j
+        else:
+            i += 1
+    return None, True
+
+
+def _find_test_class(text):
+    """Find `class <cls> extends <base> ... {` outside comments and literals.
+    Returns `(cls, base, body_start)` or `None`."""
+    n = len(text)
+    i = 0
+    while i < n:
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= n:
+            return None
+        ch = text[i]
+        if ch in ('"', "'"):
+            i, ok = _skip_java_quoted(text, i)
+            if not ok:
+                return None
+        elif ch.isalpha() or ch in "_$":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] in "_$"):
+                j += 1
+            if text[i:j] == "class":
+                cls, k, ok = _next_java_ident(text, j)
+                if not ok or not cls:
+                    i = j
+                    continue
+                ext, k2, ok = _next_java_ident(text, k)
+                if ok and ext == "extends":
+                    base, k3, ok = _next_java_ident(text, k2)
+                    if ok and base in TEST_BASES:
+                        while k3 < n:
+                            k3, ok = _skip_java_ws(text, k3)
+                            if not ok or k3 >= n:
+                                return None
+                            if text[k3] == "{":
+                                return cls, base, k3 + 1
+                            if text[k3] in ('"', "'"):
+                                k3, ok = _skip_java_quoted(text, k3)
+                                if not ok:
+                                    return None
+                            else:
+                                k3 += 1
+            i = j
+        else:
+            i += 1
+    return None
+
+
+def _is_java_int_str(val):
+    return val.isdigit() or (val.startswith("-") and len(val) > 1 and val[1:].isdigit())
+
+
+def _parse_suite_super_call(text, start, base):
+    """Parse `SuiteTestCase`/`SuiteETestCase` `super(...)` arguments at `start`.
+    Returns `(args, stats, exit_str, ok)` where `ok=False` marks an unsupported
+    or non-literal `super(...)` call (distinct from a genuine `super()` default)."""
+    i, ok = _skip_java_ws(text, start)
+    if not ok or i >= len(text):
+        return [], None, None, False
+    if text[i] == ")":
+        return [], None, None, True
+    if base == "SuiteETestCase":
+        args = []
+        arr = _JAVA_NEW_ARR_RE.match(text, i)
+        if arr:
+            args, arr_nonlit, i = scan_java_string_array(text, arr.end())
+            if arr_nonlit:
+                return [], None, None, False
+            i, ok = _skip_java_ws(text, i)
+            if not ok or i >= len(text):
+                return [], None, None, False
+            if text[i] == ")":
+                return args, None, None, True
+            if text[i] != ",":
+                return [], None, None, False
+            i, ok = _skip_java_ws(text, i + 1)
+            if not ok or i >= len(text):
+                return [], None, None, False
+        m_ex = _JAVA_EXIT_RE.match(text, i)
+        if not m_ex:
+            return [], None, None, False
+        j, ok = _skip_java_ws(text, m_ex.end())
+        if ok and j < len(text) and text[j] == ")":
+            return args, None, m_ex.group(1), True
+        return [], None, None, False
+    vals = []
+    for idx in range(5):
+        val, ok_s, i = _scan_java_string_expr(text, i)
+        if not ok_s:
+            return [], None, None, False
+        if idx < 4 and not _is_java_int_str(val):
+            return [], None, None, False
+        vals.append(val)
+        i, ok = _skip_java_ws(text, i)
+        if not ok or i >= len(text):
+            return [], None, None, False
+        if text[i] == ")":
+            if len(vals) < 3:
+                return [], None, None, False
+            stats = [vals[:3]] if all(v.isdigit() for v in vals[:3]) else None
+            return [], stats, None, True
+        if idx == 4 or text[i] != ",":
+            return [], None, None, False
+        i, ok = _skip_java_ws(text, i + 1)
+        if not ok or i >= len(text):
+            return [], None, None, False
+    return [], None, None, False
+
+
+def _parse_super_call(text, start):
+    """Parse `super(spec[, subdir][, new String[] { ... }][, ExitStatus])` at
+    `start` and require the matching closing `)` so partial prefixes cannot run."""
+    i, ok = _skip_java_ws(text, start)
+    if not ok:
+        return "", None, [], True, None
+    if i >= len(text) or not _starts_string_expr(text, i):
+        return None
+    spec, spec_ok, i = _scan_java_string_expr(text, i)
+    if not spec_ok:
+        return "", None, [], True, None
+    subdir, args, nonlit, ex = None, [], False, None
+    i, ok = _skip_java_ws(text, i)
+    if not ok:
+        return spec, None, [], True, None
+    if i < len(text) and text[i] == ",":
+        i, ok = _skip_java_ws(text, i + 1)
+        if not ok:
+            nonlit = True
+        if ok and i < len(text) and not _JAVA_NEW_ARR_RE.match(text, i) and not _JAVA_EXIT_RE.match(text, i):
+            subdir, sub_ok, i = _scan_java_string_expr(text, i)
+            if not sub_ok:
+                nonlit = True
+                subdir = ""
+            i, ok = _skip_java_ws(text, i)
+            if not ok:
+                nonlit = True
+            elif i < len(text) and text[i] == ",":
+                i, ok = _skip_java_ws(text, i + 1)
+                if not ok:
+                    nonlit = True
+        if ok and i < len(text):
+            arr = _JAVA_NEW_ARR_RE.match(text, i)
+            if arr:
+                args, arr_nonlit, i = scan_java_string_array(text, arr.end())
+                nonlit = nonlit or arr_nonlit
+                i, ok = _skip_java_ws(text, i)
+                if not ok:
+                    nonlit = True
+                elif i < len(text) and text[i] == ",":
+                    i, ok = _skip_java_ws(text, i + 1)
+                    m_ex = _JAVA_EXIT_RE.match(text, i) if ok else None
+                    if m_ex:
+                        ex = m_ex.group(1)
+                        i = m_ex.end()
+                    else:
+                        nonlit = True
+            elif text[i] != ")":
+                m_ex = _JAVA_EXIT_RE.match(text, i)
+                if m_ex:
+                    ex = m_ex.group(1)
+                    i = m_ex.end()
+                else:
+                    nonlit = True
+    i, ok = _skip_java_ws(text, i)
+    if not ok or i >= len(text) or text[i] != ")":
+        nonlit = True
+    if nonlit:
+        args = []
+    return spec, subdir, args, nonlit, ex
+
+
+def _canon_exit(ex):
+    return (ex or "SUCCESS").replace("EC.", "").replace("ExitStatus.", "")
+
+
 def extract_cases(root):
     """The model-checker test cases of root/test/**/*.java: dicts with cls (the
     test class: the case's name), base, spec, path (below test-model), args,
@@ -104,27 +584,37 @@ def extract_cases(root):
             path = os.path.join(base_dir, name)
             with open(path, errors="ignore") as source:
                 text = source.read()
-            m = re.search(r"class\s+(\w+)\s+extends\s+(\w+)", text)
-            if not m or m.group(2) not in TEST_BASES:
+            found = _find_test_class(text)
+            if not found:
                 continue
-            cls, base = m.groups()
+            cls, base, body_start = found
             rel = os.path.relpath(path, root)
+            super_start, scan_ok = _find_class_super_call(text, cls, body_start)
             if base in ("SuiteTestCase", "SuiteETestCase"):
-                st = re.search(r'super\("(\d+)",\s*"(\d+)",\s*"(\d+)"', text)
-                ex = re.search(r"super\(((?:EC\.)?ExitStatus\.\w+)", text)
-                out.append(dict(cls=cls, base=base, spec=cls.lower(), path="suite", args=[], exit=ex.group(1) if ex else "SUCCESS",
-                                stats=[list(st.groups())] if st else ([] if base == "SuiteETestCase" else [["2", "1", "0"]]),
-                                deadlock=False, ignored="@Ignore" in text, nonlit=False, file=rel))
+                if not scan_ok:
+                    args, st, ex, suite_ok = [], None, None, False
+                elif super_start is not None:
+                    args, st, ex, suite_ok = _parse_suite_super_call(text, super_start, base)
+                else:
+                    args, st, ex, suite_ok = [], None, None, True
+                out.append(dict(cls=cls, base=base, spec=cls.lower(), path="suite", args=args, exit=_canon_exit(ex),
+                                stats=st if st is not None else ([] if base == "SuiteETestCase" else [["2", "1", "0"]]),
+                                deadlock=False, ignored="@Ignore" in text, nonlit=not suite_ok, file=rel))
                 continue
-            sup = re.search(r'super\(\s*"([^"]+)"\s*(?:,\s*"([^"]*)")?\s*(?:,\s*new String\[\]\s*\{([^}]*)\})?\s*(?:,\s*((?:EC\.)?ExitStatus\.\w+|\d+))?', text)
-            if not sup:
+            if not scan_ok:
+                out.append(dict(cls=cls, base=base, spec="", path="", args=[], exit="SUCCESS", stats=[],
+                                deadlock=False, ignored="@Ignore" in text, nonlit=True, file=rel))
                 continue
-            spec, subdir, args, ex = sup.groups()
+            if super_start is None:
+                continue
+            parsed = _parse_super_call(text, super_start)
+            if not parsed:
+                continue
+            spec, subdir, args, nonlit, ex = parsed
             stats = re.findall(r'EC\.TLC_STATS,\s*"([\d,]+)",\s*"([\d,]+)"(?:,\s*"([\d,]+)")?', text)
             deadlock = bool(re.search(r"checkDeadLock\(\)\s*\{\s*return\s+true", text))
-            nonlit = any(x.strip() and not x.strip().startswith('"') for x in (args or "").split(","))
-            out.append(dict(cls=cls, base=base, spec=spec, path=subdir or "", args=re.findall(r'"([^"]*)"', args or ""),
-                            exit=(ex or "SUCCESS").replace("EC.", "").replace("ExitStatus.", ""), stats=[list(s) for s in stats],
+            out.append(dict(cls=cls, base=base, spec=spec, path=subdir or "", args=args,
+                            exit=_canon_exit(ex), stats=[list(s) for s in stats],
                             deadlock=deadlock, ignored="@Ignore" in text, nonlit=nonlit, file=rel))
     # (Test classes of different packages may share a name: qualified by the package then.)
     names = [c["cls"] for c in out]
@@ -496,7 +986,7 @@ def main():
     json_update(RESULTS, lambda data: data.update({c["cls"]: {"ok": not diffs, "differs": diffs, "tlx": tlx, "tlc": tlc}
                                                    for c, tlc, tlx, diffs, _, _, _ in results}))
     count = lambda s: sum(r[4] == s for r in results)
-    agree = [oracle[c["cls"]]["junit_agrees"] for c in runnable]
+    agree = [junit_agrees(c, oracle[c["cls"]]["tlc"]) for c in runnable]
     print(f"\n{len(results)} cases run: {count('PASS') + count('FIXED')} passed, {count('XFAIL')} expected failures, {count('FAIL')} unexpected"
           f" ({count('FIXED')} of the passed are listed as expected failures: remove them)")
     print(f"{len(skipped)} skipped ({_tally(c['skip'] for c in skipped)}), {len(no_oracle)} without a TLC result in {a.oracle_timeout} s;"

@@ -27,6 +27,7 @@ completion or performance on the original benchmark configuration.
 | Configuration | Remaining work |
 |---|---|
 | `ext/vanlightly-kafka/kafka_replication_v3_5`, compiled 16 workers and default one worker | Collect repeated same-instance before/after samples with explicit cache conditions. Investigate remaining layout migration and interpreted-region costs; compiler cancellation alone does not establish that the timeout problem is solved. |
+| `bcastFolklore/bcastFolklore`, default one worker | Collect repeated cloud benchmark samples after hoisting suffix-invariant temporal conditions out of `<>`/`[]` and compacting product storage (local `-maxmem 2048 -stats` verification now completes with 5 tableau states, 655,360 product nodes, 6,483,968 product edges, 58.3 MiB CSR, 76.2 MiB largest product and 239.7 MiB peak RSS vs. the 16,845 MiB freeze failure). |
 
 Other long-running configurations still need completion or a documented resource bound:
 `KeyValueStore/MCKVSSafetyLarge`, `TLC/TestMCReachability`, `byzpaxos/BPConProof`, `c1cs/c1cs`,
@@ -42,16 +43,6 @@ CarTalkPuzzle Model_3 and SpanTreeTest5Nodes no longer fail immediately on cardi
 but both reached the 600-second warm-up limit with no timed samples in the
 [post-fix validation](research/post-fix-validation.md). Their large enumerations still
 need optimization or a documented larger resource bound; neither is a completed timing.
-
-## Liveness resource limit
-
-`bcastFolklore/bcastFolklore` exceeded the default memory budget: the frozen run requested about
-16,845 MiB against a 15,603 MiB budget. The product graph is large; correcting the separate
-MCInnerSerial fairness issue does not remove this resource requirement.
-
-Validate an explicitly larger budget as a separate configuration, or reduce product-graph memory
-use. Do not silently raise the budget of an existing measurement or treat a resource failure as
-success.
 
 ## Incomplete upstream EWD998 examples
 

@@ -407,6 +407,14 @@ fn invalid_values_are_reported() {
     let (code, _, err) = tlx(&["check", "X.tla"], &[("TLX_MAXMEM", "lots")]);
     assert_eq!(code, 2);
     assert!(err.contains("invalid value of TLX_MAXMEM: \"lots\""), "{err}");
+    for empty in ["", ".tla"] {
+        let (code, _, err) = tlx(&["check", empty], &[]);
+        assert_eq!(code, 2, "{empty:?}: {err}");
+        assert!(err.contains("empty spec name"), "{empty:?}: {err}");
+    }
+    let (code, _, err) = tlx(&["check", "X.tla", "Y.tla"], &[]);
+    assert_eq!(code, 2);
+    assert!(err.contains("more than one spec: Y.tla"), "{err}");
 }
 
 #[test]

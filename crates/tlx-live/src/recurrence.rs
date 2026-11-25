@@ -7,16 +7,23 @@
 //! to 2^k states (e.g. the `<>[][A]_v` assumptions of a specification, one
 //! per process). Bodies `x` are propositional and may mix state and action
 //! atoms, evaluated at the same position (a state and the step leaving it).
+//!
+//! Suffix-invariant ("tail") subformulas — `[]<>` and `<>[]` obligations and
+//! boolean combinations of them — hold at a position of a behavior iff they
+//! hold at position 0, so `<>(P /\ T)` is equivalent to `(<>P) /\ T` and
+//! `[](P \/ T)` to `([]P) \/ T`. Hoisting them out of `<>` and `[]` turns
+//! nested patterns such as `[]( \E k : S_k => <>[]R_k )` (whose negation is
+//! `<>( /\ (S_k /\ []<>~R_k) )`, as in `bcastFolklore`'s `ReliableChan`) into
+//! top-level cycle conditions plus a two-state reachability automaton instead
+//! of an exponential GPVW tableau. Propositional `[]<>A \/ []<>B` disjuncts
+//! merge into `[]<>(A \/ B)` as in TLC's `toDNF`.
 
 use crate::{Bits, Ltl};
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Condition<'a> {
-    body: &'a Ltl,
-    neg: bool,
-}
+#[derive(Clone, Debug)]
+pub(crate) struct Condition(Ltl);
 
-impl Condition<'_> {
+impl Condition {
     pub fn holds(&self, state: &Bits, step: &Bits) -> bool {
         fn eval(f: &Ltl, state: &Bits, step: &Bits) -> bool {
             match f {
@@ -30,15 +37,15 @@ impl Condition<'_> {
                 Ltl::Always(_) | Ltl::Eventually(_) => unreachable!("propositional condition"),
             }
         }
-        eval(self.body, state, step) != self.neg
+        eval(&self.0, state, step)
     }
 }
 
 /// One disjunct of the negation of a property (see the module doc).
 #[derive(Debug, Default)]
-pub(crate) struct Disjunct<'a> {
-    pub recur: Vec<Condition<'a>>,
-    pub persist: Vec<Condition<'a>>,
+pub(crate) struct Disjunct {
+    pub recur: Vec<Condition>,
+    pub persist: Vec<Condition>,
     /// The other conjuncts, if any: their conjunction (not negated).
     pub rest: Option<Ltl>,
 }
@@ -48,34 +55,223 @@ pub(crate) struct Disjunct<'a> {
 /// of its top-level conjuncts.
 const MAX_DISJUNCTS: usize = 64;
 
-/// The disjuncts of the negation of `prop` (borrowing its bodies; the rest
-/// is cloned). The formula is not put in a normal form beyond pushing the
-/// negation through the connectives, with at most `MAX_DISJUNCTS`
-/// disjuncts.
-pub(crate) fn split_negation(prop: &Ltl) -> Vec<Disjunct<'_>> {
-    let conjunctions = dnf(prop, true).filter(|d| d.len() <= MAX_DISJUNCTS).unwrap_or_else(|| {
+/// The disjuncts of the negation of `prop`, normalized in negation normal
+/// form with suffix-invariant tail formulas hoisted to the top level and at
+/// most `MAX_DISJUNCTS` disjuncts.
+pub(crate) fn split_negation(prop: &Ltl) -> Vec<Disjunct> {
+    let neg = norm(prop, true);
+    let conjunctions = dnf(&neg).filter(|d| d.len() <= MAX_DISJUNCTS).unwrap_or_else(|| {
         let mut c = Vec::new();
-        conjuncts(prop, true, &mut c);
+        conjuncts(&neg, &mut c);
         vec![c]
     });
     conjunctions.into_iter().map(|c| disjunct(&c)).collect()
 }
 
-/// A conjunct: a formula and whether it is negated.
-type Lit<'a> = (&'a Ltl, bool);
+fn propositional(f: &Ltl) -> bool {
+    match f {
+        Ltl::Always(_) | Ltl::Eventually(_) => false,
+        Ltl::Not(x) => propositional(x),
+        Ltl::And(xs) | Ltl::Or(xs) => xs.iter().all(propositional),
+        _ => true,
+    }
+}
 
-/// `f` (negated if `neg`) in disjunctive normal form over its temporal
+/// Whether `f` is suffix-invariant: its truth at any position of an infinite
+/// behavior equals its truth at position 0.
+fn is_tail(f: &Ltl) -> bool {
+    match f {
+        Ltl::True | Ltl::False => true,
+        Ltl::Always(x) => matches!(&**x, Ltl::Eventually(_)) || is_tail(x),
+        Ltl::Eventually(x) => matches!(&**x, Ltl::Always(_)) || is_tail(x),
+        Ltl::Not(x) => is_tail(x),
+        Ltl::And(xs) | Ltl::Or(xs) => xs.iter().all(is_tail),
+        Ltl::State(_) | Ltl::Action(_) => false,
+    }
+}
+
+/// Propositional body `x` if `f` is `[]<>x`.
+fn ae_prop_body(f: &Ltl) -> Option<&Ltl> {
+    match f {
+        Ltl::Always(x) => match &**x {
+            Ltl::Eventually(y) if propositional(y) => Some(y),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn make_and(xs: Vec<Ltl>) -> Ltl {
+    let mut flat = Vec::new();
+    for x in xs {
+        match x {
+            Ltl::True => {}
+            Ltl::False => return Ltl::False,
+            Ltl::And(ys) => flat.extend(ys),
+            y => flat.push(y),
+        }
+    }
+    match flat.len() {
+        0 => Ltl::True,
+        1 => flat.pop().unwrap(),
+        _ => Ltl::And(flat),
+    }
+}
+
+fn make_or(xs: Vec<Ltl>) -> Ltl {
+    let (mut flat, mut ae, mut ae_pos) = (Vec::new(), Vec::new(), None);
+    let mut add = |x: Ltl| match x {
+        Ltl::False => {}
+        Ltl::True => flat.push(Ltl::True),
+        y => match ae_prop_body(&y) {
+            Some(b) => {
+                if ae_pos.is_none() {
+                    ae_pos = Some(flat.len());
+                    flat.push(Ltl::False);
+                }
+                ae.push(b.clone());
+            }
+            None => flat.push(y),
+        },
+    };
+    for x in xs {
+        match x {
+            Ltl::Or(ys) => ys.into_iter().for_each(&mut add),
+            y => add(y),
+        }
+    }
+    if flat.iter().any(|x| matches!(x, Ltl::True)) {
+        return Ltl::True;
+    }
+    if let Some(pos) = ae_pos {
+        let body = if ae.len() == 1 { ae.pop().unwrap() } else { Ltl::Or(ae) };
+        flat[pos] = Ltl::Always(Box::new(Ltl::Eventually(Box::new(body))));
+    }
+    match flat.len() {
+        0 => Ltl::False,
+        1 => flat.pop().unwrap(),
+        _ => Ltl::Or(flat),
+    }
+}
+
+fn make_eventually(inner: Ltl) -> Ltl {
+    if is_tail(&inner) {
+        return inner;
+    }
+    match inner {
+        Ltl::Eventually(y) => Ltl::Eventually(y),
+        Ltl::And(xs) if xs.iter().any(is_tail) => {
+            let (tails, rest): (Vec<_>, Vec<_>) = xs.into_iter().partition(is_tail);
+            let mut out = Vec::with_capacity(tails.len() + 1);
+            if !rest.is_empty() {
+                out.push(make_eventually(make_and(rest)));
+            }
+            out.extend(tails);
+            make_and(out)
+        }
+        Ltl::Or(xs) if xs.iter().any(|x| is_tail(x) || matches!(x, Ltl::And(ys) if ys.iter().any(is_tail))) => {
+            let (mut hoisted, mut plain) = (Vec::new(), Vec::new());
+            for x in xs {
+                if is_tail(&x) || matches!(&x, Ltl::And(ys) if ys.iter().any(is_tail)) {
+                    hoisted.push(make_eventually(x));
+                } else {
+                    plain.push(x);
+                }
+            }
+            if !plain.is_empty() {
+                hoisted.push(Ltl::Eventually(Box::new(make_or(plain))));
+            }
+            make_or(hoisted)
+        }
+        y => Ltl::Eventually(Box::new(y)),
+    }
+}
+
+fn make_always(inner: Ltl) -> Ltl {
+    if is_tail(&inner) {
+        return inner;
+    }
+    match inner {
+        Ltl::Always(y) => Ltl::Always(y),
+        Ltl::Or(xs) if xs.iter().any(is_tail) => {
+            let (tails, rest): (Vec<_>, Vec<_>) = xs.into_iter().partition(is_tail);
+            let mut out = Vec::with_capacity(tails.len() + 1);
+            if !rest.is_empty() {
+                out.push(make_always(make_or(rest)));
+            }
+            out.extend(tails);
+            make_or(out)
+        }
+        Ltl::And(xs) if xs.iter().any(|x| is_tail(x) || matches!(x, Ltl::Or(ys) if ys.iter().any(is_tail))) => {
+            let (mut hoisted, mut plain) = (Vec::new(), Vec::new());
+            for x in xs {
+                if is_tail(&x) || matches!(&x, Ltl::Or(ys) if ys.iter().any(is_tail)) {
+                    hoisted.push(make_always(x));
+                } else {
+                    plain.push(x);
+                }
+            }
+            if !plain.is_empty() {
+                hoisted.push(Ltl::Always(Box::new(make_and(plain))));
+            }
+            make_and(hoisted)
+        }
+        y => Ltl::Always(Box::new(y)),
+    }
+}
+
+/// Negation normal form of `f` (negated if `neg`), hoisting suffix-invariant
+/// subformulas out of `[]` and `<>` and merging propositional `[]<>`
+/// disjunctions.
+fn norm(f: &Ltl, neg: bool) -> Ltl {
+    match f {
+        Ltl::Not(x) => norm(x, !neg),
+        Ltl::True | Ltl::False => {
+            if matches!(f, Ltl::True) != neg {
+                Ltl::True
+            } else {
+                Ltl::False
+            }
+        }
+        Ltl::State(_) | Ltl::Action(_) => {
+            if neg {
+                Ltl::Not(Box::new(f.clone()))
+            } else {
+                f.clone()
+            }
+        }
+        Ltl::And(xs) | Ltl::Or(xs) => {
+            let conj = matches!(f, Ltl::And(_)) != neg;
+            let ys: Vec<Ltl> = xs.iter().map(|x| norm(x, neg)).collect();
+            if conj {
+                make_and(ys)
+            } else {
+                make_or(ys)
+            }
+        }
+        Ltl::Always(x) | Ltl::Eventually(x) => {
+            let always = matches!(f, Ltl::Always(_)) != neg;
+            let y = norm(x, neg);
+            if always {
+                make_always(y)
+            } else {
+                make_eventually(y)
+            }
+        }
+    }
+}
+
+/// `f` (already in NNF) in disjunctive normal form over its temporal
 /// subformulas and atoms, if it has at most `MAX_DISJUNCTS` disjuncts
 /// (each a list of conjuncts; no disjunct: FALSE, an empty one: TRUE).
-fn dnf(f: &Ltl, neg: bool) -> Option<Vec<Vec<Lit<'_>>>> {
+fn dnf(f: &Ltl) -> Option<Vec<Vec<&Ltl>>> {
     match f {
-        Ltl::Not(x) => dnf(x, !neg),
-        Ltl::True | Ltl::False => Some(if matches!(f, Ltl::True) != neg { vec![Vec::new()] } else { Vec::new() }),
-        Ltl::And(xs) | Ltl::Or(xs) if matches!(f, Ltl::And(_)) != neg => {
-            // A conjunction: every combination of its parts' disjuncts.
+        Ltl::True => Some(vec![Vec::new()]),
+        Ltl::False => Some(Vec::new()),
+        Ltl::And(xs) => {
             let mut out = vec![Vec::new()];
             for x in xs {
-                let d = dnf(x, neg)?;
+                let d = dnf(x)?;
                 if out.len().saturating_mul(d.len()) > MAX_DISJUNCTS {
                     return None;
                 }
@@ -83,39 +279,38 @@ fn dnf(f: &Ltl, neg: bool) -> Option<Vec<Vec<Lit<'_>>>> {
             }
             Some(out)
         }
-        Ltl::And(xs) | Ltl::Or(xs) => {
+        Ltl::Or(xs) => {
             let mut out = Vec::new();
             for x in xs {
-                out.extend(dnf(x, neg)?);
+                out.extend(dnf(x)?);
                 if out.len() > MAX_DISJUNCTS {
                     return None;
                 }
             }
             Some(out)
         }
-        _ => Some(vec![vec![(f, neg)]]),
+        _ => Some(vec![vec![f]]),
     }
 }
 
-/// The top-level conjuncts of `f` (negated if `neg`), into `out`.
-fn conjuncts<'a>(f: &'a Ltl, neg: bool, out: &mut Vec<Lit<'a>>) {
+/// The top-level conjuncts of `f` (in NNF), into `out`.
+fn conjuncts<'a>(f: &'a Ltl, out: &mut Vec<&'a Ltl>) {
     match f {
-        Ltl::Not(x) => conjuncts(x, !neg, out),
-        Ltl::And(xs) if !neg => xs.iter().for_each(|x| conjuncts(x, neg, out)),
-        Ltl::Or(xs) if neg => xs.iter().for_each(|x| conjuncts(x, neg, out)),
-        _ => out.push((f, neg)),
+        Ltl::And(xs) => xs.iter().for_each(|x| conjuncts(x, out)),
+        Ltl::True => {}
+        _ => out.push(f),
     }
 }
 
 /// The conditions and the rest of the conjunction `c`.
-fn disjunct<'a>(c: &[Lit<'a>]) -> Disjunct<'a> {
+fn disjunct(c: &[&Ltl]) -> Disjunct {
     let mut d = Disjunct::default();
     let mut rest = Vec::new();
-    for &(f, neg) in c {
-        match condition(f, neg) {
+    for &f in c {
+        match condition(f) {
             Some((true, cond)) => d.recur.push(cond),
             Some((false, cond)) => d.persist.push(cond),
-            None => rest.push(if neg { Ltl::Not(Box::new(f.clone())) } else { f.clone() }),
+            None => rest.push(f.clone()),
         }
     }
     d.rest = match rest.len() {
@@ -126,37 +321,19 @@ fn disjunct<'a>(c: &[Lit<'a>]) -> Disjunct<'a> {
     d
 }
 
-/// `f` (negated if `neg`) as a recurrence (`(true, x)` for `[]<>x`) or
-/// persistence condition (`(false, x)` for `<>[]x`), if it is one.
-fn condition(f: &Ltl, neg: bool) -> Option<(bool, Condition<'_>)> {
-    match (f, neg) {
-        (Ltl::Not(x), _) => condition(x, !neg),
-        // []y, with y = <>x for a recurrence.
-        (Ltl::Always(y), false) | (Ltl::Eventually(y), true) => inner(y, neg, true).map(|c| (true, c)),
-        // <>y, with y = []x for a persistence.
-        (Ltl::Eventually(y), false) | (Ltl::Always(y), true) => inner(y, neg, false).map(|c| (false, c)),
-        _ => None,
-    }
-}
-
-/// `y` (negated if `neg`) as `<>x` (`eventually`) or `[]x` with `x`
-/// propositional: `x` as a condition.
-fn inner(y: &Ltl, neg: bool, eventually: bool) -> Option<Condition<'_>> {
-    match y {
-        Ltl::Not(z) => inner(z, !neg, eventually),
-        Ltl::Eventually(x) | Ltl::Always(x) if (matches!(y, Ltl::Eventually(_)) != neg) == eventually && propositional(x) => {
-            Some(Condition { body: x, neg })
-        }
-        _ => None,
-    }
-}
-
-fn propositional(f: &Ltl) -> bool {
+/// `f` (in NNF) as a recurrence (`(true, x)` for `[]<>x`) or persistence
+/// condition (`(false, x)` for `<>[]x`), if `x` is propositional.
+fn condition(f: &Ltl) -> Option<(bool, Condition)> {
     match f {
-        Ltl::Always(_) | Ltl::Eventually(_) => false,
-        Ltl::Not(x) => propositional(x),
-        Ltl::And(xs) | Ltl::Or(xs) => xs.iter().all(propositional),
-        _ => true,
+        Ltl::Always(y) => match &**y {
+            Ltl::Eventually(x) if propositional(x) => Some((true, Condition((**x).clone()))),
+            _ => None,
+        },
+        Ltl::Eventually(y) => match &**y {
+            Ltl::Always(x) if propositional(x) => Some((false, Condition((**x).clone()))),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -215,5 +392,26 @@ mod tests {
         let d = split_negation(&prop);
         assert_eq!(d.len(), 1);
         assert!(d[0].rest.is_some());
+    }
+
+    #[test]
+    fn tail_conditions_hoist_out_of_eventually_and_merge_in_or() {
+        // `[]( \E k \in 0..7 : s_k => <>[]r_k )` (`bcastFolklore` ReliableChan):
+        // negation `<>( /\ (s_k /\ []<>~r_k) )` hoists all 8 `[]<>~r_k` to top-level
+        // recurrence conditions, leaving only `<>(s_0 /\ ... /\ s_7)` in `rest`.
+        let prop = al(Ltl::Or((0..8).map(|k| Ltl::Or(vec![not(st(2 * k)), ev(al(st(2 * k + 1)))])).collect()));
+        let d = split_negation(&prop);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].recur.len(), d[0].persist.len()), (8, 0));
+        assert_eq!(d[0].rest, Some(ev(Ltl::And((0..8).map(|k| st(2 * k)).collect()))));
+
+        // `\E k \in 0..11 : (<>[]a_k /\ <>[]b_k)`: negation is a 12-way conjunction
+        // of `([]<>~a_k \/ []<>~b_k)`, each merged to `[]<>(~a_k \/ ~b_k)` so it
+        // produces 1 disjunct of 12 recurrence conditions and no tableau.
+        let prop = Ltl::Or((0..12).map(|k| Ltl::And(vec![ev(al(st(2 * k))), ev(al(st(2 * k + 1)))])).collect());
+        let d = split_negation(&prop);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].recur.len(), 12);
+        assert!(d[0].rest.is_none());
     }
 }

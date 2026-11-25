@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use crate::recurrence::Condition;
 use crate::tableau::Automaton;
-use crate::{Bits, GraphView};
+use crate::{Bits, GraphView, Ids};
 
 use super::automaton::{AutInfo, GraphBfs, NodeMap, Part, DENSE_LIMIT};
 use super::{Prod, NONE};
@@ -22,10 +22,10 @@ pub(super) struct Check<'a> {
     pub(super) aut: Automaton,
     pub(super) info: AutInfo,
     /// Its recurrence conditions (`Prod::need`: on edges).
-    pub(super) recur: &'a [Condition<'a>],
+    pub(super) recur: &'a [Condition],
     /// Its persistence conditions: the product keeps only the edges whose
     /// position satisfies them.
-    pub(super) persist: &'a [Condition<'a>],
+    pub(super) persist: &'a [Condition],
 }
 
 /// The reachable product in CSR form, without the nodes of waiting states
@@ -35,21 +35,21 @@ pub(super) struct Product<'a, G: GraphView> {
     g: &'a G,
     aut: &'a Automaton,
     info: &'a AutInfo,
-    recurrence: &'a [Condition<'a>],
+    recurrence: &'a [Condition],
     /// With waiting states.
     bfs: Option<&'a GraphBfs>,
     pub(super) st: Vec<u32>,
-    aq: Vec<u32>,
+    aq: Ids,
     /// BFS tree: `(parent node, index of the graph edge from its state)`;
     /// `NONE` for roots, `FROM_WAITING` for nodes entered from a waiting
     /// state.
     parent: Vec<(u32, u32)>,
-    /// The BFS distance of each node (while it is built).
-    dist: Vec<u32>,
+    /// Monotone `(start_node, dist)` spans while building with waiting states.
+    levels: Vec<(u32, u32)>,
     off: Vec<usize>,
     pub(super) tgt: Vec<u32>,
     /// Index into `edges[st[source]]` of the graph edge behind each product edge.
-    pub(super) gedge: Vec<u32>,
+    pub(super) gedge: Ids,
 }
 
 pub(crate) fn lits_hold(lits: &[(u32, bool)], bits: &Bits) -> bool {
@@ -58,35 +58,36 @@ pub(crate) fn lits_hold(lits: &[(u32, bool)], bits: &Bits) -> bool {
 
 impl<'a, G: GraphView> Product<'a, G> {
     /// The memory of the product (bytes, estimated from its allocations),
-    /// with the node map, the graph's BFS and what the search adds per node.
+    /// with the larger of the build-time node map and the post-build SCC
+    /// search buffers (`map` is dropped before `fair_cycle` allocates `Search`).
     fn bytes(&self, map: &NodeMap) -> usize {
         let bfs = self.bfs;
-        let nodes = self.st.capacity() * 4
-            + self.aq.capacity() * 4
-            + self.parent.capacity() * 8
-            + self.dist.capacity() * 4
-            + self.off.capacity() * 8;
+        let nodes =
+            self.st.capacity() * 4 + self.aq.bytes() + self.parent.capacity() * 8 + self.levels.capacity() * 8 + self.off.capacity() * 8;
         self.aut.bytes()
             + self.info.bytes()
             + std::mem::size_of_val(self.recurrence)
             + bfs.map_or(0, GraphBfs::bytes)
             + nodes
             + self.tgt.capacity() * 4
-            + self.gedge.capacity() * 4
-            + map.bytes()
-            + self.st.len() * SEARCH_NODE_BYTES
+            + self.gedge.bytes()
+            + map.bytes().max(self.st.len() * SEARCH_NODE_BYTES)
     }
 
     /// Node `(s, q)` with BFS tree parent `parent` at distance `dist`,
     /// added unless it exists: its id.
     #[inline]
     fn add(&mut self, map: &mut NodeMap, s: u32, q: u32, parent: (u32, u32), dist: u32) -> u32 {
-        let (w, fresh) = map.get_or_insert(s, self.info.slot[q as usize], self.st.len() as u32);
+        let id = self.st.len() as u32;
+        let (w, fresh) = map.get_or_insert(s, self.info.slot[q as usize], id);
         if fresh {
             self.st.push(s);
             self.aq.push(q);
             self.parent.push(parent);
-            self.dist.push(dist);
+            if self.bfs.is_some() && self.levels.last().is_none_or(|&(_, d)| d != dist) {
+                debug_assert!(self.levels.last().is_none_or(|&(_, d)| dist >= d));
+                self.levels.push((id, dist));
+            }
         }
         w
     }
@@ -121,12 +122,12 @@ impl<'a, G: GraphView> Product<'a, G> {
             recurrence,
             bfs,
             st: Vec::new(),
-            aq: Vec::new(),
+            aq: Ids::zeros(0, aut.states.len().saturating_sub(1) as u32),
             parent: Vec::new(),
-            dist: Vec::new(),
+            levels: Vec::new(),
             off: vec![0],
             tgt: Vec::new(),
-            gedge: Vec::new(),
+            gedge: Ids::default(),
         };
         let state_ok = |q: u32, s: u32| lits_hold(&aut.states[q as usize].state_lits, g.state_bits(s));
         let mine = |q: u32| part.states.binary_search(&q).is_ok();
@@ -138,37 +139,50 @@ impl<'a, G: GraphView> Product<'a, G> {
             }
         }
         // The next graph state entered from waiting states (in
-        // `GraphBfs::order`).
+        // `GraphBfs::order`), and the current span in `p.levels`.
         let mut entered = 0;
+        let mut lvl = 0;
         let mut v = 0;
         loop {
-            if let Some(bfs) = &bfs {
+            let d = if let Some(bfs) = &bfs {
+                while p.levels.get(lvl + 1).is_some_and(|&(start, _)| v >= start as usize) {
+                    lvl += 1;
+                }
                 // Enter the nodes of the waiting states' steps at the
                 // distance of the next node's successors (with no node left,
                 // at the next such distance), keeping the ids in BFS order.
-                let upto = match p.dist.get(v) {
-                    Some(&d) => d + 1,
-                    None if entered < bfs.order.len() => bfs.entry_dist(bfs.order[entered]),
-                    None => break,
+                let upto = if v < p.st.len() {
+                    p.levels[lvl].1 + 1
+                } else if entered < bfs.order.len() {
+                    bfs.entry_dist(bfs.order[entered])
+                } else {
+                    break;
                 };
                 while let Some(&t) = bfs.order.get(entered) {
-                    let d = bfs.entry_dist(t);
-                    if d > upto {
+                    let dt = bfs.entry_dist(t);
+                    if dt > upto {
                         break;
                     }
                     entered += 1;
                     for &q in &part.entries {
                         if state_ok(q, t) {
-                            p.add(&mut map, t, q, (FROM_WAITING, 0), d);
+                            p.add(&mut map, t, q, (FROM_WAITING, 0), dt);
                         }
                     }
                 }
                 if v == p.st.len() {
                     continue;
                 }
-            } else if v == p.st.len() {
-                break;
-            }
+                while p.levels.get(lvl + 1).is_some_and(|&(start, _)| v >= start as usize) {
+                    lvl += 1;
+                }
+                p.levels[lvl].1
+            } else {
+                if v == p.st.len() {
+                    break;
+                }
+                0
+            };
             if v % GUARD_EVERY == GUARD_EVERY - 1 {
                 if let Some(f) = within.as_deref_mut() {
                     if !f(p.st.len(), p.tgt.len(), p.bytes(&map)) {
@@ -176,7 +190,7 @@ impl<'a, G: GraphView> Product<'a, G> {
                     }
                 }
             }
-            let (s, q, d) = (p.st[v], p.aq[v], p.dist[v]);
+            let (s, q) = (p.st[v], p.aq.get(v));
             let a = &aut.states[q as usize];
             for li in 0..g.degree(s) {
                 let (t, bits) = g.edge(s, li);
@@ -202,7 +216,7 @@ impl<'a, G: GraphView> Product<'a, G> {
                 return None;
             }
         }
-        p.dist = Vec::new();
+        p.levels = Vec::new();
         Some(p)
     }
 
@@ -265,12 +279,12 @@ impl<G: GraphView> Prod for Product<'_, G> {
 
     #[inline]
     fn live(&self, v: u32) -> bool {
-        self.info.live[self.aq[v as usize] as usize]
+        self.info.live[self.aq.get(v as usize) as usize]
     }
 
     #[inline]
     fn acc(&self, v: u32) -> &[bool] {
-        &self.aut.states[self.aq[v as usize] as usize].acc
+        &self.aut.states[self.aq.get(v as usize) as usize].acc
     }
 
     fn num_acc(&self) -> usize {
@@ -293,6 +307,6 @@ impl<G: GraphView> Prod for Product<'_, G> {
 
     #[inline]
     fn edge_bits(&self, v: u32, e: usize) -> &Bits {
-        self.g.edge(self.st[v as usize], self.gedge[e] as usize).1
+        self.g.edge(self.st[v as usize], self.gedge.get(e) as usize).1
     }
 }

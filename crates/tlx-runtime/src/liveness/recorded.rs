@@ -1,9 +1,20 @@
 //! Checking the behavior graph recorded during the search.
 
+use std::borrow::Cow;
+
 use super::shape::{violated, violated_names, Shape};
 use super::{LiveInput, LiveResult, STUTTER};
 use crate::mem::RssGuard;
 use crate::{LiveGraph, Model, ModelError};
+
+struct ReplayStep {
+    src: u32,
+    edge: u32,
+    stutter: bool,
+    target_fp: u64,
+    state_pat: u32,
+    action_pat: u32,
+}
 
 /// Check every temporal property of `input` on the behavior graph `g`
 /// recorded during the search of `m` (on up to `workers` threads). A counterexample's states are rebuilt
@@ -13,7 +24,7 @@ use crate::{LiveGraph, Model, ModelError};
 pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, workers: usize, guard: RssGuard) -> LiveResult<M::State> {
     record_live_graph(&g);
     let LiveGraph { init, fps, off, tgt, edge_pat, state_pat, state_pats, action_pats } = g;
-    let bits = |p: Vec<Box<[u64]>>| p.iter().map(|b| tlx_live::Bits::from_words(b)).collect();
+    let bits = |p: Vec<Box<[u64]>>| p.into_iter().map(tlx_live::Bits::from_boxed_words).collect();
     let graph = tlx_live::Csr { init, off, tgt, edge_pat, state_pat, state_pats: bits(state_pats), action_pats: bits(action_pats) };
     let (mut peak, mut err) = ((0, 0, 0), None);
     for (i, (_, f)) in input.props.iter().enumerate() {
@@ -23,36 +34,58 @@ pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, w
         record_check(&st);
         let Ok(r) = r else { return LiveResult::OutOfMemory(err.unwrap_or_default()) };
         if let Err(cx) = r {
-            let lasso: Vec<(u32, u32)> = cx.prefix.iter().chain(&cx.cycle).copied().collect();
-            let path = match replay(m, &graph, &fps, &lasso) {
+            let steps: Vec<ReplayStep> = cx
+                .prefix
+                .iter()
+                .chain(&cx.cycle)
+                .map(|&(src, edge)| {
+                    let idx = edge as usize;
+                    let e = graph.off[src as usize] + idx;
+                    let t = graph.tgt[e];
+                    ReplayStep {
+                        src,
+                        edge,
+                        stutter: idx + 1 == graph.degree(src),
+                        target_fp: fps[t as usize],
+                        state_pat: graph.state_pat[src as usize],
+                        action_pat: graph.edge_pat.get(e),
+                    }
+                })
+                .collect();
+            let first = steps.first().map(|step| fps[step.src as usize]);
+            let (state_pats, action_pats) = {
+                let mut csr = graph;
+                (std::mem::take(&mut csr.state_pats), std::mem::take(&mut csr.action_pats))
+            };
+            drop(fps);
+            let path = match replay(m, first, &steps) {
                 Ok(p) => p,
                 Err(e) => return LiveResult::Error(e),
             };
-            let seq: Vec<(u32, &M::State, u32)> = lasso.iter().zip(&path).map(|(&(s, _), (st, a))| (s, st, *a)).collect();
+            let seq: Vec<(u32, &M::State, u32)> = steps.iter().zip(&path).map(|(step, (st, a))| (step.src, st, *a)).collect();
             let sh = Shape::new(&seq, cx.prefix.len());
-            let names = violated_names(input, &sh, &mut |k| Ok(graph.state_bits(lasso[sh.shown[k].pos].0).clone()), &mut |k| {
-                let (s, e) = lasso[sh.shown[k].leave];
-                Ok(graph.edge(s, e as usize).1.clone())
-            });
+            let names =
+                violated_names(input, &sh, &mut |k| Ok(Cow::Borrowed(&state_pats[steps[sh.shown[k].pos].state_pat as usize])), &mut |k| {
+                    Ok(Cow::Borrowed(&action_pats[steps[sh.shown[k].leave].action_pat as usize]))
+                });
             return violated(names, i, &seq, &sh);
         }
     }
     LiveResult::Holds
 }
 
-/// The states along the path `lasso` (node, edge leaving it) of the recorded
-/// graph `g` of `m` (node fingerprints `fps`), each with the action of the
-/// edge leaving it: re-executed from the initial state, taking at each node
-/// the successor in the model the edge stands for (the edges of a state are
-/// its successors in the model in generation order, then the stuttering
-/// step), as error traces are rebuilt. An error if `m` fails or a state's
-/// fingerprint is not the node's (a bug: the graph is of this model).
-fn replay<M: Model>(m: &M, g: &tlx_live::Csr, fps: &[u64], lasso: &[(u32, u32)]) -> Result<Vec<(M::State, u32)>, ModelError> {
+/// The states along `steps` of the recorded graph of `m`, each with the
+/// action of the edge leaving it: re-executed from the initial state, taking
+/// at each node the successor in the model the edge stands for (the edges of
+/// a state are its successors in the model in generation order, then the
+/// stuttering step), as error traces are rebuilt. An error if `m` fails or a
+/// state's fingerprint is not the node's (a bug: the graph is of this model).
+fn replay<M: Model>(m: &M, first: Option<u64>, steps: &[ReplayStep]) -> Result<Vec<(M::State, u32)>, ModelError> {
     let lost = || ModelError::new("internal error: a counterexample of the recorded liveness graph cannot be replayed");
     // (An error counts as a step out of the model: the search evaluated
     // these steps without one, so the path is lost then, reported below.)
     let in_model = |s: &M::State, t: &M::State| crate::admits(m, s, t).unwrap_or(false);
-    let first = fps[lasso.first().ok_or_else(lost)?.0 as usize];
+    let first = first.ok_or_else(lost)?;
     let mut found = None;
     m.init_states(&mut |s| {
         if found.is_none() && m.fingerprint(&s) == first && matches!(m.constraint(&s), Ok(true)) {
@@ -60,10 +93,10 @@ fn replay<M: Model>(m: &M, g: &tlx_live::Csr, fps: &[u64], lasso: &[(u32, u32)])
         }
     })?;
     let mut cur = found.ok_or_else(lost)?;
-    let mut path = Vec::with_capacity(lasso.len());
-    for &(s, e) in lasso {
-        let e = e as usize;
-        let (t, a) = if e + 1 == g.degree(s) {
+    let mut path = Vec::with_capacity(steps.len());
+    for step in steps {
+        let e = step.edge as usize;
+        let (t, a) = if step.stutter {
             (cur.clone(), STUTTER)
         } else {
             let (mut i, mut next) = (0, None);
@@ -79,7 +112,7 @@ fn replay<M: Model>(m: &M, g: &tlx_live::Csr, fps: &[u64], lasso: &[(u32, u32)])
             })?;
             next.ok_or_else(lost)?
         };
-        if m.fingerprint(&t) != fps[g.edge(s, e).0 as usize] {
+        if m.fingerprint(&t) != step.target_fp {
             return Err(lost());
         }
         path.push((std::mem::replace(&mut cur, t), a));

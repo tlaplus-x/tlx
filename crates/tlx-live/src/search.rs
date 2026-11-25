@@ -197,7 +197,7 @@ impl<G: GraphView + Sync> PartCx<'_, G> {
         stats.build_secs += t0.elapsed().as_secs_f64();
         let t0 = std::time::Instant::now();
         let found = fair_cycle(&p, self.fair).map(|(v0, cycle)| {
-            let cycle = cycle.into_iter().map(|(v, e)| (p.st[v as usize], p.gedge[e])).collect();
+            let cycle = cycle.into_iter().map(|(v, e)| (p.st[v as usize], p.gedge.get(e))).collect();
             Lasso { prefix: p.prefix(v0), cycle }
         });
         stats.search_secs += t0.elapsed().as_secs_f64();

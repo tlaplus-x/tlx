@@ -216,3 +216,74 @@ fn persistence_assumptions_need_no_tableau() {
     assert!(lasso_error(&g, &prop, &[], &l).is_none());
     assert!(peak <= n as usize, "{peak} product nodes for {n} states");
 }
+
+#[test]
+fn nested_tail_conditions_and_strong_fairness_startup_scale_linearly() {
+    use tlx_live::{
+        branches, check_lasso_csr_stats, check_size, reports_early, tableau_initial_checks, tableau_state_atoms, CheckStats, Csr,
+    };
+    // `[]( \E k \in 0..16 : s_k => <>[]r_k )` (`bcastFolklore`'s ReliableChan
+    // pattern scaled to k = 16): without hoisting `[]<>~r_k` out of `<>`, the
+    // negation `<>( /\ (s_k /\ []<>~r_k) )` builds >= 2^16 tableau states.
+    let n = 1000u32;
+    let k = 16u32;
+    let all_s = (1u64 << k) - 1;
+    // State 0 sets all s_k; subsequent states cycle through clearing one r_k at
+    // a time so every []<>~r_k holds on the cycle after leaving state 0.
+    let states: Vec<u64> = (0..n)
+        .map(|s| {
+            let s_bits = if s == 0 { all_s } else { 0 };
+            let r_clear = (s as u64) % u64::from(k);
+            let r_bits = ((all_s) & !(1u64 << r_clear)) << k;
+            s_bits | r_bits
+        })
+        .collect();
+    let edges: Vec<(u32, u32, u64)> = (0..n).map(|s| (s, (s + 1) % n, 1)).collect();
+    let g = graph(&[0], &states, &edges, true);
+    let csr = Csr::from_graph(&g);
+    let prop = always(or((0..k).map(|i| or(vec![not(st(i)), eventually(always(st(k + i)))])).collect()));
+    let mut stats = CheckStats::default();
+    let mut peak_bytes = 0usize;
+    let res = check_lasso_csr_stats(
+        &csr,
+        &prop,
+        &[wf(0, 0)],
+        1,
+        &mut |_, _, bytes| {
+            peak_bytes = peak_bytes.max(bytes);
+            true
+        },
+        &mut stats,
+    )
+    .expect("fits");
+    let lasso = res.expect_err("every r_k fails infinitely often after state 0");
+    assert!(lasso_error(&g, &prop, &[wf(0, 0)], &lasso).is_none());
+    assert_eq!(stats.tableau_states, 3, "entry, waiting state, and accepting sink");
+    assert_eq!(stats.waiting_states, 1);
+    assert!(stats.product_nodes <= n as usize * 2);
+    // Compacted `aq` (u8), `gedge` (u8), and level-span distances keep the
+    // 1000-node, 2000-edge product well below 128 KiB.
+    assert!(peak_bytes < 128 * 1024, "peak product bytes = {peak_bytes}");
+
+    // Startup metadata helpers on 24 strong fairness constraints and 20-way
+    // `([]<> \/ <>[])` conjunctions must not materialize 2^24 / 2^20 DNF rows.
+    let many_sf: Vec<_> = (0..24).map(|i| sf(i, i)).collect();
+    let t0 = Instant::now();
+    assert!(check_size(&eventually(st(0)), &many_sf).is_ok());
+    assert_eq!(tableau_state_atoms(&eventually(st(0)), &many_sf), vec![0]);
+    assert_eq!(tableau_initial_checks(&eventually(st(0)), &many_sf), vec![vec![(0, false)]]);
+    assert!(!reports_early(&always(or(vec![not(st(0)), always(st(1))])), &many_sf));
+
+    let pem_conj = or((0..20).map(|i| and(vec![always(eventually(st(2 * i))), eventually(always(st(2 * i + 1)))])).collect());
+    assert!(check_size(&pem_conj, &[]).is_ok());
+    assert!(tableau_state_atoms(&pem_conj, &[]).is_empty());
+    assert!(tableau_initial_checks(&pem_conj, &[]).is_empty());
+    assert!(!reports_early(&pem_conj, &[]));
+    assert_eq!(branches([&pem_conj]), 1);
+
+    // 13 binary choices (8,192 distinct rows) must deduplicate in O(rows), not O(rows^2).
+    let bin13 = or((0..13).map(|i| and(vec![always(st(2 * i)), always(st(2 * i + 1))])).collect());
+    assert_eq!(tableau_state_atoms(&bin13, &[]).len(), 26);
+    assert_eq!(branches([&bin13]), 1 << 13);
+    assert!(t0.elapsed().as_secs_f64() < 1.0, "startup metadata took {:?}", t0.elapsed());
+}

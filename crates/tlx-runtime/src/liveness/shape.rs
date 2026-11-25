@@ -1,5 +1,7 @@
 //! A counterexample as TLC shows it, and the properties it violates.
 
+use std::borrow::Cow;
+
 use super::{LiveInput, LiveResult, Violation};
 use crate::AtomBits;
 
@@ -115,11 +117,11 @@ pub(super) fn violated<S: Clone>(names: Vec<String>, prop: usize, seq: &[(u32, &
 /// If an atom cannot be evaluated, no property is named (TLC reports the
 /// error and leaves the property out; the atoms were evaluated on these
 /// states when the counterexample was found, so this is not expected).
-pub(super) fn violated_names(
+pub(super) fn violated_names<'a>(
     input: &LiveInput,
     sh: &Shape,
-    state: &mut dyn FnMut(usize) -> Result<tlx_live::Bits, String>,
-    step: &mut dyn FnMut(usize) -> Result<tlx_live::Bits, String>,
+    state: &mut dyn FnMut(usize) -> Result<Cow<'a, tlx_live::Bits>, String>,
+    step: &mut dyn FnMut(usize) -> Result<Cow<'a, tlx_live::Bits>, String>,
 ) -> Vec<String> {
     let bits: Result<Vec<_>, String> = (0..sh.shown.len()).map(|k| Ok((state(k)?, step(k)?))).collect();
     let Ok(bits) = bits else { return Vec::new() };
@@ -134,6 +136,6 @@ pub(super) fn violated_names(
 }
 
 /// The action-atom bits of the step `s -> t`.
-pub(super) fn step_bits<S>(bits: &(dyn AtomBits<S> + Sync), s: &S, t: &S) -> Result<tlx_live::Bits, String> {
-    bits.action(s, t).map(|b| tlx_live::Bits::from_words(&b)).map_err(|e| e.message)
+pub(super) fn step_bits<S>(bits: &(dyn AtomBits<S> + Sync), s: &S, t: &S) -> Result<Cow<'static, tlx_live::Bits>, String> {
+    bits.action(s, t).map(|b| Cow::Owned(tlx_live::Bits::from_words(&b))).map_err(|e| e.message)
 }

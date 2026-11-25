@@ -410,6 +410,7 @@ pub(crate) fn parse_args() -> Args {
             "-coverage" => a.coverage = Some(opt_value(&x, it.next(), |n| minutes_duration(n.parse().ok()?))),
             "-seed" => a.seed = Some(opt_value(&x, it.next(), |d| d.parse::<i64>().ok()) as u64),
             _ if x.starts_with('-') => bad_args(&format!("unknown option {x}")),
+            _ if x.is_empty() || x == ".tla" => bad_args("empty spec name"),
             _ if spec.is_some() => bad_args(&format!("more than one spec: {x}")),
             _ => spec = Some(PathBuf::from(x)),
         }
