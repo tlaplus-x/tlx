@@ -444,3 +444,426 @@ fn intervals_and_big_integers_keep_their_representation() {
     let f = s.freeze(&Value::Fcn(Arc::from(vec![(Value::Int(0), Value::Int(1))]), FcnDom::Interval)).unwrap();
     assert_eq!(s.select(f, s.freeze(&Value::str("a")).unwrap()), Err(RefOpError::Eval));
 }
+
+#[test]
+fn snapshot_round_trip_preserves_values_digests_witnesses_and_stats() {
+    use tlx_value::ser::{Reader, Writer};
+
+    for tiny in [false, true] {
+        let run = || {
+            let orig = Store::new(usize::MAX);
+            let vs = values(7, 400);
+            let hs: Vec<u64> = vs.iter().map(|v| orig.freeze(v).unwrap()).collect();
+
+            let mut w = Writer::new();
+            orig.write_snapshot(&mut w).unwrap();
+            let bytes = w.into_bytes();
+
+            // Determinism: writing again produces byte-for-byte identical output.
+            let mut w2 = Writer::new();
+            orig.write_snapshot(&mut w2).unwrap();
+            assert_eq!(bytes, w2.into_bytes());
+
+            let mut r = Reader::new(&bytes);
+            let restored = Store::read_snapshot(&mut r, usize::MAX).unwrap();
+            assert_ne!(restored.uid(), orig.uid(), "restored store must allocate a fresh uid");
+            assert_eq!(restored.stats(), orig.stats(), "restored stats must match");
+
+            for (v, &oh) in vs.iter().zip(&hs) {
+                let ck = orig.checkpoint_handle(oh);
+                let rh = restored.recover_handle(ck).unwrap();
+                if tag(oh) == TAG_NODE {
+                    assert_ne!(rh, oh, "node handle store_id must be rewritten to fresh store");
+                    assert!(!restored.is_valid(oh), "foreign store handle must remain invalid");
+                } else {
+                    assert_eq!(rh, oh);
+                }
+                assert!(exact(&restored.thaw(rh), v), "thaw mismatch for {v}");
+                assert_eq!(restored.digest(rh), orig.digest(oh), "digest mismatch for {v}");
+                // Re-freezing must hit the restored shard intern index without allocating a new node.
+                assert_eq!(restored.freeze(v).unwrap(), rh);
+            }
+            assert_eq!(restored.stats().nodes, orig.stats().nodes, "re-freezing allocated duplicate nodes");
+        };
+        if tiny {
+            with_tiny_hashes(run);
+        } else {
+            run();
+        }
+    }
+}
+
+#[test]
+fn snapshot_restore_rejects_corrupt_and_invalid_inputs() {
+    use tlx_base::bytes::zigzag;
+    use tlx_value::ser::{Reader, Writer};
+
+    let restore = |bytes: &[u8], budget: usize| -> Result<Arc<Store>, String> {
+        let mut r = Reader::new(bytes);
+        Store::read_snapshot(&mut r, budget)
+    };
+
+    // Valid snapshot with several nodes for truncation / trailing-byte / budget tests.
+    let orig = Store::new(usize::MAX);
+    let big_tuple = Value::tuple(vec![
+        Value::Int(1 << 62),
+        Value::Interval(2, 5),
+        Value::record(vec![(Sym::new("store_ser_a"), Value::str("store_ser_v"))]),
+        Value::fcn_over(&Value::Interval(0, 1), vec![(Value::Int(0), Value::TRUE), (Value::Int(1), Value::FALSE)]).unwrap(),
+    ]);
+    let root = orig.freeze(&big_tuple).unwrap();
+    let mut w = Writer::new();
+    orig.write_snapshot(&mut w).unwrap();
+    let valid = w.into_bytes();
+
+    // Every strict prefix is rejected as truncated.
+    for cut in 0..valid.len() {
+        assert!(restore(&valid[..cut], usize::MAX).is_err(), "truncated at {cut} was accepted");
+    }
+
+    // Trailing garbage rejected.
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    assert!(restore(&trailing, usize::MAX).unwrap_err().contains("trailing"));
+
+    // Budget overflow rejected cleanly.
+    let need = orig.stats().node_bytes as usize;
+    let err = restore(&valid, need - 1).unwrap_err();
+    assert!(err.contains("exceeds its budget"), "{err}");
+    assert!(restore(&valid, need).is_ok());
+
+    // Unsupported version rejected.
+    let mut w = Writer::new();
+    w.uvar(99);
+    w.usize(0);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("version 99"));
+
+    // Unknown body tag rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(99);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("unknown body tag"));
+
+    // Self / forward / out-of-range node reference rejected (node 0 referencing node 0).
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(4); // Body::Tuple
+    w.usize(1);
+    w.uvar((0u64 << TAG_BITS) | TAG_NODE);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("out-of-range/forward"));
+
+    // Forward reference: node 0 referencing node 1.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(2);
+    w.u8(4); // Tuple [node 1]
+    w.usize(1);
+    w.uvar((1u64 << TAG_BITS) | TAG_NODE);
+    w.u8(4); // Tuple []
+    w.usize(0);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("out-of-range/forward"));
+
+    // Invalid child handle tag (0) and non-canonical boolean payload.
+    for bad_child in [0u64, (2u64 << TAG_BITS) | TAG_BOOL, 6u64] {
+        let mut w = Writer::new();
+        w.uvar(1);
+        w.usize(1);
+        w.u8(4);
+        w.usize(1);
+        w.uvar(bad_child);
+        assert!(restore(&w.into_bytes(), usize::MAX).is_err(), "bad child {bad_child:#x} accepted");
+    }
+
+    // Unpublished Sym ID in immediate string handle and in Record field key.
+    let bad_sym: u64 = 0x7fff_ffff;
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(4); // Tuple [Str(bad_sym)]
+    w.usize(1);
+    w.uvar((bad_sym << TAG_BITS) | TAG_STR);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("unpublished symbol"));
+
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(5); // Record [(bad_sym, TRUE)]
+    w.usize(1);
+    w.uvar(bad_sym);
+    w.uvar(bool_handle(true));
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("unpublished symbol"));
+
+    // Immediate integer encoded as Body::Int rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(1); // Body::Int
+    w.ivar(42);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("immediate integer"));
+
+    // Empty record and unsorted record fields rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(5);
+    w.usize(0);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("empty record"));
+
+    let s1 = Sym::new("store_ser_order_first");
+    let s2 = Sym::new("store_ser_order_second");
+    let (lo_sym, hi_sym) = if s1 < s2 { (s1, s2) } else { (s2, s1) };
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(5);
+    w.usize(2);
+    w.uvar(hi_sym.id() as u64);
+    w.uvar(bool_handle(false));
+    w.uvar(lo_sym.id() as u64);
+    w.uvar(bool_handle(true));
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("strict symbol order"));
+
+    // Unsorted set elements rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(2); // Body::Set
+    w.usize(2);
+    w.uvar((zigzag(2) << TAG_BITS) | TAG_INT);
+    w.uvar((zigzag(1) << TAG_BITS) | TAG_INT);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("canonical order"));
+
+    // Non-contiguous FcnDom::Interval keys rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(7); // Body::Fcn(_, Interval)
+    w.usize(2);
+    w.uvar((zigzag(0) << TAG_BITS) | TAG_INT);
+    w.uvar((zigzag(2) << TAG_BITS) | TAG_INT);
+    w.uvar(bool_handle(false));
+    w.uvar(bool_handle(true));
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("contiguous"));
+
+    // Oversized interval rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(1);
+    w.u8(3); // Body::Interval
+    w.ivar(0);
+    w.ivar(i32::MAX as i64 + 10);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("32-bit"));
+
+    // Duplicate node body rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(2);
+    w.u8(4);
+    w.usize(0);
+    w.u8(4);
+    w.usize(0);
+    assert!(restore(&w.into_bytes(), usize::MAX).unwrap_err().contains("duplicate node body"));
+
+    // `recover_handle` rejects non-zero store_id, out-of-range node index, zero, and unpublished symbol.
+    let restored = restore(&valid, usize::MAX).unwrap();
+    let ck_root = orig.checkpoint_handle(root);
+    assert!(restored.recover_handle(ck_root).is_ok());
+    assert!(restored.recover_handle(root).unwrap_err().contains("non-zero checkpoint store id"));
+    assert!(restored.recover_handle((999_999u64 << INDEX_SHIFT) | TAG_NODE).unwrap_err().contains("node out of range"));
+    assert!(restored.recover_handle(0).unwrap_err().contains("invalid immediate"));
+    assert!(restored.recover_handle((bad_sym << TAG_BITS) | TAG_STR).unwrap_err().contains("invalid immediate"));
+}
+
+/// Restoring or comparing a set containing a large compact interval (e.g.
+/// `{{0}, 1..8000000}`) compares cardinalities first and walks equal-length
+/// intervals lazily, never materializing `Node::elems`.
+#[test]
+fn snapshot_restore_and_comparisons_keep_intervals_compact() {
+    use tlx_value::ser::{Reader, Writer};
+
+    let orig = Store::new(usize::MAX);
+    let zero_set = Value::set_from(vec![Value::Int(0)]).unwrap();
+    let big_iv = Value::Interval(1, 8_000_000);
+    let outer = Value::set_from(vec![zero_set.clone(), big_iv.clone()]).unwrap();
+    let h_outer = orig.freeze(&outer).unwrap();
+    let h_iv = orig.freeze(&big_iv).unwrap();
+    assert!(orig.get(h_iv).elems.get().is_none(), "freeze must not materialize interval elems");
+
+    let mut w = Writer::new();
+    orig.write_snapshot(&mut w).unwrap();
+    let bytes = w.into_bytes();
+
+    let mut r = Reader::new(&bytes);
+    let restored = Store::read_snapshot(&mut r, usize::MAX).unwrap();
+    let r_iv = restored.recover_handle(orig.checkpoint_handle(h_iv)).unwrap();
+    let r_outer = restored.recover_handle(orig.checkpoint_handle(h_outer)).unwrap();
+    assert!(restored.get(r_iv).elems.get().is_none(), "restore order validation materialized interval elems");
+    assert!(exact(&restored.thaw(r_outer), &outer));
+
+    // Equal-length set vs interval comparisons also stay lazy without populating `elems`.
+    let r_zero = restored.recover_handle(orig.checkpoint_handle(orig.freeze(&zero_set).unwrap())).unwrap();
+    assert_eq!(cmp_tlc(&restored, r_zero, r_iv), Ok(std::cmp::Ordering::Less));
+    assert_eq!(cmp_tlc(&restored, r_iv, r_zero), Ok(std::cmp::Ordering::Greater));
+    assert_eq!(eq_tlc(&restored, r_zero, r_iv), Ok(false));
+    assert_eq!(eq_tlc(&restored, r_iv, r_zero), Ok(false));
+    assert!(restored.get(r_iv).elems.get().is_none(), "different-length comparisons materialized interval elems");
+
+    let small_iv = restored.freeze(&Value::Interval(1, 3)).unwrap();
+    let eq_set = restored.freeze(&Value::set_from(vec![Value::Int(1), Value::Int(2), Value::Int(3)]).unwrap()).unwrap();
+    let gt_set = restored.freeze(&Value::set_from(vec![Value::Int(1), Value::Int(2), Value::Int(4)]).unwrap()).unwrap();
+    assert_eq!(eq_tlc(&restored, eq_set, small_iv), Ok(true));
+    assert_eq!(eq_tlc(&restored, small_iv, eq_set), Ok(true));
+    assert_eq!(cmp_tlc(&restored, eq_set, small_iv), Ok(std::cmp::Ordering::Equal));
+    assert_eq!(cmp_tlc(&restored, small_iv, eq_set), Ok(std::cmp::Ordering::Equal));
+    assert_eq!(cmp_tlc(&restored, small_iv, gt_set), Ok(std::cmp::Ordering::Less));
+    assert_eq!(cmp_tlc(&restored, gt_set, small_iv), Ok(std::cmp::Ordering::Greater));
+    assert!(restored.get(small_iv).elems.get().is_none(), "equal-length comparisons materialized interval elems");
+}
+
+/// An oversized node exceeding the remaining budget is rejected immediately
+/// after decoding its count, before allocating or scanning its body.
+#[test]
+fn snapshot_restore_rejects_oversized_node_before_allocating() {
+    use tlx_value::ser::{Reader, Writer};
+
+    let count = 200_000usize;
+    let budget = 4096usize;
+    let bool_byte = bool_handle(false) as u8;
+    let sym_id = Sym::new("budget_precheck_sym").id() as u64;
+
+    // Tuple, Set, Record, and Fcn payloads whose element count alone exceeds `budget`.
+    let cases: [(&str, Vec<u8>); 4] = [
+        ("tuple", {
+            let mut w = Writer::with_capacity(count + 16);
+            w.uvar(1);
+            w.usize(1);
+            w.u8(4);
+            w.usize(count);
+            let mut b = w.into_bytes();
+            b.resize(b.len() + count, bool_byte);
+            b
+        }),
+        ("set", {
+            let mut w = Writer::with_capacity(count + 16);
+            w.uvar(1);
+            w.usize(1);
+            w.u8(2);
+            w.usize(count);
+            let mut b = w.into_bytes();
+            b.resize(b.len() + count, bool_byte);
+            b
+        }),
+        ("record", {
+            let mut w = Writer::with_capacity(count * 2 + 16);
+            w.uvar(1);
+            w.usize(1);
+            w.u8(5);
+            w.usize(count);
+            w.uvar(sym_id);
+            let mut b = w.into_bytes();
+            b.resize(b.len() + count * 2, bool_byte);
+            b
+        }),
+        ("fcn", {
+            let mut w = Writer::with_capacity(count * 2 + 16);
+            w.uvar(1);
+            w.usize(1);
+            w.u8(6);
+            w.usize(count);
+            let mut b = w.into_bytes();
+            b.resize(b.len() + count * 2, bool_byte);
+            b
+        }),
+    ];
+
+    for (kind, bytes) in cases {
+        let mut r = Reader::new(&bytes);
+        let err = Store::read_snapshot(&mut r, budget).unwrap_err();
+        assert!(err.contains("exceeds its budget"), "{kind}: {err}");
+        assert!(r.pos() < 32, "{kind}: reader scanned {} bytes before rejecting budget overflow", r.pos());
+    }
+}
+
+/// 64-bit interval endpoints (`> IMM_INT`) and interval-backed functions with
+/// node-backed `Body::Int` keys (including ranges straddling `IMM_INT`) round-trip
+/// cleanly, compare lazily without populating `Node::elems`, and still reject
+/// non-contiguous keys.
+#[test]
+fn snapshot_restore_preserves_64bit_intervals_and_interval_function_keys() {
+    use tlx_value::ser::{Reader, Writer};
+
+    let ns_lo: i64 = 1_735_689_600_000_000_000;
+    let ns_hi: i64 = ns_lo + 3;
+    let straddle_lo: i64 = crate::scalar::IMM_INT - 2;
+    let straddle_hi: i64 = crate::scalar::IMM_INT + 1;
+
+    let orig = Store::new(usize::MAX);
+    let ns_iv = Value::Interval(ns_lo, ns_hi);
+    let ns_set = Value::set_from((ns_lo..=ns_hi).map(Value::Int).collect()).unwrap();
+    let ns_set_gt = Value::set_from(vec![Value::Int(ns_lo), Value::Int(ns_lo + 1), Value::Int(ns_lo + 2), Value::Int(ns_hi + 1)]).unwrap();
+    let ns_fcn = Value::fcn_over(&ns_iv, (ns_lo..=ns_hi).map(|k| (Value::Int(k), Value::TRUE)).collect()).unwrap();
+    let straddle_iv = Value::Interval(straddle_lo, straddle_hi);
+    let straddle_fcn =
+        Value::fcn_over(&straddle_iv, (straddle_lo..=straddle_hi).map(|k| (Value::Int(k), Value::Int(k - straddle_lo))).collect()).unwrap();
+    let empty_64 = Value::Interval(ns_hi, ns_lo);
+    let outer = Value::set_from(vec![Value::set_from(vec![Value::Int(0)]).unwrap(), ns_iv.clone()]).unwrap();
+    let all = [ns_iv.clone(), ns_set.clone(), ns_set_gt.clone(), ns_fcn, straddle_iv, straddle_fcn, empty_64, outer];
+    let hs: Vec<u64> = all.iter().map(|v| orig.freeze(v).unwrap()).collect();
+
+    let mut w = Writer::new();
+    orig.write_snapshot(&mut w).unwrap();
+    let bytes = w.into_bytes();
+
+    let mut r = Reader::new(&bytes);
+    let restored = Store::read_snapshot(&mut r, usize::MAX).unwrap();
+    assert_eq!(restored.stats(), orig.stats());
+
+    let rhs: Vec<u64> = hs.iter().map(|&h| restored.recover_handle(orig.checkpoint_handle(h)).unwrap()).collect();
+    for (v, &rh) in all.iter().zip(&rhs) {
+        assert!(exact(&restored.thaw(rh), v), "thaw mismatch for {v}");
+        assert_eq!(restored.freeze(v).unwrap(), rh);
+    }
+
+    // Equal-length set vs 64-bit interval comparisons stay lazy and exact.
+    let (r_iv, r_set, r_gt, r_straddle_iv, r_empty_64) = (rhs[0], rhs[1], rhs[2], rhs[4], rhs[6]);
+    assert_eq!(eq_tlc(&restored, r_iv, r_set), Ok(true));
+    assert_eq!(eq_tlc(&restored, r_set, r_iv), Ok(true));
+    assert_eq!(cmp_tlc(&restored, r_iv, r_set), Ok(std::cmp::Ordering::Equal));
+    assert_eq!(cmp_tlc(&restored, r_set, r_iv), Ok(std::cmp::Ordering::Equal));
+    assert_eq!(cmp_tlc(&restored, r_iv, r_gt), Ok(std::cmp::Ordering::Less));
+    assert_eq!(cmp_tlc(&restored, r_gt, r_iv), Ok(std::cmp::Ordering::Greater));
+    assert!(restored.get(r_iv).elems.get().is_none());
+
+    // Non-empty intervals with non-immediate endpoints return None from
+    // `set_elems` (routing compiled iteration through the interpreter fallback)
+    // without populating `Node::elems`; empty 64-bit intervals return `&[]`.
+    assert_eq!(restored.set_elems(r_iv), None);
+    assert!(restored.get(r_iv).elems.get().is_none());
+    assert_eq!(restored.set_elems(r_straddle_iv), None);
+    assert!(restored.get(r_straddle_iv).elems.get().is_none());
+    assert_eq!(restored.set_elems(r_empty_64), Some(&[][..]));
+    assert!(restored.get(r_empty_64).elems.get().is_none());
+
+    // Non-contiguous 64-bit interval function keys are still rejected.
+    let mut w = Writer::new();
+    w.uvar(1);
+    w.usize(3);
+    // node 0: Body::Int(ns_lo)
+    w.u8(1);
+    w.ivar(ns_lo);
+    // node 1: Body::Int(ns_lo + 2) (gap!)
+    w.u8(1);
+    w.ivar(ns_lo + 2);
+    // node 2: Body::Fcn([node 0, node 1], Interval)
+    w.u8(7);
+    w.usize(2);
+    w.uvar((0u64 << TAG_BITS) | TAG_NODE);
+    w.uvar((1u64 << TAG_BITS) | TAG_NODE);
+    w.uvar(bool_handle(true));
+    w.uvar(bool_handle(true));
+    let bad = w.into_bytes();
+    let mut r = Reader::new(&bad);
+    assert!(Store::read_snapshot(&mut r, usize::MAX).unwrap_err().contains("contiguous"));
+}

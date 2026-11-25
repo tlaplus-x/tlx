@@ -484,7 +484,7 @@ second barrier the last arriving worker writes the model files and the manifest 
 | `queue-<l>` | unclaimed blocks of list `l` in claim order: XOR records for encoded models, `Persist` bytes otherwise; with VIEW/SYMMETRY and several workers each carries its BFS position |
 | `trace-<id>.<n>`, `edges-<id>-fps.<n>`, `edges-<id>-meta.<n>`, `edges-<id>` | history shards by stable ID, independent of worker count; append-only stream segments (`.<n>` = new part of the n-th checkpoint) and the edge-log header |
 | `archive-<w>.<n>` | each current worker's archive, as append-only stream segments |
-| `model-strings`, `model-shapes`, `model-dyn` | string intern table; compiled mode's shapes and speculation state (per variable and materialized definition: shape, miss counts, fallbacks, attempt); Dyn interner snapshot |
+| `model-strings`, `model-shapes`, `model-dyn`, `model-store` | string intern table; compiled mode's shapes, store mode, and speculation state (per variable and materialized definition: shape, miss counts, fallbacks, attempt); Dyn interner snapshot; value store node table (present when `TLX_VALUE_STORE` is active) |
 
 Every file is framed (magic, format version, file kind, build id, per-block checksums, end marker) and the
 manifest records every file's size, checked when opened. Runs of the live spill directory are not
@@ -557,10 +557,12 @@ checkpoint is kept (`DirHold::keep`).
   Either way representatives are chosen in BFS order whatever the worker count.
 - **Liveness** uses the recorded edges, no re-exploration; a checkpoint written by the same binary always
   contains them when there are temporal properties and no VIEW/SYMMETRY.
-- **Compiled mode**: the CLI restores the string table before parsing; the driver restores the Dyn interner
-  and the speculation state, skips the pre-run and continues from the checkpoint's attempt. The generated C is
-  identical so the cache hits. A later layout miss resumes from the (restored) archive when it is
-  complete, otherwise restarts from scratch.
+- **Compiled mode**: the CLI restores the string table before parsing; the driver restores the speculation
+  state (verifying version and `TLX_VALUE_STORE` mode), the Dyn interner, and (when `TLX_VALUE_STORE` is
+  active) `model-store` into a fresh process-unique `Store` id, rewriting store-id-neutral `Ref` handles in
+  recovered queue and archive words before validation. It skips the pre-run and continues from the
+  checkpoint's attempt. The generated C is identical so the cache hits. A later layout miss resumes from the
+  (restored) archive when it is complete, otherwise restarts from scratch.
 - **Side effects**: the run re-expands from the checkpoint's level, so `Print` output and file writes after
   it happen again (a killed process's earlier output cannot be deduplicated); registers come from the
   snapshot (compat.md).

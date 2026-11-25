@@ -54,7 +54,7 @@ impl Fn<'_> {
 enum View<'a> {
     Imm(u64),
     BigInt(i64),
-    Set,
+    Set(&'a [u64]),
     Interval(i64, i64),
     Fn(Fn<'a>),
 }
@@ -65,7 +65,7 @@ fn view(s: &Store, h: u64) -> View<'_> {
     }
     match &s.get(h).body {
         Body::Int(i) => View::BigInt(*i),
-        Body::Set(_) => View::Set,
+        Body::Set(es) => View::Set(es),
         Body::Interval(lo, hi) => View::Interval(*lo, *hi),
         Body::Tuple(t) => View::Fn(Fn::Tuple(t)),
         Body::Record(r) => View::Fn(Fn::Record(r)),
@@ -102,9 +102,66 @@ fn interval_len(lo: i64, hi: i64) -> usize {
     }
 }
 
-/// The elements of a set view as handles (an interval's on the fly).
-fn set_handles(s: &Store, h: u64) -> &[u64] {
-    s.set_elems(h).expect("set node")
+/// Compare a stored handle `h` against a 64-bit integer `v` without allocating
+/// or populating `Node::elems`; `h_left` selects TLC's left/right operand order.
+fn eq_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<bool> {
+    if let Some(vh) = int_handle(v) {
+        return if h_left { eq_tlc(s, h, vh) } else { eq_tlc(s, vh, h) };
+    }
+    if tag(h) == TAG_INT {
+        return Ok(false);
+    }
+    if let Some(Body::Int(x)) = s.node(h).map(|n| &n.body) {
+        return Ok(*x == v);
+    }
+    let iv = tlx_value::Value::Int(v);
+    let hv = s.thaw(h);
+    let r = if h_left { tlx_value::order::eq_tlc(&hv, &iv) } else { tlx_value::order::eq_tlc(&iv, &hv) };
+    r.map_err(|_| RefOpError::Eval)
+}
+
+fn cmp_with_int(s: &Store, h: u64, v: i64, h_left: bool) -> R<Ordering> {
+    if let Some(vh) = int_handle(v) {
+        return if h_left { cmp_tlc(s, h, vh) } else { cmp_tlc(s, vh, h) };
+    }
+    if tag(h) == TAG_INT {
+        let x = (h as i64) >> scalar::TAG_BITS;
+        return Ok(if h_left { x.cmp(&v) } else { v.cmp(&x) });
+    }
+    if let Some(Body::Int(x)) = s.node(h).map(|n| &n.body) {
+        return Ok(if h_left { x.cmp(&v) } else { v.cmp(x) });
+    }
+    let iv = tlx_value::Value::Int(v);
+    let hv = s.thaw(h);
+    let r = if h_left { tlx_value::order::cmp_tlc(&hv, &iv) } else { tlx_value::order::cmp_tlc(&iv, &hv) };
+    r.map_err(|_| RefOpError::Eval)
+}
+
+fn eq_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<bool> {
+    if es.len() != interval_len(lo, hi) {
+        return Ok(false);
+    }
+    for (&h, v) in es.iter().zip(lo..=hi) {
+        if !eq_with_int(s, h, v, set_left)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cmp_set_interval(s: &Store, es: &[u64], lo: i64, hi: i64, set_left: bool) -> R<Ordering> {
+    let n = interval_len(lo, hi);
+    let c = if set_left { es.len().cmp(&n) } else { n.cmp(&es.len()) };
+    if c != Ordering::Equal {
+        return Ok(c);
+    }
+    for (&h, v) in es.iter().zip(lo..=hi) {
+        let c = cmp_with_int(s, h, v, set_left)?;
+        if c != Ordering::Equal {
+            return Ok(c);
+        }
+    }
+    Ok(Ordering::Equal)
 }
 
 /// TLC `a.equals(b)` on handles (`order::eq_tlc`).
@@ -129,13 +186,14 @@ pub fn eq_tlc(s: &Store, a: u64, b: u64) -> R<bool> {
         (View::BigInt(_), View::Imm(y)) if tag(y) == TAG_INT => Ok(false),
         (View::Imm(x), View::BigInt(_)) if tag(x) == TAG_INT => Ok(false),
         (View::Interval(l1, h1), View::Interval(l2, h2)) => Ok(if h1 < l1 { h2 < l2 } else { l1 == l2 && h1 == h2 }),
-        (View::Set | View::Interval(..), View::Set | View::Interval(..)) => {
-            let (x, y) = (set_handles(s, a), set_handles(s, b));
+        (View::Set(x), View::Set(y)) => {
             if x.len() != y.len() {
                 return Ok(false);
             }
             eq_seq(s, x.iter().copied(), y.iter().copied())
         }
+        (View::Set(x), View::Interval(lo, hi)) => eq_set_interval(s, x, lo, hi, true),
+        (View::Interval(lo, hi), View::Set(y)) => eq_set_interval(s, y, lo, hi, false),
         (View::Fn(x), View::Fn(y)) => match (x, y) {
             (Fn::Tuple(t), Fn::Tuple(u)) => {
                 if t.len() != u.len() {
@@ -231,14 +289,15 @@ pub fn cmp_tlc(s: &Store, a: u64, b: u64) -> R<Ordering> {
             }
             Ok(l1.cmp(&l2))
         }
-        (View::Set | View::Interval(..), View::Set | View::Interval(..)) => {
-            let (x, y) = (set_handles(s, a), set_handles(s, b));
+        (View::Set(x), View::Set(y)) => {
             let c = x.len().cmp(&y.len());
             if c != Ordering::Equal {
                 return Ok(c);
             }
             cmp_seq(s, x.iter().copied(), y.iter().copied())
         }
+        (View::Set(x), View::Interval(lo, hi)) => cmp_set_interval(s, x, lo, hi, true),
+        (View::Interval(lo, hi), View::Set(y)) => cmp_set_interval(s, y, lo, hi, false),
         (View::Fn(x), View::Fn(y)) => match (x, y) {
             (Fn::Tuple(t), Fn::Tuple(u)) => {
                 let c = t.len().cmp(&u.len());
@@ -335,7 +394,7 @@ fn comparison_kind(s: &Store, h: u64) -> ComparisonKind {
             _ => unreachable!("validated immediate"),
         },
         View::BigInt(_) => ComparisonKind::Int,
-        View::Set | View::Interval(..) => ComparisonKind::Set,
+        View::Set(_) | View::Interval(..) => ComparisonKind::Set,
         View::Fn(_) => ComparisonKind::Function,
     }
 }

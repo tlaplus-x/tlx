@@ -384,6 +384,7 @@ impl<M: Model> Shared<'_, M> {
         let mut cache = SegCache::default();
         let mut prev = XorPrev::new(words);
         let mut enc = vec![0u64; words];
+        let mut ck_buf = Vec::new();
         let mut bytes = Vec::new();
         self.frontier.for_each_queued_in(l, |b: &Block<M::State>| -> Result<(), String> {
             level = b.depth();
@@ -394,7 +395,8 @@ impl<M: Model> Shared<'_, M> {
                         match codec {
                             Some(cd) => {
                                 let fp = cd.encode(&t.state, &mut enc);
-                                q.words(t.log, fp, &enc, pos(t.log));
+                                let w = cd.checkpoint_words(&enc, &mut ck_buf);
+                                q.words(t.log, fp, w, pos(t.log));
                             }
                             None => {
                                 bytes.clear();
@@ -407,7 +409,9 @@ impl<M: Model> Shared<'_, M> {
                     }
                 }
                 Block::Encoded { .. } => {
+                    let cd = codec.expect("codec");
                     let r = b.records(&mut cache, &mut prev, |log, fp, w| -> Result<(), String> {
+                        let w = cd.checkpoint_words(w, &mut ck_buf);
                         q.words(log, fp, w, pos(log));
                         n += 1;
                         q.flush_if_full(&mut out)
@@ -554,10 +558,10 @@ impl<M: Model> WorkerState<'_, '_, M> {
         let codec = shared.model.caps().codec();
         let archived = match self.local.archived() {
             Some(blocks) if codec.is_some() && blocks.iter().all(|b| b.encoded()) => {
-                let words = codec.expect("codec").words();
+                let cd = codec.expect("codec");
                 let name = format!("archive-{me}");
                 let segs = write_stream(prev, tmp, number, &name, K_ARCHIVE, blocks.len() as u64, &mut files, |start, out| {
-                    write_archive(&blocks[start as usize..], words, out)
+                    write_archive(&blocks[start as usize..], cd, out)
                 })?;
                 streams.push((name, segs));
                 true
@@ -569,18 +573,21 @@ impl<M: Model> WorkerState<'_, '_, M> {
     }
 }
 
-/// Write the records of the archived `blocks` (encoded, of `words` words):
+/// Write the records of the archived `blocks` (encoded, of `codec.words()` words):
 /// chunks of (uvar depth, uvar n, uvar length, the XOR-coded records).
-fn write_archive<S>(blocks: &[Block<S>], words: usize, out: &mut Out) -> Result<(), String> {
+fn write_archive<S>(blocks: &[Block<S>], codec: &dyn crate::StateCodec<S>, out: &mut Out) -> Result<(), String> {
+    let words = codec.words();
     let mut cache = SegCache::default();
     let mut prev = XorPrev::new(words);
     let mut enc = XorPrev::new(words);
+    let mut ck_buf = Vec::new();
     let mut chunk = Writer::new();
     let mut recs = Vec::new();
     for b in blocks {
         recs.clear();
         enc.reset();
         b.records(&mut cache, &mut prev, |log, fp, w| -> Result<(), String> {
+            let w = codec.checkpoint_words(w, &mut ck_buf);
             put_xor(&mut recs, &mut enc, log, fp, w);
             Ok(())
         })

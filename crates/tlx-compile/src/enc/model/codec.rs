@@ -11,7 +11,7 @@ use tlx_runtime::stats::{self, C, T};
 use tlx_runtime::{ErrorKind, ModelError};
 use tlx_value::Value;
 
-use super::{EState, EncModel, Fingerprint, DYN_FILE, MISS_MSG, SPECULATION_FILE};
+use super::{EState, EncModel, Fingerprint, DYN_FILE, MISS_MSG, SPECULATION_FILE, STORE_FILE};
 use crate::paranoid::{mismatch, state_list};
 
 impl EncModel {
@@ -210,19 +210,25 @@ struct DecodeCache {
 }
 
 /// Checkpoints: the string table, the shapes (the layout and the
-/// materialized definitions, and the driver's state) and the `Dyn`
-/// interner, so that a recovered run encodes states as this one does; the
-/// TLCSet registers.
+/// materialized definitions, and the driver's state), the `Dyn` interner,
+/// and (when `TLX_VALUE_STORE` is active) the run's value store, so that a
+/// recovered run encodes states as this one does; the TLCSet registers.
 impl tlx_runtime::Checkpointed for EncModel {
     fn files(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
         let mut w = tlx_value::ser::Writer::new();
         tlx_layout::ser::write_dyn_table(&mut w, &tlx_layout::dynval::snapshot())
             .map_err(|e| format!("cannot write the Dyn interner to a checkpoint: {e}"))?;
-        Ok(vec![
+        let mut files = vec![
             (tlx_eval::model::STRINGS_FILE.to_string(), tlx_eval::model::strings_snapshot()),
             (SPECULATION_FILE.to_string(), self.speculation.clone()),
             (DYN_FILE.to_string(), w.into_bytes()),
-        ])
+        ];
+        if let Some(store) = &self.checkpoint_store {
+            let mut sw = tlx_value::ser::Writer::new();
+            tlx_layout::ser::write_store(&mut sw, store).map_err(|e| format!("cannot write the value store to a checkpoint: {e}"))?;
+            files.push((STORE_FILE.to_string(), sw.into_bytes()));
+        }
+        Ok(files)
     }
     fn worker_snapshot(&self) -> Result<Vec<u8>, String> {
         self.base.ip.registers_snapshot()
@@ -232,6 +238,9 @@ impl tlx_runtime::Checkpointed for EncModel {
     }
     fn restore_workers(&self, main: &[u8], snaps: &[Vec<u8>]) -> Result<(), String> {
         tlx_runtime::Checkpointed::restore_workers(&*self.base, main, snaps)
+    }
+    fn keep_checkpoint(&self) -> bool {
+        self.checkpoint_store.as_ref().is_some_and(|s| s.is_full())
     }
 }
 
@@ -250,6 +259,38 @@ impl tlx_runtime::StateCodec<EState> for EncModel {
     }
     fn validate(&self, w: &[u64]) -> Result<(), String> {
         self.escape.as_ref().map_or_else(|| self.layout.validate_canonical_words(w), |e| e.codec.validate(w))
+    }
+    fn checkpoint_words<'a>(&self, src: &'a [u64], buf: &'a mut Vec<u64>) -> &'a [u64] {
+        let Some(sem) = &self.sem else { return src };
+        let Some(store) = &sem.store else { return src };
+        if sem.state.is_empty() {
+            return src;
+        }
+        buf.clear();
+        buf.extend_from_slice(src);
+        for &off in &sem.state {
+            buf[off] = store.checkpoint_handle(buf[off]);
+        }
+        buf
+    }
+    fn recover_words<'a>(&self, src: &'a [u64], buf: &'a mut Vec<u64>) -> Result<&'a [u64], String> {
+        let words: &[u64] = match &self.sem {
+            Some(sem) if !sem.state.is_empty() => {
+                let store = sem.store.as_ref().expect("Ref offsets imply a store");
+                if src.len() < self.layout.words {
+                    return Err("short encoded state".into());
+                }
+                buf.clear();
+                buf.extend_from_slice(src);
+                for &off in &sem.state {
+                    buf[off] = store.recover_handle(buf[off])?;
+                }
+                buf
+            }
+            _ => src,
+        };
+        <Self as tlx_runtime::StateCodec<EState>>::validate(self, words)?;
+        Ok(words)
     }
     fn decode(&self, w: &[u64], depth: u32, fp: u64) -> EState {
         <Self as tlx_runtime::StateCodec<EState>>::validate(self, w).unwrap_or_else(|e| panic!("{e}"));

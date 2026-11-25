@@ -221,6 +221,13 @@ pub trait Checkpointed: Sync {
     fn restore_workers(&self, _main: &[u8], _snaps: &[Vec<u8>]) -> Result<(), String> {
         Ok(())
     }
+
+    /// Whether the model hit a recoverable resource limit (such as value-store
+    /// budget exhaustion) and wants the last committed checkpoint preserved
+    /// when the search finishes so the user can retry with more resources.
+    fn keep_checkpoint(&self) -> bool {
+        false
+    }
 }
 
 /// The optional capabilities of a model (`Model::caps`): None is "not
@@ -307,6 +314,11 @@ impl<'a, S> Caps<'a, S> {
     /// `Checkpointed::restore_workers`.
     pub fn restore_workers(&self, main: &[u8], snaps: &[Vec<u8>]) -> Result<(), String> {
         self.checkpoint.map_or(Ok(()), |c| c.restore_workers(main, snaps))
+    }
+
+    /// `Checkpointed::keep_checkpoint`.
+    pub fn keep_checkpoint(&self) -> bool {
+        self.checkpoint.is_some_and(|c| c.keep_checkpoint())
     }
 }
 

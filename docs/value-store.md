@@ -164,22 +164,37 @@ interner's growth was (section 10, gap 1).
 
 ## 7. Checkpoint and recovery
 
-There is no checkpoint format for the store. A run that recovers, or that asks for checkpoints, turns
-the store off and logs `value store (TLX_VALUE_STORE) disabled: checkpoints keep Dyn values`; a run
-whose only checkpoint setting is the default interval takes no checkpoints and logs
-`value store (TLX_VALUE_STORE): this run takes no checkpoints (TLX_VALUE_STORE=0 keeps them)`
-(`crates/tlx-compile/src/enc/driver.rs`). This is the largest gap of the experiment: a stored run
-cannot be resumed, and a stored run takes none of TLC's default interval checkpoints either
-(section 10, gap 2).
+Stored runs support both TLC's default 30-minute checkpoint interval and explicit `-checkpoint` /
+`-recover` (`crates/tlx-layout/src/store/ser.rs`, `crates/tlx-compile/src/enc/driver.rs`).
+
+- **`model-store`:** `Checkpointed::files` writes a framed `model-store` file alongside
+  `model-strings`, `model-shapes`, and `model-dyn`. It serializes the store's published nodes in
+  index order (`0..n`), preserving every `Body` kind and `FcnDom` witness while encoding node
+  references as 0-based indices (`< i`, acyclic by construction) and symbols by `Sym` id (resolved
+  after `model-strings` restore).
+- **Store-id-neutral queue and archive words:** on checkpoint write, `StateCodec::checkpoint_words`
+  strips the 16-bit `store_id` bits (`-> 0`) of `TAG_NODE` handles in `Ref` slots without adding
+  overhead to in-run `StateCodec::encode`. Keeping on-disk state words store-id-neutral preserves
+  incremental `archive-*` segment hard-linking across repeated recoveries.
+- **Process-safe recovery:** `model-shapes` (`SPECULATION_VERSION = 4`) records the run's store mode
+  (`TLX_VALUE_STORE=0` / `1` / `all`), and recovery refuses mode mismatches (including recovering a
+  stored checkpoint under `TLX_VALUE_STORE=0` or `TLX_ESCAPE=1`, or vice versa) before loading
+  tables. `Store::read_snapshot` always allocates a fresh process-unique `uid` from `NEXT_UID`,
+  recomputes semantic digests, rebuilds the shard intern index, enforces `-maxmem`, and rejects
+  corrupt/truncated payloads, forward/cyclic/out-of-range node references, malformed or duplicate
+  bodies, and unpublished `Sym` ids (`Sym::try_from_id`). `StateCodec::recover_words` then rewrites
+  `store_id = 0 -> store.id` in recovered `queue` and `archive` state words and validates every slot
+  canonically before any words enter trusted execution paths. If the store exhausts its `-maxmem`
+  budget during a run (including after a recovery), `Checkpointed::keep_checkpoint` preserves the
+  last committed checkpoint on disk so the user can retry `-recover` with a larger `-maxmem`.
 
 ## 8. Limits and known deviations
 
 - **One experiment at a time.** `TLX_VALUE_STORE` is experimental and off by default. It cannot be
   combined with `TLX_ESCAPE`: when both are set, the driver logs
   `value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout` and runs the escape
-  layout rather than refusing the environment (`crates/tlx-compile/src/enc/driver.rs`). When
-  `TLX_VALUE_STORE` is enabled without `-recover` or an explicit `-checkpoint`, it suppresses the
-  default 30-minute checkpoint timer (section 7).
+  layout rather than refusing the environment (`crates/tlx-compile/src/enc/driver.rs`). Recovering a
+  `TLX_VALUE_STORE` checkpoint under `TLX_ESCAPE=1` is refused cleanly.
 - **Still boxed.** Applying a fixed-domain function to a key that comes from a stored value (the
   `currentTerm[m.dest]` shape), and EXCEPT of a fixed-domain function at such a key, convert to boxed
   values. `Merge` rebuilds the merged node, which costs O(n log n) in the size of the function.
@@ -199,7 +214,7 @@ cannot be resumed, and a stored run takes none of TLC's default interval checkpo
   fallbacks), digests against value equality, comparisons against the interpreter, tiny-hash
   collisions, growth across 31/32/33 and 255/256/257 keys, failed operations that publish nothing,
   the byte budget as a hard limit, handles of another store, store ids that never wrap, store
-  identity, and concurrent interning.
+  identity, concurrent interning, and `model-store` snapshot round-trip and corruption rejection.
 - `crates/tlx-layout/src/store/order.rs` — comparison and equality of mixed stored function kinds against
   their boxed consumers; `crates/tlx-layout/src/permute.rs` — permutation of stored handles.
 - `crates/tlx-compile/src/exec/refops.rs` — the native callbacks accept an uninitialized output and
@@ -209,13 +224,17 @@ cannot be resumed, and a stored run takes none of TLC's default interval checkpo
 - `crates/tlx-compile/tests/value_store_switch.rs` — the switch on: a `Dyn` slot is a `Ref` slot and
   the run's counts equal the interpreter's; a run whose shapes are all fixed takes no store path; the
   store's budget is the run's `-maxmem` (a value set that fits it finishes, half of what it needs ends
-  the run with the error that names the way out); an explicit checkpointer keeps `Dyn` values and
-  turns the store off, and the default interval keeps the store and takes no checkpoint. The switch's
-  own values (`0`, `1`, `all`, unset, and its coexistence with `TLX_ESCAPE`) are parsed in
-  `tlx-compile/src/settings.rs`, tested there: one test binary runs one environment.
+  the run with the error that names the way out); default and explicit checkpoints persist `model-store`
+  and recover repeatedly in-process with fresh store ids; budget overflow and corrupt `model-store` are
+  rejected cleanly. The switch's own values (`0`, `1`, `all`, unset, and its coexistence with
+  `TLX_ESCAPE`) are parsed in `tlx-compile/src/settings.rs`, tested there: one test binary runs one
+  environment.
 - `crates/tlx-native/tests/native.rs` — an operation-table count or hash mismatch is refused, and the
   ABI header matches the Rust descriptor field by field.
-- `crates/tlx-cli/tests/value_store.rs` — the budget error, and the checkpoint policy.
+- `crates/tlx-cli/tests/value_store.rs` — the budget error, checkpoint and `-recover` across workers,
+  `TLX_VALUE_STORE=all`, counterexample traces, `VIEW`/`SYMMETRY`, layout-miss restarts after recovery,
+  store-mode mismatch refusals (`TLX_VALUE_STORE=0`/`all`, `TLX_ESCAPE=1`), and corrupt `model-store`
+  rejection.
 - `crates/tlx-cli/tests/repr_litmus.rs` — the value-contract litmus specs
   (`tests/specs/Repr*.tla`: aliases, empty function, missing EXCEPT path, CHOOSE order, lazy union,
   EXCEPT side effects and errors) on the interpreter and the closure, C and JIT executors, with the
@@ -225,14 +244,14 @@ cannot be resumed, and a stored run takes none of TLC's default interval checkpo
 ## 10. Gaps of the experiment
 
 `TLX_VALUE_STORE=1` is what a run sets to use the store, and the switch stays off by default until
-the first two gaps below are closed. This section is the record of what turning it on costs a user
-today, what the way out is, and what closing each gap would take; a gap here is not a defect of
+gap 1 below is closed (gap 2 is resolved). This section is the record of what turning it on costs a
+user today, what the way out is, and what closing each gap takes; a gap here is not a defect of
 the store's operation set (section 4) but a property of the experiment it still is.
 
 | # | Gap | What a run with the store on sees | Way out today | Fix | Cost |
 |---|---|---|---|---|---|
 | 1 | **No reclamation** (section 6) | A `Dyn` variable's values accumulate for the whole run; past the run's `-maxmem` the run *stops with an error*, where the `Dyn` interner it replaced grew until the machine ran out of memory. Long runs on bag-like state are the ones that reach it. The budget is the run's own `-maxmem`, not a fraction of it | raise `-maxmem`, or `TLX_VALUE_STORE=0` | reclamation (reference counting, or mark-and-sweep rooted in the live states) plus a budget policy that matches the other representations — the "stable state root slots" step of the design record | a full batch: it needs the set of live state roots (queue, archive, spill, memo) to be enumerable, which is a change to the search, not to the store |
-| 2 | **No checkpoint format** (section 7) | (a) `-recover` or an explicit `-checkpoint N`: the store is off (logged) — as before. (b) With only TLC's default interval, the run takes **no checkpoints at all** (logged): a crash costs the whole search, where the same run without the store would leave a resumable checkpoint. This is what a run with the store on does today. | `TLX_VALUE_STORE=0` restores the checkpoint | a checkpoint format for the store (serialize its nodes, remap handles on recovery), which belongs with the stable-root work: an encoding is only stable across a recovery if the slots are | a full batch |
+| 2 | **Checkpoint format** *(resolved, section 7)* | Default 30-minute checkpoints and explicit `-checkpoint` / `-recover` work with `TLX_VALUE_STORE=1` and `all` via framed `model-store` snapshots, fresh `NEXT_UID` allocation on restore, store-id-neutral checkpoint handles, and mode-mismatch validation | none needed | implemented (`crates/tlx-layout/src/store/ser.rs`, `crates/tlx-compile/src/enc/driver.rs`) | done |
 | 3 | **Not combined with `TLX_ESCAPE`** | With both `TLX_ESCAPE=1` and `TLX_VALUE_STORE=1`, the driver runs with the store off (logged) rather than refusing the pair | none needed | escape wins when both switches are set | none |
 | 4 | **Crude slot selection** | A slot that merely *contains* a `Dyn` part becomes one handle, so its other, already-encoded components (a bitset field of a tuple, say) stop using their encodings; and a materialized definition with a `Dyn` part stays unmaterialized (`enc/driver.rs`). Only models with a `Dyn` slot are affected. | `TLX_VALUE_STORE=0` | promote per component, or choose per slot by measured benefit | half a batch: it needs a per-slot read/write and representation analysis, and the recorded regressions of the earlier broader promotion policy are the evidence that guessing is worse than not promoting |
 | 5 | **Still boxed** (section 8) | Operations whose operands arrive as boxed values (a fixed-domain function applied to a key from a handle, `@@`/`:>` on a handle in the boxed expression path, a higher-order operator call over a handle) keep an interpreter boundary; native share stays below 100% on the analysis configurations. Results are unaffected | none | separate lowering batches (the operations themselves, not the representation) | a batch per operation family |

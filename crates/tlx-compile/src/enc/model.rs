@@ -123,9 +123,10 @@ struct PredAt<'a> {
 }
 
 /// The checkpoint files of the compiled tier: the driver's shapes, the
-/// `Dyn` interner.
+/// `Dyn` interner, and (with `TLX_VALUE_STORE`) the value store.
 pub(super) const SPECULATION_FILE: &str = "shapes";
 pub(super) const DYN_FILE: &str = "dyn";
+pub(super) const STORE_FILE: &str = "store";
 
 pub struct EncModel {
     pub base: Arc<InterpModel>,
@@ -211,8 +212,12 @@ pub struct EncModel {
     /// evaluated by the interpreter instead.
     pub(super) restartable: bool,
     /// Checkpoints: the driver's state (the shapes and their misses, the
-    /// attempt), which a recovered run starts from (`Checkpointed::files`).
+    /// attempt, store mode), which a recovered run starts from (`Checkpointed::files`).
     pub(super) speculation: Vec<u8>,
+    /// Checkpoints: the run's value store when `TLX_VALUE_STORE` is active
+    /// (present even while all current slots are fixed, so `model-store`
+    /// matches the store mode recorded in `speculation`).
+    pub(super) checkpoint_store: Option<tlx_layout::store::StoreRef>,
 }
 
 impl EncModel {
@@ -385,6 +390,7 @@ impl EncModel {
             id,
             restartable: false,
             speculation: Vec::new(),
+            checkpoint_store: None,
         }
     }
 

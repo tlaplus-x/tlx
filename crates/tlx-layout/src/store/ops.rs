@@ -120,7 +120,8 @@ impl Store {
                 match w.schedule(keys.len()) {
                     Schedule::Offset => {
                         let Some(i) = as_int(k) else { return eval() };
-                        let Some(lo) = keys.first().map(|f| as_int(*f).expect("interval keys are integers")) else { return Ok(None) };
+                        let Some(first) = keys.first() else { return Ok(None) };
+                        let Some(lo) = as_int(*first) else { return eval() };
                         let off = i.wrapping_sub(lo);
                         Ok((0..keys.len() as i64).contains(&off).then_some(off as usize))
                     }

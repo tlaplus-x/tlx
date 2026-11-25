@@ -15,7 +15,7 @@ use tlx_runtime::{explore_from, Options, Outcome, Recovery, Report, ResumePoint,
 use tlx_sema::hir::DefId;
 
 use super::diag;
-use super::model::{EState, EncModel, Miss, DYN_FILE, SPECULATION_FILE};
+use super::model::{EState, EncModel, Miss, DYN_FILE, SPECULATION_FILE, STORE_FILE};
 use super::speculate::{has_dyn, hints, materialize_candidates, prerun_shapes, Prerun, PrerunBudget};
 use crate::settings::Settings;
 use tlx_base::diag::{emit, Topic};
@@ -76,24 +76,48 @@ fn run_check(
     mut recover: Option<&Recovery>,
     reuse: bool,
 ) -> Result<Checked, String> {
-    let settings = Settings::global();
-    let checkpoint_escape = settings.escape && (recover.is_some() || opts.checkpoint.as_ref().is_some_and(|c| c.explicit()));
+    let raw_settings = Settings::global();
+    // `TLX_ESCAPE` replaces the layouts value-store slots would sit in, so
+    // the store stays off whenever `TLX_ESCAPE` is enabled (the pair is not
+    // refused on fresh runs; recovering a store checkpoint under `TLX_ESCAPE`
+    // is refused by `recovered_speculation`).
+    let escape_set = raw_settings.escape;
+    let store_mode = if raw_settings.value_store && !escape_set {
+        if raw_settings.value_store_all {
+            StoreMode::All
+        } else {
+            StoreMode::Dyn
+        }
+    } else {
+        StoreMode::Off
+    };
+    if raw_settings.value_store && escape_set {
+        log("value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout");
+    }
+    let checkpoint_escape = raw_settings.escape && (recover.is_some() || opts.checkpoint.as_ref().is_some_and(|c| c.explicit()));
     let settings_override = checkpoint_escape.then(|| {
         log("escape slots disabled: explicit checkpoints require the original codec");
-        Settings { escape: false, ..settings.clone() }
+        Settings { escape: false, ..raw_settings.clone() }
     });
-    let settings = settings_override.as_ref().unwrap_or(settings);
+    let settings = settings_override.as_ref().unwrap_or(raw_settings);
     let max_restarts = settings.max_restarts.unwrap_or(max_restarts);
     // (The pre-run's evaluations may set TLCGet registers.)
     let registers = base.ip.save_registers();
     let (mut spec, first) = match recover {
         Some(r) => {
-            let (spec, attempt) = recovered_speculation(&base, |name| r.file(name))?;
+            let (spec, attempt) =
+                recovered_speculation(&base, store_mode, escape_set, settings.value_store_bytes(opts.maxmem), |name| r.file(name))?;
             log(format_args!("recovering with the shapes of attempt {attempt} (no pre-run)"));
             (spec, attempt)
         }
         None => match Speculation::new(&base, settings, 0, opts.workers, reuse.then_some(opts)) {
-            Ok(spec) => (spec, 0),
+            Ok(mut spec) => {
+                if store_mode != StoreMode::Off {
+                    spec.store = Some(StoreRef::new(settings.value_store_bytes(opts.maxmem)));
+                    spec.store_all = store_mode == StoreMode::All;
+                }
+                (spec, 0)
+            }
             Err(SpeculationError::Effects(e)) => return Err(e),
             Err(SpeculationError::Search(r)) => {
                 let r = *r;
@@ -107,32 +131,19 @@ fn run_check(
             }
         },
     };
-    // The value store (`TLX_VALUE_STORE`, experimental, default off) has no
-    // checkpoint format yet: it is disabled when recovering or when explicit
-    // checkpoints were asked for; with TLC's default interval only, the run
-    // takes no checkpoints instead. `TLX_ESCAPE` replaces the layouts the
-    // store slots would sit in, so the store is off with it (the pair is not
-    // refused).
-    if settings.value_store && settings.escape {
-        log("value store (TLX_VALUE_STORE) disabled: the escape slots replace its layout");
-    }
-    let mut store_opts = None;
-    if settings.value_store && !settings.escape {
-        if recover.is_some() || opts.checkpoint.as_ref().is_some_and(|c| c.explicit()) {
-            log("value store (TLX_VALUE_STORE) disabled: checkpoints keep Dyn values");
-        } else {
-            spec.store = Some(StoreRef::new(settings.value_store_bytes(opts.maxmem)));
-            spec.store_all = settings.value_store_all;
-            if opts.checkpoint.is_some() {
-                log("value store (TLX_VALUE_STORE): this run takes no checkpoints (TLX_VALUE_STORE=0 keeps them)");
-                store_opts = Some(Options { checkpoint: None, ..opts.clone() });
+    let escape_opts = (settings.escape && opts.checkpoint.is_some()).then(|| Options { checkpoint: None, ..opts.clone() });
+    let opts = escape_opts.as_ref().unwrap_or(opts);
+    // Ensure a checkpoint held across layout-miss restarts is always finalized
+    // if `run_check` exits before a terminal `explore_from` runs.
+    struct FinishCheckpoint<'a>(Option<&'a tlx_runtime::Checkpointer>);
+    impl Drop for FinishCheckpoint<'_> {
+        fn drop(&mut self) {
+            if let Some(c) = self.0 {
+                c.finish();
             }
         }
     }
-    if settings.escape && opts.checkpoint.is_some() {
-        store_opts = Some(Options { checkpoint: None, ..opts.clone() });
-    }
-    let opts = store_opts.as_ref().unwrap_or(opts);
+    let _finish_ckpt = FinishCheckpoint(opts.checkpoint.as_deref());
     // The search to resume, and the layout of its states.
     let mut resume: Option<(ResumePoint<EState>, Arc<Layout>)> = None;
     // The search time that resuming saves.
@@ -146,6 +157,7 @@ fn run_check(
             m.note_restart();
         }
         m.speculation = spec.encode(attempt);
+        m.checkpoint_store = spec.store.clone();
         if tlx_base::diag::enabled(Topic::Coverage) {
             if let Some((_, old)) = &resume {
                 for (i, (a, b)) in old.vars.iter().zip(&m.layout.vars).enumerate().filter(|(_, (a, b))| a != b) {
@@ -196,7 +208,7 @@ fn run_check(
             (None, None) => Start::Init,
         };
         let (r, resume_point) = explore_from(&m, opts, start, retain);
-        spec.check_store()?;
+        spec.check_store(opts.checkpoint.as_deref())?;
         searched += r.elapsed;
         if !spec.after_run(&m, &r, attempt, max_restarts) {
             base.ip.effects_finish();
@@ -213,16 +225,43 @@ fn run_check(
 
 /// The speculation of a checkpoint, and its attempt (`file`: the
 /// checkpoint's compiled-tier files), with the checkpointed run's `Dyn`
-/// interner restored. The shapes are decoded first: a checkpoint of another
-/// speculation version (whose interner table may be encoded otherwise) is
-/// refused before its table is loaded.
-fn recovered_speculation<'a>(base: &InterpModel, file: impl Fn(&str) -> Option<&'a [u8]>) -> Result<(Speculation, usize), String> {
+/// interner and (when `TLX_VALUE_STORE` was active) its `Store` restored.
+/// The shapes are decoded first: a checkpoint of another speculation version
+/// or value-store mode is refused before its tables are loaded.
+fn recovered_speculation<'a>(
+    base: &InterpModel,
+    expected_store: StoreMode,
+    escape_set: bool,
+    store_budget: usize,
+    file: impl Fn(&str) -> Option<&'a [u8]>,
+) -> Result<(Speculation, usize), String> {
     let dynv = file(DYN_FILE).ok_or("the checkpoint has no compiled-tier state (it was not taken with -compile)")?;
     let shapes = file(SPECULATION_FILE).ok_or("the checkpoint has no compiled-tier shapes")?;
-    let (spec, attempt) = Speculation::decode(base, shapes)?;
+    let (mut spec, attempt, ck_mode) = Speculation::decode(base, shapes)?;
+    if ck_mode != expected_store {
+        if escape_set && ck_mode != StoreMode::Off {
+            return Err(format!("the checkpoint was taken with {}, cannot recover with TLX_ESCAPE=1", ck_mode.label()));
+        }
+        return Err(format!("the checkpoint was taken with {}, this run uses {}", ck_mode.label(), expected_store.label()));
+    }
     let mut rd = tlx_value::ser::Reader::new(dynv);
     let snap = tlx_layout::ser::read_dyn_table(&mut rd).map_err(|e| format!("corrupt Dyn interner: {e}"))?;
+    rd.finish().map_err(|e| format!("corrupt Dyn interner: {e}"))?;
     tlx_layout::dynval::restore(&snap)?;
+    match ck_mode {
+        StoreMode::Off => {
+            if file(STORE_FILE).is_some() {
+                return Err("corrupt checkpoint: unexpected value store file for TLX_VALUE_STORE=0".into());
+            }
+        }
+        StoreMode::Dyn | StoreMode::All => {
+            let store_bytes = file(STORE_FILE).ok_or("the checkpoint has no value store (missing model-store)")?;
+            let mut srd = tlx_value::ser::Reader::new(store_bytes);
+            let store = tlx_layout::ser::read_store(&mut srd, store_budget)?;
+            spec.store = Some(StoreRef(store));
+            spec.store_all = ck_mode == StoreMode::All;
+        }
+    }
     Ok((spec, attempt))
 }
 
@@ -267,7 +306,7 @@ pub fn simulate<S>(
             m.note_restart();
         }
         let (r, extra) = run(&m);
-        spec.check_store()?;
+        spec.check_store(None)?;
         if !spec.after_run(&m, &r, attempt, max_restarts) {
             base.ip.effects_finish();
             // Nothing restarts after the simulation (see `EncModel::restartable`).
@@ -308,19 +347,56 @@ struct Speculation {
 }
 
 /// The version of `Speculation::encode`, and of the compiled tier's
-/// checkpoint files with it (2: `Dyn` handles with kind tags).
-const SPECULATION_VERSION: u64 = 3;
+/// checkpoint files with it (4: value store mode and `model-store`).
+const SPECULATION_VERSION: u64 = 4;
+
+/// How a run uses the value store (`TLX_VALUE_STORE`), recorded in
+/// `model-shapes` so recovery refuses mismatched modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreMode {
+    Off = 0,
+    Dyn = 1,
+    All = 2,
+}
+
+impl StoreMode {
+    fn from_byte(b: u8) -> Result<StoreMode, String> {
+        match b {
+            0 => Ok(StoreMode::Off),
+            1 => Ok(StoreMode::Dyn),
+            2 => Ok(StoreMode::All),
+            _ => Err(format!("corrupt compiled-tier shapes: unknown value store mode {b}")),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            StoreMode::Off => "TLX_VALUE_STORE=0",
+            StoreMode::Dyn => "TLX_VALUE_STORE=1",
+            StoreMode::All => "TLX_VALUE_STORE=all",
+        }
+    }
+}
 
 impl Speculation {
+    fn store_mode(&self) -> StoreMode {
+        match (&self.store, self.store_all) {
+            (None, _) => StoreMode::Off,
+            (Some(_), false) => StoreMode::Dyn,
+            (Some(_), true) => StoreMode::All,
+        }
+    }
+
     /// The state of the speculation at attempt `attempt`, for a checkpoint:
-    /// version, attempt, fallback, the variables' shapes and misses, the
-    /// materialized definitions (id, shape) and their misses.
+    /// version, attempt, fallback, store mode, the variables' shapes and
+    /// misses, the materialized definitions (id, shape) and their misses.
     fn encode(&self, attempt: usize) -> Vec<u8> {
         use tlx_layout::ser::write_shape;
         let mut w = tlx_value::ser::Writer::new();
         w.uvar(SPECULATION_VERSION);
         w.usize(attempt);
         w.u8(self.fallback as u8);
+        w.u8(self.store_mode() as u8);
         w.usize(self.shapes.len());
         for (s, &n) in self.shapes.iter().zip(&self.misses) {
             write_shape(&mut w, s);
@@ -335,8 +411,8 @@ impl Speculation {
         w.into_bytes()
     }
 
-    /// The speculation `encode` wrote, and its attempt.
-    fn decode(base: &InterpModel, b: &[u8]) -> Result<(Speculation, usize), String> {
+    /// The speculation `encode` wrote, its attempt, and its store mode.
+    fn decode(base: &InterpModel, b: &[u8]) -> Result<(Speculation, usize, StoreMode), String> {
         use tlx_layout::ser::read_shape;
         let mut r = tlx_value::ser::Reader::new(b);
         let e = |e: tlx_value::ser::DecodeError| format!("corrupt compiled-tier shapes: {e}");
@@ -349,6 +425,7 @@ impl Speculation {
         }
         let attempt = r.usize().map_err(e)?;
         let fallback = r.u8().map_err(e)? != 0;
+        let store_mode = StoreMode::from_byte(r.u8().map_err(e)?)?;
         let n = r.count(2).map_err(e)?;
         if n != base.ip.prog.vars.len() {
             return Err(format!("the checkpoint has shapes of {n} variables, the spec {}", base.ip.prog.vars.len()));
@@ -369,7 +446,11 @@ impl Speculation {
             def_misses.push(small(r.uvar().map_err(e)?)?);
         }
         r.finish().map_err(e)?;
-        Ok((Speculation { hints: hints(base), shapes, def_shapes, misses, def_misses, fallback, store: None, store_all: false }, attempt))
+        Ok((
+            Speculation { hints: hints(base), shapes, def_shapes, misses, def_misses, fallback, store: None, store_all: false },
+            attempt,
+            store_mode,
+        ))
     }
 
     /// `walk_depth`, `workers`: see `PrerunBudget`; `search`: see
@@ -553,12 +634,18 @@ impl Speculation {
     /// Err if the value store filled up: its budget is a hard limit (no
     /// reclamation yet), and values it refused were neither stored nor
     /// fingerprinted correctly.
-    fn check_store(&self) -> Result<(), String> {
+    fn check_store(&self, checkpoint: Option<&tlx_runtime::Checkpointer>) -> Result<(), String> {
         match &self.store {
-            Some(s) if s.is_full() => Err(format!(
-                "the value store (TLX_VALUE_STORE) exceeded its budget of {} MiB (-maxmem): raise -maxmem or turn the store off (TLX_VALUE_STORE=0)",
-                s.budget() >> 20
-            )),
+            Some(s) if s.is_full() => {
+                let mut msg = format!(
+                    "the value store (TLX_VALUE_STORE) exceeded its budget of {} MiB (-maxmem): raise -maxmem or turn the store off (TLX_VALUE_STORE=0)",
+                    s.budget() >> 20
+                );
+                if checkpoint.is_some_and(|c| c.keep_last()) {
+                    msg.push_str(", recovering the last checkpoint, which is kept");
+                }
+                Err(msg)
+            }
             _ => Ok(()),
         }
     }
@@ -832,10 +919,11 @@ mod tests {
             store_all: false,
         };
         let shapes = spec.encode(4);
-        let recover = |shapes: &[u8], dynv: &[u8]| {
-            recovered_speculation(&m, |name| match name {
+        let recover = |shapes: &[u8], dynv: &[u8], store: Option<&[u8]>, mode: StoreMode, escape: bool| {
+            recovered_speculation(&m, mode, escape, usize::MAX, |name| match name {
                 SPECULATION_FILE => Some(shapes),
                 DYN_FILE => Some(dynv),
+                STORE_FILE => store,
                 _ => None,
             })
         };
@@ -844,18 +932,52 @@ mod tests {
             tlx_layout::ser::write_dyn_table(&mut w, snap).unwrap();
             w.into_bytes()
         };
+        let good_dyn = table(&tlx_layout::dynval::snapshot());
         // A table of no shards does not fit this build: refused when loaded.
         let bad = table(&[]);
-        let Err(e) = recover(&shapes, &bad) else { panic!("an interner table of no shards was restored") };
+        let Err(e) = recover(&shapes, &bad, None, StoreMode::Off, false) else { panic!("an interner table of no shards was restored") };
         assert!(e.contains("shards"), "{e}");
         // The current table (restoring it changes nothing): recovered.
-        let (got, attempt) = recover(&shapes, &table(&tlx_layout::dynval::snapshot())).unwrap();
+        let (got, attempt) = recover(&shapes, &good_dyn, None, StoreMode::Off, false).unwrap();
         assert_eq!((got.shapes, got.misses, attempt), (spec.shapes.clone(), spec.misses.clone(), 4));
+        assert!(got.store.is_none());
+        // Stray model-store with StoreMode::Off is refused.
+        let Err(e) = recover(&shapes, &good_dyn, Some(&[]), StoreMode::Off, false) else { panic!("stray model-store must be refused") };
+        assert!(e.contains("unexpected value store"), "{e}");
+        // Mode mismatches are refused before loading tables.
+        let Err(e) = recover(&shapes, &bad, None, StoreMode::Dyn, false) else {
+            panic!("StoreMode::Off checkpoint must be refused under StoreMode::Dyn")
+        };
+        assert!(e.contains("TLX_VALUE_STORE=0") && e.contains("TLX_VALUE_STORE=1"), "{e}");
+        // StoreMode::Dyn checkpoint: requires matching mode and valid model-store.
+        let mut store_spec = spec;
+        let orig_store = StoreRef::new(usize::MAX);
+        orig_store.freeze(&tlx_value::Value::tuple(vec![tlx_value::Value::Int(7)])).unwrap();
+        store_spec.store = Some(orig_store.clone());
+        let store_shapes = store_spec.encode(2);
+        let mut sw = tlx_value::ser::Writer::new();
+        tlx_layout::ser::write_store(&mut sw, &orig_store).unwrap();
+        let store_bytes = sw.into_bytes();
+        let Err(e) = recover(&store_shapes, &good_dyn, Some(&store_bytes), StoreMode::Off, false) else {
+            panic!("StoreMode::Dyn checkpoint must be refused under StoreMode::Off")
+        };
+        assert!(e.contains("TLX_VALUE_STORE=1") && e.contains("TLX_VALUE_STORE=0"), "{e}");
+        let Err(e) = recover(&store_shapes, &good_dyn, Some(&store_bytes), StoreMode::Off, true) else {
+            panic!("StoreMode::Dyn checkpoint must be refused under TLX_ESCAPE=1")
+        };
+        assert!(e.contains("TLX_ESCAPE=1"), "{e}");
+        let Err(e) = recover(&store_shapes, &good_dyn, None, StoreMode::Dyn, false) else { panic!("missing model-store must be refused") };
+        assert!(e.contains("missing model-store"), "{e}");
+        let (got, attempt) = recover(&store_shapes, &good_dyn, Some(&store_bytes), StoreMode::Dyn, false).unwrap();
+        assert_eq!(attempt, 2);
+        let restored = got.store.expect("restored store");
+        assert_ne!(restored.uid(), orig_store.uid(), "restored store must allocate a fresh uid");
+        assert_eq!(restored.stats().nodes, orig_store.stats().nodes);
         // Version 1: refused before the table is read.
         let mut old = shapes.clone();
         assert_eq!(old[0], SPECULATION_VERSION as u8);
         old[0] = 1;
-        let Err(e) = recover(&old, &bad) else { panic!("a checkpoint of version 1 was recovered") };
-        assert_eq!(e, "the checkpoint's compiled-tier shapes are of version 1, this tlx reads version 3");
+        let Err(e) = recover(&old, &bad, None, StoreMode::Off, false) else { panic!("a checkpoint of version 1 was recovered") };
+        assert_eq!(e, "the checkpoint's compiled-tier shapes are of version 1, this tlx reads version 4");
     }
 }

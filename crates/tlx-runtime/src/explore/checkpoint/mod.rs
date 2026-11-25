@@ -249,12 +249,13 @@ impl Checkpointer {
 
     /// The search ended (not killed): remove the checkpoint (unless it is
     /// to be kept, with the metadir) and release the metadir.
-    pub(super) fn finish(&self) {
+    pub fn finish(&self) {
         let Some(h) = self.hold.lock().take() else { return };
         if self.keep.load(Ordering::SeqCst) && self.present.load(Ordering::SeqCst) {
             h.keep();
             return;
         }
+        self.present.store(false, Ordering::SeqCst);
         checkpoint_dirs(h.path()).remove_all();
     }
 }
