@@ -13,6 +13,7 @@ that writes nothing `cwd=None`, so a measured tlx (or TLC) child inherited the
 driver's own directory and the model's relative input was not there.
 """
 
+import io
 import os
 import json
 import tempfile
@@ -20,6 +21,7 @@ import unittest
 from unittest.mock import patch
 
 import corpus
+import oracle
 import testkit
 import tlc
 import tlxlib
@@ -79,6 +81,54 @@ class ModelCwd(testkit.GuardedTestCase):
         self.assertEqual(corpus.by_id(models, "A/two"), [models[1]])
         with self.assertRaises(SystemExit):
             corpus.by_id(models, "A/three")
+
+
+class InvalidUpstreamModels(testkit.GuardedTestCase):
+    invalid_ids = ("ewd998/EWD998ChanID_export", "ewd998/EWD998ChanID_shiviz")
+    valid_ids = ("ewd998/EWD998ChanID", "ewd998/EWD998ChanTrace")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = os.path.join(tmp.name, "specifications", "ewd998")
+        os.makedirs(directory)
+        modules = [{"path": "specifications/ewd998/EWD998ChanID.tla", "models": [
+            {"path": f"specifications/{name}.cfg", "mode": "exhaustive search",
+             "runtime": "00:00:01"} for name in self.invalid_ids + self.valid_ids]}]
+        with open(os.path.join(directory, "manifest.json"), "w") as stream:
+            json.dump({"modules": modules}, stream)
+        self.enterContext(patch.object(corpus, "EX", tmp.name))
+        self.stderr = self.enterContext(patch("sys.stderr", new_callable=io.StringIO))
+
+    def test_selection_excludes_only_invalid_configurations_with_reasons(self):
+        self.assertEqual([m["id"] for m in corpus.models(60)], list(self.valid_ids))
+        for model_id in self.invalid_ids:
+            reason = corpus.INVALID_UPSTREAM_MODELS[model_id]
+            self.assertIn("MCInit leaves passes unassigned", reason)
+            self.assertIn("rejected by TLC and tlx", reason)
+            self.assertIn(f"excluded {model_id}: {reason}", self.stderr.getvalue())
+
+    def test_listing_and_explicit_collection_report_classification(self):
+        with patch("sys.argv", ["corpus.py", "list"]), patch("sys.stdout", new_callable=io.StringIO) as out:
+            corpus.main()
+        for model_id in self.valid_ids:
+            self.assertIn(model_id, out.getvalue())
+        for model_id in self.invalid_ids:
+            self.assertNotIn(model_id, out.getvalue())
+            with self.subTest(model_id=model_id), patch("sys.argv", ["corpus.py", "tlc", "--ids", model_id]), \
+                    patch.object(tlc, "run_tlc") as run:
+                with self.assertRaisesRegex(SystemExit, "invalid upstream input: MCInit leaves passes unassigned"):
+                    corpus.main()
+                run.assert_not_called()
+
+    def test_oracle_selection_cannot_restore_invalid_cached_rows(self):
+        cached = {model_id: {"tlc": {"result": "success"}} for model_id in self.invalid_ids}
+        with patch.object(tlxlib, "load_oracle", return_value=cached):
+            self.assertEqual(set(oracle.select_models()), set(self.valid_ids))
+            selected = oracle.select_models(ids=self.invalid_ids)
+        for model_id in self.invalid_ids:
+            self.assertEqual(selected[model_id]["tlc"], {})
+            self.assertEqual(selected[model_id]["selection_error"], corpus.INVALID_UPSTREAM_MODELS[model_id])
 
 
 class DriverRunDirectory(testkit.GuardedTestCase):

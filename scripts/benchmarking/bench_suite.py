@@ -540,7 +540,9 @@ def resolve_models(ids, *, stage):
     missing = set(ids) - available.keys()
     if missing:
         import corpus
-        for model in corpus.models(float("inf")):
+        # Explicit benchmark entries retain their historical inputs and expectations,
+        # including invalid upstream configs excluded from ordinary corpus sweeps.
+        for model in corpus.models(float("inf"), include_invalid=True):
             mid = model["id"]
             if mid in missing:
                 available[mid] = {**model, **bench_models.declared_run_fields(mid), "tlc": {}}

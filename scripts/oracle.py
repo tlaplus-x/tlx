@@ -40,6 +40,7 @@ def issue(model):
 
 def select_models(filter="", ids=(), oracles=(), tiers=""):
     from corpus import models, external_models, EXTERNAL_TIERS, HUGE_MAX_RUNTIME, HUGE_MIN_RUNTIME
+    from corpus import INVALID_UPSTREAM_MODELS
     from tlxlib import load_oracle
     ids = {i for i in (ids.split(",") if isinstance(ids, str) else ids) if i}
     names = [n for n in (oracles.split(",") if isinstance(oracles, str) else oracles) if n]
@@ -70,5 +71,6 @@ def select_models(filter="", ids=(), oracles=(), tiers=""):
             # Manifest paths, flags, worker requirements and tiers win over old caches.
             result[k] = {**data.get(k, {}), **m, "tlc": data.get(k, {}).get("tlc", {})}
     for k in ids - result.keys():
-        result[k] = {"id": k, "tlc": {}, "selection_error": "requested id absent from selected manifest"}
+        result[k] = {"id": k, "tlc": {}, "selection_error": INVALID_UPSTREAM_MODELS.get(
+            k, "requested id absent from selected manifest")}
     return result
