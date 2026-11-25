@@ -68,7 +68,18 @@ impl Mem {
 
     /// An empty segment buffer of capacity `seg_bytes`, if one is free.
     pub(super) fn reuse(&self) -> Option<Vec<u8>> {
-        self.pool.lock().pop()
+        let data = self.pool.lock().pop()?;
+        self.sub(data.capacity());
+        Some(data)
+    }
+
+    /// Free idle segment buffers, returning the released capacity.
+    pub(crate) fn clear_pool(&self) -> usize {
+        let mut pool = self.pool.lock();
+        let bytes = pool.iter().map(Vec::capacity).sum();
+        pool.clear();
+        self.sub(bytes);
+        bytes
     }
 }
 
@@ -130,12 +141,17 @@ pub(crate) struct Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        let mem = &self.charge.get_mut().mem;
+        let charge = self.charge.get_mut();
+        let mem = &charge.mem;
         if self.data.capacity() == mem.seg_bytes {
             let mut pool = mem.pool.lock();
             if pool.len() < mem.pool_max {
                 let mut data = std::mem::take(&mut self.data);
                 data.clear();
+                // Transfer the existing charge to the pool without a
+                // transient double count in either bytes or the peak.
+                debug_assert_eq!(charge.bytes, data.capacity());
+                charge.bytes = 0;
                 pool.push(data);
             }
         }
@@ -301,4 +317,53 @@ impl<S> Block<S> {
 pub(crate) struct SegCache {
     seg: Option<Arc<Seg>>,
     bytes: Option<seg::Bytes>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(mem: &Arc<Mem>, data: Vec<u8>) -> Segment {
+        Segment { charge: Mutex::new(Charge::new(data.capacity(), mem)), data }
+    }
+
+    #[test]
+    fn pooled_capacity_is_counted_across_reuse_and_drain() {
+        let mem = Mem::new(4096, true);
+        for _ in 0..100 {
+            let data = mem.reuse().unwrap_or_else(|| Vec::with_capacity(4096));
+            assert_eq!(mem.bytes(), 0);
+            let seg = segment(&mem, data);
+            assert_eq!(mem.bytes(), 4096);
+            drop(seg);
+            assert_eq!(mem.bytes(), 4096);
+            assert_eq!(mem.peak(), 4096);
+        }
+        // Draining idle buffers must leave a live segment's charge intact.
+        let live = segment(&mem, Vec::with_capacity(4096));
+        assert_eq!(mem.bytes(), 8192);
+        assert_eq!(mem.clear_pool(), 4096);
+        assert_eq!(mem.bytes(), 4096);
+        assert!(mem.reuse().is_none());
+        drop(live);
+        assert_eq!(mem.clear_pool(), 4096);
+        assert_eq!(mem.bytes(), 0);
+        assert_eq!(mem.clear_pool(), 0);
+    }
+
+    #[test]
+    fn pool_limit_and_ineligible_buffers_release_their_charge() {
+        let mem = Mem::new(64, true);
+        let segments: Vec<_> = (0..POOL_MAX + 1).map(|_| segment(&mem, Vec::with_capacity(64))).collect();
+        drop(segments);
+        assert_eq!(mem.bytes(), POOL_MAX * 64);
+        drop(segment(&mem, Vec::with_capacity(128)));
+        assert_eq!(mem.bytes(), POOL_MAX * 64);
+        mem.clear_pool();
+        assert_eq!(mem.bytes(), 0);
+        let mem = Mem::new(64, false);
+        drop(segment(&mem, Vec::with_capacity(64)));
+        assert_eq!(mem.bytes(), 0);
+        assert!(mem.reuse().is_none());
+    }
 }

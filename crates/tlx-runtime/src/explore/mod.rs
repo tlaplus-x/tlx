@@ -532,7 +532,8 @@ impl<M: Model> Shared<'_, M> {
             let room = |others: usize| self.budget.total().saturating_sub(others);
             let mut others = self.budget.used(self.accounted()).saturating_sub(old);
             if peak > room(others) {
-                if self.budget.stage() != Stage::None {
+                let freed = self.frontier.queue_mem().clear_pool();
+                if freed > 0 || self.budget.stage() != Stage::None {
                     crate::mem::purge();
                 }
                 self.budget.sample();
@@ -606,6 +607,11 @@ impl<M: Model> Shared<'_, M> {
     /// `ROTATE_MIN_SLOTS` (or the set's limit, if less), at most the limit.
     /// An IO error stops the search.
     fn rotate_seen(&self, crew: Option<&Crew<'_>>, threads: usize) {
+        let freed = self.frontier.queue_mem().clear_pool();
+        if freed > 0 && self.budget.limited() {
+            crate::mem::purge();
+            self.budget.sample();
+        }
         let seen = &self.seen;
         let limit = seen.limit();
         let floor = ROTATE_MIN_SLOTS.min(limit);
@@ -765,13 +771,15 @@ impl<M: Model> Shared<'_, M> {
         b.sample();
         let mut used = b.used(self.accounted());
         let total = b.total();
-        if used > total && b.stage() == Stage::None {
-            // Before the first stage: the allocator keeps freed memory for
-            // a while (the CLI sets a long purge delay); what it returns
-            // may be all the excess.
-            crate::mem::purge();
-            b.sample();
-            used = b.used(self.accounted());
+        if used > total {
+            let freed = self.frontier.queue_mem().clear_pool();
+            if freed > 0 || b.stage() == Stage::None {
+                // Return idle buffers and, before the first stage, other
+                // allocator-retained memory before escalating to disk.
+                crate::mem::purge();
+                b.sample();
+                used = b.used(self.accounted());
+            }
         }
         if used <= total {
             // (Some slack before compressing, and spilling, no more.)
@@ -1241,6 +1249,92 @@ mod tests {
         }
         fn caps(&self) -> Caps<'_, u64> {
             Caps { format: Some(StateFormat::Words(self)), ..Default::default() }
+        }
+    }
+
+    #[test]
+    fn pressure_drains_idle_queue_segments() {
+        for growth in [false, true] {
+            let opts = Options {
+                workers: 1,
+                maxmem: 1,
+                queue: crate::queue::Config { seg_bytes: 4096, kinds: crate::queue::BlockKinds::Raw, compress_above: 0 },
+                fp: FpConfig::growing(4096).with_initial(1024),
+                spill: Spill::new(SpillConfig { mode: SpillMode::Off, ..Default::default() }),
+                ..Default::default()
+            };
+            let r = run::prepare(&DummyModel, &opts, &Start::Init, None, None, Instant::now());
+            let shared = &r.shared;
+            {
+                let mut local = shared.frontier.local(0, false);
+                for state in 1..=400 {
+                    local.push_new(Task { state, log: state, depth: 1 });
+                }
+                local.advance();
+                let mut count = 0;
+                while local.pop().is_some() {
+                    count += 1;
+                }
+                assert_eq!(count, 400);
+            }
+            assert!(shared.frontier.queue_mem().bytes() > 0, "idle buffers remain charged");
+            if growth {
+                let mut probes = 0;
+                for fp in 1..=shared.seen.slots() as u64 {
+                    if shared.seen.at_high() {
+                        break;
+                    }
+                    shared.seen.insert(fp, &mut probes, || {}).unwrap();
+                }
+                assert!(shared.seen.at_high());
+                shared.grow_seen(None);
+            } else {
+                shared.relieve();
+            }
+            assert_eq!(shared.frontier.queue_mem().bytes(), 0, "growth={growth}");
+        }
+    }
+
+    #[test]
+    fn first_rotation_at_slot_limit_drains_idle_queue_segments() {
+        for maxmem in [0, 1 << 30] {
+            let dir = tlx_testkit::TempDir::new("rotation-queue-pool");
+            let opts = Options {
+                workers: 1,
+                maxmem,
+                queue: crate::queue::Config { seg_bytes: 4096, kinds: crate::queue::BlockKinds::Raw, compress_above: 0 },
+                fp: FpConfig::growing(1024).with_initial(1024),
+                spill: Spill::new(SpillConfig { mode: SpillMode::Auto, dir: Some(dir.child_path("spill")), ..Default::default() }),
+                ..Default::default()
+            };
+            let r = run::prepare(&DummyModel, &opts, &Start::Init, None, None, Instant::now());
+            let shared = &r.shared;
+            {
+                let mut local = shared.frontier.local(0, false);
+                for state in 1..=400 {
+                    local.push_new(Task { state, log: state, depth: 1 });
+                }
+                local.advance();
+                while local.pop().is_some() {}
+            }
+            assert!(shared.frontier.queue_mem().bytes() > 0);
+            let mut probes = 0;
+            for fp in 1..=shared.seen.slots() as u64 {
+                if shared.seen.at_high() {
+                    break;
+                }
+                shared.seen.insert(fp, &mut probes, || {}).unwrap();
+            }
+            assert!(shared.seen.at_high());
+            assert_eq!(shared.seen.next_slots(), shared.seen.slots());
+            assert!(!shared.seen.spilling(), "first rotation has not happened yet");
+            shared.budget.sample();
+            shared.grow_seen(None);
+            assert!(shared.seen.spilling(), "the slot limit triggers the first rotation");
+            assert_eq!(shared.frontier.queue_mem().bytes(), 0);
+            drop(r);
+            opts.spill.wait_for_writes();
+            opts.spill.wait_for_reads();
         }
     }
 
