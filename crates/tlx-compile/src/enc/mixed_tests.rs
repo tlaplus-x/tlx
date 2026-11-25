@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::ir::{ExprKind as K, IndexMap, SetOp, Stmt};
+use crate::ir::{ExprKind as K, FieldLoc, IndexMap, SetOp, SlotLayout, Stmt};
 
 // Hash arbitrary syntax directly: these payload fixtures intentionally do not
 // satisfy type/layout contracts and must never become executable regions.
@@ -22,18 +22,19 @@ fn var(v: u32) -> Expr {
 /// Pairs of expressions that differ only in one payload that is not a
 /// child expression.
 fn pairs() -> Vec<(&'static str, Expr, Expr)> {
-    let union_field = |o: u32| int(K::UnionField { base: var(0), offsets: Arc::from([Some(1), Some(o), None]) });
+    let union_field =
+        |o: usize| int(K::UnionField { base: var(0), locs: Arc::from([Some(FieldLoc::Words(1)), Some(FieldLoc::Words(o)), None]) });
     let lookup = |x: i32| int(K::Lookup { x: var(0), table: Arc::from([0, x, -1]) });
     let recode = |x: u64| int(K::Recode { x: var(0), arm_base: Arc::from([0]), table: Arc::from([1, x]), words: 1 });
     let rank_flat = |r: u64| int(K::RankFlat { x: var(0), radices: Arc::from([3, r]) });
-    let index = |map: IndexMap| int(K::Index { base: var(0), arg: var(0), map, elem_words: 1 });
+    let index = |map: IndexMap| int(K::Index { base: var(0), arg: var(0), map, slot: SlotLayout::Words(1) });
     let sorted_op = |max_card: u32| int(K::SortedOp { op: SetOp::Union, a: var(0), b: var(0), elem_words: 1, max_card });
     let map_put = |insert: bool| {
         let absent = if insert { tlx_value::plan::Absent::Insert } else { tlx_value::plan::Absent::Unchanged };
         let plan = crate::ir::MapPutPlan { absent, reject_when_empty: Arc::from([]) };
         int(K::MapPut { base: var(0), rank: var(0), value: var(0), plan })
     };
-    let seq_sub = |elem_words: u32| int(K::SeqSub { base: var(0), lo: var(0), hi: var(0), elem_words });
+    let seq_sub = |elem_words: usize| int(K::SeqSub { base: var(0), lo: var(0), hi: var(0), slot: SlotLayout::Words(elem_words) });
     let map_set = |cond: Option<Expr>| int(K::MapSet { bind: 0, set: var(0), elem: var(0), cond });
     let enabled = |v: u32| Expr::new(Ty::Bool, K::Enabled(Box::new(Stmt::Assign { var: v, value: var(0), body: Box::new(Stmt::Emit) })));
     let tuple = |xs: Vec<Expr>| int(K::Tuple(xs));

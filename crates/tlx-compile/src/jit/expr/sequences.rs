@@ -6,7 +6,7 @@ use cranelift_codegen::ir::{InstBuilder, Value};
 use tlx_layout::layout::bitset_universe;
 use tlx_layout::Shape;
 
-use super::super::gen::{Gen, MAX_SSA_WORDS};
+use super::super::gen::{Gen, Known, MAX_SSA_WORDS};
 use super::super::{no, R};
 use crate::ir::*;
 
@@ -14,37 +14,75 @@ impl Gen<'_, '_, '_> {
     /// The value family.
     pub(super) fn seq_expr(&mut self, e: &Expr) -> R<Value> {
         Ok(match &*e.kind {
-            ExprKind::Slice { base, offset } => {
+            ExprKind::Slice { base, loc } => {
                 let b = self.expr(base)?;
-                self.offset(b, *offset as usize)
+                match *loc {
+                    FieldLoc::Words(offset) => self.offset(b, offset),
+                    FieldLoc::Bits(pos) => {
+                        let v = self.extract_bitpos(b, pos);
+                        self.materialize(&[Known::Val(v)])
+                    }
+                }
             }
-            ExprKind::Index { base, arg, map, elem_words } => {
+            ExprKind::Index { base, arg, map, slot } => {
                 let b = self.expr(base)?;
-                let slot = self.slot(arg, map, true)?;
-                self.index(b, slot, *elem_words as usize)
+                let sl = self.slot(arg, map, true)?;
+                match *slot {
+                    SlotLayout::Words(elem_words) => self.index(b, sl, elem_words),
+                    SlotLayout::Bits(bits) => {
+                        let v = self.load_slot_bits(b, bits, sl);
+                        self.materialize(&[Known::Val(v)])
+                    }
+                }
             }
-            ExprKind::ExceptAt { base, offset, value } => {
+            ExprKind::ExceptAt { base, loc, value } => {
                 let Ty::Enc(bsid) = e.ty else { return no("boxed EXCEPT") };
                 let Ty::Enc(vsid) = value.ty else { return no("boxed EXCEPT value") };
                 let (n, vn) = (self.words_of(bsid), self.words_of(vsid));
                 let v = self.expr(value)?;
                 let b = self.expr(base)?;
-                if n <= MAX_SSA_WORDS {
-                    let off = *offset as usize;
-                    let mut ws = self.words(b, off);
-                    ws.extend(self.words(v, vn));
-                    let rest = self.offset(b, off + vn);
-                    ws.extend(self.words(rest, n - off - vn));
-                    return Ok(self.materialize(&ws));
+                match *loc {
+                    FieldLoc::Words(offset) => {
+                        let off = offset;
+                        if n <= MAX_SSA_WORDS {
+                            let mut ws = self.words(b, off);
+                            ws.extend(self.words(v, vn));
+                            let rest = self.offset(b, off + vn);
+                            ws.extend(self.words(rest, n - off - vn));
+                            return Ok(self.materialize(&ws));
+                        }
+                        let buf = self.buf(n);
+                        let bp = self.addr(buf);
+                        self.copy(bp, b, n);
+                        let dst = self.offset(bp, off);
+                        self.copy(dst, v, vn);
+                        bp
+                    }
+                    FieldLoc::Bits(pos) => {
+                        let val = self.load(v, 0);
+                        if n <= MAX_SSA_WORDS {
+                            let mut ws = self.words(b, n);
+                            let (nw, mv) = self.insert_known_bits(ws[pos.word], pos, val);
+                            ws[pos.word] = nw;
+                            let p = self.materialize(&ws);
+                            let mut bits: Vec<(BitPos, Known)> = self
+                                .known_bits_of(b)
+                                .into_iter()
+                                .filter(|(bp, _)| bp.word != pos.word || (bp.shifted_mask() & pos.shifted_mask()) == 0)
+                                .collect();
+                            bits.push((pos, mv));
+                            self.know_bits(p, bits);
+                            return Ok(p);
+                        }
+                        let buf = self.buf(n);
+                        let bp = self.addr(buf);
+                        self.copy(bp, b, n);
+                        self.store_bitpos(bp, pos, val);
+                        bp
+                    }
                 }
-                let buf = self.buf(n);
-                let bp = self.addr(buf);
-                self.copy(bp, b, n);
-                let dst = self.offset(bp, *offset as usize);
-                self.copy(dst, v, vn);
-                bp
             }
-            ExprKind::ExceptIndex { base, arg, map, elem_words, value } => {
+            ExprKind::ExceptIndex { base, arg, map, slot, value } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed EXCEPT")?;
                 let b = self.expr(base)?;
                 let sl = self.slot(arg, map, false)?;
@@ -55,9 +93,17 @@ impl Gen<'_, '_, '_> {
                 self.brif(c, yes, &[], after, &[]);
                 self.switch(yes);
                 let v = self.expr(value)?;
-                let ew = *elem_words as usize;
-                let dst = self.index(bp, sl, ew);
-                self.copy(dst, v, ew);
+                match *slot {
+                    SlotLayout::Words(elem_words) => {
+                        let ew = elem_words;
+                        let dst = self.index(bp, sl, ew);
+                        self.copy(dst, v, ew);
+                    }
+                    SlotLayout::Bits(bits) => {
+                        let val = self.load(v, 0);
+                        self.store_slot_bits(bp, bits, sl, val);
+                    }
+                }
                 self.b.ins().jump(after, &[]);
                 self.switch(after);
                 bp
@@ -96,12 +142,42 @@ impl Gen<'_, '_, '_> {
                 }
                 self.addr(buf)
             }
-            ExprKind::SeqFilter { bind, seq, pred, elem_words } => {
+            ExprKind::SeqFilter { bind, seq, pred, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let s = self.expr(seq)?;
                 let bp = self.addr(buf);
                 self.zero(bp, n);
-                self.filter_sorted(*bind, s, pred, *elem_words as usize, buf)?;
+                match *slot {
+                    SlotLayout::Words(elem_words) => self.filter_sorted(*bind, s, pred, elem_words, buf)?,
+                    SlotLayout::Bits(bits) => {
+                        let zero = self.iconst(0);
+                        let l = self.var(zero);
+                        let len = self.load(s, 0);
+                        self.for_range(zero, len, false, &mut |g, i| {
+                            let base = g.offset(s, 1);
+                            let val = g.load_slot_bits(base, bits, i);
+                            let t = g.materialize(&[Known::Val(val)]);
+                            let sc = g.scope();
+                            let p = g.with_temp(*bind, t, |g| g.bool_expr(pred))?;
+                            g.end_scope(sc);
+                            let (yes, after) = (g.b.create_block(), g.b.create_block());
+                            g.brif(p, yes, &[], after, &[]);
+                            g.switch(yes);
+                            let lv = g.b.use_var(l);
+                            let bp = g.addr(buf);
+                            let d0 = g.offset(bp, 1);
+                            g.store_slot_bits(d0, bits, lv, val);
+                            let l1 = g.b.ins().iadd_imm(lv, 1);
+                            g.b.def_var(l, l1);
+                            g.b.ins().jump(after, &[]);
+                            g.switch(after);
+                            Ok(())
+                        })?;
+                        let lv = self.b.use_var(l);
+                        let bp = self.addr(buf);
+                        self.store(lv, bp, 0);
+                    }
+                }
                 self.addr(buf)
             }
             ExprKind::MapSet { bind, set, elem, cond } => {
@@ -186,7 +262,7 @@ impl Gen<'_, '_, '_> {
             ExprKind::Collect { bind, set, elem } => {
                 let Ty::Enc(sid) = e.ty else { return no("boxed sequence") };
                 let Shape::Seq { elem: es, max_len } = self.cx.ty.shape(sid).clone() else { return no("collect into a non-sequence") };
-                let ew = self.words_of(self.find_sid(&es)?);
+                let slot = SlotLayout::of(&es);
                 let n = self.words_of(sid);
                 let buf = self.buf(n);
                 let bp = self.addr(buf);
@@ -198,15 +274,23 @@ impl Gen<'_, '_, '_> {
                     let ok = g.cmp_imm(IntCC::UnsignedLessThan, len, max_len as i64);
                     g.check(ok);
                     let p = g.offset(bp, 1);
-                    let dst = g.index(p, len, ew);
-                    g.copy(dst, x, ew);
+                    match slot {
+                        SlotLayout::Words(ew) => {
+                            let dst = g.index(p, len, ew);
+                            g.copy(dst, x, ew);
+                        }
+                        SlotLayout::Bits(bits) => {
+                            let val = g.load(x, 0);
+                            g.store_slot_bits(p, bits, len, val);
+                        }
+                    }
                     let l1 = g.b.ins().iadd_imm(len, 1);
                     g.store(l1, bp, 0);
                     Ok(())
                 })?;
                 self.addr(buf)
             }
-            ExprKind::SeqIndex { base, arg, elem_words } => {
+            ExprKind::SeqIndex { base, arg, slot } => {
                 let s = self.expr(base)?;
                 let i = self.int_expr(arg)?;
                 let len = self.load(s, 0);
@@ -217,29 +301,55 @@ impl Gen<'_, '_, '_> {
                 let ok = self.b.ins().band(pos, le);
                 self.check(ok);
                 let p = self.offset(s, 1);
-                self.index(p, i1, *elem_words as usize)
+                match *slot {
+                    SlotLayout::Words(elem_words) => self.index(p, i1, elem_words),
+                    SlotLayout::Bits(bits) => {
+                        let v = self.load_slot_bits(p, bits, i1);
+                        self.materialize(&[Known::Val(v)])
+                    }
+                }
             }
-            ExprKind::SeqTail { base, elem_words } => {
+            ExprKind::SeqTail { base, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
-                let ew = *elem_words as usize;
                 let s = self.expr(base)?;
                 let len = self.load(s, 0);
                 self.check(len);
-                let bp = self.addr(buf);
-                self.copy(bp, s, n);
                 let l1 = self.b.ins().iadd_imm(len, -1);
-                let dst = self.offset(bp, 1);
-                let src = self.offset(bp, 1 + ew);
-                let bytes = self.b.ins().imul_imm(l1, (ew * 8) as i64);
-                self.copy_dyn(dst, src, bytes);
-                let last = self.index(dst, l1, ew);
-                self.zero(last, ew);
-                self.store(l1, bp, 0);
-                bp
+                match *slot {
+                    SlotLayout::Words(elem_words) => {
+                        let ew = elem_words;
+                        let bp = self.addr(buf);
+                        self.copy(bp, s, n);
+                        let dst = self.offset(bp, 1);
+                        let src = self.offset(bp, 1 + ew);
+                        let bytes = self.b.ins().imul_imm(l1, (ew * 8) as i64);
+                        self.copy_dyn(dst, src, bytes);
+                        let last = self.index(dst, l1, ew);
+                        self.zero(last, ew);
+                        self.store(l1, bp, 0);
+                        bp
+                    }
+                    SlotLayout::Bits(bits) => {
+                        let bp = self.addr(buf);
+                        self.zero(bp, n);
+                        let zero = self.iconst(0);
+                        self.for_range(zero, l1, false, &mut |g, j| {
+                            let sp = g.offset(s, 1);
+                            let j1 = g.b.ins().iadd_imm(j, 1);
+                            let v = g.load_slot_bits(sp, bits, j1);
+                            let bp = g.addr(buf);
+                            let dp = g.offset(bp, 1);
+                            g.store_slot_bits(dp, bits, j, v);
+                            Ok(())
+                        })?;
+                        let bp = self.addr(buf);
+                        self.store(l1, bp, 0);
+                        bp
+                    }
+                }
             }
-            ExprKind::SeqSub { base, lo, hi, elem_words } => {
+            ExprKind::SeqSub { base, lo, hi, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
-                let ew = *elem_words as usize;
                 let s = self.expr(base)?;
                 let (m, k) = (self.int_expr(lo)?, self.int_expr(hi)?);
                 let bp = self.addr(buf);
@@ -256,20 +366,37 @@ impl Gen<'_, '_, '_> {
                 let cnt = self.b.ins().isub(k, m);
                 let cnt = self.b.ins().iadd_imm(cnt, 1);
                 let m1 = self.b.ins().iadd_imm(m, -1);
-                let sp = self.offset(s, 1);
-                let src = self.index(sp, m1, ew);
+                match *slot {
+                    SlotLayout::Words(elem_words) => {
+                        let ew = elem_words;
+                        let sp = self.offset(s, 1);
+                        let src = self.index(sp, m1, ew);
+                        let bp = self.addr(buf);
+                        let dst = self.offset(bp, 1);
+                        let bytes = self.b.ins().imul_imm(cnt, (ew * 8) as i64);
+                        self.copy_dyn(dst, src, bytes);
+                    }
+                    SlotLayout::Bits(bits) => {
+                        let zero = self.iconst(0);
+                        self.for_range(zero, cnt, false, &mut |g, j| {
+                            let sp = g.offset(s, 1);
+                            let si = g.b.ins().iadd(m1, j);
+                            let v = g.load_slot_bits(sp, bits, si);
+                            let bp = g.addr(buf);
+                            let dp = g.offset(bp, 1);
+                            g.store_slot_bits(dp, bits, j, v);
+                            Ok(())
+                        })?;
+                    }
+                }
                 let bp = self.addr(buf);
-                let dst = self.offset(bp, 1);
-                let bytes = self.b.ins().imul_imm(cnt, (ew * 8) as i64);
-                self.copy_dyn(dst, src, bytes);
                 self.store(cnt, bp, 0);
                 self.b.ins().jump(after, &[]);
                 self.switch(after);
                 self.addr(buf)
             }
-            ExprKind::SeqConcat { a, b, elem_words, max_len } => {
+            ExprKind::SeqConcat { a, b, slot, max_len } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
-                let ew = *elem_words as usize;
                 let (a, b) = (self.expr(a)?, self.expr(b)?);
                 let (la, lb) = (self.load(a, 0), self.load(b, 0));
                 let l = self.b.ins().iadd(la, lb);
@@ -277,17 +404,34 @@ impl Gen<'_, '_, '_> {
                 self.check(ok);
                 let bp = self.addr(buf);
                 self.copy(bp, a, n);
-                let d0 = self.offset(bp, 1);
-                let dst = self.index(d0, la, ew);
-                let src = self.offset(b, 1);
-                let bytes = self.b.ins().imul_imm(lb, (ew * 8) as i64);
-                self.copy_dyn(dst, src, bytes);
+                match *slot {
+                    SlotLayout::Words(elem_words) => {
+                        let ew = elem_words;
+                        let d0 = self.offset(bp, 1);
+                        let dst = self.index(d0, la, ew);
+                        let src = self.offset(b, 1);
+                        let bytes = self.b.ins().imul_imm(lb, (ew * 8) as i64);
+                        self.copy_dyn(dst, src, bytes);
+                    }
+                    SlotLayout::Bits(bits) => {
+                        let zero = self.iconst(0);
+                        self.for_range(zero, lb, false, &mut |g, j| {
+                            let sp = g.offset(b, 1);
+                            let v = g.load_slot_bits(sp, bits, j);
+                            let bp = g.addr(buf);
+                            let dp = g.offset(bp, 1);
+                            let di = g.b.ins().iadd(la, j);
+                            g.store_slot_bits(dp, bits, di, v);
+                            Ok(())
+                        })?;
+                    }
+                }
+                let bp = self.addr(buf);
                 self.store(l, bp, 0);
                 bp
             }
-            ExprKind::SeqAppend { base, value, elem_words, max_len } => {
+            ExprKind::SeqAppend { base, value, slot, max_len } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
-                let ew = *elem_words as usize;
                 let s = self.expr(base)?;
                 let v = self.expr(value)?;
                 let len = self.load(s, 0);
@@ -296,8 +440,17 @@ impl Gen<'_, '_, '_> {
                 let bp = self.addr(buf);
                 self.copy(bp, s, n);
                 let d0 = self.offset(bp, 1);
-                let dst = self.index(d0, len, ew);
-                self.copy(dst, v, ew);
+                match *slot {
+                    SlotLayout::Words(elem_words) => {
+                        let ew = elem_words;
+                        let dst = self.index(d0, len, ew);
+                        self.copy(dst, v, ew);
+                    }
+                    SlotLayout::Bits(bits) => {
+                        let val = self.load(v, 0);
+                        self.store_slot_bits(d0, bits, len, val);
+                    }
+                }
                 let l1 = self.b.ins().iadd_imm(len, 1);
                 self.store(l1, bp, 0);
                 bp

@@ -138,6 +138,7 @@ impl Renaming<'_> {
             (And(xs), And(ys)) | (Or(xs), Or(ys)) | (Concat(xs), Concat(ys)) | (BitSet(xs), BitSet(ys)) | (Tuple(xs), Tuple(ys)) => {
                 self.all(xs, ys)
             }
+            (Pack { locs: la, parts: xs }, Pack { locs: lb, parts: ys }) => la == lb && self.all(xs, ys),
             (If(x1, x2, x3), If(y1, y2, y3)) => self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3),
             (IntBin(o, x1, x2), IntBin(p, y1, y2)) => o == p && self.expr(x1, y1) && self.expr(x2, y2),
             (IntCmp(o, x1, x2), IntCmp(p, y1, y2)) => o == p && self.expr(x1, y1) && self.expr(x2, y2),
@@ -170,48 +171,49 @@ impl Renaming<'_> {
                         _ => false,
                     }
             }
-            (SeqFilter { bind: t, seq: x1, pred: x2, elem_words: w }, SeqFilter { bind: u, seq: y1, pred: y2, elem_words: v }) => {
+            (SeqFilter { bind: t, seq: x1, pred: x2, slot: w }, SeqFilter { bind: u, seq: y1, pred: y2, slot: v }) => {
                 w == v && self.bind(*t, *u) && self.expr(x1, y1) && self.expr(x2, y2)
             }
             (MapBuild { bind: t, set: x1, rank: x2, value: x3 }, MapBuild { bind: u, set: y1, rank: y2, value: y3 }) => {
                 self.bind(*t, *u) && self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3)
             }
             (ValField(x, f), ValField(y, g)) => f == g && self.expr(x, y),
-            (Slice { base: x, offset: o }, Slice { base: y, offset: p }) => o == p && self.expr(x, y),
-            (Index { base: x1, arg: x2, map: m, elem_words: w }, Index { base: y1, arg: y2, map: n, elem_words: v }) => {
+            (Slice { base: x, loc: o }, Slice { base: y, loc: p }) => o == p && self.expr(x, y),
+            (Index { base: x1, arg: x2, map: m, slot: w }, Index { base: y1, arg: y2, map: n, slot: v }) => {
                 w == v && m == n && self.expr(x1, y1) && self.expr(x2, y2)
             }
-            (ExceptAt { base: x1, offset: o, value: x2 }, ExceptAt { base: y1, offset: p, value: y2 }) => {
+            (ExceptAt { base: x1, loc: o, value: x2 }, ExceptAt { base: y1, loc: p, value: y2 }) => {
                 o == p && self.expr(x1, y1) && self.expr(x2, y2)
             }
             (
-                ExceptIndex { base: x1, arg: x2, map: m, elem_words: w, value: x3 },
-                ExceptIndex { base: y1, arg: y2, map: n, elem_words: v, value: y3 },
+                ExceptIndex { base: x1, arg: x2, map: m, slot: w, value: x3 },
+                ExceptIndex { base: y1, arg: y2, map: n, slot: v, value: y3 },
             ) => w == v && m == n && self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3),
             (BitMember { set: x1, rank: x2 }, BitMember { set: y1, rank: y2 })
             | (MapGet { base: x1, rank: x2 }, MapGet { base: y1, rank: y2 }) => self.expr(x1, y1) && self.expr(x2, y2),
-            (SeqIndex { base: x1, arg: x2, elem_words: w }, SeqIndex { base: y1, arg: y2, elem_words: v })
-            | (SortedMember { set: x1, elem: x2, elem_words: w }, SortedMember { set: y1, elem: y2, elem_words: v }) => {
+            (SeqIndex { base: x1, arg: x2, slot: w }, SeqIndex { base: y1, arg: y2, slot: v }) => {
                 w == v && self.expr(x1, y1) && self.expr(x2, y2)
             }
-            (SeqTail { base: x, elem_words: w }, SeqTail { base: y, elem_words: v }) => w == v && self.expr(x, y),
+            (SortedMember { set: x1, elem: x2, elem_words: w }, SortedMember { set: y1, elem: y2, elem_words: v }) => {
+                w == v && self.expr(x1, y1) && self.expr(x2, y2)
+            }
+            (SeqTail { base: x, slot: w }, SeqTail { base: y, slot: v }) => w == v && self.expr(x, y),
+            (SeqAppend { base: x1, value: x2, slot: w, max_len: l }, SeqAppend { base: y1, value: y2, slot: v, max_len: k })
+            | (SeqConcat { a: x1, b: x2, slot: w, max_len: l }, SeqConcat { a: y1, b: y2, slot: v, max_len: k }) => {
+                w == v && l == k && self.expr(x1, y1) && self.expr(x2, y2)
+            }
             (
-                SeqAppend { base: x1, value: x2, elem_words: w, max_len: l },
-                SeqAppend { base: y1, value: y2, elem_words: v, max_len: k },
-            )
-            | (SeqConcat { a: x1, b: x2, elem_words: w, max_len: l }, SeqConcat { a: y1, b: y2, elem_words: v, max_len: k })
-            | (
                 SortedInsert { set: x1, elem: x2, elem_words: w, max_card: l },
                 SortedInsert { set: y1, elem: y2, elem_words: v, max_card: k },
             ) => w == v && l == k && self.expr(x1, y1) && self.expr(x2, y2),
-            (SeqSub { base: x1, lo: x2, hi: x3, elem_words: w }, SeqSub { base: y1, lo: y2, hi: y3, elem_words: v }) => {
+            (SeqSub { base: x1, lo: x2, hi: x3, slot: w }, SeqSub { base: y1, lo: y2, hi: y3, slot: v }) => {
                 w == v && self.expr(x1, y1) && self.expr(x2, y2) && self.expr(x3, y3)
             }
             (
                 SortedOp { op: o, a: x1, b: x2, elem_words: w, max_card: l },
                 SortedOp { op: p, a: y1, b: y2, elem_words: v, max_card: k },
             ) => o == p && w == v && l == k && self.expr(x1, y1) && self.expr(x2, y2),
-            (UnionField { base: x, offsets: o }, UnionField { base: y, offsets: p }) => o == p && self.expr(x, y),
+            (UnionField { base: x, locs: o }, UnionField { base: y, locs: p }) => o == p && self.expr(x, y),
             (UnionFieldInt { base: x, entries: o }, UnionFieldInt { base: y, entries: p }) => o == p && self.expr(x, y),
             (ConstElems { elem: s, words: w, count: n }, ConstElems { elem: t, words: v, count: k }) => s == t && w == v && n == k,
             (Fail(x), Fail(y)) => x == y,
@@ -270,6 +272,7 @@ impl Renaming<'_> {
                 | BitCard(_)
                 | Rank(_)
                 | Concat(_)
+                | Pack { .. }
                 | BitSet(_)
                 | SeqLen(_)
                 | SeqIndex { .. }

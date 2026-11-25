@@ -199,6 +199,8 @@ pub(crate) struct Gen<'c, 't, 'f> {
     pub(super) in_fn: bool,
     /// Pointers whose words are known (constants, unranked elements).
     known: HashMap<Value, Vec<Known>>,
+    /// Sub-word bitfields of known pointers (`Pack`, `unrank`, `for_bitset`).
+    known_bits: HashMap<Value, Vec<(BitPos, Known)>>,
     /// Mixed mode: the function calls the host regions the C generator
     /// made of it (`Cx::regions`), and boxed values are handles.
     pub(super) mixing: bool,
@@ -276,6 +278,7 @@ impl<'c, 't, 'f> Gen<'c, 't, 'f> {
             sigs: HashMap::new(),
             fn_refs: HashMap::new(),
             known: HashMap::new(),
+            known_bits: HashMap::new(),
             in_fn: matches!(kind, Kind::Func(_)),
             mixing: false,
             handles: 0,

@@ -1227,6 +1227,7 @@ pub fn expr_kinds(e: &Expr, out: &mut BTreeSet<&'static str>) {
         BitCard(_) => "BitCard",
         Rank(_) => "Rank",
         Concat(_) => "Concat",
+        Pack { .. } => "Pack",
         BitSet(_) => "BitSet",
         SeqLen(_) => "SeqLen",
         SeqIndex { .. } => "SeqIndex",

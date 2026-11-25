@@ -311,13 +311,16 @@ mod tests {
     #[test]
     fn native_refops_accept_uninitialized_output_and_preserve_failure() {
         let store = store::StoreRef::new(1 << 20);
-        let shape = Shape::Tuple(vec![Shape::Int { lo: 0, hi: 9 }; 2].into());
+        // Two 63-bit bounded ints span two packed words (`[3 << 1, 4 << 1]`),
+        // exercising multi-word uninitialized `ToEnc` output initialization.
+        let shape = Shape::Tuple(vec![Shape::Int { lo: 0, hi: i64::MAX }; 2].into());
         let mut typing = Typing::new(Arc::new(Layout::new(vec![Shape::Ref(store.clone())])));
         let sid = typing.id(&shape);
+        let expected_node = typing.node(sid).clone();
         let table = RefOpTable {
             ops: vec![(RefOp::FromInt, 1), (RefOp::ToEnc(sid), 1)],
             ids: Default::default(),
-            nodes: vec![None, Some(typing.node(sid).clone())],
+            nodes: vec![None, Some(expected_node.clone())],
             store,
             typing,
             text: String::new(),
@@ -333,10 +336,13 @@ mod tests {
             let mut unchanged = 17;
             assert!(!table.run(0, [i64::MAX as u64].as_ptr(), &mut unchanged));
             assert_eq!(unchanged, 17);
-            let value = table.store.freeze(&Value::tuple(vec![Value::Int(3), Value::Int(4)])).unwrap();
+            let tuple = Value::tuple(vec![Value::Int(3), Value::Int(4)]);
+            let mut expected = [0u64; 2];
+            expected_node.encode(&tuple, &mut expected).unwrap();
+            let value = table.store.freeze(&tuple).unwrap();
             let mut encoded = MaybeUninit::<[u64; 2]>::uninit();
             assert!(table.run(1, [value].as_ptr(), encoded.as_mut_ptr().cast()));
-            assert_eq!(encoded.assume_init(), [3, 4]);
+            assert_eq!(encoded.assume_init(), expected);
         }
     }
 }

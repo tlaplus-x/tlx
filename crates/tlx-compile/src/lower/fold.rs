@@ -180,9 +180,9 @@ impl Lowerer<'_> {
                 let order = tlx_value::ops::enumerate_normalized(&dom).ok()?;
                 let mut out = Vec::with_capacity(order.len());
                 for k in order {
-                    let (_, off, sh) = slots.iter().find(|(d, _, _)| *d == k)?;
+                    let (_, loc, sh) = slots.iter().find(|(d, _, _)| *d == k)?;
                     let ssid = self.sid(sh);
-                    out.push((Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: f.clone(), offset: *off }), None));
+                    out.push((Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: f.clone(), loc: *loc }), None));
                 }
                 out
             }

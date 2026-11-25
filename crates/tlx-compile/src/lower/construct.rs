@@ -260,7 +260,7 @@ impl Lowerer<'_> {
                 return (!matches!(&*conv.kind, ExprKind::Convert(_))).then_some(conv);
             };
             let (x, bind) = self.share(x.clone());
-            let payload = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x.clone(), offset: 1 });
+            let payload = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x.clone(), loc: FieldLoc::Words(1) });
             let tag = Expr::new(Ty::Int, ExprKind::Rank(x));
             let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail("value of an unexpected kind".into()));
             return Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(eq(tag, int_lit(i as i64)), payload, fail))));
@@ -307,7 +307,7 @@ impl Lowerer<'_> {
         for (i, arm) in src.iter().enumerate().rev() {
             let target = dst.iter().find(|d| d.kind_key() == arm.kind_key())?;
             let (asid, tsid) = (self.sid(arm), self.sid(target));
-            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: xs.clone(), offset: 1 });
+            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: xs.clone(), loc: FieldLoc::Words(1) });
             let conv = self.coerce_enc(payload, tsid);
             if matches!(&*conv.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Val | Ty::Enc(_))) {
                 return None;
@@ -348,7 +348,7 @@ impl Lowerer<'_> {
                 let n = es.len() as i64;
                 let (x, bind) = self.share(x.clone());
                 let len = Expr::new(Ty::Int, ExprKind::SeqLen(x.clone()));
-                let payload = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x, offset: 1 });
+                let payload = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x, loc: FieldLoc::Words(1) });
                 let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail("sequence of an unexpected length".into()));
                 Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(eq(len, int_lit(n)), payload, fail))))
             }
@@ -363,7 +363,7 @@ impl Lowerer<'_> {
                     let (x, bind) = self.share(x.clone());
                     let len = Expr::new(Ty::Int, ExprKind::SeqLen(x.clone()));
                     let fits = Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, len, int_lit(*m2 as i64)));
-                    let prefix = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x, offset: 0 });
+                    let prefix = Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x, loc: FieldLoc::Words(0) });
                     let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail("sequence longer than the layout allows".into()));
                     Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(fits, prefix, fail))))
                 }
@@ -393,17 +393,22 @@ impl Lowerer<'_> {
             // beyond the target's capacity is a runtime layout miss).
             (Shape::Seq { elem: e1, max_len: m1 }, Shape::Seq { elem: e2, max_len: m2 }) if *m1 <= MAX_SEQ_COERCED => {
                 let (e1sid, e2sid) = (self.sid(e1), self.sid(e2));
-                let w1 = self.words(e1sid);
+                let s1 = SlotLayout::of(e1);
+                let s2 = SlotLayout::of(e2);
                 let (x, bind) = self.share(x.clone());
                 let (n, bn) = self.share(Expr::new(Ty::Int, ExprKind::SeqLen(x.clone())));
                 let lsid = self.sid(&Shape::Int { lo: 0, hi: *m2 as i64 });
-                let mut parts = vec![self.coerce_enc(n.clone(), lsid)];
+                let mut locs = Vec::with_capacity(1 + *m2);
+                let mut parts = Vec::with_capacity(1 + *m2);
+                locs.push(FieldLoc::Words(0));
+                parts.push(self.coerce_enc(n.clone(), lsid));
                 for i in 1..=*m2 {
+                    locs.push(s2.loc(1, i - 1));
                     if i > *m1 {
                         parts.push(self.zero_enc(e2sid));
                         continue;
                     }
-                    let slot = Expr::new(Ty::Enc(e1sid), ExprKind::Slice { base: x.clone(), offset: 1 + (i as u32 - 1) * w1 });
+                    let slot = Expr::new(Ty::Enc(e1sid), ExprKind::Slice { base: x.clone(), loc: s1.loc(1, i - 1) });
                     let c = self.coerce_enc(slot, e2sid);
                     if matches!(&*c.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Enc(_) | Ty::Val)) {
                         return None;
@@ -411,7 +416,7 @@ impl Lowerer<'_> {
                     let inside = Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, int_lit(i as i64), n.clone()));
                     parts.push(Expr::new(Ty::Enc(e2sid), ExprKind::If(inside, c, self.zero_enc(e2sid))));
                 }
-                Some(let_in(bn.into_iter().chain(bind), Expr::new(Ty::Enc(sid), ExprKind::Concat(parts))))
+                Some(let_in(bn.into_iter().chain(bind), self.pack_locs(sid, locs, parts)))
             }
             _ => None,
         }
@@ -423,6 +428,7 @@ impl Lowerer<'_> {
     fn struct_coerce(&mut self, x: &Expr, sid: ShapeId) -> Option<Expr> {
         let Ty::Enc(from) = x.ty else { return None };
         let (src, dst) = (self.shape_of(Ty::Enc(from))?.clone(), self.shape_of(Ty::Enc(sid))?.clone());
+        let src_fl = FieldLayout::of_shape(&src)?;
         let pairs: Vec<(Shape, Shape)> = match (&src, &dst) {
             (Shape::Record(a), Shape::Record(b)) if a.len() == b.len() && a.iter().zip(b.iter()).all(|(p, q)| p.0 == q.0) => {
                 a.iter().zip(b.iter()).map(|(p, q)| (p.1.clone(), q.1.clone())).collect()
@@ -434,20 +440,18 @@ impl Lowerer<'_> {
             _ => return None,
         };
         let (xs, bind) = self.share(x.clone());
-        let mut parts = Vec::new();
-        let mut off = 0u32;
-        for (a, b) in pairs {
+        let mut parts = Vec::with_capacity(pairs.len());
+        for (&loc, (a, b)) in src_fl.locs.iter().zip(pairs) {
             let asid = self.sid(&a);
             let bsid = self.sid(&b);
-            let slot = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: xs.clone(), offset: off });
-            off += self.words(asid);
+            let slot = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: xs.clone(), loc });
             let c = self.coerce_enc(slot, bsid);
             if matches!(&*c.kind, ExprKind::Convert(y) if matches!(y.ty, Ty::Enc(_) | Ty::Val)) {
                 return None;
             }
             parts.push(c);
         }
-        Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::Concat(parts))))
+        Some(let_in(bind, self.pack_shape(sid, parts)))
     }
 
     /// A set of scalars re-encoded element by element into a bitset of
@@ -508,7 +512,7 @@ impl Lowerer<'_> {
     /// One raw word (a union arm index or a sequence length) as a part of
     /// a `Concat`.
     fn raw_word(&mut self, w: u64) -> Expr {
-        let sid = self.sid(&Shape::Int { lo: 0, hi: 0 });
+        let sid = self.sid(&Shape::Int { lo: i64::MIN, hi: i64::MAX });
         Expr::new(Ty::Enc(sid), ExprKind::ConstWords(vec![w].into()))
     }
 
@@ -517,7 +521,7 @@ impl Lowerer<'_> {
         if n == 0 {
             return None;
         }
-        let sid = self.sid(&Shape::Tuple(vec![Shape::Int { lo: 0, hi: 0 }; n].into()));
+        let sid = self.sid(&Shape::Tuple(vec![Shape::Int { lo: i64::MIN, hi: i64::MAX }; n].into()));
         Some(Expr::new(Ty::Enc(sid), ExprKind::ConstWords(vec![0u64; n].into())))
     }
 
@@ -532,7 +536,7 @@ impl Lowerer<'_> {
             let fsid = self.sid(fshape);
             parts.push(self.expr_into(fe, env, st, fsid));
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// A record literal into a union: the arm with exactly its field names,
@@ -573,7 +577,7 @@ impl Lowerer<'_> {
                 self.expr_into(x, env, st, xsid)
             })
             .collect();
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// A tuple literal into a sequence shape: length, elements, padding.
@@ -582,13 +586,27 @@ impl Lowerer<'_> {
             return None;
         }
         let esid = self.sid(elem);
-        let ew = self.words(esid) as usize;
-        let mut parts = vec![self.raw_word(es.len() as u64)];
-        for x in es {
-            parts.push(self.expr_into(x, env, st, esid));
+        match SlotLayout::of(elem) {
+            SlotLayout::Words(ew) => {
+                let mut parts = vec![self.raw_word(es.len() as u64)];
+                for x in es {
+                    parts.push(self.expr_into(x, env, st, esid));
+                }
+                parts.extend(self.zero_pad((max_len - es.len()) * ew));
+                Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+            }
+            slot @ SlotLayout::Bits(_) => {
+                let mut locs = Vec::with_capacity(1 + es.len());
+                let mut parts = Vec::with_capacity(1 + es.len());
+                locs.push(FieldLoc::Words(0));
+                parts.push(self.raw_word(es.len() as u64));
+                for (i, x) in es.iter().enumerate() {
+                    locs.push(slot.loc(1, i));
+                    parts.push(self.expr_into(x, env, st, esid));
+                }
+                Some(Expr::new(Ty::Enc(sid), ExprKind::Pack { locs: locs.into(), parts }))
+            }
         }
-        parts.extend(self.zero_pad((max_len - es.len()) * ew));
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
     }
 
     /// A set enumeration into a bitset: the ranks of its elements.
@@ -640,7 +658,7 @@ impl Lowerer<'_> {
                 let x = self.expr_into(body, &env2, st, xsid);
                 parts.push(self.coerce_enc(x, xsid));
             }
-            let built = Expr::new(Ty::Enc(sid), ExprKind::Concat(parts));
+            let built = self.pack_shape(sid, parts);
             let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail("function of another length than the layout's tuple".into()));
             return Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(eq(n, int_lit(k)), built, fail))));
         }
@@ -663,7 +681,7 @@ impl Lowerer<'_> {
             let ksid = self.sid(&ks);
             parts.push(self.expr_into(body, &env2, st, ksid));
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// `[i \in 1..n |-> body]` into a sequence shape: the length, then the
@@ -694,9 +712,14 @@ impl Lowerer<'_> {
         }
         let (n, bind) = self.share(n);
         let lsid = self.sid(&Shape::Int { lo: 0, hi: max_len as i64 });
-        let mut parts = vec![self.coerce_enc(n.clone(), lsid)];
+        let slot_layout = SlotLayout::of(elem);
+        let mut locs = Vec::with_capacity(1 + max_len);
+        let mut parts = Vec::with_capacity(1 + max_len);
+        locs.push(FieldLoc::Words(0));
+        parts.push(self.coerce_enc(n.clone(), lsid));
         let esid = self.sid(elem);
         for i in 1..=max_len as i64 {
+            locs.push(slot_layout.loc(1, (i - 1) as usize));
             let env2 = env.bind(*l, LBind::Ir(int_lit(i)));
             let x = self.expr_into(body, &env2, st, esid);
             let x = self.coerce_enc(x, esid);
@@ -710,7 +733,7 @@ impl Lowerer<'_> {
             };
             parts.push(slot);
         }
-        Some(let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::Concat(parts))))
+        Some(let_in(bind, self.pack_locs(sid, locs, parts)))
     }
 
     /// The value of a set that is constant, or the fixed domain of an
@@ -786,7 +809,7 @@ impl Lowerer<'_> {
         }
         let range = self.common_shape(&mut xs)?;
         let rsid = self.sid(&range);
-        if self.words(rsid) as usize * dom.len() > 1 << 12 {
+        if SlotLayout::of(&range).array_words(dom.len()) > 1 << 12 {
             return None;
         }
         let parts: Vec<Expr> = xs.into_iter().map(|x| self.coerce_enc(x, rsid)).collect();
@@ -809,12 +832,12 @@ impl Lowerer<'_> {
             fields.sort_by_key(|f| f.0);
             let shape = Shape::Record(fields.iter().map(|(n, _)| (*n, range.clone())).collect());
             let sid = self.sid(&shape);
-            let body = Expr::new(Ty::Enc(sid), ExprKind::Concat(fields.into_iter().map(|(_, p)| p).collect()));
+            let body = self.pack_shape(sid, fields.into_iter().map(|(_, p)| p).collect());
             return Some(let_in(binds.into_iter().rev().flatten(), body));
         }
         let shape = if ints { Shape::Tuple(vec![range; dom.len()].into()) } else { Shape::Fcn { dom: dom.into(), range: Box::new(range) } };
         let sid = self.sid(&shape);
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// A tuple / record literal without a target encoding: its components
@@ -866,7 +889,7 @@ impl Lowerer<'_> {
         }
         if !is_record {
             let sid = self.sid(&Shape::Tuple(shapes.into()));
-            return Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)));
+            return Some(self.pack_shape(sid, parts));
         }
         // Records: fields in name order (the evaluation order of the
         // literal is kept by binding the components first).
@@ -885,7 +908,7 @@ impl Lowerer<'_> {
         }
         let fields: Vec<(Sym, Shape)> = order.iter().map(|&i| (names[i], shapes[i].clone())).collect();
         let sid = self.sid(&Shape::Record(fields.into()));
-        let body = Expr::new(Ty::Enc(sid), ExprKind::Concat(order.iter().map(|&i| shared[i].clone()).collect()));
+        let body = self.pack_shape(sid, order.iter().map(|&i| shared[i].clone()).collect());
         Some(let_in(binds.into_iter().rev().flatten(), body))
     }
 
@@ -1025,7 +1048,7 @@ impl Lowerer<'_> {
             }
             parts.push(self.expr_into(body, &env2, st, rsid));
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Concat(parts)))
+        Some(self.pack_shape(sid, parts))
     }
 
     /// `lo..hi` into a bitset of integers.

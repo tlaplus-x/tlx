@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use tlx_compile::exec::fast;
-use tlx_compile::ir::{ActionFn, Expr, ExprKind, IndexMap, Stmt, Ty};
+use tlx_compile::ir::{ActionFn, Expr, ExprKind, IndexMap, SlotLayout, Stmt, Ty};
 use tlx_compile::types::Typing;
 use tlx_eval::Interp;
 use tlx_layout::{Layout, Shape};
@@ -59,8 +59,13 @@ fn except_index_reports_an_index_error() {
     let fail = |ty| Expr::new(ty, ExprKind::Fail("index failed".into()));
     let value = Expr::new(Ty::Enc(bit), ExprKind::ConstWords(vec![1u64].into()));
     let except = |arg: Expr| {
-        let kind =
-            ExprKind::ExceptIndex { base: f.clone(), arg, map: IndexMap::IntRange { lo: 1, n: 3 }, elem_words: 1, value: value.clone() };
+        let kind = ExprKind::ExceptIndex {
+            base: f.clone(),
+            arg,
+            map: IndexMap::IntRange { lo: 1, n: 3 },
+            slot: SlotLayout::Bits(1),
+            value: value.clone(),
+        };
         Expr::new(f.ty, kind)
     };
     // An index outside the domain leaves the function unchanged (TLC)...

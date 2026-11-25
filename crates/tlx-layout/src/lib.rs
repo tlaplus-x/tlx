@@ -21,6 +21,7 @@ pub mod escape;
 pub mod infer;
 pub mod layout;
 pub mod layout_tree;
+pub mod pack;
 pub mod permute;
 pub mod scalar;
 pub mod ser;

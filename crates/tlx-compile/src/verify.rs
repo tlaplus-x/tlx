@@ -215,10 +215,10 @@ impl<'a> Check<'a> {
             _ => Err("expected bitset shape".into()),
         }
     }
-    fn sequence(&self, ty: Ty, width: u32) -> Result<(&'a Shape, usize)> {
+    fn sequence(&self, ty: Ty, slot: SlotLayout) -> Result<(&'a Shape, usize)> {
         match self.shape(ty)? {
             Shape::Seq { elem, max_len } => {
-                require(words(elem) == width as usize, "sequence element width mismatch")?;
+                require(SlotLayout::of(elem) == slot, "sequence element width mismatch")?;
                 Ok((elem, *max_len))
             }
             _ => Err("expected sequence shape".into()),
@@ -233,21 +233,36 @@ impl<'a> Check<'a> {
             _ => Err("expected sorted set shape".into()),
         }
     }
-    fn span(&self, base: Ty, offset: u32, value: Ty) -> Result {
+    fn span(&self, base: Ty, loc: FieldLoc, value: Ty) -> Result {
         let base_width = self.width(base)?;
-        require((offset as usize).checked_add(self.width(value)?).is_some_and(|end| end <= base_width), "encoding slice outside base")
+        let val_width = self.width(value)?;
+        match loc {
+            FieldLoc::Words(offset) => {
+                require(offset.checked_add(val_width).is_some_and(|end| end <= base_width), "encoding slice outside base")
+            }
+            FieldLoc::Bits(pos) => {
+                require(val_width == 1 && self.shape(value)?.is_scalar(), "bitfield slice value width mismatch")?;
+                require(pos.valid_in(base_width), "encoding slice outside base")
+            }
+        }
     }
-    fn index(&mut self, base: &Expr, arg: &Expr, map: &IndexMap, width: u32, value: Ty) -> Result {
+    fn index(&mut self, base: &Expr, arg: &Expr, map: &IndexMap, slot: SlotLayout, value: Ty) -> Result {
         self.expr(base)?;
         self.expr(arg)?;
-        require(self.width(value)? == width as usize, "index element width mismatch")?;
+        let val_shape = self.shape(value)?;
+        let val_width = self.width(value)?;
+        require(SlotLayout::of(val_shape) == slot, "index element width mismatch")?;
+        match slot {
+            SlotLayout::Words(w) => require(val_width == w, "index element width mismatch")?,
+            SlotLayout::Bits(_) => require(val_width == 1 && val_shape.is_scalar(), "index element width mismatch")?,
+        }
         let slots: Vec<&Shape> = match self.shape(base.ty)? {
             Shape::Tuple(parts) => parts.iter().collect(),
             Shape::Record(fields) => fields.iter().map(|(_, s)| s).collect(),
             Shape::Fcn { dom, range } => vec![range; dom.len()],
             _ => return Err("indexed base has no fixed slots".into()),
         };
-        require(slots.iter().all(|s| **s == *self.shape(value).unwrap()), "index slot shape mismatch")?;
+        require(slots.iter().all(|s| **s == *val_shape), "index slot shape mismatch")?;
         match map {
             IndexMap::IntRange { lo, n } => {
                 same(arg.ty, Ty::Int)?;
@@ -379,21 +394,21 @@ impl<'a> Check<'a> {
                 same(e.ty, Ty::Val)?;
                 self.expect(x, Ty::Val)
             }
-            Slice { base, offset } => {
+            Slice { base, loc } => {
                 self.expr(base)?;
-                self.span(base.ty, *offset, e.ty)
+                self.span(base.ty, *loc, e.ty)
             }
-            Index { base, arg, map, elem_words } => self.index(base, arg, map, *elem_words, e.ty),
-            ExceptAt { base, offset, value } => {
+            Index { base, arg, map, slot } => self.index(base, arg, map, *slot, e.ty),
+            ExceptAt { base, loc, value } => {
                 same(e.ty, base.ty)?;
                 self.expr(base)?;
                 self.expr(value)?;
-                self.span(base.ty, *offset, value.ty)
+                self.span(base.ty, *loc, value.ty)
             }
-            ExceptIndex { base, arg, map, elem_words, value } => {
+            ExceptIndex { base, arg, map, slot, value } => {
                 same(e.ty, base.ty)?;
                 self.expr(value)?;
-                self.index(base, arg, map, *elem_words, value.ty)
+                self.index(base, arg, map, *slot, value.ty)
             }
             BitMember { set, rank } => {
                 same(e.ty, Ty::Bool)?;
@@ -425,6 +440,33 @@ impl<'a> Check<'a> {
                 }
                 require(n == self.width(e.ty)?, "concatenation width mismatch")
             }
+            Pack { locs, parts } => {
+                let total = self.width(e.ty)?;
+                require(locs.len() == parts.len(), "pack location/part count mismatch")?;
+                let mut word_used = vec![0u64; total];
+                for (loc, part) in locs.iter().zip(parts.iter()) {
+                    self.expr(part)?;
+                    let pw = self.width(part.ty)?;
+                    match *loc {
+                        FieldLoc::Words(off) => {
+                            let end = off.checked_add(pw).ok_or("pack word range overflow")?;
+                            require(end <= total, "pack word slice outside target")?;
+                            for m in &mut word_used[off..end] {
+                                require(*m == 0, "pack overlapping target words")?;
+                                *m = u64::MAX;
+                            }
+                        }
+                        FieldLoc::Bits(pos) => {
+                            require(pw == 1 && self.shape(part.ty)?.is_scalar(), "pack bitfield part width mismatch")?;
+                            require(pos.valid_in(total), "pack bitfield outside target")?;
+                            let sm = pos.shifted_mask();
+                            require(word_used[pos.word] & sm == 0, "pack overlapping bitfields")?;
+                            word_used[pos.word] |= sm;
+                        }
+                    }
+                }
+                Ok(())
+            }
             BitSet(xs) => {
                 self.bitset(e.ty)?;
                 for x in xs {
@@ -437,15 +479,15 @@ impl<'a> Check<'a> {
                 self.expr(x)?;
                 require(matches!(self.shape(x.ty)?, Shape::Seq { .. }), "sequence length on non-sequence")
             }
-            SeqIndex { base, arg, elem_words } => {
+            SeqIndex { base, arg, slot } => {
                 self.expr(base)?;
                 self.expect(arg, Ty::Int)?;
-                let (s, _) = self.sequence(base.ty, *elem_words)?;
+                let (s, _) = self.sequence(base.ty, *slot)?;
                 same(e.ty, self.shape_ty(s)?)
             }
-            SeqTail { base, elem_words } | SeqSub { base, elem_words, .. } | SeqAppend { base, elem_words, .. } => {
+            SeqTail { base, slot } | SeqSub { base, slot, .. } | SeqAppend { base, slot, .. } => {
                 self.expect(base, e.ty)?;
-                let (s, n) = self.sequence(e.ty, *elem_words)?;
+                let (s, n) = self.sequence(e.ty, *slot)?;
                 match &*e.kind {
                     SeqSub { lo, hi, .. } => {
                         self.expect(lo, Ty::Int)?;
@@ -459,15 +501,15 @@ impl<'a> Check<'a> {
                 }
                 Ok(())
             }
-            SeqConcat { a, b, elem_words, max_len } => {
+            SeqConcat { a, b, slot, max_len } => {
                 self.expect(a, e.ty)?;
                 self.expect(b, e.ty)?;
-                let (_, n) = self.sequence(e.ty, *elem_words)?;
+                let (_, n) = self.sequence(e.ty, *slot)?;
                 require(n == *max_len as usize, "sequence capacity mismatch")
             }
-            SeqFilter { bind, seq, pred, elem_words } => {
+            SeqFilter { bind, seq, pred, slot } => {
                 self.expect(seq, e.ty)?;
-                let (s, _) = self.sequence(e.ty, *elem_words)?;
+                let (s, _) = self.sequence(e.ty, *slot)?;
                 self.bind(*bind, self.shape_ty(s)?, |c| c.expect(pred, Ty::Bool))
             }
             SortedOp { a, b, elem_words, max_card, .. } => {
@@ -478,12 +520,12 @@ impl<'a> Check<'a> {
             }
             // A constant sorted array of composite encodings (`member_enum`
             // in lower/member.rs): a word array [n, elements...] typed as a
-            // sequence of one-word integers (a set shape over a small
+            // sequence of full-width 64-bit integers (a set shape over a small
             // universe would be a bitset); the element is any encoding of
             // that width.
             SortedMember { set, elem, elem_words }
                 if matches!(&*set.kind, ExprKind::ConstWords(_))
-                    && matches!(self.shape(set.ty), Ok(Shape::Seq { elem: w, .. }) if **w == Shape::Int { lo: 0, hi: 0 }) =>
+                    && matches!(self.shape(set.ty), Ok(Shape::Seq { elem: w, .. }) if **w == Shape::Int { lo: i64::MIN, hi: i64::MAX }) =>
             {
                 self.expr(set)?;
                 let ExprKind::ConstWords(data) = &*set.kind else { unreachable!() };
@@ -508,16 +550,25 @@ impl<'a> Check<'a> {
                     same(e.ty, Ty::Bool)
                 }
             }
-            UnionField { base, offsets } => {
+            UnionField { base, locs } => {
                 self.expr(base)?;
                 let Shape::Union(arms) = self.shape(base.ty)? else {
                     return Err("union field on non-union".into());
                 };
-                require(arms.len() == offsets.len(), "union arm table length mismatch")?;
+                require(arms.len() == locs.len(), "union arm table length mismatch")?;
                 let w = self.width(e.ty)?;
-                for (s, off) in arms.iter().zip(offsets.iter()) {
-                    if let Some(off) = off {
-                        require((*off as usize).checked_add(w).is_some_and(|end| end <= words(s)), "union field outside arm")?;
+                for (s, loc) in arms.iter().zip(locs.iter()) {
+                    if let Some(loc) = loc {
+                        let aw = words(s);
+                        match *loc {
+                            FieldLoc::Words(off) => {
+                                require(off.checked_add(w).is_some_and(|end| end <= aw), "union field outside arm")?;
+                            }
+                            FieldLoc::Bits(pos) => {
+                                require(w == 1 && self.shape(e.ty)?.is_scalar(), "union field width mismatch")?;
+                                require(pos.valid_in(aw), "union field outside arm")?;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -530,8 +581,12 @@ impl<'a> Check<'a> {
                 };
                 require(arms.len() == entries.len(), "union arm table length mismatch")?;
                 for (s, entry) in arms.iter().zip(entries.iter()) {
-                    if let Some((off, _)) = entry {
-                        require((*off as usize) < words(s), "union integer field outside arm")?;
+                    if let Some((loc, _)) = entry {
+                        let aw = words(s);
+                        match *loc {
+                            FieldLoc::Words(off) => require(off < aw, "union integer field outside arm")?,
+                            FieldLoc::Bits(pos) => require(pos.valid_in(aw), "union integer field outside arm")?,
+                        }
                     }
                 }
                 Ok(())

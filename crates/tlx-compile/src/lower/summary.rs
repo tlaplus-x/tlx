@@ -141,6 +141,7 @@ fn scan(e: &Expr, external: bool, out: &mut Summary, edges: &mut Vec<Edge>, leaf
         | ExprKind::BitCard(..)
         | ExprKind::Rank { .. }
         | ExprKind::Concat(_)
+        | ExprKind::Pack { .. }
         | ExprKind::BitSet(_)
         | ExprKind::SeqLen(_)
         | ExprKind::SeqIndex { .. }

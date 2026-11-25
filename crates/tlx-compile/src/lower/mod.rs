@@ -540,9 +540,44 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The word at `offset` of `base`, holding an integer in `0..=hi`.
-    fn int_word(&mut self, base: Expr, offset: u32, hi: i64) -> Expr {
+    fn int_word(&mut self, base: Expr, offset: usize, hi: i64) -> Expr {
         let sid = self.sid(&Shape::Int { lo: 0, hi });
-        Expr::new(Ty::Int, ExprKind::Convert(Expr::new(Ty::Enc(sid), ExprKind::Slice { base, offset })))
+        Expr::new(Ty::Int, ExprKind::Convert(Expr::new(Ty::Enc(sid), ExprKind::Slice { base, loc: FieldLoc::Words(offset) })))
+    }
+
+    /// Build a composite of shape `sid` (`Record`, `Tuple`, `Fcn`) from its
+    /// component expressions `parts`: emits `Pack` when any field is sub-word
+    /// packed, else `Concat`.
+    fn pack_shape(&self, sid: ShapeId, parts: Vec<Expr>) -> Expr {
+        let fl = FieldLayout::of_shape(self.typing.shape(sid)).expect("product/fcn shape");
+        self.pack_locs(sid, fl.locs.into_vec(), parts)
+    }
+
+    /// Build a composite of shape `sid` placing `parts[i]` at `locs[i]`: emits
+    /// `Concat` when all locations are contiguous word offsets covering
+    /// `words(sid)`, else `Pack`.
+    fn pack_locs(&self, sid: ShapeId, locs: Vec<FieldLoc>, parts: Vec<Expr>) -> Expr {
+        let has_bits = locs.iter().any(|l| matches!(l, FieldLoc::Bits(_)));
+        if !has_bits {
+            let mut off = 0usize;
+            let mut contiguous = true;
+            for (loc, p) in locs.iter().zip(&parts) {
+                let FieldLoc::Words(w) = *loc else { unreachable!() };
+                let Ty::Enc(psid) = p.ty else {
+                    contiguous = false;
+                    break;
+                };
+                if w != off {
+                    contiguous = false;
+                    break;
+                }
+                off += self.words(psid) as usize;
+            }
+            if contiguous && off == self.words(sid) as usize {
+                return Expr::new(Ty::Enc(sid), ExprKind::Concat(parts));
+            }
+        }
+        Expr::new(Ty::Enc(sid), ExprKind::Pack { locs: locs.into(), parts })
     }
 }
 
@@ -652,7 +687,7 @@ fn same_simple(a: &Expr, b: &Expr) -> bool {
             (ExprKind::Temp(x), ExprKind::Temp(y)) => x == y,
             (ExprKind::Var(x), ExprKind::Var(y)) | (ExprKind::NextVar(x), ExprKind::NextVar(y)) => x == y,
             (ExprKind::Convert(x), ExprKind::Convert(y)) => same_simple(x, y),
-            (ExprKind::Slice { base: x, offset: i }, ExprKind::Slice { base: y, offset: j }) => i == j && same_simple(x, y),
+            (ExprKind::Slice { base: x, loc: i }, ExprKind::Slice { base: y, loc: j }) => i == j && same_simple(x, y),
             _ => false,
         }
 }

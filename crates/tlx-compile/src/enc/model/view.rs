@@ -46,7 +46,18 @@ pub(super) struct ProjectionOrbit {
 impl ProjectionOrbit {
     fn compile(base: &InterpModel, shape: &Shape, notes: &mut Vec<String>) -> Option<Self> {
         let Shape::Tuple(parts) = shape else { return None };
-        let layout = Layout::new(parts.to_vec());
+        let fl = tlx_layout::pack::FieldLayout::of_shape(shape)?;
+        let mut units = Vec::new();
+        for group in fl.word_groups() {
+            match group {
+                tlx_layout::pack::FieldGroup::Word { index, .. } => units.push(parts[*index].clone()),
+                tlx_layout::pack::FieldGroup::Packed { fields, .. } => {
+                    units.push(Shape::Tuple(fields.iter().map(|&(i, _)| parts[i].clone()).collect()));
+                }
+            }
+        }
+        let layout = Layout::new(units);
+        debug_assert_eq!(layout.words, fl.words);
         // Keep the existing by-value path for store-backed shapes. This
         // path compares only canonical encodings, never handle identities.
         if super::SemFp::of(&layout, None).is_some() {

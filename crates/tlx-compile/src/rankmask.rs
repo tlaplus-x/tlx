@@ -18,6 +18,7 @@ use crate::types::Typing;
 /// that can pass the leading field tests of `pred` on the element bound to
 /// `bind`, if `elem` is a union and `pred` starts with such tests.
 pub(crate) fn rank_mask(ty: &Typing, elem: &Shape, n: usize, bind: Temp, pred: &Expr) -> Option<Vec<u64>> {
+    let Shape::Union(arm_shapes) = elem else { return None };
     let arms = crate::lower::union_radices(elem)?;
     let mut tests = Vec::new();
     field_tests(ty, pred, bind, &mut tests);
@@ -28,7 +29,7 @@ pub(crate) fn rank_mask(ty: &Typing, elem: &Shape, n: usize, bind: Temp, pred: &
     let mut base = 0;
     for (i, radices) in arms.iter().enumerate() {
         let card: u64 = radices.iter().product();
-        if let Some(ok) = arm_ranks(&tests, i, radices) {
+        if let Some(ok) = arm_ranks(&tests, i, &arm_shapes[i], radices) {
             for (q, ok) in ok.into_iter().enumerate() {
                 let r = base + q as u64;
                 if !ok && r < n as u64 * 64 {
@@ -41,20 +42,20 @@ pub(crate) fn rank_mask(ty: &Typing, elem: &Shape, n: usize, bind: Temp, pred: &
     Some(m)
 }
 
-/// The leading conjuncts of `pred` that compare a one-word field of the
-/// union element `bind` with a constant: (the field's offset in each arm, the
-/// constant's word). Whether all of `pred` was such.
-fn field_tests<'e>(ty: &Typing, pred: &'e Expr, bind: Temp, out: &mut Vec<(&'e [Option<u32>], u64)>) -> bool {
+/// The leading conjuncts of `pred` that compare a scalar field of the union
+/// element `bind` with a constant: (the field's location in each arm, the
+/// constant's code). Whether all of `pred` was such.
+fn field_tests<'e>(ty: &Typing, pred: &'e Expr, bind: Temp, out: &mut Vec<(&'e [Option<FieldLoc>], u64)>) -> bool {
     match &*pred.kind {
         ExprKind::And(xs) => xs.iter().all(|x| field_tests(ty, x, bind, out)),
         ExprKind::Eq(a, b) => {
             let (f, c) = if matches!(&*a.kind, ExprKind::UnionField { .. }) { (a, b) } else { (b, a) };
-            let ExprKind::UnionField { base, offsets } = &*f.kind else { return false };
+            let ExprKind::UnionField { base, locs } = &*f.kind else { return false };
             if !matches!(&*base.kind, ExprKind::Temp(t) if *t == bind) {
                 return false;
             }
             let Ty::Enc(sid) = f.ty else { return false };
-            if c.ty != f.ty || ty.words(sid) != 1 {
+            if c.ty != f.ty || ty.words(sid) != 1 || !ty.shape(sid).is_scalar() {
                 return false;
             }
             let w = match &*c.kind {
@@ -68,7 +69,7 @@ fn field_tests<'e>(ty: &Typing, pred: &'e Expr, bind: Temp, out: &mut Vec<(&'e [
                 }
                 _ => return false,
             };
-            out.push((offsets, w));
+            out.push((locs, w));
             true
         }
         _ => false,
@@ -78,11 +79,20 @@ fn field_tests<'e>(ty: &Typing, pred: &'e Expr, bind: Temp, out: &mut Vec<(&'e [
 /// Which ranks of arm `i` (of `radices`) pass the field tests `tests`
 /// (`field_tests`) evaluated in order, up to the first one on a field the
 /// arm does not have (which fails); None if no test applies.
-fn arm_ranks(tests: &[(&[Option<u32>], u64)], i: usize, radices: &[u64]) -> Option<Vec<bool>> {
+fn arm_ranks(tests: &[(&[Option<FieldLoc>], u64)], i: usize, arm_shape: &Shape, radices: &[u64]) -> Option<Vec<bool>> {
     let card: u64 = radices.iter().product();
+    if card == 0 {
+        return None;
+    }
+    let fl = FieldLayout::of_shape(arm_shape);
     let mut ok: Option<Vec<bool>> = None;
-    for (offsets, v) in tests {
-        let Some(o) = offsets.get(i).copied().flatten().map(|o| o as usize).filter(|o| *o < radices.len()) else { break };
+    for (locs, v) in tests {
+        let Some(target) = locs.get(i).copied().flatten() else { break };
+        let idx = match &fl {
+            Some(fl) => fl.locs.iter().position(|&l| l == target),
+            None => (target == FieldLoc::Words(0)).then_some(0),
+        };
+        let Some(o) = idx.filter(|o| *o < radices.len()) else { break };
         let weight: u64 = radices[o + 1..].iter().product();
         let ok = ok.get_or_insert_with(|| vec![true; card as usize]);
         for (q, x) in ok.iter_mut().enumerate() {

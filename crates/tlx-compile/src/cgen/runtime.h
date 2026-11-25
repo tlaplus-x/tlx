@@ -32,6 +32,26 @@ static inline int tlx_mod(int64_t a, int64_t b, int64_t *r) {
 static inline int64_t tlx_bit(const uint64_t *s, int64_t n, int64_t r) {
   return r >= 0 && r < n * 64 && ((s[r >> 6] >> (r & 63)) & 1);
 }
+static inline uint64_t tlx_bget(const uint64_t *p, uint32_t word, uint32_t shift, uint32_t bits) {
+  return (p[word] >> shift) & ((1ULL << bits) - 1ULL);
+}
+static inline void tlx_bset(uint64_t *p, uint32_t word, uint32_t shift, uint32_t bits, uint64_t val) {
+  uint64_t m = (1ULL << bits) - 1ULL;
+  p[word] = (p[word] & ~(m << shift)) | ((val & m) << shift);
+}
+static inline uint64_t tlx_sget(const uint64_t *p, uint32_t bits, uint64_t idx) {
+  uint32_t per = 64u / bits;
+  uint64_t w = idx / per;
+  uint32_t sh = 64u - ((uint32_t)(idx % per) + 1u) * bits;
+  return (p[w] >> sh) & ((1ULL << bits) - 1ULL);
+}
+static inline void tlx_sset(uint64_t *p, uint32_t bits, uint64_t idx, uint64_t val) {
+  uint32_t per = 64u / bits;
+  uint64_t w = idx / per;
+  uint32_t sh = 64u - ((uint32_t)(idx % per) + 1u) * bits;
+  uint64_t m = (1ULL << bits) - 1ULL;
+  p[w] = (p[w] & ~(m << sh)) | ((val & m) << sh);
+}
 static inline int tlx_cmpw(const uint64_t *a, const uint64_t *b, uint32_t n) {
   for (uint32_t i = 0; i < n; i++) { if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1; }
   return 0;

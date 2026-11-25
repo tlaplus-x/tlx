@@ -461,6 +461,7 @@ impl Gen<'_, '_, '_> {
             | ExprKind::Rank { .. }
             | ExprKind::SeqLen { .. }
             | ExprKind::Concat { .. }
+            | ExprKind::Pack { .. }
             | ExprKind::BitSet { .. }
             | ExprKind::UnionField { .. }
             | ExprKind::UnionFieldInt { .. }

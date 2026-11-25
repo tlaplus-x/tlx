@@ -21,20 +21,19 @@ impl Lowerer<'_> {
     pub(super) fn tuple_parts(&mut self, n: usize, x: &Expr) -> Option<(Vec<Expr>, Option<Expr>)> {
         match self.shape_of(x.ty)?.clone() {
             Shape::Tuple(parts) if parts.len() == n => {
-                let mut out = Vec::new();
-                let mut off = 0;
-                for p in parts.iter() {
+                let fl = FieldLayout::of_shapes(parts.iter());
+                let mut out = Vec::with_capacity(n);
+                for (p, &loc) in parts.iter().zip(fl.locs.iter()) {
                     let psid = self.sid(p);
-                    out.push(Expr::new(Ty::Enc(psid), ExprKind::Slice { base: x.clone(), offset: off }));
-                    off += self.words(psid);
+                    out.push(Expr::new(Ty::Enc(psid), ExprKind::Slice { base: x.clone(), loc }));
                 }
                 Some((out, None))
             }
             Shape::Seq { elem, max_len } if max_len >= n && n > 0 => {
                 let esid = self.sid(&elem);
-                let ew = self.words(esid);
+                let slot = SlotLayout::of(&elem);
                 let out = (1..=n as i64)
-                    .map(|i| Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: int_lit(i), elem_words: ew }))
+                    .map(|i| Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: int_lit(i), slot }))
                     .collect();
                 let len = Expr::new(Ty::Int, ExprKind::SeqLen(x.clone()));
                 Some((out, Some(eq(len, int_lit(n as i64)))))

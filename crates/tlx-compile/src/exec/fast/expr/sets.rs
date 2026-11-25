@@ -30,6 +30,30 @@ impl<'c> Compiler<'c> {
                     out,
                 )
             }
+            ExprKind::Pack { locs, parts } => {
+                let n = self.words(ty)?;
+                let locs = locs.clone();
+                let parts = parts.iter().map(|x| self.enc(x)).collect::<C<Vec<_>>>()?;
+                let out = self.alloc(n);
+                self.fresh(
+                    Box::new(move |fx| {
+                        fx.fr.w[out..out + n].fill(0);
+                        for (loc, (p, k)) in locs.iter().zip(&parts) {
+                            let l = p.at(fx)?;
+                            match *loc {
+                                FieldLoc::Words(off) => fx.copy_to(l, out + off, *k),
+                                FieldLoc::Bits(pos) => {
+                                    let val = fx.word(l, 0);
+                                    pos.set_zeroed(&mut fx.fr.w[out..out + n], val);
+                                }
+                            }
+                        }
+                        Ok(Loc::frame(out))
+                    }),
+                    n,
+                    out,
+                )
+            }
             ExprKind::Rank(x) => {
                 let (x, n) = self.enc(x)?;
                 if n == 0 {
@@ -69,6 +93,11 @@ impl<'c> Compiler<'c> {
                 )
             }
             ExprKind::RankUnion { x, arms } => {
+                let Shape::Union(arm_shapes) = self.shape(x.ty)?.clone() else { return Err("RankUnion of non-union".into()) };
+                let arm_locs: Vec<Box<[FieldLoc]>> = arm_shapes
+                    .iter()
+                    .map(|a| FieldLayout::of_shape(a).map_or_else(|| Box::from([FieldLoc::Words(0)]), |fl| fl.locs))
+                    .collect();
                 let (x, _) = self.enc(x)?;
                 let arms = arms.clone();
                 let bases: Vec<u64> = UnionArms::new(&arms).map(|(base, _)| base).collect();
@@ -78,7 +107,12 @@ impl<'c> Compiler<'c> {
                     if tag >= arms.len() {
                         return err("unknown union tag");
                     }
-                    let r = rank_with(&arms[tag], |index| fx.word(l, 1 + index));
+                    let locs = &arm_locs[tag];
+                    let r = rank_with(&arms[tag], |index| match locs.get(index).copied() {
+                        Some(FieldLoc::Words(w)) => fx.word(l, 1 + w),
+                        Some(FieldLoc::Bits(pos)) => tlx_layout::layout::extract_bits(fx.word(l, 1 + pos.word), pos.shift, pos.bits),
+                        None => 0,
+                    });
                     Ok((bases[tag] + r) as i64)
                 }))
             }
@@ -91,27 +125,53 @@ impl<'c> Compiler<'c> {
                 }))
             }
             ExprKind::RankFlat { x, radices } => {
+                let locs = FieldLayout::of_shape(self.shape(x.ty)?).ok_or("RankFlat of non-product")?.locs;
                 let (x, _) = self.enc(x)?;
                 let radices = radices.clone();
                 Code::I(Box::new(move |fx| {
                     let l = x.at(fx)?;
-                    let r = rank_with(&radices, |index| fx.word(l, index));
+                    let r = rank_with(&radices, |index| match locs.get(index).copied() {
+                        Some(FieldLoc::Words(w)) => fx.word(l, w),
+                        Some(FieldLoc::Bits(pos)) => tlx_layout::layout::extract_bits(fx.word(l, pos.word), pos.shift, pos.bits),
+                        None => 0,
+                    });
                     Ok(r as i64)
                 }))
             }
-            ExprKind::UnionField { base, offsets } => {
+            ExprKind::UnionField { base, locs } => {
                 let n = self.words(ty)?;
                 let (b, _) = self.enc(base)?;
-                let offsets = offsets.clone();
-                Code::E(
+                let locs = locs.clone();
+                if locs.iter().all(|o| !matches!(o, Some(FieldLoc::Bits(_)))) {
+                    return Ok(Code::E(
+                        Box::new(move |fx| {
+                            let l = b.at(fx)?;
+                            match locs.get(fx.word(l, 0) as usize).copied().flatten() {
+                                Some(FieldLoc::Words(off)) => Ok(l.plus(1 + off)),
+                                _ => err(NO_FIELD),
+                            }
+                        }),
+                        n,
+                    ));
+                }
+                let out = self.alloc(n);
+                self.fresh(
                     Box::new(move |fx| {
                         let l = b.at(fx)?;
-                        match offsets.get(fx.word(l, 0) as usize).copied().flatten() {
-                            Some(off) => Ok(l.plus(1 + off as usize)),
+                        match locs.get(fx.word(l, 0) as usize).copied().flatten() {
+                            Some(FieldLoc::Words(off)) => {
+                                fx.copy_to(l.plus(1 + off), out, n);
+                                Ok(Loc::frame(out))
+                            }
+                            Some(FieldLoc::Bits(pos)) => {
+                                fx.fr.w[out] = tlx_layout::layout::extract_bits(fx.word(l, 1 + pos.word), pos.shift, pos.bits);
+                                Ok(Loc::frame(out))
+                            }
                             None => err(NO_FIELD),
                         }
                     }),
                     n,
+                    out,
                 )
             }
             ExprKind::UnionFieldInt { base, entries } => {
@@ -120,7 +180,10 @@ impl<'c> Compiler<'c> {
                 Code::I(Box::new(move |fx| {
                     let l = b.at(fx)?;
                     match entries.get(fx.word(l, 0) as usize).copied().flatten() {
-                        Some((off, lo)) => Ok(lo + fx.word(l, 1 + off as usize) as i64),
+                        Some((FieldLoc::Words(off), lo)) => Ok(lo + fx.word(l, 1 + off) as i64),
+                        Some((FieldLoc::Bits(pos), lo)) => {
+                            Ok(lo + tlx_layout::layout::extract_bits(fx.word(l, 1 + pos.word), pos.shift, pos.bits) as i64)
+                        }
                         None => err(NO_FIELD),
                     }
                 }))

@@ -69,32 +69,74 @@ fn constant_and_concatenation_widths() {
 fn slice_and_except_ranges() {
     let t = typing();
     let x = Expr::new(Ty::Enc(0), ExprKind::Var(0));
-    for offset in [1, u32::MAX] {
-        reject(&t, Expr::new(x.ty, ExprKind::Slice { base: x.clone(), offset }), "outside base");
-        reject(&t, Expr::new(x.ty, ExprKind::ExceptAt { base: x.clone(), offset, value: x.clone() }), "outside base");
+    for loc in [
+        FieldLoc::Words(1),
+        FieldLoc::Words(usize::MAX),
+        FieldLoc::Bits(BitPos::new(1, 0, 2)),
+        FieldLoc::Bits(BitPos::new(0, 60, 8)),
+        FieldLoc::Bits(BitPos::new(0, 0, 0)),
+        FieldLoc::Bits(BitPos::new(0, 0, 64)),
+    ] {
+        reject(&t, Expr::new(x.ty, ExprKind::Slice { base: x.clone(), loc }), "outside base");
+        reject(&t, Expr::new(x.ty, ExprKind::ExceptAt { base: x.clone(), loc, value: x.clone() }), "outside base");
     }
+}
+#[test]
+fn pack_bounds_and_overlaps() {
+    let mut t = typing();
+    let tup = enc(&mut t, Shape::Tuple(vec![Shape::Bool, Shape::Int { lo: 0, hi: 2 }].into()));
+    let b = enc(&mut t, Shape::Bool);
+    let x = Expr::new(Ty::Enc(0), ExprKind::Var(0));
+    reject(
+        &t,
+        Expr::new(tup.ty, ExprKind::Pack { locs: vec![FieldLoc::Bits(BitPos::new(0, 63, 1))].into(), parts: vec![b.clone(), x.clone()] }),
+        "count mismatch",
+    );
+    reject(
+        &t,
+        Expr::new(
+            tup.ty,
+            ExprKind::Pack {
+                locs: vec![FieldLoc::Bits(BitPos::new(0, 62, 2)), FieldLoc::Bits(BitPos::new(0, 61, 2))].into(),
+                parts: vec![b.clone(), x.clone()],
+            },
+        ),
+        "overlapping",
+    );
+    reject(
+        &t,
+        Expr::new(
+            tup.ty,
+            ExprKind::Pack {
+                locs: vec![FieldLoc::Bits(BitPos::new(1, 63, 1)), FieldLoc::Bits(BitPos::new(0, 61, 2))].into(),
+                parts: vec![b, x],
+            },
+        ),
+        "outside target",
+    );
 }
 #[test]
 fn index_spans_widths_and_tables() {
     let mut t = typing();
     let x = enc(&mut t, Shape::Tuple(vec![Shape::Int { lo: 0, hi: 2 }; 2].into()));
     let atom = enc(&mut t, Shape::Bool);
-    for (arg, map, width, why) in [
-        (int(), IndexMap::IntRange { lo: 0, n: 3 }, 1, "span"),
-        (int(), IndexMap::IntRange { lo: i64::MAX, n: 2 }, 1, "overflow"),
-        (int(), IndexMap::IntRange { lo: 0, n: 2 }, 2, "width"),
-        (atom.clone(), IndexMap::Table(vec![0, 2].into()), 1, "outside base"),
-        (atom, IndexMap::Table(vec![-2, 0].into()), 1, "outside base"),
+    for (arg, map, slot, why) in [
+        (int(), IndexMap::IntRange { lo: 0, n: 3 }, SlotLayout::Bits(2), "span"),
+        (int(), IndexMap::IntRange { lo: i64::MAX, n: 2 }, SlotLayout::Bits(2), "overflow"),
+        (int(), IndexMap::IntRange { lo: 0, n: 2 }, SlotLayout::Words(2), "width"),
+        (int(), IndexMap::IntRange { lo: 0, n: 2 }, SlotLayout::Bits(3), "width"),
+        (atom.clone(), IndexMap::Table(vec![0, 2].into()), SlotLayout::Bits(2), "outside base"),
+        (atom, IndexMap::Table(vec![-2, 0].into()), SlotLayout::Bits(2), "outside base"),
     ] {
-        reject(&t, Expr::new(Ty::Enc(0), ExprKind::Index { base: x.clone(), arg, map, elem_words: width }), why);
+        reject(&t, Expr::new(Ty::Enc(0), ExprKind::Index { base: x.clone(), arg, map, slot }), why);
     }
 }
 #[test]
 fn sequences_and_sorted_sets() {
     let mut t = typing();
     let seq = enc(&mut t, Shape::Seq { elem: Box::new(Shape::Int { lo: 0, hi: 2 }), max_len: 3 });
-    reject(&t, Expr::new(Ty::Enc(0), ExprKind::SeqIndex { base: seq.clone(), arg: int(), elem_words: 2 }), "width");
-    reject(&t, Expr::new(seq.ty, ExprKind::SeqConcat { a: seq.clone(), b: seq, elem_words: 1, max_len: 4 }), "capacity");
+    reject(&t, Expr::new(Ty::Enc(0), ExprKind::SeqIndex { base: seq.clone(), arg: int(), slot: SlotLayout::Words(2) }), "width");
+    reject(&t, Expr::new(seq.ty, ExprKind::SeqConcat { a: seq.clone(), b: seq, slot: SlotLayout::Bits(2), max_len: 4 }), "capacity");
     let set = enc(&mut t, Shape::Set { elem: Box::new(Shape::Dyn), max_card: 2 });
     reject(&t, Expr::new(set.ty, ExprKind::SortedOp { op: SetOp::Union, a: set.clone(), b: set, elem_words: 1, max_card: 3 }), "capacity");
 }
@@ -102,8 +144,12 @@ fn sequences_and_sorted_sets() {
 fn union_fields_and_recode_widths() {
     let mut t = typing();
     let x = enc(&mut t, Shape::Union(vec![Shape::Bool, Shape::Int { lo: 0, hi: 2 }].into()));
-    reject(&t, Expr::new(Ty::Enc(0), ExprKind::UnionField { base: x.clone(), offsets: vec![Some(0)].into() }), "length");
-    reject(&t, Expr::new(Ty::Int, ExprKind::UnionFieldInt { base: x.clone(), entries: vec![Some((1, 0)), None].into() }), "outside arm");
+    reject(&t, Expr::new(Ty::Enc(0), ExprKind::UnionField { base: x.clone(), locs: vec![Some(FieldLoc::Words(0))].into() }), "length");
+    reject(
+        &t,
+        Expr::new(Ty::Int, ExprKind::UnionFieldInt { base: x.clone(), entries: vec![Some((FieldLoc::Words(1), 0)), None].into() }),
+        "outside arm",
+    );
     reject(&t, Expr::new(Ty::Enc(0), ExprKind::Recode { x, arm_base: vec![0, 2].into(), table: vec![0].into(), words: 0 }), "width");
 }
 #[test]
@@ -404,12 +450,12 @@ fn stale_verification_is_caught() {
 fn sorted_member_of_a_constant_word_array() {
     let mut t = typing();
     let pair = t.id(&Shape::Tuple(vec![Shape::Int { lo: 0, hi: 3 }, Shape::Int { lo: 0, hi: 3 }].into()));
-    let words = t.id(&Shape::Seq { elem: Box::new(Shape::Int { lo: 0, hi: 0 }), max_len: 4 });
+    let words = t.id(&Shape::Seq { elem: Box::new(Shape::Int { lo: i64::MIN, hi: i64::MAX }), max_len: 2 });
     let set = |data: Vec<u64>| Expr::new(Ty::Enc(words), ExprKind::ConstWords(data.into()));
-    let elem = Expr::new(Ty::Enc(pair), ExprKind::ConstWords(vec![1, 2].into()));
-    let member = |set| Expr::new(Ty::Bool, ExprKind::SortedMember { set, elem: elem.clone(), elem_words: 2 });
-    super::expression(&t, &[], &[], &member(set(vec![2, 0, 1, 1, 2]))).unwrap();
-    reject(&t, member(set(vec![3, 0, 1, 1, 2])), "sorted word array shorter");
-    let wide = Expr::new(Ty::Bool, ExprKind::SortedMember { set: set(vec![1, 0, 1, 0, 0]), elem: elem.clone(), elem_words: 1 });
+    let elem = Expr::new(Ty::Enc(pair), ExprKind::ConstWords(vec![0].into()));
+    let member = |set| Expr::new(Ty::Bool, ExprKind::SortedMember { set, elem: elem.clone(), elem_words: 1 });
+    super::expression(&t, &[], &[], &member(set(vec![2, 1, 2]))).unwrap();
+    reject(&t, member(set(vec![3, 1, 2])), "sorted word array shorter");
+    let wide = Expr::new(Ty::Bool, ExprKind::SortedMember { set: set(vec![1, 1, 0]), elem: elem.clone(), elem_words: 2 });
     reject(&t, wide, "width mismatch");
 }

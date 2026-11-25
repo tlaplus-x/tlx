@@ -383,23 +383,25 @@ InterpModel
  → (7) a successor outside the layout = layout miss: stop, widen the Shape, go back to (3), resume from the failing level when possible (§6.5.3)
 ```
 
-### 6.2 Shapes and encoding (`tlx-layout`: `shape.rs`, `layout.rs`)
+### 6.2 Shapes and encoding (`tlx-layout`: `shape.rs`, `pack.rs`, `layout.rs`)
 
-A `Shape` statically describes a value precisely enough to give it a fixed-length encoding. The encoding is **canonical**: for one shape `encode(a) == encode(b)` iff `a == b`, and unused words are 0.
+A `Shape` statically describes a value precisely enough to give it a fixed-length encoding. The encoding is **canonical**: for one shape `encode(a) == encode(b)` iff `a == b`, and all unused words, sequence tails, absent map slots, and unused bitfield padding bits are 0. `LayoutNode::validate_words` (and `StateCodec::validate`) rejects non-zero padding bits and out-of-range scalar codes before accepting external encoded states.
+
+Standalone top-level state variables and IR temporaries of scalar shapes (`Bool`, `Int`, `Atom`) occupy **1 full `u64` word** so narrow scalar specs avoid bit-extraction overhead. Inside composite shapes (`Record`, `Tuple`, `Fcn`, `Map`, `Seq`), packable scalar leaves (`Bool` -> `1` bit, `Atom(U)` -> `1..=63` bits for `|U| - 1 < 2^63`, bounded `Int{lo, hi}` -> `1..=63` bits for `hi - lo < 2^63`, `Never` -> `0` bits) are packed **MSB-first** into shared `u64` words without straddling word boundaries (`pack.rs`: `scalar_bits`, `FieldLayout`, `SlotLayout`). Full-width 64-bit `Int`, `Dyn`, `Ref`, and non-empty composite children remain word-aligned (flushing any partial packed word first). Because each scalar's raw unsigned code (`0/1`, `v - lo`, universe index) is monotone in TLC order, plain unsigned word-slice comparison preserves TLC lexicographic order on packed `Record`, `Tuple`, `Fcn`, and `Seq` encodings.
 
 | Shape | Encoding (`u64` words) |
 |---|---|
-| `Never` | 0 words (no value observed yet) |
-| `Bool` | 1 word, 0/1 |
-| `Int{lo, hi}` | 1 word holding `v - lo`; out of range = miss |
-| `Atom(U)`: finite universe of model values / strings in TLC order | 1 word, index into U |
+| `Never` | 0 words / 0 bits (no value observed yet) |
+| `Bool` | 1 word standalone, 1 bit packed inside composites (`0`/`1`) |
+| `Int{lo, hi}` | 1 word standalone holding `v - lo`; `1..=63` bits packed inside composites when `hi - lo < 2^63` (else 1 full word); out of range = miss |
+| `Atom(U)`: finite universe of model values / strings in TLC order | 1 word standalone holding index into `U`; `1..=63` bits packed inside composites |
 | `Set{elem, max_card}` with a countable element universe of at most 4096 (`MAX_BITSET_UNIVERSE`) | bitset; bit r = the element of rank r is in the set (rank order; compound elements containing sets may need TLC ordering at iteration time). More than `max_card` elements is also a miss (compiled unions, constructions and shape changes check the cardinality, `lower/sets.rs::card_checked`; otherwise a state could transcode differently from a fresh encoding when the layout is widened) |
 | `Set{elem, max_card}` with a larger universe | `len` plus `max_card` elements in encoding-lexicographic order, zero padded; exceeding = miss |
-| `Fcn{dom, range}` with a compile-time-known finite domain (`1..n` or all strings when built over an enumerated domain, §4 item 5; tuples/records and such an `Fcn` convert into each other when encoding, `shape::fit_repr`; a join of both is a `Map`) | the values' encodings in domain order |
-| `Map{key, range}`: the domain varies over a subset of the key universe (bags, functions on `0..n`, functions built with `:>`/`@@`) | presence bitmap over the key universe plus one range slot per key (0 when absent); at most 4096 words (`MAX_MAP_WORDS`) |
-| `Record{f: s}` (fields in `Sym` order) | field encodings concatenated |
-| `Tuple(s1..sn)` | components concatenated |
-| `Seq{elem, max_len}` | `len` plus `max_len` slots, zero padded |
+| `Fcn{dom, range}` with a compile-time-known finite domain (`1..n` or all strings when built over an enumerated domain, §4 item 5; tuples/records and such an `Fcn` convert into each other when encoding, `shape::fit_repr`; a join of both is a `Map`) | `|dom|` range slots in domain order (`SlotLayout`: packed MSB-first with `64 / bits` slots per word when `range` is a packable scalar, else word-aligned) |
+| `Map{key, range}`: the domain varies over a subset of the key universe (bags, functions on `0..n`, functions built with `:>`/`@@`) | presence bitmap over the key universe plus one range slot per key (`SlotLayout`, packed MSB-first for packable scalar ranges, 0 when absent); at most 4096 words (`MAX_MAP_WORDS`) |
+| `Record{f: s}` (fields in `Sym` order) | `FieldLayout`: contiguous packable scalar fields share `u64` words MSB-first (zero-padded low bits); word-aligned children start on the next `u64` boundary |
+| `Tuple(s1..sn)` | `FieldLayout`: same MSB-first sub-word scalar packing and word-alignment rules as `Record` |
+| `Seq{elem, max_len}` | `len` word plus `max_len` element slots (`SlotLayout`, packed MSB-first for packable scalar elements), zero padded past `len` |
 | `Union(arms)` (values of different kinds, e.g. records with different fields; at most 8 arms) | arm index plus that arm's encoding (padded to the widest arm) |
 | tuple arms of a `Union` (distinguished by length, e.g. `<<>>` and `<<node, round>>`): tuples of different lengths join into a `Tuple` arm sorted by length if every non-empty tuple's components belong to distinct kinds (positional types) and there are at most 4 lengths, otherwise into a `Seq` (a sequence grown by repeated Append passes through length 1, so it stays a `Seq`) | as `Union`; arms sorted by length, which is TLC order |
 | `Dyn` | 1 word: the low 3 bits are a kind tag; strings, model values (by `Sym` number), booleans and integers within 61 bits are encoded in the handle, other values are handles into a global interner (`dynval.rs`) sharded 64 ways by hash, one lock per shard; canonical within one run |

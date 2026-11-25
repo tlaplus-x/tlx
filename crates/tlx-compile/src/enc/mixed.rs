@@ -466,6 +466,26 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
         h.u64(t.len() as u64);
         t.iter().for_each(|x| h.u64(*x as i64 as u64));
     };
+    let loc = |h: &mut Hashing, l: crate::ir::FieldLoc| match l {
+        crate::ir::FieldLoc::Words(w) => {
+            h.u64(0);
+            h.u64(w as u64);
+        }
+        crate::ir::FieldLoc::Bits(p) => {
+            h.u64(1);
+            h.u64((p.word as u64) << 16 | (p.shift as u64) << 8 | p.bits as u64);
+        }
+    };
+    let slot = |h: &mut Hashing, s: crate::ir::SlotLayout| match s {
+        crate::ir::SlotLayout::Words(w) => {
+            h.u64(0);
+            h.u64(w as u64);
+        }
+        crate::ir::SlotLayout::Bits(b) => {
+            h.u64(1);
+            h.u64(b as u64);
+        }
+    };
     match &*e.kind {
         K::Const(v) => h.value(v),
         K::ConstWords(w) => words(h, w),
@@ -487,6 +507,10 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
         | K::MapGet { .. }
         | K::MapMerge(..) => {}
         K::And(xs) | K::Or(xs) | K::Concat(xs) | K::BitSet(xs) | K::Tuple(xs) => h.u64(xs.len() as u64),
+        K::Pack { locs, parts } => {
+            h.u64(parts.len() as u64);
+            locs.iter().for_each(|l| loc(h, *l));
+        }
         K::IntBin(op, ..) => h.str(&format!("{op:?}")),
         K::IntCmp(op, ..) => h.str(&format!("{op:?}")),
         K::BitSetOp(op, ..) => h.str(&format!("{op:?}")),
@@ -506,9 +530,9 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
             h.u64(args.len() as u64);
         }
         K::RefElems(_) => h.str("refelems"),
-        K::Slice { offset, .. } | K::ExceptAt { offset, .. } => h.u64(*offset as u64),
-        K::Index { map, elem_words, .. } | K::ExceptIndex { map, elem_words, .. } => {
-            h.u64(*elem_words as u64);
+        K::Slice { loc: l, .. } | K::ExceptAt { loc: l, .. } => loc(h, *l),
+        K::Index { map, slot: s, .. } | K::ExceptIndex { map, slot: s, .. } => {
+            slot(h, *s);
             match map {
                 IndexMap::IntRange { lo, n } => {
                     h.u64(0);
@@ -521,29 +545,37 @@ fn hash_expr(h: &mut Hashing, e: &Expr) {
                 }
             }
         }
-        K::SeqIndex { elem_words, .. }
-        | K::SeqTail { elem_words, .. }
-        | K::SeqSub { elem_words, .. }
-        | K::SortedMember { elem_words, .. } => h.u64(*elem_words as u64),
-        K::SeqAppend { elem_words, max_len: max, .. }
-        | K::SeqConcat { elem_words, max_len: max, .. }
-        | K::SortedInsert { elem_words, max_card: max, .. } => h.u64((*elem_words as u64) << 32 | *max as u64),
+        K::SeqIndex { slot: s, .. } | K::SeqTail { slot: s, .. } | K::SeqSub { slot: s, .. } => slot(h, *s),
+        K::SortedMember { elem_words, .. } => h.u64(*elem_words as u64),
+        K::SeqAppend { slot: s, max_len: max, .. } | K::SeqConcat { slot: s, max_len: max, .. } => {
+            slot(h, *s);
+            h.u64(*max as u64);
+        }
+        K::SortedInsert { elem_words, max_card: max, .. } => h.u64((*elem_words as u64) << 32 | *max as u64),
         K::SortedOp { op, elem_words, max_card, .. } => {
             h.str(&format!("{op:?}"));
             h.u64((*elem_words as u64) << 32 | *max_card as u64);
         }
-        K::SeqFilter { bind, elem_words, .. } => h.u64((*bind as u64) << 32 | *elem_words as u64),
-        K::UnionField { offsets, .. } => {
-            h.u64(offsets.len() as u64);
-            offsets.iter().for_each(|o| h.u64(o.map_or(u64::MAX, |o| o as u64)));
+        K::SeqFilter { bind, slot: s, .. } => {
+            h.u64(*bind as u64);
+            slot(h, *s);
+        }
+        K::UnionField { locs, .. } => {
+            h.u64(locs.len() as u64);
+            for o in locs.iter() {
+                match o {
+                    None => h.u64(u64::MAX),
+                    Some(l) => loc(h, *l),
+                }
+            }
         }
         K::UnionFieldInt { entries, .. } => {
             h.u64(entries.len() as u64);
             for x in entries.iter() {
                 match x {
                     None => h.u64(u64::MAX),
-                    Some((offset, lo)) => {
-                        h.u64(*offset as u64);
+                    Some((l, lo)) => {
+                        loc(h, *l);
                         h.u64(*lo as u64);
                     }
                 }

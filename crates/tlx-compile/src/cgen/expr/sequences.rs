@@ -11,29 +11,59 @@ impl CGen<'_> {
     /// The value family.
     pub(super) fn seq_expr(&mut self, e: &Expr) -> R<String> {
         Ok(match &*e.kind {
-            ExprKind::Slice { base, offset } => format!("({} + {offset})", self.expr(base)?),
-            ExprKind::Index { base, arg, map, elem_words } => {
+            ExprKind::Slice { base, loc } => match *loc {
+                FieldLoc::Words(offset) => format!("({} + {offset})", self.expr(base)?),
+                FieldLoc::Bits(pos) => {
+                    let b = self.expr(base)?;
+                    let buf = self.buf(1);
+                    format!("({{ {buf}[0] = tlx_bget({b}, {}, {}, {}); (const uint64_t *){buf}; }})", pos.word, pos.shift, pos.bits)
+                }
+            },
+            ExprKind::Index { base, arg, map, slot } => {
                 let b = self.expr(base)?;
-                let slot = self.slot(arg, map)?;
-                format!("({b} + ({slot}) * {elem_words})")
+                let sl = self.slot(arg, map)?;
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!("({b} + ({sl}) * {elem_words})"),
+                    SlotLayout::Bits(bits) => {
+                        let buf = self.buf(1);
+                        format!("({{ const uint64_t *b_ = {b}; uint64_t sl_ = (uint64_t)({sl}); {buf}[0] = tlx_sget(b_, {bits}, sl_); (const uint64_t *){buf}; }})")
+                    }
+                }
             }
-            ExprKind::ExceptAt { base, offset, value } => {
+            ExprKind::ExceptAt { base, loc, value } => {
                 let Ty::Enc(bsid) = e.ty else { return no("boxed EXCEPT") };
                 let Ty::Enc(vsid) = value.ty else { return no("boxed EXCEPT value") };
                 let (n, vn) = (self.words(bsid), self.words(vsid));
                 let buf = self.buf(n);
                 let b = self.expr(base)?;
                 let v = self.expr(value)?;
-                format!("({{ const uint64_t *v_ = {v}; memcpy({buf}, {b}, {n} * 8); memcpy({buf} + {offset}, v_, {vn} * 8); {buf}; }})")
+                match *loc {
+                    FieldLoc::Words(offset) => {
+                        format!(
+                            "({{ const uint64_t *v_ = {v}; memcpy({buf}, {b}, {n} * 8); memcpy({buf} + {offset}, v_, {vn} * 8); {buf}; }})"
+                        )
+                    }
+                    FieldLoc::Bits(pos) => {
+                        format!(
+                            "({{ const uint64_t *v_ = {v}; memcpy({buf}, {b}, {n} * 8); tlx_bset({buf}, {}, {}, {}, v_[0]); (const uint64_t *){buf}; }})",
+                            pos.word, pos.shift, pos.bits
+                        )
+                    }
+                }
             }
-            ExprKind::ExceptIndex { base, arg, map, elem_words, value } => {
+            ExprKind::ExceptIndex { base, arg, map, slot, value } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed EXCEPT")?;
                 let b = self.expr(base)?;
-                let slot = self.slot_or(arg, map, "-1")?;
+                let sl = self.slot_or(arg, map, "-1")?;
                 let v = self.expr(value)?;
-                format!(
-                    "({{ int64_t sl_ = {slot}; memcpy({buf}, {b}, {n} * 8); if (sl_ >= 0) {{ const uint64_t *v_ = {v}; memcpy({buf} + sl_ * {elem_words}, v_, {elem_words} * 8); }} {buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ int64_t sl_ = {sl}; memcpy({buf}, {b}, {n} * 8); if (sl_ >= 0) {{ const uint64_t *v_ = {v}; memcpy({buf} + sl_ * {elem_words}, v_, {elem_words} * 8); }} {buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ int64_t sl_ = {sl}; memcpy({buf}, {b}, {n} * 8); if (sl_ >= 0) {{ const uint64_t *v_ = {v}; tlx_sset({buf}, {bits}, (uint64_t)sl_, v_[0]); }} (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
             ExprKind::SeqLen(x) => format!("((int64_t)({})[0])", self.expr(x)?),
             ExprKind::Filter { bind, set, pred } => {
@@ -113,37 +143,65 @@ impl CGen<'_> {
             ExprKind::Collect { bind, set, elem } => {
                 let Ty::Enc(sid) = e.ty else { return no("boxed sequence") };
                 let Shape::Seq { elem: es, max_len } = self.ty.shape(sid).clone() else { return no("collect into a non-sequence") };
-                let ew = self.words(self.find_sid(&es)?);
+                let slot = SlotLayout::of(&es);
                 let n = self.words(sid);
                 let buf = self.buf(n);
                 let h0 = self.loop_start(set)?;
                 let x = self.expr(elem)?;
-                let body = format!("      {{ const uint64_t *x_ = {x}; if ({buf}[0] >= {max_len}) return TLX_ERR; memcpy({buf} + 1 + {buf}[0] * {ew}, x_, {ew} * 8); {buf}[0]++; }}\n");
+                let body = match slot {
+                    SlotLayout::Words(ew) => format!(
+                        "      {{ const uint64_t *x_ = {x}; if ({buf}[0] >= {max_len}) return TLX_ERR; memcpy({buf} + 1 + {buf}[0] * {ew}, x_, {ew} * 8); {buf}[0]++; }}\n"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "      {{ const uint64_t *x_ = {x}; if ({buf}[0] >= {max_len}) return TLX_ERR; tlx_sset({buf} + 1, {bits}, {buf}[0], x_[0]); {buf}[0]++; }}\n"
+                    ),
+                };
                 let lp = self.foreach(*bind, set, &body, 3, h0, None, None)?;
                 format!("({{ memset({buf}, 0, {n} * 8); {{\n{lp} }} (const uint64_t *){buf}; }})")
             }
-            ExprKind::SeqIndex { base, arg, elem_words } => {
+            ExprKind::SeqIndex { base, arg, slot } => {
                 let b = self.expr(base)?;
                 let i = self.int_expr(arg)?;
-                format!("({{ const uint64_t *s_ = {b}; int64_t i_ = {i}; if (i_ < 1 || (uint64_t)i_ > s_[0]) return TLX_ERR; s_ + 1 + (i_ - 1) * {elem_words}; }})")
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *s_ = {b}; int64_t i_ = {i}; if (i_ < 1 || (uint64_t)i_ > s_[0]) return TLX_ERR; s_ + 1 + (i_ - 1) * {elem_words}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => {
+                        let buf = self.buf(1);
+                        format!(
+                            "({{ const uint64_t *s_ = {b}; int64_t i_ = {i}; if (i_ < 1 || (uint64_t)i_ > s_[0]) return TLX_ERR; {buf}[0] = tlx_sget(s_ + 1, {bits}, (uint64_t)(i_ - 1)); (const uint64_t *){buf}; }})"
+                        )
+                    }
+                }
             }
-            ExprKind::SeqTail { base, elem_words } => {
+            ExprKind::SeqTail { base, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let b = self.expr(base)?;
-                format!(
-                    "({{ const uint64_t *s_ = {b}; if (s_[0] == 0) return TLX_ERR; memcpy({buf}, s_, {n} * 8); uint64_t l_ = s_[0]; memmove({buf} + 1, {buf} + 1 + {elem_words}, (l_ - 1) * {elem_words} * 8); memset({buf} + 1 + (l_ - 1) * {elem_words}, 0, {elem_words} * 8); {buf}[0] = l_ - 1; (const uint64_t *){buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *s_ = {b}; if (s_[0] == 0) return TLX_ERR; memcpy({buf}, s_, {n} * 8); uint64_t l_ = s_[0]; memmove({buf} + 1, {buf} + 1 + {elem_words}, (l_ - 1) * {elem_words} * 8); memset({buf} + 1 + (l_ - 1) * {elem_words}, 0, {elem_words} * 8); {buf}[0] = l_ - 1; (const uint64_t *){buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ const uint64_t *s_ = {b}; if (s_[0] == 0) return TLX_ERR; uint64_t l_ = s_[0]; memset({buf}, 0, {n} * 8); for (uint64_t j_ = 0; j_ < l_ - 1; j_++) tlx_sset({buf} + 1, {bits}, j_, tlx_sget(s_ + 1, {bits}, j_ + 1)); {buf}[0] = l_ - 1; (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
-            ExprKind::SeqSub { base, lo, hi, elem_words } => {
+            ExprKind::SeqSub { base, lo, hi, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let b = self.expr(base)?;
                 let (m, k) = (self.int_expr(lo)?, self.int_expr(hi)?);
-                format!(
-                    "({{ const uint64_t *s_ = {b}; int64_t m_ = {m}, n_ = {k}; memset({buf}, 0, {n} * 8); \
-                     if (n_ >= m_) {{ if (m_ < 1 || n_ > (int64_t)s_[0]) return TLX_ERR; memcpy({buf} + 1, s_ + 1 + (m_ - 1) * {elem_words}, (n_ - m_ + 1) * {elem_words} * 8); {buf}[0] = n_ - m_ + 1; }} (const uint64_t *){buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *s_ = {b}; int64_t m_ = {m}, n_ = {k}; memset({buf}, 0, {n} * 8); \
+                         if (n_ >= m_) {{ if (m_ < 1 || n_ > (int64_t)s_[0]) return TLX_ERR; memcpy({buf} + 1, s_ + 1 + (m_ - 1) * {elem_words}, (n_ - m_ + 1) * {elem_words} * 8); {buf}[0] = n_ - m_ + 1; }} (const uint64_t *){buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ const uint64_t *s_ = {b}; int64_t m_ = {m}, n_ = {k}; memset({buf}, 0, {n} * 8); \
+                         if (n_ >= m_) {{ if (m_ < 1 || n_ > (int64_t)s_[0]) return TLX_ERR; uint64_t c_ = (uint64_t)(n_ - m_ + 1); for (uint64_t j_ = 0; j_ < c_; j_++) tlx_sset({buf} + 1, {bits}, j_, tlx_sget(s_ + 1, {bits}, (uint64_t)(m_ - 1) + j_)); {buf}[0] = c_; }} (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
-            ExprKind::SeqFilter { bind, seq, pred, elem_words } => {
+            ExprKind::SeqFilter { bind, seq, pred, slot } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let s_ = self.expr(seq)?;
                 let h0 = self.handles;
@@ -151,25 +209,41 @@ impl CGen<'_> {
                 let p = self.scoped_scalar(&p, h0);
                 let t = temp(*bind);
                 let k = self.fresh();
-                format!(
-                    "({{ const uint64_t *S{k} = {s_}; memset({buf}, 0, {n} * 8); uint64_t L{k} = 0; for (uint64_t i{k} = 0; i{k} < S{k}[0]; i{k}++) {{ \
-                     const uint64_t *{t} = S{k} + 1 + i{k} * {elem_words}; if ({p}) {{ memcpy({buf} + 1 + L{k} * {elem_words}, {t}, {elem_words} * 8); L{k}++; }} }} {buf}[0] = L{k}; (const uint64_t *){buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *S{k} = {s_}; memset({buf}, 0, {n} * 8); uint64_t L{k} = 0; for (uint64_t i{k} = 0; i{k} < S{k}[0]; i{k}++) {{ \
+                         const uint64_t *{t} = S{k} + 1 + i{k} * {elem_words}; if ({p}) {{ memcpy({buf} + 1 + L{k} * {elem_words}, {t}, {elem_words} * 8); L{k}++; }} }} {buf}[0] = L{k}; (const uint64_t *){buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ const uint64_t *S{k} = {s_}; memset({buf}, 0, {n} * 8); uint64_t L{k} = 0; for (uint64_t i{k} = 0; i{k} < S{k}[0]; i{k}++) {{ \
+                         uint64_t E{k}[1] = {{tlx_sget(S{k} + 1, {bits}, i{k})}}; const uint64_t *{t} = E{k}; if ({p}) {{ tlx_sset({buf} + 1, {bits}, L{k}, E{k}[0]); L{k}++; }} }} {buf}[0] = L{k}; (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
-            ExprKind::SeqConcat { a, b, elem_words, max_len } => {
+            ExprKind::SeqConcat { a, b, slot, max_len } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let (a, b) = (self.expr(a)?, self.expr(b)?);
-                format!(
-                    "({{ const uint64_t *a_ = {a}; const uint64_t *b_ = {b}; if (a_[0] + b_[0] > {max_len}) return TLX_ERR; memcpy({buf}, a_, {n} * 8); memcpy({buf} + 1 + a_[0] * {elem_words}, b_ + 1, b_[0] * {elem_words} * 8); {buf}[0] = a_[0] + b_[0]; (const uint64_t *){buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *a_ = {a}; const uint64_t *b_ = {b}; if (a_[0] + b_[0] > {max_len}) return TLX_ERR; memcpy({buf}, a_, {n} * 8); memcpy({buf} + 1 + a_[0] * {elem_words}, b_ + 1, b_[0] * {elem_words} * 8); {buf}[0] = a_[0] + b_[0]; (const uint64_t *){buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ const uint64_t *a_ = {a}; const uint64_t *b_ = {b}; if (a_[0] + b_[0] > {max_len}) return TLX_ERR; memcpy({buf}, a_, {n} * 8); for (uint64_t j_ = 0; j_ < b_[0]; j_++) tlx_sset({buf} + 1, {bits}, a_[0] + j_, tlx_sget(b_ + 1, {bits}, j_)); {buf}[0] = a_[0] + b_[0]; (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
-            ExprKind::SeqAppend { base, value, elem_words, max_len } => {
+            ExprKind::SeqAppend { base, value, slot, max_len } => {
                 let (n, buf) = self.result_buf(e.ty, "boxed sequence")?;
                 let b = self.expr(base)?;
                 let v = self.expr(value)?;
-                format!(
-                    "({{ const uint64_t *s_ = {b}; const uint64_t *v_ = {v}; if (s_[0] >= {max_len}) return TLX_ERR; memcpy({buf}, s_, {n} * 8); memcpy({buf} + 1 + s_[0] * {elem_words}, v_, {elem_words} * 8); {buf}[0] = s_[0] + 1; (const uint64_t *){buf}; }})"
-                )
+                match *slot {
+                    SlotLayout::Words(elem_words) => format!(
+                        "({{ const uint64_t *s_ = {b}; const uint64_t *v_ = {v}; if (s_[0] >= {max_len}) return TLX_ERR; memcpy({buf}, s_, {n} * 8); memcpy({buf} + 1 + s_[0] * {elem_words}, v_, {elem_words} * 8); {buf}[0] = s_[0] + 1; (const uint64_t *){buf}; }})"
+                    ),
+                    SlotLayout::Bits(bits) => format!(
+                        "({{ const uint64_t *s_ = {b}; const uint64_t *v_ = {v}; if (s_[0] >= {max_len}) return TLX_ERR; memcpy({buf}, s_, {n} * 8); tlx_sset({buf} + 1, {bits}, s_[0], v_[0]); {buf}[0] = s_[0] + 1; (const uint64_t *){buf}; }})"
+                    ),
+                }
             }
             _ => unreachable!("not an encoded-value expression"),
         })

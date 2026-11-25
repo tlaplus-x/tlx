@@ -309,9 +309,12 @@ fn set_family_c_keeps_the_guards() {
     assert!(sorted.contains("!tlx_sorted_op("), "SortedOp has no capacity guard");
 
     let unions = c_of(&CASES[2].harness());
-    assert!(unions.contains("int32_t o_ = u_[0] < "), "UnionField does not select its table arm");
-    assert!(unions.contains("if (o_ < 0) return TLX_ERR; u_ + 1 + o_;"), "UnionField has no wrong-arm error");
-    assert!(unions.contains("(int64_t)u_[1 + o_] + "), "UnionFieldInt does not add its low word");
+    assert!(unions.contains("int64_t d_ = u_[0] < "), "UnionField does not select its table arm");
+    assert!(
+        unions.contains("if (d_ < 0) return TLX_ERR;") && unions.contains("(uint64_t)d_ >> 16"),
+        "UnionField has no wrong-arm error or bitfield descriptor read"
+    );
+    assert!(unions.contains("(int64_t)v_ + "), "UnionFieldInt does not add its low word");
     assert!(unions.contains("static const int64_t"), "UnionFieldInt has no low-word table");
     assert!(unions.contains("(int64_t)("), "Rank is not the first word read inline");
 

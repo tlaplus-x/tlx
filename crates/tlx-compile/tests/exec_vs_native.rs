@@ -840,7 +840,7 @@ fn tiers_agree() {
 /// reaches it.
 #[test]
 fn except_index_error_in_index() {
-    use tlx_compile::ir::{ActionFn, Expr, ExprKind, IndexMap, IntOp, Stmt, Ty};
+    use tlx_compile::ir::{ActionFn, Expr, ExprKind, IndexMap, IntOp, SlotLayout, Stmt, Ty};
     let src = module(
         "ExceptIndexErr",
         "EXTENDS Integers\nVARIABLE f\nInit == f = <<0, 0, 0>>\nBad == f' = [f EXCEPT ![1 \\div (f[1] - f[1])] = 1]\nNext == Bad\n",
@@ -857,7 +857,7 @@ fn except_index_error_in_index() {
             base: Expr::new(Ty::Enc(f), ExprKind::Var(0)),
             arg,
             map: IndexMap::IntRange { lo: 1, n: 3 },
-            elem_words: 1,
+            slot: SlotLayout::Bits(2),
             value,
         };
         let body = Stmt::Assign { var: 0, value: Expr::new(Ty::Enc(f), except), body: Box::new(Stmt::Emit) };

@@ -73,7 +73,7 @@ fn same_plain(a: &Expr, b: &Expr) -> bool {
             (ExprKind::Temp(x), ExprKind::Temp(y)) => x == y,
             (ExprKind::Var(x), ExprKind::Var(y)) | (ExprKind::NextVar(x), ExprKind::NextVar(y)) => x == y,
             (ExprKind::ConstWords(x), ExprKind::ConstWords(y)) => x == y,
-            (ExprKind::Slice { base: x, offset: i }, ExprKind::Slice { base: y, offset: j }) => i == j && same_plain(x, y),
+            (ExprKind::Slice { base: x, loc: i }, ExprKind::Slice { base: y, loc: j }) => i == j && same_plain(x, y),
             _ => false,
         }
 }

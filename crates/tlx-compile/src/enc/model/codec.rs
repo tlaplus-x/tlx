@@ -249,7 +249,7 @@ impl tlx_runtime::StateCodec<EState> for EncModel {
         s.fp
     }
     fn validate(&self, w: &[u64]) -> Result<(), String> {
-        self.escape.as_ref().map_or_else(|| self.layout.validate_words(w), |e| e.codec.validate(w))
+        self.escape.as_ref().map_or_else(|| self.layout.validate_canonical_words(w), |e| e.codec.validate(w))
     }
     fn decode(&self, w: &[u64], depth: u32, fp: u64) -> EState {
         <Self as tlx_runtime::StateCodec<EState>>::validate(self, w).unwrap_or_else(|e| panic!("{e}"));

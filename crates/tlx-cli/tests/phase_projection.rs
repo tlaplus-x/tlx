@@ -278,3 +278,33 @@ fn refused_composition_keeps_concrete_counterexample_steps() {
         assert!(!run.stdout.contains("data |-> FALSE"), "{tier}: {}", run.text());
     }
 }
+
+#[test]
+fn projected_view_with_empty_component_between_packed_fields() {
+    let spec = r#"---- MODULE Phase ----
+EXTENDS TLC
+CONSTANT Actors
+VARIABLES x, pad, y, tag
+Init == x \in Actors /\ pad = <<>> /\ y \in Actors /\ tag = "init"
+Next == x' \in Actors /\ pad' = <<>> /\ y' \in Actors /\ (tag' = "one" \/ tag' = "two")
+Inv == x \in Actors /\ pad = <<>> /\ y \in Actors
+Sym == Permutations(Actors)
+===="#;
+    let cfg = format!("{CFG}CONSTANT Actors = {{a, b}}\n");
+    let dir = tlx_testkit::TempDir::with_spec("packed-empty-middle-view", spec, &cfg);
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let run = tlx_testkit::tlx_default!()
+            .check("Phase.tla")
+            .args(args)
+            .args(["-optimize", "-stats", "json=stats.json"])
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("2 distinct states found"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("unobserved-state-projection"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "{tier}: {}", run.text());
+    }
+}

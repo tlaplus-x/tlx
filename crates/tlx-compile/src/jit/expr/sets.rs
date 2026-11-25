@@ -4,10 +4,13 @@
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{InstBuilder, Value};
+use tlx_layout::Shape;
 
 use super::super::gen::{Gen, Known, MAX_SSA_WORDS};
 use super::super::{no, R};
-use crate::ir::encoding::{RecodeTable, UnionArms};
+use crate::ir::encoding::{
+    union_loc_desc, RecodeTable, UnionArms, UNION_DESC_BIT_SHIFT, UNION_DESC_FIELD_MASK, UNION_DESC_MISSING, UNION_DESC_WORD_SHIFT,
+};
 use crate::ir::*;
 
 impl Gen<'_, '_, '_> {
@@ -88,6 +91,54 @@ impl Gen<'_, '_, '_> {
                 }
                 bp
             }
+            ExprKind::Pack { locs, parts } => {
+                let (total, buf) = self.result_buf(e.ty, "boxed construction")?;
+                let mut evals = Vec::with_capacity(parts.len());
+                for x in parts {
+                    let Ty::Enc(xs_) = x.ty else { return no("boxed part") };
+                    let n = self.words_of(xs_);
+                    evals.push((self.expr(x)?, n));
+                }
+                if total <= MAX_SSA_WORDS {
+                    let mut ws = vec![Known::Const(0); total];
+                    let mut kbits = Vec::new();
+                    for (loc, (v, n)) in locs.iter().zip(evals) {
+                        match *loc {
+                            FieldLoc::Words(off) => {
+                                for (k, kw) in self.words(v, n).into_iter().enumerate() {
+                                    ws[off + k] = kw;
+                                }
+                            }
+                            FieldLoc::Bits(pos) => {
+                                let val = self.load(v, 0);
+                                let mv = self.mask_bits(val, pos.bits);
+                                ws[pos.word] = self.or_known_bits(ws[pos.word], pos, mv);
+                                kbits.push((pos, mv));
+                            }
+                        }
+                    }
+                    let p = self.materialize(&ws);
+                    self.know_bits(p, kbits);
+                    return Ok(p);
+                }
+                let bp = self.addr(buf);
+                self.zero(bp, total);
+                for (loc, (v, n)) in locs.iter().zip(evals) {
+                    match *loc {
+                        FieldLoc::Words(off) => {
+                            if n > 0 {
+                                let dst = self.offset(bp, off);
+                                self.copy(dst, v, n);
+                            }
+                        }
+                        FieldLoc::Bits(pos) => {
+                            let val = self.load(v, 0);
+                            self.store_bitpos(bp, pos, val);
+                        }
+                    }
+                }
+                bp
+            }
             ExprKind::BitSet(rs) => {
                 let (n, buf) = self.result_buf(e.ty, "boxed set")?;
                 let u = self.universe(e.ty)?;
@@ -102,37 +153,79 @@ impl Gen<'_, '_, '_> {
                 }
                 self.addr(buf)
             }
-            ExprKind::UnionField { base, offsets } => {
-                let items: Vec<i32> = offsets.iter().map(|o| o.map_or(-1, |x| x as i32)).collect();
-                let tbl = self.cx.statics.i32s(&items);
+            ExprKind::UnionField { base, locs } => {
                 let u = self.expr(base)?;
-                let o = self.table_i32(u, tbl, &items);
-                let ok = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, o, 0);
-                self.check(ok);
-                let p = self.offset(u, 1);
-                self.index(p, o, 1)
+                let tag = self.load(u, 0);
+                if let Some(t) = self.konst(tag) {
+                    return Ok(match locs.get(t as usize).copied().flatten() {
+                        Some(FieldLoc::Words(off)) => self.offset(u, 1 + off),
+                        Some(FieldLoc::Bits(pos)) => {
+                            let v = self.extract_bitpos(u, pos.offset_words(1));
+                            self.materialize(&[Known::Val(v)])
+                        }
+                        None => {
+                            self.fail();
+                            self.iconst(0)
+                        }
+                    });
+                }
+                if locs.iter().all(|o| !matches!(o, Some(FieldLoc::Bits(_)))) {
+                    let items: Vec<i32> = locs
+                        .iter()
+                        .map(|o| match o {
+                            Some(FieldLoc::Words(x)) => {
+                                i32::try_from(*x).map_err(|_| super::super::Unsupported("union field offset exceeds i32".into()))
+                            }
+                            _ => Ok(-1),
+                        })
+                        .collect::<R<_>>()?;
+                    let tbl = self.cx.statics.i32s(&items);
+                    let o = self.table_i32(u, tbl, &items);
+                    let ok = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, o, 0);
+                    self.check(ok);
+                    let p = self.offset(u, 1);
+                    self.index(p, o, 1)
+                } else {
+                    let descs: Vec<i64> = locs
+                        .iter()
+                        .map(|o| union_loc_desc(*o).ok_or_else(|| super::super::Unsupported("union field descriptor overflow".into())))
+                        .collect::<R<_>>()?;
+                    let v = self.union_scalar_field(u, tag, &descs);
+                    self.materialize(&[Known::Val(v)])
+                }
             }
             ExprKind::UnionFieldInt { base, entries } => {
-                let offs: Vec<i32> = entries.iter().map(|o| o.map_or(-1, |x| x.0 as i32)).collect();
-                let los: Vec<i64> = entries.iter().map(|o| o.map_or(0, |x| x.1)).collect();
-                let (to, tl) = (self.cx.statics.i32s(&offs), self.cx.statics.i64s(&los));
                 let u = self.expr(base)?;
-                let o = self.table_i32(u, to, &offs);
-                let ok = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, o, 0);
-                self.check(ok);
-                let p = self.offset(u, 1);
-                let p = self.index(p, o, 1);
-                let w = self.load(p, 0);
                 let tag = self.load(u, 0);
-                match self.konst(tag).and_then(|t| los.get(t as usize)) {
-                    Some(lo) => self.add_imm(w, *lo),
-                    None => {
-                        let tlv = self.iconst(tl);
-                        let lp = self.index(tlv, tag, 1);
-                        let lo = self.load(lp, 0);
-                        self.b.ins().iadd(w, lo)
-                    }
+                if let Some(t) = self.konst(tag) {
+                    return Ok(match entries.get(t as usize).copied().flatten() {
+                        Some((FieldLoc::Words(off), lo)) => {
+                            let w = self.load(u, 1 + off);
+                            self.add_imm(w, lo)
+                        }
+                        Some((FieldLoc::Bits(pos), lo)) => {
+                            let w = self.extract_bitpos(u, pos.offset_words(1));
+                            self.add_imm(w, lo)
+                        }
+                        None => {
+                            self.fail();
+                            self.iconst(0)
+                        }
+                    });
                 }
+                let descs: Vec<i64> = entries
+                    .iter()
+                    .map(|o| {
+                        union_loc_desc(o.map(|x| x.0)).ok_or_else(|| super::super::Unsupported("union field descriptor overflow".into()))
+                    })
+                    .collect::<R<_>>()?;
+                let los: Vec<i64> = entries.iter().map(|o| o.map_or(0, |x| x.1)).collect();
+                let tl = self.cx.statics.i64s(&los);
+                let w = self.union_scalar_field(u, tag, &descs);
+                let tlv = self.iconst(tl);
+                let lp = self.index(tlv, tag, 1);
+                let lo = self.load(lp, 0);
+                self.b.ins().iadd(w, lo)
             }
             ExprKind::SortedMember { set, elem, elem_words } => {
                 let (s, x) = (self.expr(set)?, self.expr(elem)?);
@@ -187,10 +280,14 @@ impl Gen<'_, '_, '_> {
                 p
             }
             ExprKind::RankUnion { x, arms } => {
+                let Ty::Enc(xsid) = x.ty else { return no("boxed union") };
+                let Shape::Union(arm_shapes) = self.cx.ty.shape(xsid).clone() else { return no("RankUnion of non-union") };
                 let v = self.expr(x)?;
                 let tag = self.load(v, 0);
                 let (j, r) = self.join();
                 for (i, (base, radices)) in UnionArms::new(arms).enumerate() {
+                    let locs: Box<[FieldLoc]> =
+                        FieldLayout::of_shape(&arm_shapes[i]).map_or_else(|| Box::from([FieldLoc::Words(0)]), |fl| fl.locs);
                     let (yes, next) = (self.b.create_block(), self.b.create_block());
                     let c = self.cmp_imm(IntCC::Equal, tag, i as i64);
                     self.brif(c, yes, &[], next, &[]);
@@ -198,7 +295,10 @@ impl Gen<'_, '_, '_> {
                     // The arm offset plus the mixed-radix rank within the arm.
                     let mut acc = self.iconst(0);
                     for (k, c) in radices.iter().enumerate() {
-                        let d = self.load(v, k + 1);
+                        let d = match locs[k] {
+                            FieldLoc::Words(w) => self.load(v, 1 + w),
+                            FieldLoc::Bits(pos) => self.extract_bitpos(v, pos.offset_words(1)),
+                        };
                         let m = self.b.ins().imul_imm(acc, *c as i64);
                         acc = self.b.ins().iadd(m, d);
                     }
@@ -216,10 +316,16 @@ impl Gen<'_, '_, '_> {
                 self.table_i32(v, tbl, table)
             }
             ExprKind::RankFlat { x, radices } => {
+                let Ty::Enc(xsid) = x.ty else { return no("boxed product") };
+                let fl = FieldLayout::of_shape(self.cx.ty.shape(xsid))
+                    .ok_or_else(|| super::super::Unsupported("RankFlat of non-product".into()))?;
                 let v = self.expr(x)?;
                 let mut acc = self.iconst(0);
                 for (i, c) in radices.iter().enumerate() {
-                    let d = self.load(v, i);
+                    let d = match fl.locs[i] {
+                        FieldLoc::Words(w) => self.load(v, w),
+                        FieldLoc::Bits(pos) => self.extract_bitpos(v, pos),
+                    };
                     let m = self.b.ins().imul_imm(acc, *c as i64);
                     acc = self.b.ins().iadd(m, d);
                 }
@@ -251,5 +357,38 @@ impl Gen<'_, '_, '_> {
             }
             _ => unreachable!("not an encoded-value expression"),
         })
+    }
+
+    /// Look up `descs[tag]` (`union_loc_desc`, `< 0` on missing arm -> error)
+    /// and extract the scalar value from union `u` (at runtime `tag`).
+    fn union_scalar_field(&mut self, u: Value, tag: Value, descs: &[i64]) -> Value {
+        let len = descs.len();
+        let tbl = self.cx.statics.i64s(descs);
+        let d = if self.bound(tag).is_some_and(|b| b <= len as u64) {
+            let tv = self.iconst(tbl);
+            let tp = self.index(tv, tag, 1);
+            self.load(tp, 0)
+        } else {
+            let inside = self.cmp_imm(IntCC::UnsignedLessThan, tag, len as i64);
+            let zero = self.iconst(0);
+            let idx = self.b.ins().select(inside, tag, zero);
+            let tv = self.iconst(tbl);
+            let tp = self.index(tv, idx, 1);
+            let v = self.load(tp, 0);
+            let m1 = self.iconst(UNION_DESC_MISSING);
+            self.b.ins().select(inside, v, m1)
+        };
+        let ok = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, d, 0);
+        self.check(ok);
+        let widx = self.b.ins().ushr_imm(d, UNION_DESC_WORD_SHIFT as i64);
+        let wp = self.index(u, widx, 1);
+        let word = self.load(wp, 0);
+        let sh = self.b.ins().ushr_imm(d, UNION_DESC_BIT_SHIFT as i64);
+        let sh = self.b.ins().band_imm(sh, UNION_DESC_FIELD_MASK);
+        let rtrim = self.b.ins().band_imm(d, UNION_DESC_FIELD_MASK);
+        let ones = self.iconst(-1);
+        let mask = self.b.ins().ushr(ones, rtrim);
+        let shifted = self.b.ins().ushr(word, sh);
+        self.b.ins().band(shifted, mask)
     }
 }
