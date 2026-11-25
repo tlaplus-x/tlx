@@ -37,6 +37,44 @@ one; `none` requires every sample to record an empty list, and a sample without 
 `unknown`). Historical markdown is retained as source material and is
 not updated. `bench.py table` now regenerates the fixed report without running measurements.
 
+New TLC baselines can collect repeated process runs, for example on a cloud instance:
+
+```sh
+python3 scripts/bench.py tlcbase --models DieHard/DieHard --workers 1 --tlc-repetitions 3
+```
+
+A complete set stores raw `tlc_samples`, median wall/CPU times, and
+`provenance.sample_spread` (`wall_s` and `cpu_s`, each range divided by median;
+null for missing or zero CPU time). Every sample must finish with a valid exit
+and agree on verdict and violated property; counts must also agree for single-worker
+runs and successful searches. Incomplete or inconsistent sets cannot become reusable
+baselines or enter timing totals/distributions. Rejected sets keep all attempts and
+use `aggregation: last-attempt`; their scalar timing preserves the terminating
+attempt (including its actual timeout bound). Missing resource metrics display
+as unavailable. Samples are sequential and each uses the existing deadline admission.
+An existing valid key is always reused, even if it has only one sample; requesting
+more repetitions never replaces frozen evidence. Ingesting a history reference to
+a reusable baseline preserves the canonical row and its raw samples byte for byte.
+Use a new input/tool/hardware key
+for new measurements. Historical scalar records remain valid.
+
+`suite`, `track` and repeated `run` measurements support `--isolate-cache` (option
+reference: [configuration.md](configuration.md)). Each configuration gets
+an empty temporary `TLX_CACHE`; suite A/B binaries get separate caches. It lasts
+through that configuration's samples, any `run --stats` diagnostic, and, for suite,
+its discarded warm-up, then
+is removed. Isolated runs use synchronous native compilation so builds finish
+before cleanup. Timed suite samples therefore follow a warm-up even in this mode;
+`run` has no discarded warm-up, so its first sample starts with an empty cache.
+
+New rows from these runners carry `provenance.cache`: `mode` is `fresh-per-model`
+for isolation, `inherited` for an explicit environment cache, or `shared-batch`
+for the default shared cache. `initial_state` is `empty` only for isolation and
+`unknown` otherwise; `warmup` states whether a discarded warm-up was scheduled.
+These are collection conditions, not claims that every timed access is a cache hit.
+Legacy rows omit this field. Cache provenance does not change historical keys or
+rewrite the frozen 2026-10-11 snapshot.
+
 Benchmark measurements captured with `wait4` (including suite warm-ups) own a new process group. On timeout,
 cancellation or capture completion, the runner kills remaining members of that group before
 starting another run; compiler descendants must not outlive their checker and contaminate the

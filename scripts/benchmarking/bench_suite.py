@@ -382,6 +382,8 @@ def record_of(entry, rs, load, expect_check=True, warmups=()):
     native = [r['native_coverage'] for r in warmups if r.get('native_coverage') and r.get('result') not in UNFINISHED]
     if native:
         rec['native_coverage'] = native[-1]
+    if "cache" in last:
+        rec["cache"] = last["cache"]
     if entry.get("tlc_1w_s"):
         rec["tlc_1w_s"] = entry["tlc_1w_s"]
     rec.update(args=entry.get("args", []), category=entry.get("category", []), cgroup_mib=entry.get("cgroup_mib"),
@@ -392,7 +394,19 @@ def record_of(entry, rs, load, expect_check=True, warmups=()):
     return rec
 
 
-def measure_entry(bench, m, entry, bins, repeat, instr, slow_for, *, budget=None, checkpoint=None):
+def measure_entry(bench, m, entry, bins, repeat, instr, slow_for, *, budget=None, checkpoint=None, isolate_cache=False):
+    from benchmarking.measurement import cache_environment
+    with contextlib.ExitStack() as stack:
+        caches = {name: stack.enter_context(cache_environment(isolate_cache, entry.get('env'), warmup=True))
+                  for name, _ in bins}
+        records = _measure_entry(bench, m, entry, bins, repeat, instr, slow_for,
+                                 budget=budget, checkpoint=checkpoint, caches=caches)
+        for name, rec in records.items():
+            rec['cache'] = caches[name][1]
+        return records
+
+
+def _measure_entry(bench, m, entry, bins, repeat, instr, slow_for, *, budget=None, checkpoint=None, caches):
     """Interleaved A/B samples; checkpoint each completed warmup or measured run."""
     budget = budget or bench_budget.current()
     # The entry's own environment (a pinned adaptive tier) is part of what is
@@ -423,7 +437,7 @@ def measure_entry(bench, m, entry, bins, repeat, instr, slow_for, *, budget=None
         limited = {**entry, 'timeout_s': timeout}
         try:
             r = measure_once(bench, m, limited, exe, False if warmup else instr,
-                             env=warm_env if warmup else (run_env or None),
+                             env=({**(warm_env or {}), **caches[name][0]} if warmup else caches[name][0]) or None,
                              slow=slow_for(entry) if not warmup and name == bins[-1][0] else 1.0,
                              collect_native=warmup)
         except subprocess.TimeoutExpired as error:
@@ -431,6 +445,7 @@ def measure_entry(bench, m, entry, bins, repeat, instr, slow_for, *, budget=None
         if r.get('result') in ('timeout', 'skipped'):
             stopped = 'sample timeout' if r['result'] == 'timeout' else 'deadline'
             skipped = True
+        r['cache'] = caches[name][1]
         budget.observe(key, r.get('wall_s', timeout))
         (warm if warmup else res)[name].append(r)
         print(f"sample {entry['model']} {name} {'warmup' if warmup else 'round ' + str(round_number)}: "
@@ -618,7 +633,8 @@ def _run_suite(a, bench, resolve, es, binary, slow_for):
                 if rs:
                     target[e['key']] = record_of(e, rs, [], expect_check=name == 'new')
             save()
-        return measure_entry(bench, m, e, bins, repeats, instr, slow_for, budget=budget, checkpoint=checkpoint)
+        return measure_entry(bench, m, e, bins, repeats, instr, slow_for, budget=budget, checkpoint=checkpoint,
+                             isolate_cache=getattr(a, "isolate_cache", False))
 
     for e in es:
         if budget.remaining() <= 0:
@@ -805,6 +821,8 @@ def previous_recorded(rev, hists, is_ancestor=None):
 def remote_args(a, base):
     """The bench.py argument string of the remote run."""
     parts = ["suite", f"--sizes {a.sizes}", f"--repeat {a.repeat}", f"--max-minutes {a.max_minutes}"]
+    if getattr(a, "isolate_cache", False):
+        parts.append("--isolate-cache")
     if getattr(a, "deadline_min", None):
         parts.append(f"--deadline-min {a.deadline_min}")
     if getattr(a, "pin_adapt", ""):
@@ -916,6 +934,7 @@ def add_args(sub):
     p.add_argument("--bin", default="", help="tlx binary under test (default: build target/release)")
     p.add_argument("--base-bin", default="", help="tlx binary of the previous recorded revision (A/B)")
     p.add_argument("--base-rev", default="", help="the revision of --base-bin (recorded, names the commit range)")
+    p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--max-minutes", type=int, default=0, help="stop starting new runs after M minutes (the rest is reported as skipped: inconclusive)")
     p.add_argument("--threshold", type=float, default=0.05)
@@ -943,6 +962,7 @@ def add_args(sub):
     p.add_argument("--base", default="auto", help="auto (the previous recorded revision), a revision, or none")
     p.add_argument("--sizes", default=DEFAULT_SIZES)
     p.add_argument("--models", default="")
+    p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--max-minutes", type=int, default=40, help="the suite's own budget (default 40)")
     p.add_argument("--setup-minutes", type=int, default=20, help="added to --max-minutes for the instance's dead-man switch (default 20)")

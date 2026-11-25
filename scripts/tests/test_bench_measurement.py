@@ -110,6 +110,34 @@ class FakeCgroup:
         return list(cmd)
 
 
+class CacheEnvironmentTest(unittest.TestCase):
+    def test_isolation_lifetime_and_inherited_environment(self):
+        with patch.dict(os.environ, {'TLX_CACHE': '/inherited'}):
+            with measurement.cache_environment() as (env, provenance):
+                self.assertEqual(env, {})
+                self.assertEqual(provenance['mode'], 'inherited')
+                self.assertEqual(provenance['initial_state'], 'unknown')
+            paths = []
+            for _ in range(2):
+                with measurement.cache_environment(True, warmup=True) as (env, provenance):
+                    path = env['TLX_CACHE']
+                    paths.append(path)
+                    self.assertTrue(os.path.isdir(path))
+                    self.assertFalse([name for name in os.listdir(path) if name != ".tlx-temp-owner.json"])
+                    self.assertEqual(env['TLX_NATIVE_SYNC'], '1')
+                    self.assertEqual(provenance, dict(mode='fresh-per-model', initial_state='empty', warmup=True))
+                self.assertFalse(os.path.exists(path))
+            self.assertNotEqual(*paths)
+            self.assertEqual(os.environ['TLX_CACHE'], '/inherited')
+
+    def test_isolated_cache_removed_after_failure(self):
+        with self.assertRaises(RuntimeError):
+            with measurement.cache_environment(True) as (env, _):
+                path = env['TLX_CACHE']
+                raise RuntimeError('failed sample')
+        self.assertFalse(os.path.exists(path))
+
+
 class MeasuredChild(unittest.TestCase):
     """The sampled child, its sampler and its reader belong to one call."""
 

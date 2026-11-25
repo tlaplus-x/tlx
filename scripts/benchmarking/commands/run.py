@@ -126,32 +126,34 @@ def run_bench(a, binary):
                         continue
                     load0 = os.getloadavg()[0]
                     rs = []
-                    for _ in range(a.repeat):
-                        rs.append(bench.tlx(m, bench.mode_args(mode, w, m, exe=binary), a.timeout, exe=binary))
-                        if rs[-1].get("result") == "timeout":
-                            break
-                    walls = [r["wall_s"] for r in rs]
-                    rec = {
-                        "tier": t, "model": k, "mode": mode, "workers": w,
-                        "walls": walls, "min": min(walls), "median": statistics.median(walls),
-                        "cpu": [r.get("cpu_s") for r in rs],
-                        "distinct": rs[-1].get("distinct"), "result": rs[-1].get("result"),
-                        "compatibility": rs[-1].get("compatibility", mode == "tlc"),
-                        "generated": rs[-1].get("generated"), "depth": rs[-1].get("depth"),
-                        "expected_distinct": m["tlc"].get("distinct"),
-                        "load": [round(load0, 2), round(os.getloadavg()[0], 2)],
-                    }
-                    from benchmarking.bench_suite import sample_record
-                    rec["samples"] = [sample_record(r) for r in rs]
-                    if a.stats:
-                        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-                            path = f.name
-                        bench.tlx(m, bench.mode_args(mode, w, m, binary) + ["-stats", f"json={path}"], a.timeout, exe=binary)
-                        try:
-                            rec["stats"] = bench.read_json(path)
-                        except (OSError, ValueError):
-                            pass
-                        os.unlink(path)
+                    from benchmarking.measurement import cache_environment
+                    with cache_environment(getattr(a, 'isolate_cache', False)) as (cache_env, cache):
+                        for _ in range(a.repeat):
+                            rs.append(bench.tlx(m, bench.mode_args(mode, w, m, exe=binary), a.timeout, exe=binary, env=cache_env or None))
+                            if rs[-1].get("result") == "timeout":
+                                break
+                        walls = [r["wall_s"] for r in rs]
+                        rec = {
+                            "tier": t, "model": k, "mode": mode, "workers": w, "cache": cache,
+                            "walls": walls, "min": min(walls), "median": statistics.median(walls),
+                            "cpu": [r.get("cpu_s") for r in rs],
+                            "distinct": rs[-1].get("distinct"), "result": rs[-1].get("result"),
+                            "compatibility": rs[-1].get("compatibility", mode == "tlc"),
+                            "generated": rs[-1].get("generated"), "depth": rs[-1].get("depth"),
+                            "expected_distinct": m["tlc"].get("distinct"),
+                            "load": [round(load0, 2), round(os.getloadavg()[0], 2)],
+                        }
+                        from benchmarking.bench_suite import sample_record
+                        rec["samples"] = [sample_record(r) for r in rs]
+                        if a.stats:
+                            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+                                path = f.name
+                            bench.tlx(m, bench.mode_args(mode, w, m, binary) + ["-stats", f"json={path}"], a.timeout, exe=binary, env=cache_env or None)
+                            try:
+                                rec["stats"] = bench.read_json(path)
+                            except (OSError, ValueError):
+                                pass
+                            os.unlink(path)
                     from benchmarking.baselines import content_digest
                     rec["content_digest"] = content_digest(m)
                     rec["tlc_version"] = bench_machine.tla2tools_info().get("revision")

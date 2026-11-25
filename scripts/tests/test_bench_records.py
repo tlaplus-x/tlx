@@ -8,6 +8,8 @@ from benchmarking.legacy import adopt_legacy, ingest, legacy_rows, measurement_r
 from benchmarking.records import (dump, load_records, normalize, receipt_revisions,
                                   store_lock, validate, write_records)
 import copy
+import contextlib
+import io
 import hashlib
 import json
 import os
@@ -557,11 +559,69 @@ class RecordsTest(unittest.TestCase):
             self.assertEqual(tuple(sorted(json.loads(path.read_text()))), ('key', 'measurement', 'schema_version'))
         self.assertEqual({r['id'] for r in load_records(self.root)}, {'tlc-row', 'tlx-row'})
 
+    def test_repeated_tlc_baseline_roundtrip_and_immutable_reuse(self):
+        samples = [dict(result='success', exit=0, distinct=10, wall_s=w, cpu_s=c)
+                   for w, c in [(9, 8), (3, 2), (6, 5)]]
+        collect = Mock(side_effect=samples)
+        kw = dict(root=self.root, version='v', instance='i', repetitions=3)
+        raw = cached_tlc(self.model, 1, collect, **kw)
+        self.assertEqual((raw['wall_s'], raw['cpu_s']), (6, 5))
+        self.assertEqual(raw['tlc_samples'], samples)
+        row = load_records(self.root)[0]
+        self.assertEqual(row['samples'], {'wall_s': [9, 3, 6], 'cpu_s': [8, 2, 5]})
+        self.assertEqual(row['aggregation'], 'median')
+        self.assertEqual(row['provenance']['sample_spread'], {'wall_s': 1, 'cpu_s': 1.2})
+        before = {p: p.read_bytes() for p in store.store_files(self.root)}
+        self.assertEqual(cached_tlc(self.model, 1, collect, **kw)['wall_s'], 6)
+        self.assertEqual(collect.call_count, 3)
+        self.assertEqual(before, {p: p.read_bytes() for p in store.store_files(self.root)})
+
+    def test_repeated_tlc_rejects_partial_and_disagreeing_samples(self):
+        good = dict(result='success', exit=0, distinct=10, wall_s=3, cpu_s=2)
+        for bad in [dict(good, result='timeout'), dict(good, distinct=11), dict(good, exit=1)]:
+            with self.subTest(bad=bad):
+                raw = cached_tlc(self.model, 1, Mock(side_effect=[good, bad, good]),
+                                 root=self.root, version='v', instance='i', repetitions=3)
+                self.assertTrue(raw['count_problems'])
+                self.assertFalse(store.store_files(self.root))
+
+    def test_repeated_tlc_missing_cpu_and_parallel_violation_counts(self):
+        samples = [dict(result='safety failure', exit=12, distinct=n, wall_s=w, cpu_s=c)
+                   for n, w, c in [(4, 2, None), (5, 4, 1), (6, 6, 2)]]
+        raw = cached_tlc(self.model, 2, Mock(side_effect=samples), root=self.root,
+                         version='v', instance='i', repetitions=3)
+        self.assertEqual(raw['wall_s'], 4)
+        self.assertIsNone(raw['cpu_s'])
+        self.assertIsNone(raw['sample_spread']['cpu_s'])
+        row = load_records(self.root)[0]
+        self.assertIsNone(row['metrics']['cpu_s'])
+        self.assertEqual(row['samples']['cpu_s'], [None, 1, 2])
+
+    def test_repetition_count_rejected_before_collection(self):
+        from benchmarking.cli import parse_args
+        for n in [0, -1]:
+            with self.assertRaises(SystemExit):
+                parse_args(['tlcbase', '--tlc-repetitions', str(n)])
+            collect = Mock()
+            with self.assertRaises(ValueError):
+                cached_tlc(self.model, 1, collect, repetitions=n)
+            collect.assert_not_called()
+
+    def test_cache_provenance_is_optional_but_validated(self):
+        raw = dict(tool='tlx', result='success', wall_s=1,
+                   cache={'mode': 'fresh-per-model', 'initial_state': 'empty', 'warmup': True})
+        row = normalize({}, raw, 'test', '/', model='M', mode='default', workers=1)
+        validate(row)
+        self.assertEqual(row['provenance']['cache'], raw['cache'])
+        row['provenance']['cache']['initial_state'] = 'unknown'
+        with self.assertRaisesRegex(ValueError, 'cache provenance'):
+            validate(row)
+
     def test_baseline_cache_key_and_no_recollection(self):
         measured = Mock(return_value={'wall_s': 8, 'cpu_s': 9, 'result': 'success', 'distinct': 10})
         kw = dict(root=self.root, version='TLC-v', instance='SA5.4XLARGE32')
         one = cached_tlc(self.model, 1, measured, **kw)
-        self.assertEqual(cached_tlc(self.model, 1, measured, **kw)['wall_s'], one['wall_s'])
+        self.assertEqual(cached_tlc(self.model, 1, measured, repetitions=3, **kw)['wall_s'], one['wall_s'])
         self.assertEqual(measured.call_count, 1)
         for k, v in [('workers', 2), ('version', 'TLC-new'), ('instance', 'other')]:
             args = {**kw, k: v}
@@ -750,6 +810,183 @@ class RecordsTest(unittest.TestCase):
         self.assertEqual(br.check(self.root), [])
         p.unlink()
         self.assertTrue(any('source file is missing' in q for q in br.check(self.root)))
+
+    def test_tlcbase_collection_ingestion_reuse_and_report_preserve_evidence(self):
+        import argparse
+        import platform
+        import bench
+        from benchmarking.commands import tlcbase
+        path = self.root / 'bench/history/repeated.json'
+        model = {**self.model, 'source': 'fixture', 'tlc': {}}
+        a = argparse.Namespace(workers='1', missing=False, out=str(path), timeout=60, slice='', tlc_repetitions=3)
+        samples = [dict(result='success', exit=0, distinct=10, wall_s=w, cpu_s=c, maxrss_mib=None)
+                   for w, c in [(1, None), (2, 1), (4, 2)]]
+        snapshots = []
+        def import_history(path):
+            before = {p: p.read_bytes() for p in store.store_files(self.root)}
+            ingest(path, self.root)
+            self.assertEqual(before, {p: p.read_bytes() for p in store.store_files(self.root)})
+            snapshots.append(before)
+        def cache(m, w, collect, **kw):
+            return cached_tlc(m, w, collect, root=self.root, version='v', instance='SA5.4XLARGE32', **kw)
+        with patch.object(bench, 'tlcbase_models', return_value={'M': model}), \
+             patch.object(bench_machine, 'machine_desc', return_value=f'{platform.machine()} SA5.4XLARGE32'), \
+             patch.object(bench_machine, 'tla2tools_info', return_value={'revision': 'v'}), \
+             patch.object(bench_machine, 'jvm_info', return_value={}), \
+             patch.object(baselines, 'cached_tlc', side_effect=cache), \
+             patch.object(tlcbase, '_collect_tlc_measured', side_effect=samples) as collect, \
+             patch.object(legacy, 'ingest', side_effect=import_history), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            bench.cmd_tlcbase(a)
+            migrate(self.root)
+            self.assertEqual(snapshots[0], {p: p.read_bytes() for p in store.store_files(self.root)})
+            bench.cmd_tlcbase(a)
+            bench.cmd_tlcbase_report(argparse.Namespace(baseline=str(path), top=10))
+        self.assertEqual(collect.call_count, 3)
+        self.assertEqual(snapshots[0], snapshots[1])
+        row = load_records(self.root)[0]
+        self.assertEqual(row['raw_result']['tlc_samples'], samples)
+        self.assertEqual(row['samples']['wall_s'], [1, 2, 4])
+        self.assertEqual(row['provenance']['sample_spread']['wall_s'], 1.5)
+        self.assertEqual(row['aggregation'], 'median')
+        self.assertIn('n/a', output.getvalue())
+        self.assertIn('CPU n/as', output.getvalue())
+        history = json.loads(path.read_text())['models']['M']['runs']['1']
+        self.assertIsNone(history['cpu_s'])
+        self.assertEqual(history['tlc_samples'], samples)
+
+    def test_history_owned_baseline_survives_reingestion_and_migration_until_removed(self):
+        import platform
+        path = self.root / 'bench/history/owned.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        digest = content_digest(self.model)
+        header = {'kind': 'tlc-baseline', 'machine': f'{platform.machine()} SA5.4XLARGE32',
+                  'instance_type': 'SA5.4XLARGE32', 'tla2tools': {'revision': 'v'}, 'workers': [1]}
+        run = {'result': 'success', 'exit': 0, 'distinct': 10, 'wall_s': 5.0, 'cpu_s': 4.0,
+               'content_digest': digest, 'tlc_version': 'v'}
+        path.write_text(json.dumps({**header, 'models': {'M': {'runs': {'1': run}}}}))
+        ingest(path, self.root)
+        before = {p: p.read_bytes() for p in store.store_files(self.root)}
+        self.assertEqual(len(before), 1)
+        collect = Mock(side_effect=AssertionError('should reuse history-owned baseline'))
+        reused = cached_tlc(self.model, 1, collect, root=self.root, version='v', instance='SA5.4XLARGE32', repetitions=3)
+        self.assertEqual(collect.call_count, 0)
+        path.write_text(json.dumps({**header, 'models': {'M': {'runs': {'1': reused}}}}))
+        ingest(path, self.root)
+        self.assertEqual(before, {p: p.read_bytes() for p in store.store_files(self.root)})
+        migrate(self.root)
+        self.assertEqual(before, {p: p.read_bytes() for p in store.store_files(self.root)})
+        # Removing the row from its owning history still deletes the stored file.
+        path.write_text(json.dumps({**header, 'models': {}}))
+        ingest(path, self.root)
+        self.assertEqual(store.store_files(self.root), [])
+
+    def test_cached_tlc_reuses_shipped_legacy_baseline_with_historical_revision(self):
+        import argparse
+        import bench
+        from benchmarking.commands import tlcbase
+        shipped = store.ROOT / 'bench/tlc-baselines/3f4ec027479e1fb9ca60dea542a93ca1101fff3aef7532868eeef0f6dae94079.json'
+        entry = json.loads(shipped.read_bytes())
+        key = entry['key']
+        self.assertEqual(key['model'], 'DieHard/DieHard')
+        self.assertIsNotNone(key['revision'])
+        for subdir in ('bench/records', 'bench/tlc-baselines'):
+            dst = self.root / subdir
+            dst.mkdir(parents=True, exist_ok=True)
+            for src in (store.ROOT / subdir).glob('*.json'):
+                (dst / src.name).write_bytes(src.read_bytes())
+        before = {p: p.read_bytes() for p in store.store_files(self.root)}
+        model = {**self.model, 'id': key['model'], 'source': 'fixture', 'tlc': {}}
+        out_path = self.root / 'bench/history/diehard.json'
+        args = argparse.Namespace(workers=str(key['workers']), missing=False, out=str(out_path),
+                                  timeout=60, slice='', tlc_repetitions=3)
+        collect = Mock(side_effect=AssertionError('should reuse shipped legacy baseline'))
+        def cache(m, w, fn, **kw):
+            return cached_tlc(m, w, fn, root=self.root, version=key['tlc_version'],
+                              instance=key['instance_type'], **kw)
+        with patch.object(bench, 'tlcbase_models', return_value={key['model']: model}), \
+             patch.object(bench_machine, 'machine_desc', return_value=f"x86_64 {key['instance_type']}"), \
+             patch.object(bench_machine, 'tla2tools_info', return_value={'revision': key['tlc_version']}), \
+             patch.object(bench_machine, 'jvm_info', return_value={}), \
+             patch.object(baselines, 'content_digest', return_value=key['content_digest']), \
+             patch.object(baselines, 'cached_tlc', side_effect=cache), \
+             patch.object(tlcbase, '_collect_tlc_measured', side_effect=collect), \
+             patch.object(legacy, 'ingest', side_effect=lambda p: ingest(p, self.root)), \
+             patch('platform.machine', return_value='x86_64'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bench.cmd_tlcbase(args)
+            self.assertIsNone(find_baseline(model, key['workers'], root=self.root,
+                                            version=key['tlc_version'], instance=key['instance_type'], arch='aarch64'))
+        self.assertEqual(collect.call_count, 0)
+        self.assertEqual({p: p.read_bytes() for p in store.store_files(self.root)}, before)
+        saved = json.loads(out_path.read_text())['models'][key['model']]['runs'][str(key['workers'])]
+        self.assertEqual(saved['baseline_id'], entry['measurement']['id'])
+
+    def test_merged_multi_sample_history_preserves_raw_attempts_across_stores(self):
+        import argparse
+        import platform
+        import bench
+        from benchmarking.commands import tlcbase
+        src_out = self.root / 'bench/history/slice.json'
+        model = {**self.model, 'source': 'fixture', 'tlc': {}}
+        samples = [dict(result='success', exit=0, distinct=10, wall_s=w, cpu_s=c, maxrss_mib=r)
+                   for w, c, r in [(3, 2, 100), (5, 4, 110), (7, 6, 120)]]
+        def run_tlcbase(root, out_path, collector):
+            args = argparse.Namespace(workers='1', missing=False, out=str(out_path),
+                                      timeout=60, slice='', tlc_repetitions=3)
+            with patch.object(bench, 'tlcbase_models', return_value={'M': model}), \
+                 patch.object(bench_machine, 'machine_desc', return_value=f'{platform.machine()} SA5.4XLARGE32'), \
+                 patch.object(bench_machine, 'tla2tools_info', return_value={'revision': 'v'}), \
+                 patch.object(bench_machine, 'jvm_info', return_value={}), \
+                 patch.object(baselines, 'cached_tlc',
+                              side_effect=lambda m, w, fn, **kw: cached_tlc(m, w, fn, root=root, version='v',
+                                                                            instance='SA5.4XLARGE32', **kw)), \
+                 patch.object(tlcbase, '_collect_tlc_measured', side_effect=collector) as mocked, \
+                 patch.object(legacy, 'ingest', side_effect=lambda p: ingest(p, root)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                bench.cmd_tlcbase(args)
+            return mocked.call_count
+        self.assertEqual(run_tlcbase(self.root, src_out, samples), 3)
+        with tempfile.TemporaryDirectory() as td:
+            dest_root = Path(td)
+            merged = dest_root / 'bench/history/merged.json'
+            merged.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bench.cmd_tlcbase_merge(argparse.Namespace(inputs=[str(src_out)], out=str(merged), set=[]))
+            migrate(dest_root)
+            before = {p: p.read_bytes() for p in store.store_files(dest_root)}
+            self.assertEqual(len(before), 1)
+            self.assertEqual(run_tlcbase(dest_root, merged, Mock(side_effect=AssertionError('unexpected recollect'))), 0)
+            self.assertEqual({p: p.read_bytes() for p in store.store_files(dest_root)}, before)
+            row = load_records(dest_root)[0]
+            self.assertEqual(row['raw_result']['tlc_samples'], samples)
+            reused = json.loads(merged.read_text())['models']['M']['runs']['1']
+            self.assertEqual(reused['tlc_samples'], samples)
+            self.assertEqual(reused['aggregation'], 'median')
+            self.assertAlmostEqual(reused['sample_spread']['wall_s'], 0.8)
+
+    def test_rejected_tlc_attempts_keep_timeout_bound_and_leave_timing_summary(self):
+        import argparse
+        import bench
+        good = dict(result='success', exit=0, distinct=10, wall_s=20, cpu_s=1)
+        timeout = dict(result='timeout', exit=124, wall_s=4, cpu_s=2)
+        raw = cached_tlc(self.model, 1, Mock(side_effect=[good, timeout]), root=self.root,
+                         version='v', instance='i', repetitions=3)
+        self.assertEqual(raw['wall_s'], 4)
+        self.assertEqual(raw['aggregation'], 'last-attempt')
+        self.assertEqual(raw['tlc_samples'], [good, timeout])
+        rejected = baselines.collect_samples(Mock(side_effect=[good, dict(good, distinct=11)]), 2, 1)
+        paths = [self.root / 'first.json', self.root / 'second.json']
+        for path, run in zip(paths, [raw, dict(timeout, wall_s=8)]):
+            path.write_text(json.dumps({'kind': 'tlc-baseline', 'tla2tools': {}, 'workers': [1],
+                                        'models': {'M': {'runs': {'1': run}}, 'bad': {'runs': {'1': rejected}}}}))
+        merged = self.root / 'merged.json'
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            bench.cmd_tlcbase_merge(argparse.Namespace(inputs=list(map(str, paths)), out=str(merged), set=[]))
+            bench.cmd_tlcbase_report(argparse.Namespace(baseline=str(merged), top=10))
+        self.assertEqual(json.loads(merged.read_text())['models']['M']['runs']['1']['wall_s'], 8)
+        self.assertIn('1 timeouts, 1 rejected; accepted timings: wall 0s', output.getvalue())
+        self.assertIn('15-60s: 0', output.getvalue())
 
     def test_tlcbase_missing_ignores_stale_raw_history_shortcut(self):
         import argparse

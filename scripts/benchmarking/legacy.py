@@ -27,9 +27,9 @@ from pathlib import Path
 import re
 
 from benchmarking import machine as bench_machine, models as bench_models
-from benchmarking.baselines import attach_baselines, content_digest, seed_baselines
+from benchmarking.baselines import attach_baselines, content_digest, reusable, same_tlc_key, seed_baselines, store_entry
 from benchmarking.records import (CONTAINER, ROOT, STORE, VERSION, archive_inventory, archived_bytes, digest, dump,
-                                  load_records, load_store, normalize, realign_store, receipt_revisions,
+                                  load_records, load_store, measurement_key, normalize, realign_store, receipt_revisions,
                                   record_path, store_lock, store_stem, validate, write_records)
 
 
@@ -304,6 +304,16 @@ def adopt_legacy(records, models, oracles, version):
     return records
 
 
+def _referenced_baseline(record, baselines):
+    """Return the existing reusable TLC baseline `record` references, or None."""
+    if record.get('tool') != 'tlc':
+        return None
+    original = baselines.get(record['provenance'].get('reused_from'))
+    if original is not None and same_tlc_key(measurement_key(original), measurement_key(record)):
+        return original
+    return None
+
+
 def repoint_to_store(record):
     """A measurement whose source is the store file that holds it keeps that
     pointer current: the file a key names moves when the key's identity changes
@@ -346,8 +356,19 @@ def migrate(root=ROOT):
     existing = {r['id']: r for r in load_store(root)}
     if _records.UNREADABLE:
         print(f'migrate: {len(_records.UNREADABLE)} store file(s) predate the schema and were rewritten or dropped')
-    retained = []
+    store_containers = set(CONTAINER.values())
+    baselines = {r['id']: r for r in existing.values() if r['tool'] == 'tlc' and reusable(store_entry(r))}
+    live_ids = {r['id'] for r in out} | {r['id'] for r in existing.values()
+                                         if r['provenance']['source'].rsplit('/', 1)[0] in store_containers}
+    retained, retained_ids = [], set()
     for fresh in out:
+        original = _referenced_baseline(fresh, baselines)
+        if original is not None and (original['provenance']['source'] == fresh['provenance']['source']
+                                     or original['id'] in live_ids):
+            if original['provenance']['source'] == fresh['provenance']['source'] and original['id'] not in retained_ids:
+                retained.append(original)
+                retained_ids.add(original['id'])
+            continue
         old = existing.get(fresh['id'])
         keep_identity = old and (not old['provenance'].get('legacy', True) or old['provenance'].get('adoption'))
         same_measurement = old and all(old[k] == fresh[k] for k in ('model', 'mode', 'workers', 'metrics', 'counts', 'configuration'))
@@ -356,18 +377,18 @@ def migrate(root=ROOT):
             if field in fresh['provenance']:
                 record['provenance'][field] = fresh['provenance'][field]
         retained.append(record)
+        retained_ids.add(record['id'])
     out = retained
     # A measurement collected straight into the store (a fresh TLC baseline, whose
     # source is its own store file) has no other artifact to be re-derived from,
     # so migration carries it forward; without this every baseline would be
     # dropped by the store realignment below.
-    present = {r['id'] for r in out}
     for record in existing.values():
-        if record['provenance']['source'].rsplit('/', 1)[0] in set(CONTAINER.values()) \
-                and record['id'] not in present:
+        if record['provenance']['source'].rsplit('/', 1)[0] in store_containers \
+                and record['id'] not in retained_ids:
             record = repoint_to_store(record)
             out.append(record)
-            present.add(record['id'])
+            retained_ids.add(record['id'])
     if root.resolve() == ROOT.resolve():
         mids = sorted({r['model'] for r in out if r.get('tool') == 'tlc'})
         current = bench_models.oracle(mids)
@@ -430,6 +451,20 @@ def ingest(path, root=ROOT):
     rs = [normalize(h, raw, source, ptr, **kw) for raw, ptr, kw in measurement_rows(h)]
     with store_lock(root):
         stored = load_records(root)
+        # A history copy of a cached baseline is a reference, not new evidence.
+        # Resolve it to the existing reusable row so canonical evidence stays
+        # intact without deleting a row owned by this same source.
+        baselines = {r['id']: r for r in stored if r['tool'] == 'tlc' and reusable(store_entry(r))}
+        resolved, seen = [], set()
+        for r in rs:
+            original = _referenced_baseline(r, baselines)
+            if original is not None:
+                if original['provenance']['source'] == source and original['id'] not in seen:
+                    resolved.append(original)
+                    seen.add(original['id'])
+                continue
+            resolved.append(r)
+        rs = resolved
         # The files this source owned before are replaced as a unit, including
         # with no rows: a cleared source never keeps stale live measurements.
         owned = {record_path(r) for r in stored if r['provenance']['source'] == source}

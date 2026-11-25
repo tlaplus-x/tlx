@@ -108,6 +108,7 @@ def build_parser(description=None, prog=None):
     p = sub.add_parser("tiers")
     p.add_argument("--per-tier", type=int, default=6)
     p = sub.add_parser("run")
+    p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration, shared by its samples")
     p.add_argument("--tiers", default="")
     p.add_argument("--models", default="", help="run these models (tier 'custom') instead of the tiers")
     p.add_argument("--modes", default="", help="override the modes: compile, interp, default (no tier flag)")
@@ -195,6 +196,7 @@ def build_parser(description=None, prog=None):
     p.add_argument("--tlc-baseline", default=None, help=retired)
     p.add_argument("--no-tier-columns", action="store_true", help=retired)
     p = sub.add_parser("tlcbase")
+    p.add_argument("--tlc-repetitions", type=int, default=1, help="samples for a new TLC baseline; existing valid keys are reused")
     p.add_argument("--instance-type", default="", help="target baseline instance for --missing inventory (collection requires this actual instance)")
     p.add_argument("--missing", action="store_true", help="list exactly missing/stale baseline keys, without running TLC")
     p.add_argument("--collect", action="store_true", help="with --missing, collect only the listed missing keys")
@@ -248,4 +250,7 @@ def parse_args(argv, description=None, prog=None):
     ap = build_parser(description, prog)
     if not argv or (argv[0] not in subcommands(ap) and argv[0] not in HELP_FLAGS):
         argv = ["table"] + list(argv)
-    return ap, ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if getattr(args, "tlc_repetitions", 1) < 1:
+        ap.error("--tlc-repetitions must be positive")
+    return ap, args

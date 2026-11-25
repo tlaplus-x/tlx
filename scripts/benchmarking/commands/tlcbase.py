@@ -10,6 +10,7 @@ itself under its import name (HARNESS-03).
 """
 import json, os, re, shutil, sys, time
 
+from benchmarking.records import COMPLETE
 from benchmarking import bench_budget
 from benchmarking import measurement as bench_measure
 from benchmarking import machine as bench_machine, models as bench_models
@@ -151,7 +152,7 @@ def _collect_tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True):
 
 
 
-def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True):
+def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True, *, repetitions=1):
     """One measured TLC run, cached under the baseline key.
 
     `jvm_extra` is the heap/direct-memory the caller asked for, and it is what
@@ -162,8 +163,17 @@ def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True):
     from benchmarking.baselines import cached_tlc
     keyed = {**m, "measurement_constraints": list(jvm_extra)} if jvm_extra else m
     return cached_tlc(keyed, workers,
-                      lambda: _collect_tlc_measured(m, workers, timeout, jvm_extra, default_heap))
+                      lambda: _collect_tlc_measured(m, workers, timeout, jvm_extra, default_heap), repetitions=repetitions)
 
+
+
+def metric_text(value, width=8, precision=2):
+    """Keep missing resource observations visibly unavailable."""
+    return f"{value:{width}.{precision}f}" if value is not None else f"{'n/a':>{width}}"
+
+
+def accepted_timing(run):
+    return run.get('result') in COMPLETE and not run.get('count_problems') and run.get('wall_s') is not None
 
 
 def cmd_tlcbase(a):
@@ -209,11 +219,11 @@ def cmd_tlcbase(a):
         for w in ws:
             # Never trust a raw history row to decide freshness; tlc_measured
             # reuses the canonical key or collects this stale/missing key once.
-            r = bench.tlc_measured(m, w, a.timeout)
+            r = bench.tlc_measured(m, w, a.timeout, repetitions=getattr(a, "tlc_repetitions", 1))
             r.setdefault("date", time.strftime("%Y-%m-%d %H:%M:%S"))
             runs[str(w)] = r
-            print(f"  {k:<60} {w:>2}w {r['result']:<16} {str(r.get('distinct', '-')):>10} wall {r['wall_s']:8.2f}s "
-                  f"TLC {r.get('finished_s') or 0:8.2f}s cpu {r['cpu_s']:8.2f}s rss {r['maxrss_mib']:7.0f}M", flush=True)
+            print(f"  {k:<60} {w:>2}w {r['result']:<16} {str(r.get('distinct', '-')):>10} wall {metric_text(r.get('wall_s'))}s "
+                  f"TLC {metric_text(r.get('finished_s'))}s cpu {metric_text(r.get('cpu_s'))}s rss {metric_text(r.get('maxrss_mib'), 7, 0)}M", flush=True)
             h["date_end"] = time.strftime("%Y-%m-%d %H:%M:%S")
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
             with open(out, "w") as stream:
@@ -330,13 +340,19 @@ def cmd_tlcbase_report(a):
     inf = float("inf")
     for w in ws:
         rs = {k: m["runs"][str(w)] for k, m in ms.items() if str(w) in m.get("runs", {})}
-        done = {k: r for k, r in rs.items() if r.get("result") != "timeout"}
-        tos = sorted(k for k in rs if k not in done)
-        tot = lambda x: sum(r.get(x) or 0 for r in done.values())
-        print(f"\n{w} worker(s): {len(rs)} runs, {len(tos)} timeouts; without the timeouts: wall {tot('wall_s'):.0f}s, "
-              f"TLC 'Finished in' {tot('finished_s'):.0f}s, CPU {tot('cpu_s'):.0f}s")
+        done = {k: r for k, r in rs.items() if accepted_timing(r)}
+        tos = sorted(k for k, r in rs.items() if r.get('result') == 'timeout')
+        rejected = sorted(set(rs) - set(done) - set(tos))
+        def total(field):
+            values = [r.get(field) for r in done.values()]
+            return sum(values) if all(v is not None for v in values) else None
+        print(f"\n{w} worker(s): {len(rs)} runs, {len(tos)} timeouts, {len(rejected)} rejected; "
+              f"accepted timings: wall {metric_text(total('wall_s'), 0, 0)}s, "
+              f"TLC 'Finished in' {metric_text(total('finished_s'), 0, 0)}s, CPU {metric_text(total('cpu_s'), 0, 0)}s")
         for k in tos:
             print(f"  timeout: {k}")
+        for k in rejected:
+            print(f"  rejected: {k}")
         buckets = [(0, 1), (1, 5), (5, 15), (15, 60), (60, 300), (300, inf)]
         print("  wall time distribution: " + ", ".join(
             f"{lo:g}-{hi:g}s: {sum(lo <= r['wall_s'] < hi for r in done.values())}" if hi != inf else
@@ -344,12 +360,11 @@ def cmd_tlcbase_report(a):
     print(f"\nthe {a.top} slowest models (1 worker wall; timeouts first):")
     w1 = {k: m["runs"].get("1", {}) for k, m in ms.items()}
     order = sorted(w1, key=lambda k: (w1[k].get("result") != "timeout", -(w1[k].get("wall_s") or 0)))
-    nan = float("nan")
     print(f"  {'model':<60} {'result':<16} {'distinct':>11} " + " ".join(f"{str(w) + 'w wall':>10} {str(w) + 'w cpu':>10}" for w in ws) + f" {'1w rss':>8}")
     for k in order[:a.top]:
         rr = ms[k]["runs"]
-        cells = " ".join(f"{rr.get(str(w), {}).get('wall_s', nan):10.1f} {rr.get(str(w), {}).get('cpu_s', nan):10.1f}" for w in ws)
-        print(f"  {k:<60} {str(w1[k].get('result')):<16} {str(w1[k].get('distinct', '-')):>11} {cells} {w1[k].get('maxrss_mib') or 0:7.0f}M")
+        cells = " ".join(f"{metric_text(rr.get(str(w), {}).get('wall_s'), 10, 1)} {metric_text(rr.get(str(w), {}).get('cpu_s'), 10, 1)}" for w in ws)
+        print(f"  {k:<60} {str(w1[k].get('result')):<16} {str(w1[k].get('distinct', '-')):>11} {cells} {metric_text(w1[k].get('maxrss_mib'), 7, 0)}M")
     print("\nmismatches against the oracle (corpus/out/tlc.json; the large models have no oracle):")
     n = 0
     for k, m in sorted(ms.items()):

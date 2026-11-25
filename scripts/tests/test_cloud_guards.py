@@ -264,7 +264,7 @@ class LocalGuards(unittest.TestCase):
         model = {"id": "M", "tla": "M.tla", "cfg": "M.cfg"}
         keys = []
         with patch.object(benchmarking.baselines, "cached_tlc",
-                          side_effect=lambda m, w, collect: keys.append(m) or {"wall_s": 1, "result": "success"}):
+                          side_effect=lambda m, w, collect, **kw: keys.append(m) or {"wall_s": 1, "result": "success"}):
             bench.tlc_measured(model, 1, 10)
             bench.tlc_measured(model, 1, 10, jvm_extra=["-Xmx6g"])
         self.assertNotIn("measurement_constraints", keys[0])
