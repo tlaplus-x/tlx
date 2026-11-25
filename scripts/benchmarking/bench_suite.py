@@ -531,11 +531,27 @@ def print_verdict(h, v):
 
 # ---------------------------------------------------------------- the run
 
+def resolve_models(ids, *, stage):
+    """Resolve a batch in oracle, scaling-config, then Examples order."""
+    available = bench_models.oracle(ids, stage=stage)
+    scaling = [mid for mid in ids if mid not in available and mid in bench_models.SCALE_CFGS]
+    if scaling:
+        available.update(bench_models.scale_models(scaling))
+    missing = set(ids) - available.keys()
+    if missing:
+        import corpus
+        for model in corpus.models(float("inf")):
+            mid = model["id"]
+            if mid in missing:
+                available[mid] = {**model, **bench_models.declared_run_fields(mid), "tlc": {}}
+    return available
+
+
 def resolve_model(bench, mid):
-    d = bench_models.oracle([mid])
-    if mid in d:
-        return d[mid]
-    return bench_models.scale_models([mid])[mid]
+    available = resolve_models([mid], stage=True)
+    if mid not in available:
+        sys.exit(f"unknown benchmark model {mid}")
+    return available[mid]
 
 
 def run_suite(a, bench=None, resolve=None, man=None):
@@ -938,27 +954,31 @@ def add_args(sub):
     p.add_argument("--dry-run", action="store_true")
 
 
-def resolution_problems(man, available):
-    return [f"{m['id']}: benchmark model cannot be resolved from the corpus/stress manifests"
-            for m in man['models'] if m['id'] not in available]
+def resolution_problems(man, available, *, examples_present=True):
+    problems = []
+    for m in man['models']:
+        mid = m['id']
+        if mid in available:
+            continue
+        if not examples_present and not mid.startswith(("bench/", bench_models.EXTERNAL_PREFIX)):
+            continue
+        problems.append(f"{mid}: benchmark model cannot be resolved from the corpus/stress manifests")
+    return problems
 
 
 def run_check(a):
     man = load_manifest(a.manifest)
     ids = [m["id"] for m in man["models"]]
-    available = bench_models.oracle(ids)
-    for mid in ids:
-        if mid not in available:
-            try:
-                available.update(bench_models.scale_models([mid]))
-            except (KeyError, SystemExit):
-                pass
-    problems = resolution_problems(man, available)
+    available = resolve_models(ids, stage=False)
+    import corpus
+    examples_present = os.path.isdir(os.path.join(corpus.EX, "specifications"))
+    problems = resolution_problems(man, available, examples_present=examples_present)
     if problems:
         print("\n".join(problems))
         return 1
     n = len(entries(man, "all"))
-    print(f"{a.manifest}: {len(man['models'])} models, {n} runs")
+    note = "" if examples_present else " (third_party/Examples absent; corpus resolution skipped)"
+    print(f"{a.manifest}: {len(man['models'])} models, {n} runs{note}")
     if a.oracle:
         probs = oracle_problems(man, load_oracles())
         for p in probs:

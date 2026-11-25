@@ -47,6 +47,27 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "quality-opt1"
+      - name: Cache Lean 4.34.1 toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/lean-4.34.1
+          key: lean-4.34.1-${{ runner.os }}-${{ runner.arch }}
+      - name: Install Lean 4.34.1
+        run: |
+          LEAN_DIR="$HOME/.local/share/lean-4.34.1"
+          if [ ! -x "$LEAN_DIR/lean-4.34.1-linux/bin/lean" ]; then
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            curl -sSfL -o "$tmp/lean.tar.zst" \
+              https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-linux.tar.zst
+            echo "47bf4bbd78f70c2e9670598ab7124d92b6efb7330ff33e5fbb4030f6fd72e4e4  $tmp/lean.tar.zst" | sha256sum -c -
+            mkdir -p "$LEAN_DIR"
+            tar --zstd -xf "$tmp/lean.tar.zst" -C "$LEAN_DIR"
+          fi
+          # Do not add Lean's bin/ to PATH: it bundles clang/ld.lld/llvm-ar,
+          # which would shadow the system clang used by CC=clang in cargo builds.
+          echo "LEAN_BIN=$LEAN_DIR/lean-4.34.1-linux/bin/lean" >> "$GITHUB_ENV"
+          "$LEAN_DIR/lean-4.34.1-linux/bin/lean" --version
       - name: Test dependencies
         run: |
           python3 -m pip install -r .github/requirements-ci.txt
@@ -84,7 +105,13 @@ jobs:
           python3 scripts/check_imports.py
           python3 scripts/knobs_check.py
           python3 scripts/doccheck.py --require-examples
+          python3 scripts/bench.py suite-check
           python3 scripts/bench.py report --check
+      - name: Lean 4 certificate and negative-mutation checks
+        run: |
+          cargo test --profile test-release -p tlx-cli --test integration optimization_lean:: --locked
+          python3 proofs/check_generated.py --lean "$LEAN_BIN" --negative
+          "$LEAN_BIN" -t0 -DwarningAsError=true -R proofs/ordered proofs/ordered/HiddenAnchor.lean
 
   test:
     name: Rust and specs (${{ matrix.os }})

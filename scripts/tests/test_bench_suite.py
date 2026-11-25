@@ -817,5 +817,265 @@ class NativeCoverage(unittest.TestCase):
         self.assertEqual(S.judge(a, b, [], [], bench.compare_runs)['outcome'], 'INCONCLUSIVE')
 
 
+class SuiteCheck(unittest.TestCase):
+    def test_batch_resolution_preserves_precedence_and_staging_mode(self):
+        import corpus
+        ids = ["cached", "scaled", "example", "missing"]
+        for stage in (False, True):
+            with self.subTest(stage=stage), \
+                 patch.object(bench_models, "oracle", return_value={"cached": {"from": "oracle"}}) as oracle, \
+                 patch.object(bench_models, "SCALE_CFGS", {"cached": "a", "scaled": "b"}), \
+                 patch.object(bench_models, "scale_models", return_value={"scaled": {"from": "scale"}}) as scale, \
+                 patch.object(corpus, "models", return_value=[{"id": mid} for mid in ids[:-1]]) as examples, \
+                 patch.object(bench_models, "declared_run_fields", return_value={"tlc_args": ["-seed", "1"]}):
+                resolved = S.resolve_models(ids, stage=stage)
+                self.assertEqual(resolved, {
+                    "cached": {"from": "oracle"},
+                    "scaled": {"from": "scale"},
+                    "example": {"id": "example", "tlc_args": ["-seed", "1"], "tlc": {}},
+                })
+                oracle.assert_called_once_with(ids, stage=stage)
+                scale.assert_called_once_with(["scaled"])
+                examples.assert_called_once_with(float("inf"))
+
+    def test_suite_check_succeeds_without_third_party_external_or_examples(self):
+        import corpus
+        with tempfile.TemporaryDirectory() as tmp:
+            absent_tp = os.path.join(tmp, "third_party")
+            absent_ext = os.path.join(absent_tp, "external")
+            absent_ex = os.path.join(absent_tp, "Examples")
+            buf = io.StringIO()
+            with patch.object(bench_models, "TP", absent_tp), \
+                 patch.object(bench_models, "load_oracle", side_effect=lambda *a, **kw: {}), \
+                 patch.object(corpus, "EXTERNAL", absent_ext), \
+                 patch.object(corpus, "EX", absent_ex), \
+                 contextlib.redirect_stdout(buf):
+                rc = S.run_check(argparse.Namespace(manifest=S.SUITE, oracle=False))
+            self.assertEqual(rc, 0, buf.getvalue())
+            self.assertIn("models,", buf.getvalue())
+            self.assertIn("runs", buf.getvalue())
+
+    def test_suite_check_still_rejects_unknown_external_model_without_third_party(self):
+        import corpus
+        with tempfile.TemporaryDirectory() as tmp:
+            absent_tp = os.path.join(tmp, "third_party")
+            manifest = os.path.join(tmp, "suite.json")
+            write(manifest, json.dumps({
+                "version": 1,
+                "models": [{
+                    "id": "ext/nonexistent/Model",
+                    "size": "small",
+                    "timeout_s": 60,
+                    "runs": [{"mode": "compile", "workers": 1}],
+                    "expect": {"source": "unpinned"},
+                }],
+            }))
+            buf = io.StringIO()
+            with patch.object(bench_models, "TP", absent_tp), \
+                 patch.object(bench_models, "load_oracle", return_value={}), \
+                 patch.object(corpus, "EXTERNAL", os.path.join(absent_tp, "external")), \
+                 patch.object(corpus, "EX", os.path.join(absent_tp, "Examples")), \
+                 contextlib.redirect_stdout(buf):
+                rc = S.run_check(argparse.Namespace(manifest=manifest, oracle=False))
+            self.assertEqual(rc, 1)
+            self.assertIn("ext/nonexistent/Model", buf.getvalue())
+
+    def test_stress_models_handles_absent_external_sources_without_staging(self):
+        import corpus
+        with tempfile.TemporaryDirectory() as tmp:
+            absent_tp = os.path.join(tmp, "third_party")
+            with patch.object(bench_models, "TP", absent_tp), \
+                 patch.object(corpus, "EXTERNAL", os.path.join(absent_tp, "external")), \
+                 patch.object(corpus, "EX", os.path.join(absent_tp, "Examples")):
+                resolved = bench_models.stress_models(["bench/ReprZab", "bench/FlexibleRaftReduced5", "bench/ReprPaxosCommit"], stage=False)
+            self.assertEqual(set(resolved), {"bench/ReprZab", "bench/FlexibleRaftReduced5", "bench/ReprPaxosCommit"})
+            self.assertTrue(resolved["bench/ReprZab"]["tla"].endswith("/target/bench-models/ReprZab/ReprZab.tla"))
+            self.assertTrue(resolved["bench/ReprZab"]["cfg"].endswith("/bench/repr-configs/Zab.cfg"))
+            self.assertTrue(resolved["bench/FlexibleRaftReduced5"]["tla"].endswith("/target/bench-models/FlexibleRaftReduced5/FlexibleRaftReduced5.tla"))
+
+    def test_stress_models_stage_true_refuses_missing_upstream_even_with_stale_stage(self):
+        import corpus
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = os.path.join(tmp, "root")
+            os.makedirs(tmp_root)
+            os.symlink(os.path.join(S.ROOT, "bench"), os.path.join(tmp_root, "bench"))
+            tmp_tp = os.path.join(tmp, "third_party")
+            tmp_ext = os.path.join(tmp_tp, "external")
+            cases = [
+                ("bench/FlexibleRaftReduced5", os.path.join(tmp_ext, "vanlightly-raft", "flexible-raft", "FlexibleRaft.tla")),
+                ("bench/ReprZab", os.path.join(tmp_ext, "alpha-zk", "MC_tlx_Zab_new.tla")),
+            ]
+            with patch.object(bench_models, "ROOT", tmp_root), \
+                 patch.object(bench_models, "TP", tmp_tp), \
+                 patch.object(corpus, "EXTERNAL", tmp_ext), \
+                 patch.object(corpus, "EX", os.path.join(tmp_tp, "Examples")):
+                for mid, upstream in cases:
+                    with self.subTest(model=mid):
+                        os.makedirs(os.path.dirname(upstream), exist_ok=True)
+                        write(upstream, "---- MODULE Stub ----\n====\n")
+                        staged = bench_models.stress_models([mid], stage=True)
+                        self.assertTrue(os.path.isfile(staged[mid]["tla"]))
+                        os.remove(upstream)
+                        self.assertTrue(os.path.isfile(staged[mid]["tla"]))
+                        with self.assertRaisesRegex(SystemExit, "missing upstream source"):
+                            bench_models.stress_models([mid], stage=True)
+                        meta = bench_models.stress_models([mid], stage=False)
+                        self.assertEqual(meta[mid]["tla"], staged[mid]["tla"])
+
+    def _checkout_fixture(self, tmp):
+        root = os.path.join(tmp, "repo")
+        os.makedirs(root)
+        shutil.copytree(os.path.join(S.ROOT, "scripts"), os.path.join(root, "scripts"),
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(os.path.join(S.ROOT, "bench"), os.path.join(root, "bench"))
+        os.makedirs(os.path.join(root, "corpus"))
+        shutil.copyfile(os.path.join(S.ROOT, "corpus", "external.json"),
+                        os.path.join(root, "corpus", "external.json"))
+        return root
+
+    def _generated_examples_fixture(self, root):
+        spec_dir = os.path.join(root, "third_party", "Examples", "specifications", "KnuthYao")
+        os.makedirs(spec_dir)
+        write(os.path.join(spec_dir, "SimKnuthYao.tla"), "---- MODULE SimKnuthYao ----\n====\n")
+        write(os.path.join(spec_dir, "SimKnuthYao.cfg"), "INIT Init\nNEXT Next\n")
+        write(os.path.join(spec_dir, "manifest.json"), json.dumps({
+            "modules": [{
+                "path": "specifications/KnuthYao/SimKnuthYao.tla",
+                "models": [{
+                    "path": "specifications/KnuthYao/SimKnuthYao.cfg",
+                    "mode": "generate",
+                    "runtime": "unknown",
+                }],
+            }]
+        }))
+        manifest = os.path.join(root, "bench", "gen-suite.json")
+        write(manifest, json.dumps({
+            "version": 1,
+            "models": [{
+                "id": "KnuthYao/SimKnuthYao",
+                "size": "small",
+                "timeout_s": 60,
+                "runs": [{"mode": "compile", "workers": 1}],
+                "expect": {"source": "unpinned"},
+            }],
+        }))
+        return manifest
+
+    def _run_suite_check_cli(self, root, *extra_args):
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        return subprocess.run(
+            [sys.executable, "scripts/bench.py", "suite-check", *extra_args],
+            cwd=root, env=env, capture_output=True, text=True, timeout=30,
+        )
+
+    def test_suite_check_cli_fails_when_tracked_flexible_raft_stress_input_is_missing(self):
+        for name in ("FlexibleRaftReduced5.cfg", "FlexibleRaftReduced5.tla"):
+            with self.subTest(missing=name), tempfile.TemporaryDirectory() as tmp:
+                root = self._checkout_fixture(tmp)
+                os.remove(os.path.join(root, "bench", "stress", name))
+                result = self._run_suite_check_cli(root)
+                output = result.stdout + result.stderr
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertIn("FlexibleRaftReduced5", output)
+                self.assertIn(name, output)
+                self.assertNotIn("Traceback", output)
+
+    def test_suite_check_cli_succeeds_with_partial_oracle_when_examples_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout_fixture(tmp)
+            out_dir = os.path.join(root, "corpus", "out")
+            os.makedirs(out_dir)
+            write(os.path.join(out_dir, "tlc.json"), json.dumps({
+                "transaction_commit/PaxosCommit": {
+                    "id": "transaction_commit/PaxosCommit",
+                    "tla": "third_party/Examples/specifications/transaction_commit/PaxosCommit.tla",
+                    "cfg": "third_party/Examples/specifications/transaction_commit/PaxosCommit.cfg",
+                    "tlc": {"result": "success", "distinct": 1321761, "generated": 16959159, "depth": 28},
+                }
+            }))
+            result = self._run_suite_check_cli(root)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn(os.path.join(root, "bench", "suite.json"), output)
+            self.assertIn("models,", output)
+            self.assertIn("runs", output)
+
+    def test_suite_check_cli_rejects_deleted_external_model_even_if_cached_in_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout_fixture(tmp)
+            manifest = os.path.join(root, "bench", "retired-suite.json")
+            write(manifest, json.dumps({
+                "version": 1,
+                "models": [{
+                    "id": "ext/retired/Model",
+                    "size": "small",
+                    "timeout_s": 60,
+                    "runs": [{"mode": "compile", "workers": 1}],
+                    "expect": {"source": "unpinned"},
+                }],
+            }))
+            out_dir = os.path.join(root, "corpus", "out")
+            os.makedirs(out_dir)
+            write(os.path.join(out_dir, "tlc-ext.json"), json.dumps({
+                "ext/retired/Model": {
+                    "id": "ext/retired/Model",
+                    "tla": "third_party/external/retired/Model.tla",
+                    "cfg": "third_party/external/retired/Model.cfg",
+                    "tlc": {"result": "success", "distinct": 10, "generated": 20, "depth": 2},
+                }
+            }))
+            result = self._run_suite_check_cli(root, "--manifest", manifest)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1, output)
+            self.assertIn("ext/retired/Model", output)
+
+    def test_suite_check_cli_accepts_generated_examples_model_without_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout_fixture(tmp)
+            manifest = self._generated_examples_fixture(root)
+            result = self._run_suite_check_cli(root, "--manifest", manifest)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("1 models, 1 runs", output)
+            # Scaling resolver still enforces its exhaustive-only restriction.
+            import corpus
+            with patch.object(corpus, "EX", os.path.join(root, "third_party", "Examples")), \
+                 self.assertRaisesRegex(SystemExit, "unknown scaling model"):
+                bench_models.scale_models(["KnuthYao/SimKnuthYao"])
+
+    def test_suite_cli_executes_generated_examples_model_with_generate_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._checkout_fixture(tmp)
+            manifest = self._generated_examples_fixture(root)
+            log_path = os.path.join(tmp, "argv.log")
+            fake_bin = os.path.join(tmp, "fake-tlx")
+            write(fake_bin, f"""#!/usr/bin/env python3
+import json, sys
+with open({log_path!r}, "a") as f:
+    f.write(json.dumps(sys.argv) + "\\n")
+print("Model checking completed. No error has been found.")
+print("10 states generated, 5 distinct states found, 0 states left on queue.")
+print("The depth of the complete state graph search is 3.")
+""")
+            os.chmod(fake_bin, os.stat(fake_bin).st_mode | stat.S_IEXEC)
+            out_path = os.path.join(tmp, "history.json")
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            result = subprocess.run(
+                [sys.executable, "scripts/bench.py", "suite",
+                 "--manifest", manifest, "--sizes", "small",
+                 "--models", "KnuthYao/SimKnuthYao", "--bin", fake_bin,
+                 "--repeat", "1", "--no-instructions", "--out", out_path],
+                cwd=root, env=env, capture_output=True, text=True, timeout=30,
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            with open(log_path) as f:
+                calls = [json.loads(line) for line in f]
+            self.assertTrue(calls, "expected fake checker to be invoked")
+            for argv in calls:
+                self.assertIn("-generate", argv)
+                self.assertIn("-seed", argv)
+
+
 if __name__ == "__main__":
     unittest.main()
