@@ -279,6 +279,7 @@ impl CGen<'_> {
             | ExprKind::BitCard { .. }
             | ExprKind::Rank { .. }
             | ExprKind::Concat { .. }
+            | ExprKind::Pack { .. }
             | ExprKind::BitSet { .. }
             | ExprKind::SeqLen { .. }
             | ExprKind::UnionField { .. }

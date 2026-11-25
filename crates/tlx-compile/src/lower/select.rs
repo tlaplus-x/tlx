@@ -13,13 +13,13 @@ use super::*;
 /// How an argument selects a slot of an encoded function/tuple/record.
 #[derive(Clone)]
 pub(super) enum Sel {
-    /// A fixed word offset.
-    Offset(u32),
-    /// A computed slot (with the slot's width in words).
-    Index(IndexMap, u32),
+    /// A fixed word or bitfield location.
+    Loc(FieldLoc),
+    /// A computed slot (with homogeneous `SlotLayout`).
+    Index(IndexMap, SlotLayout),
     /// A slot at a computed position (an unboxed integer, -1 = not in the
-    /// domain) among `n` slots of the given width.
-    Pos(Expr, u32, u32),
+    /// domain) among `n` slots of homogeneous `SlotLayout`.
+    Pos(Expr, u32, SlotLayout),
 }
 
 impl Lowerer<'_> {
@@ -42,9 +42,9 @@ impl Lowerer<'_> {
         }
         match self.shape_of(r.ty).cloned() {
             Some(Shape::Record(fields)) => {
-                if let Some((off, fs)) = self.field_slot(&fields, sym) {
+                if let Some((loc, fs)) = self.field_slot(&fields, sym) {
                     let fsid = self.sid(&fs);
-                    return Expr::new(Ty::Enc(fsid), ExprKind::Slice { base: r, offset: off });
+                    return Expr::new(Ty::Enc(fsid), ExprKind::Slice { base: r, loc });
                 }
                 return Expr::new(Ty::Val, ExprKind::Fail("Attempted to access a field that the record does not have.".into()));
             }
@@ -52,9 +52,9 @@ impl Lowerer<'_> {
             // (`[k \in {"a", "b"} |-> e]`): the slot of the key.
             Some(Shape::Fcn { dom, range }) => {
                 if let Some(i) = dom.iter().position(|k| matches!(k, Value::Str(s) if *s == sym)) {
-                    let off = i as u32 * self.words_of(&range);
+                    let loc = SlotLayout::of(&range).loc(0, i);
                     let fsid = self.sid(&range);
-                    return Expr::new(Ty::Enc(fsid), ExprKind::Slice { base: r, offset: off });
+                    return Expr::new(Ty::Enc(fsid), ExprKind::Slice { base: r, loc });
                 }
             }
             Some(Shape::Union(arms)) => {
@@ -78,23 +78,23 @@ impl Lowerer<'_> {
         Expr::new(Ty::Val, ExprKind::ValField(to_val(r), sym))
     }
 
-    /// Word offset and shape of field `f` of a record shape (interning the
+    /// Location and shape of field `f` of a record shape (interning the
     /// shapes of the fields before it).
-    fn field_slot(&mut self, fields: &[(Sym, Shape)], f: Sym) -> Option<(u32, Shape)> {
-        let mut off = 0u32;
-        for (name, fs) in fields {
+    fn field_slot(&mut self, fields: &[(Sym, Shape)], f: Sym) -> Option<(FieldLoc, Shape)> {
+        let fl = FieldLayout::of_shapes(fields.iter().map(|(_, fs)| fs));
+        for ((name, fs), &loc) in fields.iter().zip(fl.locs.iter()) {
             if *name == f {
-                return Some((off, fs.clone()));
+                return Some((loc, fs.clone()));
             }
-            off += self.words_of(fs);
+            self.sid(fs);
         }
         None
     }
 
-    /// `r.f` for a union of records: one offset per arm, if the field has
+    /// `r.f` for a union of records: one location per arm, if the field has
     /// the same shape (or an integer shape) in every arm that has it.
     fn union_field(&mut self, r: Expr, arms: &[Shape], f: Sym) -> Option<Expr> {
-        let mut found: Vec<Option<(u32, Shape)>> = Vec::new();
+        let mut found: Vec<Option<(FieldLoc, Shape)>> = Vec::new();
         for arm in arms {
             found.push(match arm {
                 Shape::Record(fields) => self.field_slot(fields, f),
@@ -105,11 +105,11 @@ impl Lowerer<'_> {
         let first = (*shapes.first()?).clone();
         if shapes.iter().all(|s| **s == first) {
             let fsid = self.sid(&first);
-            let offsets: Vec<Option<u32>> = found.iter().map(|h| h.as_ref().map(|(o, _)| *o)).collect();
-            return Some(Expr::new(Ty::Enc(fsid), ExprKind::UnionField { base: r, offsets: offsets.into() }));
+            let locs: Vec<Option<FieldLoc>> = found.iter().map(|h| h.as_ref().map(|(o, _)| *o)).collect();
+            return Some(Expr::new(Ty::Enc(fsid), ExprKind::UnionField { base: r, locs: locs.into() }));
         }
         if shapes.iter().all(|s| matches!(s, Shape::Int { .. })) {
-            let entries: Vec<Option<(u32, i64)>> = found
+            let entries: Vec<Option<(FieldLoc, i64)>> = found
                 .iter()
                 .map(|h| match h {
                     Some((o, Shape::Int { lo, .. })) => Some((*o, *lo)),
@@ -129,7 +129,7 @@ impl Lowerer<'_> {
     /// function application on it is then native, while the boxed `ValField`
     /// fallback decodes the whole record and puts both back in the host
     /// (the widest interpreter region of the Raft models).
-    fn union_field_universe(&mut self, r: Expr, arms: usize, found: &[Option<(u32, Shape)>]) -> Option<Expr> {
+    fn union_field_universe(&mut self, r: Expr, arms: usize, found: &[Option<(FieldLoc, Shape)>]) -> Option<Expr> {
         let mut univ: Vec<Value> = Vec::new();
         for (_, s) in found.iter().flatten() {
             match s {
@@ -150,9 +150,9 @@ impl Lowerer<'_> {
         let tag = self.int_word(base.clone(), 0, arms as i64 - 1);
         let mut x = Expr::new(Ty::Enc(tsid), ExprKind::Fail("arm of a record union without the field".into()));
         for (i, entry) in found.iter().enumerate().rev() {
-            let Some((off, shape)) = entry else { continue };
+            let Some((loc, shape)) = entry else { continue };
             let ssid = self.sid(shape);
-            let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: base.clone(), offset: 1 + off });
+            let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: base.clone(), loc: loc.offset_words(1) });
             let value = if ssid == tsid { slot } else { self.recode(&slot, tsid)? };
             x = Expr::new(Ty::Enc(tsid), ExprKind::If(eq(tag.clone(), int_lit(i as i64)), value, x));
         }
@@ -196,12 +196,11 @@ impl Lowerer<'_> {
         if let (Some(Shape::Fcn { dom, .. }), Some(Shape::Tuple(parts))) = (self.shape_of(f.ty).cloned(), self.shape_of(a.ty).cloned()) {
             if matches!(dom.first(), Some(Value::Tuple(_))) && !matches!(&*a.kind, ExprKind::Const(_)) {
                 let (a, bind) = self.share(a);
-                let mut comps = Vec::new();
-                let mut off = 0;
-                for p in parts.iter() {
+                let fl = FieldLayout::of_shapes(parts.iter());
+                let mut comps = Vec::with_capacity(parts.len());
+                for (p, &loc) in parts.iter().zip(fl.locs.iter()) {
                     let psid = self.sid(p);
-                    comps.push(Expr::new(Ty::Enc(psid), ExprKind::Slice { base: a.clone(), offset: off }));
-                    off += self.words_of(p);
+                    comps.push(Expr::new(Ty::Enc(psid), ExprKind::Slice { base: a.clone(), loc }));
                 }
                 if let Some(x) = self.apply_product(f.clone(), comps) {
                     return let_in(bind, x);
@@ -281,7 +280,7 @@ impl Lowerer<'_> {
         let mut results: Vec<(usize, Expr)> = Vec::new();
         for &i in &applicable {
             let asid = self.sid(&arms[i]);
-            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: fb.clone(), offset: 1 });
+            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: fb.clone(), loc: FieldLoc::Words(1) });
             let r = self.apply_enc(payload, a.clone());
             match &*r.kind {
                 ExprKind::Fail(_) => continue,
@@ -351,8 +350,8 @@ impl Lowerer<'_> {
         match shape {
             Shape::Record(fields) => {
                 if let Some(Value::Str(sym)) = konst {
-                    let (off, fs) = self.field_slot(&fields, *sym)?;
-                    return Some((Sel::Offset(off), self.sid(&fs)));
+                    let (loc, fs) = self.field_slot(&fields, *sym)?;
+                    return Some((Sel::Loc(loc), self.sid(&fs)));
                 }
                 // A computed string key of a record with fields of one shape
                 // (e.g. a function over a set of strings).
@@ -363,8 +362,8 @@ impl Lowerer<'_> {
                 }
                 let table: Vec<i32> =
                     univ.iter().map(|u| fields.iter().position(|(n, _)| *u == Value::Str(*n)).map_or(-1, |p| p as i32)).collect();
-                let w = self.words_of(&first);
-                Some((Sel::Index(IndexMap::Table(table.into()), w), self.sid(&first)))
+                let slot = SlotLayout::of(&first);
+                Some((Sel::Index(IndexMap::Table(table.into()), slot), self.sid(&first)))
             }
             Shape::Tuple(elems) => {
                 if let Some(Value::Int(k)) = konst {
@@ -372,33 +371,33 @@ impl Lowerer<'_> {
                         return None;
                     }
                     let k = *k as usize;
-                    let mut off = 0;
+                    let fl = FieldLayout::of_shapes(elems.iter());
                     for es in &elems[..k - 1] {
-                        off += self.words_of(es);
+                        self.sid(es);
                     }
-                    return Some((Sel::Offset(off), self.sid(&elems[k - 1])));
+                    return Some((Sel::Loc(fl.locs[k - 1]), self.sid(&elems[k - 1])));
                 }
                 // Dynamic index: only for homogeneous tuples.
                 let first = elems.first()?.clone();
                 if elems.iter().any(|e| *e != first) || !self.int_like(a) {
                     return None;
                 }
-                let w = self.words_of(&first);
-                Some((Sel::Index(IndexMap::IntRange { lo: 1, n: elems.len() as u32 }, w), self.sid(&first)))
+                let slot = SlotLayout::of(&first);
+                Some((Sel::Index(IndexMap::IntRange { lo: 1, n: elems.len() as u32 }, slot), self.sid(&first)))
             }
             Shape::Fcn { dom, range } => {
-                let w = self.words_of(&range);
+                let slot = SlotLayout::of(&range);
                 let rsid = self.sid(&range);
                 if let Some(k) = konst {
                     let pos = dom.iter().position(|d| d == k)?;
-                    return Some((Sel::Offset(pos as u32 * w), rsid));
+                    return Some((Sel::Loc(slot.loc(0, pos)), rsid));
                 }
                 // Contiguous integer domain.
                 if self.int_like(a) {
                     if let Some(Value::Int(lo)) = dom.first() {
                         let contiguous = dom.iter().enumerate().all(|(i, d)| *d == Value::Int(lo + i as i64));
                         if contiguous {
-                            return Some((Sel::Index(IndexMap::IntRange { lo: *lo, n: dom.len() as u32 }, w), rsid));
+                            return Some((Sel::Index(IndexMap::IntRange { lo: *lo, n: dom.len() as u32 }, slot), rsid));
                         }
                     }
                     return None;
@@ -406,7 +405,7 @@ impl Lowerer<'_> {
                 // Atom argument: table from its universe to domain positions.
                 if let Some(Shape::Atom(univ)) = self.shape_of(a.ty) {
                     let table: Vec<i32> = univ.iter().map(|u| dom.iter().position(|d| d == u).map_or(-1, |p| p as i32)).collect();
-                    return Some((Sel::Index(IndexMap::Table(table.into()), w), rsid));
+                    return Some((Sel::Index(IndexMap::Table(table.into()), slot), rsid));
                 }
                 // A flat product argument (e.g. a tuple of atoms) of a
                 // function over some such tuples: the position from a
@@ -418,23 +417,24 @@ impl Lowerer<'_> {
                     return None;
                 }
                 let n = dom.len() as i64;
-                // Positions encoded in Int{-1..n-1} (word = position + 1).
+                // Positions encoded in full-width Int{-1..i64::MAX} (word = position + 1).
                 let mut table = vec![0u64; u as usize];
                 for (i, d) in dom.iter().enumerate() {
                     if let Ok(r) = tlx_layout::layout::rank(&ashape, d) {
                         table[r as usize] = i as u64 + 1;
                     }
                 }
-                let psid = self.sid(&Shape::Int { lo: -1, hi: n - 1 });
-                let tsid = self.sid(&Shape::Tuple(vec![Shape::Int { lo: -1, hi: n - 1 }; u as usize].into()));
+                let elem_shape = Shape::Int { lo: -1, hi: i64::MAX };
+                let psid = self.sid(&elem_shape);
+                let tsid = self.sid(&Shape::Tuple(vec![elem_shape; u as usize].into()));
                 let rank = Expr::new(Ty::Int, ExprKind::RankFlat { x: a.clone(), radices: radices.into() });
                 let base = Expr::new(Ty::Enc(tsid), ExprKind::ConstWords(table.into()));
-                let slot = Expr::new(
+                let idx_slot = Expr::new(
                     Ty::Enc(psid),
-                    ExprKind::Index { base, arg: rank, map: IndexMap::IntRange { lo: 0, n: u as u32 }, elem_words: 1 },
+                    ExprKind::Index { base, arg: rank, map: IndexMap::IntRange { lo: 0, n: u as u32 }, slot: SlotLayout::Words(1) },
                 );
-                let pos = Expr::new(Ty::Int, ExprKind::Convert(slot));
-                Some((Sel::Pos(pos, n as u32, w), rsid))
+                let pos = Expr::new(Ty::Int, ExprKind::Convert(idx_slot));
+                Some((Sel::Pos(pos, n as u32, slot), rsid))
             }
             _ => None,
         }
@@ -443,12 +443,12 @@ impl Lowerer<'_> {
     /// The slot of `f` that `a` selects (see `select`).
     pub(super) fn apply_sel(&self, f: Expr, a: Expr, sel: Sel, elem_sid: ShapeId) -> Expr {
         let k = match sel {
-            Sel::Offset(off) => ExprKind::Slice { base: f, offset: off },
-            Sel::Index(map, elem_words) => {
+            Sel::Loc(loc) => ExprKind::Slice { base: f, loc },
+            Sel::Index(map, slot) => {
                 let arg = self.index_arg(&map, a);
-                ExprKind::Index { base: f, arg, map, elem_words }
+                ExprKind::Index { base: f, arg, map, slot }
             }
-            Sel::Pos(pos, n, elem_words) => ExprKind::Index { base: f, arg: pos, map: IndexMap::IntRange { lo: 0, n }, elem_words },
+            Sel::Pos(pos, n, slot) => ExprKind::Index { base: f, arg: pos, map: IndexMap::IntRange { lo: 0, n }, slot },
         };
         Expr::new(Ty::Enc(elem_sid), k)
     }
@@ -490,9 +490,9 @@ impl Lowerer<'_> {
         let Some(Shape::Fcn { dom, range }) = self.shape_of(f.ty).cloned() else { return None };
         let (pos, valid, binds) = self.product_key(&dom, comps)?;
         let rsid = self.sid(&range);
-        let w = self.words_of(&range);
+        let slot_layout = SlotLayout::of(&range);
         let map = IndexMap::IntRange { lo: 0, n: dom.len() as u32 };
-        let slot = Expr::new(Ty::Enc(rsid), ExprKind::Index { base: f, arg: pos, map, elem_words: w });
+        let slot = Expr::new(Ty::Enc(rsid), ExprKind::Index { base: f, arg: pos, map, slot: slot_layout });
         let fail = Expr::new(Ty::Enc(rsid), ExprKind::Fail("Attempted to apply a function to an argument not in its domain.".into()));
         Some(let_in(binds, Expr::new(Ty::Enc(rsid), ExprKind::If(valid, slot, fail))))
     }
@@ -665,14 +665,12 @@ impl Lowerer<'_> {
             self.except_path(old, &keys[1..], val, env, st)?
         };
         let k = match sel {
-            Sel::Offset(off) => ExprKind::ExceptAt { base: b, offset: off, value: v },
-            Sel::Index(map, elem_words) => {
+            Sel::Loc(loc) => ExprKind::ExceptAt { base: b, loc, value: v },
+            Sel::Index(map, slot) => {
                 let arg = self.index_arg(&map, key);
-                ExprKind::ExceptIndex { base: b, arg, map, elem_words, value: v }
+                ExprKind::ExceptIndex { base: b, arg, map, slot, value: v }
             }
-            Sel::Pos(pos, n, elem_words) => {
-                ExprKind::ExceptIndex { base: b, arg: pos, map: IndexMap::IntRange { lo: 0, n }, elem_words, value: v }
-            }
+            Sel::Pos(pos, n, slot) => ExprKind::ExceptIndex { base: b, arg: pos, map: IndexMap::IntRange { lo: 0, n }, slot, value: v },
         };
         Some(let_in(bind_k, Expr::new(Ty::Enc(bsid), k)))
     }
@@ -706,7 +704,7 @@ impl Lowerer<'_> {
         let mut parts: Vec<(usize, Expr)> = Vec::with_capacity(applicable.len());
         for &i in &applicable {
             let asid = self.sid(&arms[i]);
-            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: b.clone(), offset: 1 });
+            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: b.clone(), loc: FieldLoc::Words(1) });
             let r = self.except_at(payload, key.clone(), keys, val, env, st)?;
             // Arm index, then the arm's encoding padded to the widest arm.
             parts.push((i, self.union_arm_coerce(&r, bsid)?));
@@ -738,8 +736,8 @@ impl Lowerer<'_> {
         }
         let (b, bind_b) = self.share(base);
         let (sel, elem_sid) = self.select(&b, &key)?;
-        // (`select` gives an offset only for a constant key in the domain;
-        // a computed key must be in it whatever its value.)
+        // (`select` gives a fixed location only for a constant key in the
+        // domain; a computed key must be in it whatever its value.)
         if matches!(sel, Sel::Index(..) | Sel::Pos(..)) && !self.cannot_fail(&self.apply_sel(b.clone(), key.clone(), sel.clone(), elem_sid))
         {
             return None;
@@ -747,10 +745,10 @@ impl Lowerer<'_> {
         let v = self.expr_into(&args[1], &penv, st, elem_sid);
         let v = self.coerce_enc(v, elem_sid);
         let k = match sel {
-            Sel::Offset(off) => ExprKind::ExceptAt { base: b, offset: off, value: v },
-            Sel::Index(map, elem_words) => {
+            Sel::Loc(loc) => ExprKind::ExceptAt { base: b, loc, value: v },
+            Sel::Index(map, slot) => {
                 let arg = self.index_arg(&map, key);
-                ExprKind::ExceptIndex { base: b, arg, map, elem_words, value: v }
+                ExprKind::ExceptIndex { base: b, arg, map, slot, value: v }
             }
             Sel::Pos(..) => return None,
         };
@@ -776,8 +774,8 @@ impl Lowerer<'_> {
         let i = self.as_int(key).ok()?;
         let (i, bind_i) = self.share(i);
         let esid = self.sid(elem);
-        let ew = self.words_of(elem);
-        let old = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: b.clone(), arg: i.clone(), elem_words: ew });
+        let slot = SlotLayout::of(elem);
+        let old = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: b.clone(), arg: i.clone(), slot });
         let v = if keys.len() == 1 {
             let saved = self.at.replace(old);
             let v = self.expr_into(val, env, st, esid);
@@ -788,17 +786,11 @@ impl Lowerer<'_> {
         };
         let lsid = self.sid(&Shape::Int { lo: 0, hi: max_len as i64 });
         let ssid = self.sid(&Shape::Tuple(vec![elem.clone(); max_len].into()));
-        let len_word = Expr::new(Ty::Enc(lsid), ExprKind::Slice { base: b.clone(), offset: 0 });
-        let slots = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: b.clone(), offset: 1 });
+        let len_word = Expr::new(Ty::Enc(lsid), ExprKind::Slice { base: b.clone(), loc: FieldLoc::Words(0) });
+        let slots = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: b.clone(), loc: FieldLoc::Words(1) });
         let upd = Expr::new(
             Ty::Enc(ssid),
-            ExprKind::ExceptIndex {
-                base: slots,
-                arg: i.clone(),
-                map: IndexMap::IntRange { lo: 1, n: max_len as u32 },
-                elem_words: ew,
-                value: v,
-            },
+            ExprKind::ExceptIndex { base: slots, arg: i.clone(), map: IndexMap::IntRange { lo: 1, n: max_len as u32 }, slot, value: v },
         );
         let new = Expr::new(Ty::Enc(bsid), ExprKind::Concat(vec![len_word, upd]));
         let len = Expr::new(Ty::Int, ExprKind::SeqLen(b.clone()));
@@ -826,9 +818,9 @@ impl Lowerer<'_> {
         let (pos, valid, binds) = self.product_key(&dom, comps)?;
         let (pos, bind_p) = self.share(pos);
         let rsid = self.sid(&range);
-        let w = self.words_of(&range);
+        let slot = SlotLayout::of(&range);
         let map = IndexMap::IntRange { lo: 0, n: dom.len() as u32 };
-        let old = Expr::new(Ty::Enc(rsid), ExprKind::Index { base: b.clone(), arg: pos.clone(), map: map.clone(), elem_words: w });
+        let old = Expr::new(Ty::Enc(rsid), ExprKind::Index { base: b.clone(), arg: pos.clone(), map: map.clone(), slot });
         let v = if keys.len() == 1 {
             let saved = self.at.replace(old);
             let v = self.expr_into(val, env, st, rsid);
@@ -837,7 +829,7 @@ impl Lowerer<'_> {
         } else {
             self.except_path(old, &keys[1..], val, env, st)?
         };
-        let upd = Expr::new(Ty::Enc(bsid), ExprKind::ExceptIndex { base: b.clone(), arg: pos, map, elem_words: w, value: v });
+        let upd = Expr::new(Ty::Enc(bsid), ExprKind::ExceptIndex { base: b.clone(), arg: pos, map, slot, value: v });
         // TLC: EXCEPT on a key outside the domain leaves the function unchanged.
         let x = Expr::new(Ty::Enc(bsid), ExprKind::If(valid, upd, b));
         Some(let_in(bind_p.into_iter().chain(binds).chain(bind_b), x))
@@ -846,8 +838,8 @@ impl Lowerer<'_> {
     /// Element `i` (1-based, unboxed) of an encoded sequence.
     pub(super) fn seq_index(&mut self, s: Expr, i: Expr, elem: &Shape) -> Expr {
         let esid = self.sid(elem);
-        let ew = self.words_of(elem);
-        Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: s, arg: i, elem_words: ew })
+        let slot = SlotLayout::of(elem);
+        Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: s, arg: i, slot })
     }
 
     /// `Len(s)`.
@@ -875,7 +867,10 @@ impl Lowerer<'_> {
                         Shape::Tuple(es) => int_lit(es.len() as i64),
                         Shape::Seq { .. } => {
                             let asid = self.sid(a);
-                            Expr::new(Ty::Int, ExprKind::SeqLen(Expr::new(Ty::Enc(asid), ExprKind::Slice { base: u.clone(), offset: 1 })))
+                            Expr::new(
+                                Ty::Int,
+                                ExprKind::SeqLen(Expr::new(Ty::Enc(asid), ExprKind::Slice { base: u.clone(), loc: FieldLoc::Words(1) })),
+                            )
                         }
                         _ => continue,
                     };
@@ -895,9 +890,10 @@ impl Lowerer<'_> {
         let Some(Shape::Seq { elem, .. }) = self.shape_of(s.ty).cloned() else { return None };
         let (lo, hi) = (self.expr(m, env, st), self.expr(n, env, st));
         let (lo, hi) = (self.as_int(lo).ok()?, self.as_int(hi).ok()?);
-        let ew = self.words_of(&elem);
+        self.sid(&elem);
+        let slot = SlotLayout::of(&elem);
         let ty = s.ty;
-        Some(Expr::new(ty, ExprKind::SeqSub { base: s, lo, hi, elem_words: ew }))
+        Some(Expr::new(ty, ExprKind::SeqSub { base: s, lo, hi, slot }))
     }
 
     /// An encoded sequence, or a homogeneous tuple viewed as a sequence.
@@ -971,8 +967,9 @@ impl Lowerer<'_> {
             return self.ref_op(crate::ir::RefOp::Tail, vec![s]);
         }
         if let Some(Shape::Seq { elem, .. }) = self.shape_of(s.ty).cloned() {
-            let ew = self.words_of(&elem);
-            return Expr::new(s.ty, ExprKind::SeqTail { base: s, elem_words: ew });
+            self.sid(&elem);
+            let slot = SlotLayout::of(&elem);
+            return Expr::new(s.ty, ExprKind::SeqTail { base: s, slot });
         }
         self.val_op(B::Tail, vec![s])
     }
@@ -1032,8 +1029,9 @@ impl Lowerer<'_> {
                         let max_len = ma + mb;
                         let sid = self.sid(&Shape::Seq { elem: ea.clone(), max_len });
                         let (a2, b2) = (self.coerce_enc(sa, sid), self.coerce_enc(sb, sid));
-                        let ew = self.words_of(&ea);
-                        return Expr::new(Ty::Enc(sid), ExprKind::SeqConcat { a: a2, b: b2, elem_words: ew, max_len: max_len as u32 });
+                        self.sid(&ea);
+                        let slot = SlotLayout::of(&ea);
+                        return Expr::new(Ty::Enc(sid), ExprKind::SeqConcat { a: a2, b: b2, slot, max_len: max_len as u32 });
                     }
                 }
             }
@@ -1050,9 +1048,9 @@ impl Lowerer<'_> {
         }
         if let Some(Shape::Seq { elem, max_len }) = self.shape_of(s.ty).cloned() {
             let esid = self.sid(&elem);
-            let ew = self.words_of(&elem);
+            let slot = SlotLayout::of(&elem);
             let x = self.expr_into(x, env, st, esid);
-            return Expr::new(s.ty, ExprKind::SeqAppend { base: s, value: x, elem_words: ew, max_len: max_len as u32 });
+            return Expr::new(s.ty, ExprKind::SeqAppend { base: s, value: x, slot, max_len: max_len as u32 });
         }
         let x = self.expr(x, env, st);
         self.val_op(B::Append, vec![s, x])

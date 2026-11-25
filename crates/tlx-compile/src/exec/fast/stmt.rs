@@ -685,35 +685,15 @@ impl Compiler<'_> {
                     put(fx, d)
                 })
             }
-            Plan::At { base, offset, value } => {
-                let b = self.into_s1(base)?;
-                let v = self.into_s1(value)?;
-                let off = *offset as usize;
-                Box::new(move |fx, d| {
-                    b(fx, d)?;
-                    v(fx, d + off)
-                })
-            }
-            Plan::AtIndex { base, arg, map, elem_words, value } => {
-                let b = self.into_s1(base)?;
-                let slot = self.slot_in(arg, map)?;
-                let v = self.into_s1(value)?;
-                let k = *elem_words as usize;
-                Box::new(move |fx, d| {
-                    b(fx, d)?;
-                    match slot(fx)? {
-                        Some(s) => v(fx, d + s * k),
-                        None => Ok(()),
-                    }
-                })
-            }
+            Plan::At { base, update } => self.plan_at(base, update)?,
+            Plan::AtIndex { base, arg, map, update } => self.plan_at_index(base, arg, map, update)?,
             Plan::If { cond, then, els } => {
                 let c = self.bool_(cond)?;
                 let (t, f) = (self.into_s1(then)?, self.into_s1(els)?);
                 Box::new(move |fx, d| if c(fx)? { t(fx, d) } else { f(fx, d) })
             }
             Plan::Concat(parts) => {
-                let parts = parts.iter().map(|(off, part)| Ok((*off as usize, self.into_s1(part)?))).collect::<C<Vec<_>>>()?;
+                let parts = parts.iter().map(|(off, part)| Ok((*off, self.into_s1(part)?))).collect::<C<Vec<_>>>()?;
                 Box::new(move |fx, d| {
                     for (off, part) in &parts {
                         part(fx, d + off)?;
@@ -762,6 +742,68 @@ impl Compiler<'_> {
                             SetOp::Inter => *x & w,
                             SetOp::Diff => *x & !w,
                         };
+                    }
+                    Ok(())
+                })
+            }
+        })
+    }
+
+    fn plan_at(&mut self, base: &Plan, update: &crate::inplace::AtUpdate) -> C<IntoS1> {
+        let b = self.into_s1(base)?;
+        Ok(match update {
+            crate::inplace::AtUpdate::Word { offset, value } => {
+                let v = self.into_s1(value)?;
+                let off = *offset;
+                Box::new(move |fx, d| {
+                    b(fx, d)?;
+                    v(fx, d + off)
+                })
+            }
+            crate::inplace::AtUpdate::Bits { value: None, .. } => b,
+            crate::inplace::AtUpdate::Bits { pos, value: Some(ve) } => {
+                let pos = *pos;
+                let (vf, _) = self.enc(ve)?;
+                Box::new(move |fx, d| {
+                    b(fx, d)?;
+                    let lv = vf.at(fx)?;
+                    let val = fx.word(lv, 0);
+                    pos.insert(&mut fx.s1[d..], val);
+                    Ok(())
+                })
+            }
+        })
+    }
+
+    fn plan_at_index(&mut self, base: &Plan, arg: &Expr, map: &IndexMap, update: &crate::inplace::IndexUpdate) -> C<IntoS1> {
+        let b = self.into_s1(base)?;
+        let slot_fn = self.slot_in(arg, map)?;
+        Ok(match update {
+            crate::inplace::IndexUpdate::Words { elem_words, value } => {
+                let v = self.into_s1(value)?;
+                let k = *elem_words;
+                Box::new(move |fx, d| {
+                    b(fx, d)?;
+                    match slot_fn(fx)? {
+                        Some(s) => v(fx, d + s * k),
+                        None => Ok(()),
+                    }
+                })
+            }
+            crate::inplace::IndexUpdate::Bits { value: None, .. } => Box::new(move |fx, d| {
+                b(fx, d)?;
+                slot_fn(fx)?;
+                Ok(())
+            }),
+            crate::inplace::IndexUpdate::Bits { bits, value: Some(ve) } => {
+                let bits = *bits;
+                let (vf, _) = self.enc(ve)?;
+                Box::new(move |fx, d| {
+                    b(fx, d)?;
+                    if let Some(s) = slot_fn(fx)? {
+                        let lv = vf.at(fx)?;
+                        let val = fx.word(lv, 0);
+                        SlotLayout::insert(bits, &mut fx.s1[d..], s, val);
                     }
                     Ok(())
                 })

@@ -167,22 +167,48 @@ impl Gen<'_, '_, '_> {
                 self.plan_into(value, d)?;
                 self.with_temp(*temp, d, |g| g.plan_into(body, d))?;
             }
-            Plan::At { base, offset, value } => {
+            Plan::At { base, update } => {
                 self.plan_into(base, d)?;
-                let d1 = self.offset(d, *offset as usize);
-                self.plan_into(value, d1)?;
+                match update {
+                    crate::inplace::AtUpdate::Word { offset, value } => {
+                        let d1 = self.offset(d, *offset);
+                        self.plan_into(value, d1)?;
+                    }
+                    crate::inplace::AtUpdate::Bits { pos, value: Some(ve) } => {
+                        let v = self.expr(ve)?;
+                        let val = self.load(v, 0);
+                        self.store_bitpos(d, *pos, val);
+                    }
+                    crate::inplace::AtUpdate::Bits { value: None, .. } => {}
+                }
             }
-            Plan::AtIndex { base, arg, map, elem_words, value } => {
+            Plan::AtIndex { base, arg, map, update } => {
                 self.plan_into(base, d)?;
                 let sl = self.slot(arg, map, false)?;
-                let (yes, after) = (self.b.create_block(), self.b.create_block());
-                let c = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, sl, 0);
-                self.brif(c, yes, &[], after, &[]);
-                self.switch(yes);
-                let d1 = self.index(d, sl, *elem_words as usize);
-                self.plan_into(value, d1)?;
-                self.b.ins().jump(after, &[]);
-                self.switch(after);
+                match update {
+                    crate::inplace::IndexUpdate::Words { elem_words, value } => {
+                        let (yes, after) = (self.b.create_block(), self.b.create_block());
+                        let c = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, sl, 0);
+                        self.brif(c, yes, &[], after, &[]);
+                        self.switch(yes);
+                        let d1 = self.index(d, sl, *elem_words);
+                        self.plan_into(value, d1)?;
+                        self.b.ins().jump(after, &[]);
+                        self.switch(after);
+                    }
+                    crate::inplace::IndexUpdate::Bits { bits, value: Some(ve) } => {
+                        let (yes, after) = (self.b.create_block(), self.b.create_block());
+                        let c = self.cmp_imm(IntCC::SignedGreaterThanOrEqual, sl, 0);
+                        self.brif(c, yes, &[], after, &[]);
+                        self.switch(yes);
+                        let v = self.expr(ve)?;
+                        let val = self.load(v, 0);
+                        self.store_slot_bits(d, *bits, sl, val);
+                        self.b.ins().jump(after, &[]);
+                        self.switch(after);
+                    }
+                    crate::inplace::IndexUpdate::Bits { value: None, .. } => {}
+                }
             }
             Plan::If { cond, then, els } => {
                 let c = self.bool_expr(cond)?;
@@ -198,7 +224,7 @@ impl Gen<'_, '_, '_> {
             }
             Plan::Concat(parts) => {
                 for (off, part) in parts {
-                    let d1 = self.offset(d, *off as usize);
+                    let d1 = self.offset(d, *off);
                     self.plan_into(part, d1)?;
                 }
             }
@@ -425,16 +451,45 @@ impl Gen<'_, '_, '_> {
 
     /// Words of the element encoding produced by `unrank` for `elem`.
     pub(super) fn unrank_words(&mut self, elem: &Shape) -> R<usize> {
-        if elem.is_scalar() {
-            return Ok(1);
-        }
-        if let Some(r) = crate::lower::flat_radices(elem) {
-            return Ok(r.len());
-        }
-        if crate::lower::union_radices(elem).is_some() || crate::lower::rankable(elem) {
-            return Ok(self.cx.ty.words(self.find_sid(elem)?) as usize);
+        if elem.is_scalar()
+            || crate::lower::flat_radices(elem).is_some()
+            || crate::lower::union_radices(elem).is_some()
+            || crate::lower::rankable(elem)
+        {
+            return Ok(tlx_layout::layout::words(elem));
         }
         no("bitset of composite elements")
+    }
+
+    /// Pack flat mixed-radix `digits` into the encoded words of `shape`, also
+    /// returning known bitfield entries shifted by `base_word`.
+    fn pack_digits(&mut self, shape: &Shape, digits: &[Known], base_word: u32) -> (Vec<Known>, Vec<(BitPos, Known)>) {
+        let parts: Option<Vec<&Shape>> = match shape {
+            Shape::Tuple(es) => Some(es.iter().collect()),
+            Shape::Record(fs) => Some(fs.iter().map(|(_, f)| f).collect()),
+            _ => None,
+        };
+        if let (Some(fl), Some(ps)) = (FieldLayout::of_shape(shape), parts) {
+            let mut ws = vec![Known::Const(0); fl.words];
+            let mut bits = Vec::new();
+            for (i, &d) in digits.iter().enumerate() {
+                if tlx_layout::layout::words(ps[i]) == 0 {
+                    continue;
+                }
+                match fl.locs[i] {
+                    FieldLoc::Words(w) => ws[w] = d,
+                    FieldLoc::Bits(pos) => {
+                        ws[pos.word] = self.or_known_bits(ws[pos.word], pos, d);
+                        bits.push((pos.offset_words(base_word as usize), d));
+                    }
+                }
+            }
+            (ws, bits)
+        } else if tlx_layout::layout::words(shape) == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            (vec![digits[0]], Vec::new())
+        }
     }
 
     /// For each element of the `n`-word bitset at `s` of elements of shape
@@ -478,6 +533,7 @@ impl Gen<'_, '_, '_> {
         let none_in = |lo: u64, hi: u64| mask.is_some_and(|m| (lo..hi).all(|r| m[(r / 64) as usize] >> (r % 64) & 1 == 0));
         let mut lo = 0;
         if let Some(arms) = union.filter(|a| spec && a.len() > 1 && self.spec * a.len() <= MAX_SPEC) {
+            let Shape::Union(arm_shapes) = elem else { unreachable!() };
             let w = self.cx.ty.words(self.find_sid(elem)?) as usize;
             let saved = self.spec;
             self.spec *= arms.len();
@@ -493,7 +549,8 @@ impl Gen<'_, '_, '_> {
                     lo = hi;
                     continue;
                 }
-                match skip.map(|(bind, pred, noop)| self.arm_is_noop(i, radices, w, bind, pred, noop)) {
+                let arm_shape = &arm_shapes[i];
+                match skip.map(|sk| self.arm_is_noop((i, arm_shape, radices, w), sk)) {
                     Some(Ok(true)) => {
                         lo = hi;
                         continue;
@@ -506,10 +563,13 @@ impl Gen<'_, '_, '_> {
                 }
                 r = self.for_bits_range(s, lo, hi, mask, &mut |g, q| {
                     let k = g.add_imm(q, -(lo as i64));
+                    let ds: Vec<Known> = g.digits(radices, k, card).into_iter().map(Known::Val).collect();
+                    let (arm_ws, arm_bits) = g.pack_digits(arm_shape, &ds, 1);
                     let mut ws = vec![Known::Const(i as u64)];
-                    ws.extend(g.digits(radices, k, card).into_iter().map(Known::Val));
+                    ws.extend(arm_ws);
                     ws.resize(w, Known::Const(0));
                     let p = g.materialize(&ws);
+                    g.know_bits(p, arm_bits);
                     body(g, q, p)
                 });
                 lo = hi;
@@ -534,25 +594,33 @@ impl Gen<'_, '_, '_> {
     /// all elements of arm `i` (of `radices`, encoded in `w` words) bound
     /// to `bind`: it is translated (as dead code) on an element with
     /// unknown digits.
-    fn arm_is_noop(&mut self, i: usize, radices: &[u64], w: usize, bind: Temp, pred: &Expr, noop: bool) -> R<bool> {
+    fn arm_is_noop(
+        &mut self,
+        (i, arm_shape, radices, w): (usize, &Shape, &[u64], usize),
+        (bind, pred, noop): (Temp, &Expr, bool),
+    ) -> R<bool> {
         if self.mixing && self.regions_in(pred) {
             return Ok(false);
         }
         let mut is_noop = false;
         self.dead_code(|g| {
             let blk = g.b.current_block().expect("a block");
-            let mut ws = vec![Known::Const(i as u64)];
+            let mut ds = Vec::with_capacity(radices.len());
             for c in radices {
                 if *c == 1 {
-                    ws.push(Known::Const(0));
+                    ds.push(Known::Const(0));
                     continue;
                 }
                 let d = g.b.append_block_param(blk, I64);
                 g.set_bound(d, *c);
-                ws.push(Known::Val(d));
+                ds.push(Known::Val(d));
             }
+            let (arm_ws, arm_bits) = g.pack_digits(arm_shape, &ds, 1);
+            let mut ws = vec![Known::Const(i as u64)];
+            ws.extend(arm_ws);
             ws.resize(w, Known::Const(0));
             let p = g.materialize(&ws);
+            g.know_bits(p, arm_bits);
             let e0 = g.effects;
             let c = g.with_temp(bind, p, |g| g.bool_expr(pred))?;
             is_noop = g.effects == e0 && g.konst(c) == Some(noop as i64);
@@ -592,13 +660,22 @@ impl Gen<'_, '_, '_> {
     /// its words as values (`Gen::materialize`), or written into a buffer.
     /// (`q` is less than the cardinality of `elem`.)
     pub(super) fn unrank(&mut self, elem: &Shape, q: Value) -> R<Value> {
-        let ws = if elem.is_scalar() {
+        if elem.is_scalar() {
             let c = elem.cardinality().unwrap_or(1);
-            self.digits(&[c], q, c)
-        } else if let Some(r) = crate::lower::flat_radices(elem) {
-            self.digits(&r, q, r.iter().product())
-        } else if let Some(arms) = crate::lower::union_radices(elem) {
+            let ds: Vec<Known> = self.digits(&[c], q, c).into_iter().map(Known::Val).collect();
+            let (ws, _) = self.pack_digits(elem, &ds, 0);
+            return Ok(self.materialize(&ws));
+        }
+        if let Some(r) = crate::lower::flat_radices(elem) {
+            let ds: Vec<Known> = self.digits(&r, q, r.iter().product()).into_iter().map(Known::Val).collect();
+            let (ws, bits) = self.pack_digits(elem, &ds, 0);
+            let p = self.materialize(&ws);
+            self.know_bits(p, bits);
+            return Ok(p);
+        }
+        if let Some(arms) = crate::lower::union_radices(elem) {
             // Tag, then the arm's digits, zero-padded (all zero if out of range).
+            let Shape::Union(arm_shapes) = elem else { unreachable!() };
             let w = self.cx.ty.words(self.find_sid(elem)?) as usize;
             let done = self.b.create_block();
             let params: Vec<Value> = (0..w).map(|_| self.b.append_block_param(done, I64)).collect();
@@ -609,8 +686,15 @@ impl Gen<'_, '_, '_> {
                 let c = self.cmp_imm(IntCC::UnsignedLessThan, q, card as i64);
                 self.brif(c, yes, &[], no_, &[]);
                 self.switch(yes);
+                let ds: Vec<Known> = self.digits(r, q, card).into_iter().map(Known::Val).collect();
+                let (arm_ws, _) = self.pack_digits(&arm_shapes[i], &ds, 1);
                 let mut args = vec![self.iconst(i as i64)];
-                args.extend(self.digits(r, q, card));
+                for kw in arm_ws {
+                    args.push(match kw {
+                        Known::Const(c) => self.iconst(c as i64),
+                        Known::Val(v) => v,
+                    });
+                }
                 while args.len() < w {
                     args.push(self.iconst(0));
                 }
@@ -623,19 +707,18 @@ impl Gen<'_, '_, '_> {
             let args: Vec<_> = (0..w).map(|_| zero.into()).collect();
             self.b.ins().jump(done, &args);
             self.switch(done);
-            params
-        } else if crate::lower::rankable(elem) {
+            let ws: Vec<Known> = params.into_iter().map(Known::Val).collect();
+            return Ok(self.materialize(&ws));
+        }
+        if crate::lower::rankable(elem) {
             let w = self.cx.ty.words(self.find_sid(elem)?) as usize;
             let buf = self.buf(w);
             let out = self.addr(buf);
             self.zero(out, w);
             self.unrank_nested(elem, q, out, 0)?;
             return Ok(out);
-        } else {
-            return no("bitset of composite elements");
-        };
-        let ws: Vec<Known> = ws.into_iter().map(Known::Val).collect();
-        Ok(self.materialize(&ws))
+        }
+        no("bitset of composite elements")
     }
 
     /// The digits of `q` in mixed radix `radices` (most significant first).
@@ -654,7 +737,11 @@ impl Gen<'_, '_, '_> {
 
     fn unrank_nested(&mut self, s: &Shape, q: Value, out: Value, off: usize) -> R<()> {
         match s {
-            Shape::Int { .. } | Shape::Atom(_) | Shape::Bool => self.store(q, out, off),
+            Shape::Int { .. } | Shape::Atom(_) | Shape::Bool => {
+                if tlx_layout::layout::words(s) > 0 {
+                    self.store(q, out, off);
+                }
+            }
             // A set whose rank is its bitset (none: a set over an empty
             // universe has no words).
             Shape::Set { .. } if crate::lower::word_ranked_set(s) => {
@@ -668,18 +755,20 @@ impl Gen<'_, '_, '_> {
                     Shape::Record(fs) => fs.iter().map(|(_, f)| f.clone()).collect(),
                     _ => unreachable!(),
                 };
-                let mut offs = Vec::new();
-                let mut o = off;
-                for p in &parts {
-                    offs.push(o);
-                    o += self.cx.ty.words(self.find_sid(p)?) as usize;
-                }
+                let fl = FieldLayout::of_shape(s).expect("Tuple or Record");
                 let mut q = q;
-                for (p, o) in parts.iter().zip(offs).rev() {
+                for (p, loc) in parts.iter().zip(fl.locs.iter().copied()).rev() {
                     let Some(c) = p.cardinality() else { return no("unranked part without cardinality") };
                     let v = self.b.ins().urem_imm(q, c as i64);
                     q = self.b.ins().udiv_imm(q, c as i64);
-                    self.unrank_nested(p, v, out, o)?;
+                    match loc {
+                        FieldLoc::Bits(pos) => self.store_bitpos(out, pos.offset_words(off), v),
+                        FieldLoc::Words(w) => {
+                            if tlx_layout::layout::words(p) > 0 {
+                                self.unrank_nested(p, v, out, off + w)?;
+                            }
+                        }
+                    }
                 }
             }
             Shape::Union(arms) => {

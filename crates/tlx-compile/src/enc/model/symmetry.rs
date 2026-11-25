@@ -30,7 +30,8 @@ pub(super) fn compile_symmetry(base: &InterpModel, layout: &Layout, notes: &mut 
             match PermPlan::compile(s, &perm) {
                 Some(p) => plans.push(p),
                 None => {
-                    notes.push(format!("symmetry: cannot permute the encoding of {} ({s:?})", base.ip.prog.vars[i].name));
+                    let name = base.ip.prog.vars.get(i).map_or("VIEW", |v| &*v.name);
+                    notes.push(format!("symmetry: cannot permute the encoding of {name} ({s:?})"));
                     return None;
                 }
             }

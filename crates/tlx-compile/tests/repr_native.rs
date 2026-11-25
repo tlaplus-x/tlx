@@ -331,3 +331,68 @@ Lowered == s \in Q(t)
         check_native(&h, sets.iter().flat_map(|s| sets.iter().map(move |t| vec![s.clone(), t.clone()])));
     }
 }
+
+#[test]
+fn packed_composites_and_except_preserve_neighbor_bits_across_tiers() {
+    let src = module(
+        "PackedCompositesDiff",
+        r#"EXTENDS Integers, Sequences, FiniteSets, TLC
+CONSTANTS S1, S2, S3
+VARIABLES rec, fn_var, mp, seq, msgs
+
+Nodes == {S1, S2, S3}
+
+Init ==
+    /\ rec = [a |-> S1, b |-> FALSE, lo |-> -2, hi |-> 3]
+    /\ fn_var = [s \in Nodes |-> 0]
+    /\ mp = (S1 :> 1) @@ (S3 :> 2)
+    /\ seq = <<1, 0>>
+    /\ msgs = {[type |-> "1a", bal |-> 0]}
+
+StepRec ==
+    /\ rec' = [rec EXCEPT !.b = ~@, !.lo = IF @ < 2 THEN @ + 1 ELSE -2]
+    /\ fn_var' = [fn_var EXCEPT ![rec.a] = (@ + 1) % 4]
+    /\ UNCHANGED <<mp, seq, msgs>>
+
+StepSeqAndMap ==
+    /\ rec' = [rec EXCEPT !.a = IF @ = S1 THEN S2 ELSE IF @ = S2 THEN S3 ELSE S1, !.hi = (@ + 1) % 5]
+    /\ mp' = IF S2 \in DOMAIN mp
+             THEN [mp EXCEPT ![S2] = (@ + 1) % 4]
+             ELSE (S2 :> 3) @@ mp
+    /\ seq' = IF Len(seq) < 4
+              THEN Append(seq, (rec.hi + 1) % 4)
+              ELSE SubSeq(Tail(seq), 1, 2) \o <<0>>
+    /\ msgs' = msgs \cup {[type |-> "2b", acc |-> rec.a, bal |-> (rec.hi % 3), ok |-> rec.b]}
+    /\ UNCHANGED fn_var
+
+Next == StepRec \/ StepSeqAndMap
+
+InvRec ==
+    /\ rec.lo \in -2..2
+    /\ rec.hi \in 0..4
+    /\ fn_var[rec.a] \in 0..3
+
+InvSeqMap ==
+    /\ Len(SelectSeq(seq, LAMBDA x : x > 0)) <= Len(seq)
+    /\ \A k \in DOMAIN mp : mp[k] \in 0..3
+
+InvMsgs ==
+    /\ \E m \in msgs : m.type = "1a" /\ m.bal >= 0
+    /\ Cardinality({m \in msgs : m.type = "2b" /\ m.ok}) <= Cardinality(msgs)
+"#,
+    );
+    let cfg = "CONSTANTS S1 = s1 S2 = s2 S3 = s3\nINIT Init\nNEXT Next\nINVARIANTS InvRec InvSeqMap InvMsgs\n";
+    let h = Harness::new(&src, cfg);
+    // Verify packed widths (22 words unpacked -> 8 words packed):
+    // rec: 4 scalar fields in 1 word; fn_var: 3 * 3-bit ints in 1 word;
+    // mp: 1 bitset word + 1 packed slot word = 2 words; seq: 1 len word + 1 packed elem word = 2 words;
+    // msgs: bitset over 66-element union of packed message records = 2 words.
+    assert_eq!(h.layout.words, 8, "unexpected unpacked layout: {:?}", h.layout.vars);
+    assert!(h.not_native().is_empty(), "not native: {:?} (notes: {:?})", h.not_native(), h.notes);
+    let mut rep = h.run_reachable(120);
+    h.run_random(&mut tlx_testkit::Rng::new(0x715_c0de), 200, &mut rep);
+    rep.assert_ok("packed composites differential check");
+    let (ir, native) = rep.totals();
+    assert_eq!((ir.bailout, native.bailout), (0, 0), "{}", rep.render());
+    assert!(ir.agree > 0 && native.agree > 0, "{}", rep.render());
+}

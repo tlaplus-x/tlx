@@ -270,7 +270,7 @@ pub fn map_shape(key: Shape, range: Shape) -> Shape {
         note(|| format!("Dyn: function keys {} have no finite universe of at most 4096 values", summary(&key)));
         return Shape::Dyn;
     };
-    let w = crate::layout::MapDims::new(u as usize, crate::layout::words(&range)).words();
+    let w = crate::layout::MapDims::new(u as usize, crate::pack::SlotLayout::of(&range)).words();
     if !map_key_ok(&key) || w > MAX_MAP_WORDS || range == Shape::Dyn {
         note(|| {
             if !map_key_ok(&key) {

@@ -144,20 +144,45 @@ impl CGen<'_> {
                 self.plan_into(body, d, ind + 1, out)?;
                 writeln!(out, "{pad}}}").unwrap();
             }
-            Plan::At { base, offset, value } => {
+            Plan::At { base, update } => {
                 self.plan_into(base, d, ind, out)?;
-                let d1 = format!("d{}", self.fresh());
-                writeln!(out, "{pad}{{ uint64_t *{d1} = {d} + {offset};").unwrap();
-                self.plan_into(value, &d1, ind + 1, out)?;
-                writeln!(out, "{pad}}}").unwrap();
+                match update {
+                    crate::inplace::AtUpdate::Word { offset, value } => {
+                        let d1 = format!("d{}", self.fresh());
+                        writeln!(out, "{pad}{{ uint64_t *{d1} = {d} + {offset};").unwrap();
+                        self.plan_into(value, &d1, ind + 1, out)?;
+                        writeln!(out, "{pad}}}").unwrap();
+                    }
+                    crate::inplace::AtUpdate::Bits { pos, value: Some(ve) } => {
+                        let v = self.expr(ve)?;
+                        writeln!(out, "{pad}tlx_bset({d}, {}, {}, {}, ({v})[0]);", pos.word, pos.shift, pos.bits).unwrap();
+                    }
+                    crate::inplace::AtUpdate::Bits { value: None, .. } => {}
+                }
             }
-            Plan::AtIndex { base, arg, map, elem_words, value } => {
+            Plan::AtIndex { base, arg, map, update } => {
                 self.plan_into(base, d, ind, out)?;
                 let k = self.fresh();
-                let slot = self.slot_or(arg, map, "-1")?;
-                writeln!(out, "{pad}{{ int64_t sl{k} = {slot}; if (sl{k} >= 0) {{ uint64_t *d{k} = {d} + sl{k} * {elem_words};").unwrap();
-                self.plan_into(value, &format!("d{k}"), ind + 1, out)?;
-                writeln!(out, "{pad}}} }}").unwrap();
+                let sl = self.slot_or(arg, map, "-1")?;
+                match update {
+                    crate::inplace::IndexUpdate::Words { elem_words, value } => {
+                        writeln!(out, "{pad}{{ int64_t sl{k} = {sl}; if (sl{k} >= 0) {{ uint64_t *d{k} = {d} + sl{k} * {elem_words};")
+                            .unwrap();
+                        self.plan_into(value, &format!("d{k}"), ind + 1, out)?;
+                        writeln!(out, "{pad}}} }}").unwrap();
+                    }
+                    crate::inplace::IndexUpdate::Bits { bits, value: Some(ve) } => {
+                        let v = self.expr(ve)?;
+                        writeln!(
+                            out,
+                            "{pad}{{ int64_t sl{k} = {sl}; if (sl{k} >= 0) {{ const uint64_t *v{k} = {v}; tlx_sset({d}, {bits}, (uint64_t)sl{k}, v{k}[0]); }} }}"
+                        )
+                        .unwrap();
+                    }
+                    crate::inplace::IndexUpdate::Bits { value: None, .. } => {
+                        writeln!(out, "{pad}(void)({sl});").unwrap();
+                    }
+                }
             }
             Plan::If { cond, then, els } => {
                 let c = self.bool_expr(cond)?;
@@ -345,25 +370,66 @@ impl CGen<'_> {
     /// flat products their digits (mixed radix), unions of those an arm
     /// index followed by the arm's digits (zero-padded).
     pub(super) fn unrank_code(&mut self, elem: &Shape, k: usize) -> R<(usize, String)> {
-        let digits_of = |radices: &[u64], first: usize| {
+        let digits_into = |shape: &Shape, radices: &[u64], first: usize| -> String {
             let mut d = String::new();
+            let parts: Option<Vec<&Shape>> = match shape {
+                Shape::Tuple(es) => Some(es.iter().collect()),
+                Shape::Record(fs) => Some(fs.iter().map(|(_, f)| f).collect()),
+                _ => None,
+            };
+            let fl = FieldLayout::of_shape(shape);
             for (i, c) in radices.iter().enumerate().rev() {
-                write!(d, "R{k}[{}] = q{k} % {c}ULL; q{k} /= {c}ULL; ", i + first).unwrap();
+                match (&fl, &parts) {
+                    (Some(fl), Some(ps)) => {
+                        if tlx_layout::layout::words(ps[i]) == 0 {
+                            write!(d, "q{k} /= {c}ULL; ").unwrap();
+                        } else {
+                            match fl.locs[i] {
+                                FieldLoc::Words(w) => {
+                                    write!(d, "R{k}[{}] = q{k} % {c}ULL; q{k} /= {c}ULL; ", first + w).unwrap();
+                                }
+                                FieldLoc::Bits(pos) => {
+                                    write!(
+                                        d,
+                                        "tlx_bset(R{k}, {}, {}, {}, q{k} % {c}ULL); q{k} /= {c}ULL; ",
+                                        first + pos.word,
+                                        pos.shift,
+                                        pos.bits
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        if tlx_layout::layout::words(shape) > 0 {
+                            write!(d, "R{k}[{}] = q{k} % {c}ULL; q{k} /= {c}ULL; ", first + i).unwrap();
+                        } else {
+                            write!(d, "q{k} /= {c}ULL; ").unwrap();
+                        }
+                    }
+                }
             }
             d
         };
         if elem.is_scalar() {
-            return Ok((1, digits_of(&[elem.cardinality().unwrap_or(1)], 0)));
+            let w = tlx_layout::layout::words(elem).max(1);
+            return Ok((w, digits_into(elem, &[elem.cardinality().unwrap_or(1)], 0)));
         }
         if let Some(r) = crate::lower::flat_radices(elem) {
-            return Ok((r.len(), digits_of(&r, 0)));
+            let w = tlx_layout::layout::words(elem).max(1);
+            let mut d = format!("memset(R{k}, 0, sizeof R{k}); ");
+            d.push_str(&digits_into(elem, &r, 0));
+            return Ok((w, d));
         }
         if let Some(arms) = crate::lower::union_radices(elem) {
-            let w = self.words(self.find_sid(elem)?);
+            let Shape::Union(arm_shapes) = elem else { unreachable!() };
+            let w = self.words(self.find_sid(elem)?).max(1);
             let mut d = format!("memset(R{k}, 0, sizeof R{k}); ");
             for (i, r) in arms.iter().enumerate() {
                 let card: u64 = r.iter().product();
-                write!(d, "if (q{k} < {card}ULL) {{ R{k}[0] = {i}; {}}} else {{ q{k} -= {card}ULL; ", digits_of(r, 1)).unwrap();
+                write!(d, "if (q{k} < {card}ULL) {{ R{k}[0] = {i}; {}}} else {{ q{k} -= {card}ULL; ", digits_into(&arm_shapes[i], r, 1))
+                    .unwrap();
             }
             d.push_str(&"} ".repeat(arms.len()));
             return Ok((w, d));
@@ -371,7 +437,7 @@ impl CGen<'_> {
         if crate::lower::rankable(elem) {
             // Products and unions of those: digits recursively, each part
             // from its own rank.
-            let w = self.words(self.find_sid(elem)?);
+            let w = self.words(self.find_sid(elem)?).max(1);
             let mut d = format!("memset(R{k}, 0, sizeof R{k}); ");
             let mut fresh = 0;
             self.unrank_nested(elem, &format!("q{k}"), 0, k, &mut fresh, &mut d)?;
@@ -388,7 +454,11 @@ impl CGen<'_> {
             format!("q{k}_{fresh}")
         };
         match s {
-            Shape::Int { .. } | Shape::Atom(_) | Shape::Bool => write!(d, "R{k}[{off}] = {q}; ").unwrap(),
+            Shape::Int { .. } | Shape::Atom(_) | Shape::Bool => {
+                if tlx_layout::layout::words(s) > 0 {
+                    write!(d, "R{k}[{off}] = {q}; ").unwrap();
+                }
+            }
             // A set whose rank is its bitset (none: a set over an empty
             // universe has no words).
             Shape::Set { .. } if crate::lower::word_ranked_set(s) => {
@@ -402,17 +472,21 @@ impl CGen<'_> {
                     Shape::Record(fs) => fs.iter().map(|(_, f)| f.clone()).collect(),
                     _ => unreachable!(),
                 };
-                let mut offs = Vec::new();
-                let mut o = off;
-                for p in &parts {
-                    offs.push(o);
-                    o += self.words(self.find_sid(p)?);
-                }
-                for (p, o) in parts.iter().zip(offs).rev() {
+                let fl = FieldLayout::of_shape(s).expect("Tuple or Record");
+                for (p, loc) in parts.iter().zip(fl.locs.iter().copied()).rev() {
                     let Some(c) = p.cardinality() else { return no("unranked part without cardinality") };
                     let v = var(fresh);
                     write!(d, "uint64_t {v} = {q} % {c}ULL; {q} /= {c}ULL; ").unwrap();
-                    self.unrank_nested(p, &v, o, k, fresh, d)?;
+                    match loc {
+                        FieldLoc::Bits(pos) => {
+                            write!(d, "tlx_bset(R{k}, {}, {}, {}, {v}); ", off + pos.word, pos.shift, pos.bits).unwrap();
+                        }
+                        FieldLoc::Words(w) => {
+                            if tlx_layout::layout::words(p) > 0 {
+                                self.unrank_nested(p, &v, off + w, k, fresh, d)?;
+                            }
+                        }
+                    }
                 }
             }
             Shape::Union(arms) => {

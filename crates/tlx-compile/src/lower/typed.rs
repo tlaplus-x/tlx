@@ -280,9 +280,9 @@ impl Lowerer<'_> {
         let (x, bind) = self.share(x);
         let mut vals = Vec::with_capacity(slots.len());
         for k in tlx_value::ops::enumerate_normalized(&dom).ok()? {
-            let (_, off, sh) = slots.iter().find(|(d, _, _)| *d == k)?;
+            let (_, loc, sh) = slots.iter().find(|(d, _, _)| *d == k)?;
             let ssid = self.sid(sh);
-            vals.push(Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: x.clone(), offset: *off }));
+            vals.push(Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: x.clone(), loc: *loc }));
         }
         let mut distinct = Vec::new();
         for (i, a) in vals.iter().enumerate() {
@@ -576,15 +576,15 @@ impl Lowerer<'_> {
                 let Some(Shape::Union(arms)) = self.shape_of(base.ty).cloned() else { return None };
                 let mut r: Option<(i64, i64)> = None;
                 for (arm, e) in arms.iter().zip(entries.iter()) {
-                    let (Shape::Record(fields), Some((off, _))) = (arm, e) else { continue };
-                    let mut at = 0;
+                    let (Shape::Record(fields), Some((loc, _))) = (arm, e) else { continue };
+                    let fl = FieldLayout::of_shapes(fields.iter().map(|(_, fs)| fs));
                     let mut found = None;
-                    for (_, fs) in fields.iter() {
-                        if let (Shape::Int { lo, hi }, true) = (fs, at == *off) {
+                    for ((_, fs), &floc) in fields.iter().zip(fl.locs.iter()) {
+                        if let (Shape::Int { lo, hi }, true) = (fs, floc == *loc) {
                             found = Some((*lo, *hi));
                             break;
                         }
-                        at += self.words_of(fs);
+                        self.sid(fs);
                     }
                     let (lo, hi) = found?;
                     r = Some(r.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
@@ -677,7 +677,7 @@ impl Lowerer<'_> {
         let ints: Vec<usize> = (0..arms.len()).filter(|&i| matches!(arms[i], Shape::Int { .. })).collect();
         let [i] = ints[..] else { return None };
         let asid = self.typing.lookup(&arms[i])?;
-        let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), offset: 1 });
+        let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), loc: FieldLoc::Words(1) });
         let tag = Expr::new(Ty::Int, ExprKind::Rank(x.clone()));
         let fail = Expr::new(Ty::Int, ExprKind::Fail("An integer was expected.".into()));
         Some(Expr::new(Ty::Int, ExprKind::If(eq(tag, int_lit(i as i64)), Expr::new(Ty::Int, ExprKind::Convert(payload)), fail)))
@@ -701,7 +701,7 @@ impl Lowerer<'_> {
         let (i, bind_i) = self.share(i);
         let (u, bind) = self.share(u.clone());
         let tag = Expr::new(Ty::Int, ExprKind::Rank(u.clone()));
-        let payload = Expr::new(Ty::Int, ExprKind::Convert(Expr::new(Ty::Enc(asid), ExprKind::Slice { base: u, offset: 1 })));
+        let payload = Expr::new(Ty::Int, ExprKind::Convert(Expr::new(Ty::Enc(asid), ExprKind::Slice { base: u, loc: FieldLoc::Words(1) })));
         let x = and(vec![eq(tag, int_lit(k as i64)), eq(payload, i)]);
         Some(let_in(bind.into_iter().chain(bind_i), x))
     }

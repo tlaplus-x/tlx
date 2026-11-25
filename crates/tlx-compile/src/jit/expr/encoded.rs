@@ -38,6 +38,7 @@ impl Gen<'_, '_, '_> {
             | ExprKind::BitCard(..)
             | ExprKind::Rank(..)
             | ExprKind::Concat(..)
+            | ExprKind::Pack { .. }
             | ExprKind::BitSet(..)
             | ExprKind::UnionField { .. }
             | ExprKind::UnionFieldInt { .. }

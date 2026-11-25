@@ -36,15 +36,15 @@ impl Lowerer<'_> {
             return None;
         }
         let elem = self.shape_of(ety)?.clone();
+        let slot = SlotLayout::of(&elem);
         let sid = self.sid(&Shape::Seq { elem: Box::new(elem), max_len: cap });
         let t = self.temp(Ty::Enc(esid));
         let all = Expr::new(Ty::Enc(sid), ExprKind::Collect { bind: t, set: src, elem: temp_ref(Ty::Enc(esid), t) });
         let (n, bn) = self.share(n);
         let (all, ba) = self.share(all);
-        let ew = self.words(esid);
         let len = Expr::new(Ty::Int, ExprKind::SeqLen(all.clone()));
         let fits = Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, n.clone(), len));
-        let prefix = Expr::new(Ty::Enc(sid), ExprKind::SeqSub { base: all, lo: int_lit(1), hi: n, elem_words: ew });
+        let prefix = Expr::new(Ty::Enc(sid), ExprKind::SeqSub { base: all, lo: int_lit(1), hi: n, slot });
         let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail(CHOOSE_NONE.into()));
         Some(let_in(ba.into_iter().chain(bn), Expr::new(Ty::Enc(sid), ExprKind::If(fits, prefix, fail))))
     }

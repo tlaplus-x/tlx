@@ -181,7 +181,7 @@ impl Typing {
         }
         let id = self.shapes.len() as ShapeId;
         self.shapes.push(s.clone());
-        self.words.push(words(s) as u32);
+        self.words.push(u32::try_from(words(s)).unwrap_or(u32::MAX));
         self.nodes.push(OnceLock::new());
         self.ids.insert(s.clone(), id);
         id

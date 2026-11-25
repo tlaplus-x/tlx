@@ -27,6 +27,24 @@ use std::collections::HashMap;
 use crate::ir::*;
 use crate::types::Typing;
 
+/// How to update one fixed field inside [`Plan::At`]: word-aligned fields run
+/// any nested plan, whereas packed sub-word bitfields either keep their
+/// existing bits (`None`) or evaluate and insert a scalar expression (`Some`).
+#[derive(Debug)]
+pub enum AtUpdate<'e> {
+    Word { offset: usize, value: Box<Plan<'e>> },
+    Bits { pos: BitPos, value: Option<&'e Expr> },
+}
+
+/// How to update one dynamically indexed slot inside [`Plan::AtIndex`]:
+/// word-aligned slots run any nested plan, whereas packed sub-word slots either
+/// keep their existing bits (`None`) or evaluate and insert a scalar (`Some`).
+#[derive(Debug)]
+pub enum IndexUpdate<'e> {
+    Words { elem_words: usize, value: Box<Plan<'e>> },
+    Bits { bits: u8, value: Option<&'e Expr> },
+}
+
 /// How to compute an encoded expression into a destination of its size.
 #[derive(Debug)]
 pub enum Plan<'e> {
@@ -40,15 +58,15 @@ pub enum Plan<'e> {
     /// Compute `value` into the destination, bind `temp` to the
     /// destination (same encoding), then `body`.
     LetHere { temp: Temp, value: Box<Plan<'e>>, body: Box<Plan<'e>> },
-    /// `base` into the destination, then `value` into its words at `offset`.
-    At { base: Box<Plan<'e>>, offset: u32, value: Box<Plan<'e>> },
-    /// `base` into the destination, then, if `arg` selects a slot (else
-    /// nothing more), `value` into that slot.
-    AtIndex { base: Box<Plan<'e>>, arg: &'e Expr, map: &'e IndexMap, elem_words: u32, value: Box<Plan<'e>> },
+    /// `base` into the destination, then apply `update` to one fixed field.
+    At { base: Box<Plan<'e>>, update: AtUpdate<'e> },
+    /// `base` into the destination, then evaluate `arg` and, if it selects a
+    /// slot (else nothing more), apply `update` to that slot.
+    AtIndex { base: Box<Plan<'e>>, arg: &'e Expr, map: &'e IndexMap, update: IndexUpdate<'e> },
     /// Either plan, by a boolean condition.
     If { cond: &'e Expr, then: Box<Plan<'e>>, els: Box<Plan<'e>> },
     /// Parts at consecutive word offsets.
-    Concat(Vec<(u32, Plan<'e>)>),
+    Concat(Vec<(usize, Plan<'e>)>),
     /// `set` (a sorted-array set) into the destination, then insert `elem`
     /// in place (more than `max_card` elements: runtime error).
     Insert { set: Box<Plan<'e>>, elem: &'e Expr, elem_words: u32, max_card: u32 },
@@ -106,18 +124,30 @@ enum Root {
 
 #[derive(Clone, Debug)]
 enum Step<'e> {
-    Off(u32),
-    Idx(&'e Expr, &'e IndexMap, u32),
+    Off(usize),
+    Bits(BitPos),
+    Idx(&'e Expr, &'e IndexMap, SlotLayout),
 }
 
 impl<'e> Path<'e> {
     fn push(mut self, s: Step<'e>) -> Path<'e> {
         match (self.steps.last_mut(), &s) {
-            (Some(Step::Off(a)), Step::Off(b)) => *a += b,
+            (Some(Step::Off(a)), Step::Off(b)) => *a = a.saturating_add(*b),
+            (Some(last @ Step::Off(_)), Step::Bits(p)) => {
+                let Step::Off(a) = *last else { unreachable!() };
+                *last = Step::Bits(p.offset_words(a));
+            }
             (_, Step::Off(0)) => {}
             _ => self.steps.push(s),
         }
         self
+    }
+
+    fn push_loc(self, loc: FieldLoc) -> Path<'e> {
+        match loc {
+            FieldLoc::Words(w) => self.push(Step::Off(w)),
+            FieldLoc::Bits(p) => self.push(Step::Bits(p)),
+        }
     }
 }
 
@@ -139,13 +169,27 @@ struct Planner<'e, 't> {
 }
 
 impl<'e> Planner<'e, '_> {
+    /// Whether `e` already equals the value stored at `holds`.
+    fn is_kept(&self, e: &'e Expr, holds: Option<&Path<'e>>) -> bool {
+        matches!((holds, self.path_of(e)), (Some(h), Some(p)) if self.same_path(h, &p))
+    }
+
+    /// Plan a packed bitfield scalar value: `None` when the destination already
+    /// holds it, else `Some(e)` after checking aliasing and counting the write.
+    fn plan_bits(&mut self, e: &'e Expr, holds: Option<&Path<'e>>) -> Option<Option<&'e Expr>> {
+        if self.is_kept(e, holds) {
+            return Some(None);
+        }
+        self.check(e)?;
+        self.st.writes += 1;
+        Some(Some(e))
+    }
+
     /// Plan `e` into a destination holding `holds` (None: unknown); None if
     /// no valid plan exists from the current state (the caller falls back).
     fn plan(&mut self, e: &'e Expr, holds: Option<&Path<'e>>) -> Option<Plan<'e>> {
-        if let (Some(h), Some(p)) = (holds, self.path_of(e)) {
-            if self.same_path(h, &p) {
-                return Some(Plan::Keep);
-            }
+        if self.is_kept(e, holds) {
+            return Some(Plan::Keep);
         }
         let saved = self.st.clone();
         if let Some(p) = self.node(e, holds) {
@@ -189,27 +233,33 @@ impl<'e> Planner<'e, '_> {
                 let b = self.plan(body, holds)?;
                 Some(Plan::Let { temp: *temp, value, body: Box::new(b) })
             }
-            ExprKind::ExceptAt { base, offset, value } => {
+            ExprKind::ExceptAt { base, loc, value } => {
                 if !matches!(e.ty, Ty::Enc(_)) || !matches!(value.ty, Ty::Enc(_)) {
                     return None;
                 }
                 let (b, inner) = self.base(base, holds)?;
-                let inner = inner.map(|p| p.push(Step::Off(*offset)));
-                let v = self.plan(value, inner.as_ref())?;
-                Some(Plan::At { base: Box::new(b), offset: *offset, value: Box::new(v) })
+                let inner = inner.map(|p| p.push_loc(*loc));
+                let update = match *loc {
+                    FieldLoc::Words(offset) => AtUpdate::Word { offset, value: Box::new(self.plan(value, inner.as_ref())?) },
+                    FieldLoc::Bits(pos) => AtUpdate::Bits { pos, value: self.plan_bits(value, inner.as_ref())? },
+                };
+                Some(Plan::At { base: Box::new(b), update })
             }
-            ExprKind::ExceptIndex { base, arg, map, elem_words, value } => {
+            ExprKind::ExceptIndex { base, arg, map, slot, value } => {
                 if !matches!(e.ty, Ty::Enc(_)) || !matches!(value.ty, Ty::Enc(_)) {
                     return None;
                 }
                 let (b, inner) = self.base(base, holds)?;
                 self.check(arg)?;
-                let inner = inner.map(|p| p.push(Step::Idx(arg, map, *elem_words)));
+                let inner = inner.map(|p| p.push(Step::Idx(arg, map, *slot)));
                 // The value is computed only if the slot exists.
                 let before = self.st.clone();
-                let v = self.plan(value, inner.as_ref())?;
+                let update = match *slot {
+                    SlotLayout::Words(elem_words) => IndexUpdate::Words { elem_words, value: Box::new(self.plan(value, inner.as_ref())?) },
+                    SlotLayout::Bits(bits) => IndexUpdate::Bits { bits, value: self.plan_bits(value, inner.as_ref())? },
+                };
                 self.join(&before);
-                Some(Plan::AtIndex { base: Box::new(b), arg, map, elem_words: *elem_words, value: Box::new(v) })
+                Some(Plan::AtIndex { base: Box::new(b), arg, map, update })
             }
             ExprKind::If(c, t, f) => {
                 if t.ty != e.ty || f.ty != e.ty {
@@ -225,10 +275,10 @@ impl<'e> Planner<'e, '_> {
             }
             ExprKind::Concat(xs) => {
                 let mut parts = Vec::with_capacity(xs.len());
-                let mut off = 0u32;
+                let mut off = 0usize;
                 for x in xs {
                     let Ty::Enc(sid) = x.ty else { return None };
-                    let w = (self.words)(sid);
+                    let w = (self.words)(sid) as usize;
                     let h = holds.map(|h| h.clone().push(Step::Off(off)));
                     parts.push((off, self.plan(x, h.as_ref())?));
                     off += w;
@@ -306,8 +356,8 @@ impl<'e> Planner<'e, '_> {
             },
             ExprKind::Var(v) => Some(Path { root: Root::Var(*v), steps: Vec::new() }),
             ExprKind::NextVar(v) => Some(Path { root: Root::Next(*v), steps: Vec::new() }),
-            ExprKind::Slice { base, offset } => Some(self.path_of(base)?.push(Step::Off(*offset))),
-            ExprKind::Index { base, arg, map, elem_words } => Some(self.path_of(base)?.push(Step::Idx(arg, map, *elem_words))),
+            ExprKind::Slice { base, loc } => Some(self.path_of(base)?.push_loc(*loc)),
+            ExprKind::Index { base, arg, map, slot } => Some(self.path_of(base)?.push(Step::Idx(arg, map, *slot))),
             _ => None,
         }
     }
@@ -317,6 +367,7 @@ impl<'e> Planner<'e, '_> {
             && a.steps.len() == b.steps.len()
             && a.steps.iter().zip(&b.steps).all(|(x, y)| match (x, y) {
                 (Step::Off(i), Step::Off(j)) => i == j,
+                (Step::Bits(i), Step::Bits(j)) => i == j,
                 (Step::Idx(a1, m1, w1), Step::Idx(a2, m2, w2)) => w1 == w2 && m1 == m2 && self.same(a1, a2),
                 _ => false,
             })
@@ -335,7 +386,7 @@ impl<'e> Planner<'e, '_> {
             (ExprKind::Const(x), ExprKind::Const(y)) => x == y,
             (ExprKind::ConstWords(x), ExprKind::ConstWords(y)) => x == y,
             (ExprKind::Convert(x), ExprKind::Convert(y)) | (ExprKind::Rank(x), ExprKind::Rank(y)) => self.same(x, y),
-            (ExprKind::UnionField { base: x, offsets: o1 }, ExprKind::UnionField { base: y, offsets: o2 }) => o1 == o2 && self.same(x, y),
+            (ExprKind::UnionField { base: x, locs: o1 }, ExprKind::UnionField { base: y, locs: o2 }) => o1 == o2 && self.same(x, y),
             (ExprKind::UnionFieldInt { base: x, entries: e1 }, ExprKind::UnionFieldInt { base: y, entries: e2 }) => {
                 e1 == e2 && self.same(x, y)
             }
@@ -374,12 +425,12 @@ mod tests {
         Expr::new(Ty::Enc(1), ExprKind::ConstWords(vec![c].into()))
     }
 
-    fn at(base: Expr, offset: u32, value: Expr) -> Expr {
-        Expr::new(base.ty, ExprKind::ExceptAt { base, offset, value })
+    fn at(base: Expr, offset: usize, value: Expr) -> Expr {
+        Expr::new(base.ty, ExprKind::ExceptAt { base, loc: FieldLoc::Words(offset), value })
     }
 
-    fn slice(base: Expr, offset: u32, sid: ShapeId) -> Expr {
-        Expr::new(Ty::Enc(sid), ExprKind::Slice { base, offset })
+    fn slice(base: Expr, offset: usize, sid: ShapeId) -> Expr {
+        Expr::new(Ty::Enc(sid), ExprKind::Slice { base, loc: FieldLoc::Words(offset) })
     }
 
     fn let_(temp: Temp, value: Expr, body: Expr) -> Expr {
@@ -393,22 +444,61 @@ mod tests {
         let p = plan_with(&e, &words);
         let Plan::LetHere { value, body, .. } = &p else { panic!("{p:?}") };
         assert!(
-            matches!(&**value, Plan::At { base, value, .. } if matches!(**base, Plan::Copy(_)) && matches!(**value, Plan::Copy(_))),
+            matches!(
+                &**value,
+                Plan::At { base, update: AtUpdate::Word { offset: 0, value } }
+                    if matches!(**base, Plan::Copy(_)) && matches!(**value, Plan::Copy(_))
+            ),
             "{p:?}"
         );
-        assert!(matches!(&**body, Plan::At { base, offset: 1, .. } if matches!(**base, Plan::Keep)), "{p:?}");
+        assert!(matches!(&**body, Plan::At { base, update: AtUpdate::Word { offset: 1, .. } } if matches!(**base, Plan::Keep)), "{p:?}");
     }
 
     #[test]
     fn nested_path_updates_its_slot_in_place() {
         // [x EXCEPT !.f.g = a] with x.f two words at offset 1.
         let inner = at(slice(var(0), 1, 2), 1, word(7));
-        let e = Expr::new(Ty::Enc(0), ExprKind::ExceptAt { base: var(0), offset: 1, value: inner });
+        let e = Expr::new(Ty::Enc(0), ExprKind::ExceptAt { base: var(0), loc: FieldLoc::Words(1), value: inner });
         let p = plan_with(&e, &words);
-        let Plan::At { base, offset: 1, value } = &p else { panic!("{p:?}") };
+        let Plan::At { base, update: AtUpdate::Word { offset: 1, value } } = &p else { panic!("{p:?}") };
         assert!(matches!(**base, Plan::Copy(_)));
         assert!(
-            matches!(&**value, Plan::At { base, offset: 1, value } if matches!(**base, Plan::Keep) && matches!(**value, Plan::Copy(_))),
+            matches!(
+                &**value,
+                Plan::At { base, update: AtUpdate::Word { offset: 1, value } }
+                    if matches!(**base, Plan::Keep) && matches!(**value, Plan::Copy(_))
+            ),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn chained_bitfield_updates_share_word_in_place() {
+        let pos_a = BitPos::new(0, 63, 1);
+        let pos_b = BitPos::new(0, 60, 3);
+        let e1 = Expr::new(Ty::Enc(0), ExprKind::ExceptAt { base: var(0), loc: FieldLoc::Bits(pos_a), value: word(1) });
+        let e2 = Expr::new(Ty::Enc(0), ExprKind::ExceptAt { base: temp(0, 0), loc: FieldLoc::Bits(pos_b), value: word(5) });
+        let e = let_(0, e1, e2);
+        let p = plan_with(&e, &words);
+        let Plan::LetHere { value, body, .. } = &p else { panic!("{p:?}") };
+        assert!(matches!(
+            &**value,
+            Plan::At { base, update: AtUpdate::Bits { pos, value: Some(_) } } if *pos == pos_a && matches!(**base, Plan::Copy(_))
+        ));
+        assert!(matches!(
+            &**body,
+            Plan::At { base, update: AtUpdate::Bits { pos, value: Some(_) } } if *pos == pos_b && matches!(**base, Plan::Keep)
+        ));
+    }
+
+    #[test]
+    fn identity_bitfield_updates_are_kept_without_writing() {
+        let pos_a = BitPos::new(0, 63, 1);
+        let same_a = Expr::new(Ty::Enc(1), ExprKind::Slice { base: var(0), loc: FieldLoc::Bits(pos_a) });
+        let e = Expr::new(Ty::Enc(0), ExprKind::ExceptAt { base: var(0), loc: FieldLoc::Bits(pos_a), value: same_a });
+        let p = plan_with(&e, &words);
+        assert!(
+            matches!(&p, Plan::At { base, update: AtUpdate::Bits { pos, value: None } } if *pos == pos_a && matches!(**base, Plan::Copy(_))),
             "{p:?}"
         );
     }

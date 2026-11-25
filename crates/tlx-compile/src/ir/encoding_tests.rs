@@ -70,3 +70,33 @@ fn recode_checks_tags_ranges_and_missing_entries() {
     let empty = RecodeTable { table: &[], ..scalar };
     assert_eq!(empty.lookup(|_| 0), None);
 }
+
+#[test]
+fn union_loc_descriptor_encodes_missing_word_and_packed_fields() {
+    use tlx_layout::pack::{BitPos, FieldLoc};
+
+    assert_eq!(union_loc_desc(None), Some(UNION_DESC_MISSING));
+    // Whole word at arm offset 0 sits at union payload word 1, shift 0, trim 0.
+    assert_eq!(union_loc_desc(Some(FieldLoc::Words(0))), Some(1 << UNION_DESC_WORD_SHIFT));
+    // Packed bitfield at word 0 and shift 0 (e.g. 5 low bits): non-negative, word 1, shift 0, trim 59.
+    let zero_shift = union_loc_desc(Some(FieldLoc::Bits(BitPos::new(0, 0, 5)))).unwrap();
+    assert_eq!(zero_shift, (1 << UNION_DESC_WORD_SHIFT) | (64 - 5));
+    assert!(zero_shift >= 0);
+    // Packed bitfield at non-zero word and shift: word 3, shift 60, trim 60 (4 bits).
+    let packed = union_loc_desc(Some(FieldLoc::Bits(BitPos::new(2, 60, 4)))).unwrap();
+    assert_eq!(packed, (3 << UNION_DESC_WORD_SHIFT) | (60 << UNION_DESC_BIT_SHIFT) | (64 - 4));
+    // Decoding mirrors the C and JIT extraction formulas.
+    let decode = |u: &[u64], d: i64| -> u64 {
+        let w = u[(d as u64 >> UNION_DESC_WORD_SHIFT) as usize];
+        let sh = ((d >> UNION_DESC_BIT_SHIFT) & UNION_DESC_FIELD_MASK) as u32;
+        let trim = (d & UNION_DESC_FIELD_MASK) as u32;
+        (w >> sh) & (u64::MAX >> trim)
+    };
+    assert_eq!(decode(&[0, 0xdead_beef_cafe_babe], union_loc_desc(Some(FieldLoc::Words(0))).unwrap()), 0xdead_beef_cafe_babe);
+    assert_eq!(decode(&[0, 0xffff_ffff_ffff_ff15], zero_shift), 0x15);
+    assert_eq!(decode(&[0, 0, 0, 0x9000_0000_0000_0000], packed), 0x9);
+    // Out-of-range word offset is rejected rather than silently wrapped.
+    let too_wide = (i64::MAX >> UNION_DESC_WORD_SHIFT) as usize;
+    assert_eq!(union_loc_desc(Some(FieldLoc::Words(too_wide))), None);
+    assert_eq!(union_loc_desc(Some(FieldLoc::Bits(BitPos::new(too_wide, 0, 1)))), None);
+}

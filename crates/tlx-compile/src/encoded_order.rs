@@ -88,16 +88,37 @@ fn model_union(arms: &[Shape]) -> bool {
         && !matches!(rest, Shape::Atom(_) | Shape::Union(_) | Shape::Dyn | Shape::Never))
 }
 
+/// Word-aligned child of a `PRODUCT` or `UNION` ordering plan.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    /// A single `u64` word of packed MSB-first scalars (compared directly via `WORDS`).
+    PackedWord,
+    /// A word-aligned child shape.
+    Shape(&'a Shape),
+}
+
+fn product_parts<'a>(shapes: impl IntoIterator<Item = &'a Shape>) -> Vec<Part<'a>> {
+    let shapes: Vec<&'a Shape> = shapes.into_iter().collect();
+    let fl = layout::FieldLayout::of_shapes(shapes.iter().copied());
+    fl.word_groups()
+        .iter()
+        .map(|g| match g {
+            layout::FieldGroup::Word { index, .. } => Part::Shape(shapes[*index]),
+            layout::FieldGroup::Packed { .. } => Part::PackedWord,
+        })
+        .collect()
+}
+
 /// The wire opcode and children, shared by construction and validation.
-fn node_parts(s: &Shape) -> Option<(u64, Vec<&Shape>)> {
+fn node_parts(s: &Shape) -> Option<(u64, Vec<Part<'_>>)> {
     Some(match s {
         _ if order_safe(s) => (WORDS, vec![]),
         Shape::Set { elem, .. } if elem.is_scalar() && layout::bitset_universe(elem).is_some_and(|n| n <= 64) => (SET, vec![]),
-        Shape::Record(fs) => (PRODUCT, fs.iter().map(|(_, s)| s).collect()),
-        Shape::Tuple(es) => (PRODUCT, es.iter().collect()),
+        Shape::Record(fs) => (PRODUCT, product_parts(fs.iter().map(|(_, s)| s))),
+        Shape::Tuple(es) => (PRODUCT, product_parts(es.iter())),
         // One slot per domain element, in the shape's domain order.
-        Shape::Fcn { dom, range } => (PRODUCT, vec![&**range; dom.len()]),
-        Shape::Union(arms) if homogeneous(arms) || model_union(arms) => (UNION, arms.iter().collect()),
+        Shape::Fcn { dom, range } => (PRODUCT, product_parts(std::iter::repeat_n(&**range, dom.len()))),
+        Shape::Union(arms) if homogeneous(arms) || model_union(arms) => (UNION, arms.iter().map(Part::Shape).collect()),
         _ => return None,
     })
 }
@@ -105,18 +126,26 @@ fn node_parts(s: &Shape) -> Option<(u64, Vec<&Shape>)> {
 /// Only plans whose comparisons cannot raise a TLC incomparable-value error.
 /// Collections with unknown element order stay boxed.
 pub(crate) fn plan(s: &Shape) -> Option<Arc<[u64]>> {
-    fn node(s: &Shape, out: &mut Vec<u64>) -> Option<()> {
-        let start = out.len();
-        let (op, children) = node_parts(s)?;
-        out.extend([op, layout::words(s) as u64, 0, children.len() as u64]);
-        for c in children {
-            node(c, out)?;
+    fn node(p: Part<'_>, out: &mut Vec<u64>) -> Option<()> {
+        match p {
+            Part::PackedWord => {
+                out.extend([WORDS, 1, HEADER as u64, 0]);
+                Some(())
+            }
+            Part::Shape(s) => {
+                let start = out.len();
+                let (op, children) = node_parts(s)?;
+                out.extend([op, layout::words(s) as u64, 0, children.len() as u64]);
+                for c in children {
+                    node(c, out)?;
+                }
+                out[start + SPAN] = (out.len() - start) as u64;
+                Some(())
+            }
         }
-        out[start + SPAN] = (out.len() - start) as u64;
-        Some(())
     }
     let mut out = vec![];
-    node(s, &mut out)?;
+    node(Part::Shape(s), &mut out)?;
     Some(out.into())
 }
 
@@ -128,15 +157,21 @@ pub(crate) struct CheckedPlan<'a> {
 
 impl<'a> CheckedPlan<'a> {
     pub(crate) fn new(plan: &'a [u64], elem: &Shape) -> Result<Self, &'static str> {
-        fn node(plan: &[u64], shape: &Shape) -> Result<usize, &'static str> {
+        fn node(plan: &[u64], part: Part<'_>) -> Result<usize, &'static str> {
             let header = plan.get(..HEADER).ok_or("ordered iteration plan too short")?;
             let span = usize::try_from(header[SPAN]).map_err(|_| "ordered iteration plan length overflow")?;
             let plan = plan.get(..span).filter(|_| span >= HEADER).ok_or("ordered iteration plan length mismatch")?;
-            let (opcode, children) = node_parts(shape).ok_or("ordered iteration shape has no ordering plan")?;
+            let (opcode, expected_width, children) = match part {
+                Part::PackedWord => (WORDS, 1usize, Vec::new()),
+                Part::Shape(shape) => {
+                    let (op, ch) = node_parts(shape).ok_or("ordered iteration shape has no ordering plan")?;
+                    (op, layout::words(shape), ch)
+                }
+            };
             if header[OPCODE] != opcode {
                 return Err("ordered iteration plan opcode mismatch");
             }
-            if header[WIDTH] != layout::words(shape) as u64 {
+            if header[WIDTH] != expected_width as u64 {
                 return Err("ordered iteration plan width mismatch");
             }
             if header[CHILDREN] != children.len() as u64 {
@@ -167,7 +202,7 @@ impl<'a> CheckedPlan<'a> {
             }
             Ok(span)
         }
-        let root = node(plan, elem)?;
+        let root = node(plan, Part::Shape(elem))?;
         let keys = &plan[root..];
         let ranks = layout::bitset_universe(elem).unwrap_or(0);
         if keys.len() as u64 != ranks {
@@ -380,6 +415,20 @@ mod tests {
         let union = Shape::Union(Arc::from(vec![rec("i"), rec("j")]));
         assert!(order_safe(&union));
         assert_plan_matches_tlc(&union);
+    }
+
+    #[test]
+    fn mixed_packed_scalars_and_sets_follow_tlc_order() {
+        let set = Shape::Set { elem: Box::new(Shape::Int { lo: 1, hi: 3 }), max_card: 3 };
+        let shape = Shape::Record(Arc::from(vec![
+            (Sym::new("a"), Shape::Bool),
+            (Sym::new("b"), Shape::Int { lo: 0, hi: 2 }),
+            (Sym::new("s"), set),
+            (Sym::new("c"), Shape::Bool),
+        ]));
+        assert!(!order_safe(&shape));
+        assert_eq!(layout::words(&shape), 3);
+        assert_plan_matches_tlc(&shape);
     }
 
     #[test]

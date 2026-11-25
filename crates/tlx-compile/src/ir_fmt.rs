@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 
-use crate::ir::{Expr, ExprKind, Stmt, Ty};
+use crate::ir::{Expr, ExprKind, FieldLoc, SlotLayout, Stmt, Ty};
 
 fn ty(t: Ty) -> String {
     match t {
@@ -11,6 +11,20 @@ fn ty(t: Ty) -> String {
         Ty::Int => "int".into(),
         Ty::Enc(s) => format!("#{s}"),
         Ty::Val => "val".into(),
+    }
+}
+
+fn fmt_loc(loc: FieldLoc) -> String {
+    match loc {
+        FieldLoc::Words(w) => format!("@{w}"),
+        FieldLoc::Bits(p) => format!("@{}:{}+{}", p.word, p.shift, p.bits),
+    }
+}
+
+fn fmt_slot(slot: SlotLayout) -> String {
+    match slot {
+        SlotLayout::Words(w) => format!("w{w}"),
+        SlotLayout::Bits(b) => format!("b{b}"),
     }
 }
 
@@ -23,9 +37,10 @@ pub(crate) fn label(e: &Expr) -> String {
         Var(v) => format!("var {v}"),
         NextVar(v) => format!("var' {v}"),
         Temp(t) => format!("t{t}"),
-        Slice { offset, .. } => format!("slice @{offset}"),
-        Index { elem_words, .. } => format!("index w{elem_words}"),
-        ExceptAt { offset, .. } => format!("except @{offset}"),
+        Slice { loc, .. } => format!("slice {}", fmt_loc(*loc)),
+        Index { slot, .. } => format!("index {}", fmt_slot(*slot)),
+        ExceptAt { loc, .. } => format!("except {}", fmt_loc(*loc)),
+        Pack { parts, .. } => format!("pack x{}", parts.len()),
         Exists { bind, .. } => format!("exists t{bind}"),
         Forall { bind, .. } => format!("forall t{bind}"),
         Choose { bind, .. } => format!("choose t{bind}"),

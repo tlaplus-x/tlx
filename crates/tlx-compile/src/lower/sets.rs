@@ -59,7 +59,7 @@ impl Lowerer<'_> {
         if a != b || !self.is_bitset(x.ty) {
             return None;
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x.clone(), offset: 0 }))
+        Some(Expr::new(Ty::Enc(sid), ExprKind::Slice { base: x.clone(), loc: FieldLoc::Words(0) }))
     }
 
     /// `x`, a bitset that may hold up to `bound` elements (None: any number),
@@ -221,17 +221,16 @@ impl Lowerer<'_> {
         }
         match s {
             Shape::Tuple(_) | Shape::Record(_) => {
+                let fl = FieldLayout::of_shape(s)?;
                 let parts: Vec<Shape> = match s {
                     Shape::Tuple(es) => es.to_vec(),
                     Shape::Record(fs) => fs.iter().map(|(_, f)| f.clone()).collect(),
                     _ => unreachable!(),
                 };
                 let mut acc: Option<Expr> = None;
-                let mut off = 0u32;
-                for p in &parts {
+                for (p, &loc) in parts.iter().zip(fl.locs.iter()) {
                     let psid = self.sid(p);
-                    let slot = Expr::new(Ty::Enc(psid), ExprKind::Slice { base: x.clone(), offset: off });
-                    off += self.words(psid);
+                    let slot = Expr::new(Ty::Enc(psid), ExprKind::Slice { base: x.clone(), loc });
                     let r = self.nested_rank(slot, p)?;
                     let c = p.cardinality()? as i64;
                     acc = Some(match acc {
@@ -251,7 +250,7 @@ impl Lowerer<'_> {
                 for (i, a) in arms.iter().enumerate().rev() {
                     base -= a.cardinality()? as i64;
                     let asid = self.sid(a);
-                    let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), offset: 1 });
+                    let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), loc: FieldLoc::Words(1) });
                     let r = self.nested_rank(payload, a)?;
                     let r = Expr::new(Ty::Int, ExprKind::IntBin(IntOp::Add, int_lit(base), r));
                     out = Expr::new(Ty::Int, ExprKind::If(eq(tag.clone(), int_lit(i as i64)), r, out));
@@ -447,16 +446,17 @@ impl Lowerer<'_> {
         let pair = Shape::Tuple(vec![(*ea).clone(), (*eb).clone()].into());
         // `bitset_universe` already refuses a product beyond the bitset limit.
         let n = bitset_universe(&pair)?;
+        let fl = FieldLayout::of_shape(&pair)?;
         let psid = self.sid(&pair);
         let rsid = self.sid(&Shape::Set { elem: Box::new(pair), max_card: n as usize });
         let (esid, fsid) = (self.sid(&ea), self.sid(&eb));
-        let (nw, w) = (self.words(rsid), self.words(esid));
+        let nw = self.words(rsid);
         let (xs, bx) = self.share(x);
         let (ys, by) = self.share(y);
         let t = self.temp(Ty::Enc(psid));
-        let slot = |off: u32, sid| Expr::new(Ty::Enc(sid), ExprKind::Slice { base: temp_ref(Ty::Enc(psid), t), offset: off });
-        let r0 = self.bit_rank(&xs, &slot(0, esid))?;
-        let r1 = self.bit_rank(&ys, &slot(w, fsid))?;
+        let slot = |loc: FieldLoc, sid| Expr::new(Ty::Enc(sid), ExprKind::Slice { base: temp_ref(Ty::Enc(psid), t), loc });
+        let r0 = self.bit_rank(&xs, &slot(fl.locs[0], esid))?;
+        let r1 = self.bit_rank(&ys, &slot(fl.locs[1], fsid))?;
         let m0 = Expr::new(Ty::Bool, ExprKind::BitMember { set: xs, rank: r0 });
         let m1 = Expr::new(Ty::Bool, ExprKind::BitMember { set: ys, rank: r1 });
         let mut full = vec![0u64; nw as usize];
@@ -1040,11 +1040,11 @@ impl Lowerer<'_> {
         let Some(Shape::Seq { elem, .. }) = self.shape_of(s.ty).cloned() else { return None };
         let op = self.op_arg(test, env).ok()?;
         let esid = self.sid(&elem);
-        let ew = self.words_of(&elem);
+        let slot = SlotLayout::of(&elem);
         let t = self.temp(Ty::Enc(esid));
         let pred = self.apply_op_to(&op, temp_ref(Ty::Enc(esid), t), env, st)?;
         let ty = s.ty;
-        Some(Expr::new(ty, ExprKind::SeqFilter { bind: t, seq: s, pred: to_bool(pred), elem_words: ew }))
+        Some(Expr::new(ty, ExprKind::SeqFilter { bind: t, seq: s, pred: to_bool(pred), slot }))
     }
 
     /// A one-argument operator (argument) applied to a lowered value.

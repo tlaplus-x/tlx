@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use tlx_eval::env::Env;
+pub use tlx_layout::layout::{BitPos, FieldLayout, FieldLoc, SlotLayout};
 use tlx_sema::hir;
 use tlx_value::plan::Absent;
 use tlx_value::Value;
@@ -228,24 +229,25 @@ pub enum ExprKind {
     ValField(Expr, tlx_value::Sym),
 
     // ---- encoded (layout) operations ----
-    /// Sub-encoding at a fixed word offset (record field, constant function
-    /// argument); `ty` is the field's `Enc` type.
+    /// Sub-encoding at a fixed word or bit location (record field, constant
+    /// function argument); `ty` is the field's `Enc` type.
     Slice {
         base: Expr,
-        offset: u32,
+        loc: FieldLoc,
     },
-    /// `f[arg]` on an encoded function/tuple with homogeneous slots of
-    /// `elem_words` words; out of domain = runtime error.
+    /// `f[arg]` on an encoded function/tuple with homogeneous slots; out of
+    /// domain = runtime error.
     Index {
         base: Expr,
         arg: Expr,
         map: IndexMap,
-        elem_words: u32,
+        slot: SlotLayout,
     },
-    /// `[f EXCEPT ![k] = v]` at a fixed offset (`v` already has the slot's type).
+    /// `[f EXCEPT ![k] = v]` at a fixed word or bit location (`v` already has
+    /// the slot's type).
     ExceptAt {
         base: Expr,
-        offset: u32,
+        loc: FieldLoc,
         value: Expr,
     },
     /// `[f EXCEPT ![arg] = v]` with a computed slot.
@@ -253,7 +255,7 @@ pub enum ExprKind {
         base: Expr,
         arg: Expr,
         map: IndexMap,
-        elem_words: u32,
+        slot: SlotLayout,
         value: Expr,
     },
     /// Membership of an element given by its rank in a bitset of `ty`'s set shape.
@@ -267,8 +269,14 @@ pub enum ExprKind {
     BitCard(Expr),
     /// Rank of an encoded scalar within its shape (Int: v - lo, Atom/Bool: the word).
     Rank(Expr),
-    /// Concatenation of encodings (record/tuple construction; `ty` is the result).
+    /// Concatenation of word-aligned encodings (`ty` is the result).
     Concat(Vec<Expr>),
+    /// Packed composite construction: zero-initializes the result words of
+    /// `ty` and stores each part at `locs[i]`.
+    Pack {
+        locs: Arc<[FieldLoc]>,
+        parts: Vec<Expr>,
+    },
     /// Bitset with the given element ranks set (set construction); `ty` is the set.
     BitSet(Vec<Expr>),
     /// `Len(s)` of an encoded sequence.
@@ -277,19 +285,19 @@ pub enum ExprKind {
     SeqIndex {
         base: Expr,
         arg: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
     },
     /// `Tail(s)` (error if empty).
     SeqTail {
         base: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
     },
     /// `Append(s, x)` (`x` in the element encoding; error if the layout's
     /// maximum length would be exceeded).
     SeqAppend {
         base: Expr,
         value: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
         max_len: u32,
     },
     /// `SubSeq(base, lo, hi)` (same sequence encoding as `base`).
@@ -297,7 +305,7 @@ pub enum ExprKind {
         base: Expr,
         lo: Expr,
         hi: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
     },
     /// `a \cup b` / `a \cap b` / `a \ b` for sorted-array sets of the
     /// node's encoding (a merge).
@@ -313,27 +321,27 @@ pub enum ExprKind {
         bind: Temp,
         seq: Expr,
         pred: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
     },
     /// `a \o b` (both in the node's sequence encoding).
     SeqConcat {
         a: Expr,
         b: Expr,
-        elem_words: u32,
+        slot: SlotLayout,
         max_len: u32,
     },
-    /// Field of a union of records: `offsets[arm]` is the field's offset
+    /// Field of a union of records: `locs[arm]` is the field's location
     /// within that arm's encoding (None = arm has no such field: error).
     /// `ty` is the field's (common) encoded type.
     UnionField {
         base: Expr,
-        offsets: Arc<[Option<u32>]>,
+        locs: Arc<[Option<FieldLoc>]>,
     },
     /// Integer field of a union of records whose arms encode it with
-    /// different ranges: per arm (offset, lo).
+    /// different ranges: per arm (location, lo).
     UnionFieldInt {
         base: Expr,
-        entries: Arc<[Option<(u32, i64)>]>,
+        entries: Arc<[Option<(FieldLoc, i64)>]>,
     },
     /// A sorted-array set iterated in TLC order, keeping elements encoded.
     OrderedSet {
@@ -672,6 +680,7 @@ impl Expr {
             | Or(xs)
             | Tuple(xs)
             | Concat(xs)
+            | Pack { parts: xs, .. }
             | BitSet(xs)
             | ValOp { args: xs, .. }
             | RefOp { args: xs, .. }
@@ -771,6 +780,7 @@ impl Expr {
             | Or(xs)
             | Tuple(xs)
             | Concat(xs)
+            | Pack { parts: xs, .. }
             | BitSet(xs)
             | ValOp { args: xs, .. }
             | RefOp { args: xs, .. }

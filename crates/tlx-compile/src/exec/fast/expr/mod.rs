@@ -803,6 +803,7 @@ impl<'c> Compiler<'c> {
             | ExprKind::ExceptAt { .. }
             | ExprKind::ExceptIndex { .. }
             | ExprKind::Concat { .. }
+            | ExprKind::Pack { .. }
             | ExprKind::Rank { .. }
             | ExprKind::Recode { .. }
             | ExprKind::RankUnion { .. }

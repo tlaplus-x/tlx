@@ -542,10 +542,10 @@ impl Lowerer<'_> {
                     }
                     let len_ok = eq(Expr::new(Ty::Int, ExprKind::SeqLen(x.clone())), int_lit(n));
                     let esid = self.sid(elem);
-                    let ew = self.words_of(elem);
+                    let slot = SlotLayout::of(elem);
                     let mut parts = vec![len_ok];
                     for i in 1..=n {
-                        let xi = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: int_lit(i), elem_words: ew });
+                        let xi = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: int_lit(i), slot });
                         parts.push(self.member_any(&xi, esid, range, depth + 1)?);
                     }
                     Some(and_all(parts))
@@ -554,12 +554,11 @@ impl Lowerer<'_> {
                     // \A i \in 1..Len(x) : x[i] \in T
                     Shape::Seq { elem, .. } => {
                         let esid = self.sid(elem);
-                        let ew = self.words_of(elem);
+                        let slot = SlotLayout::of(elem);
                         let i = self.temp(Ty::Int);
                         let len = Expr::new(Ty::Int, ExprKind::SeqLen(x.clone()));
                         let range = Expr::new(Ty::Val, ExprKind::IntRange(int_lit(1), len));
-                        let xi =
-                            Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: temp_ref(Ty::Int, i), elem_words: ew });
+                        let xi = Expr::new(Ty::Enc(esid), ExprKind::SeqIndex { base: x.clone(), arg: temp_ref(Ty::Int, i), slot });
                         let body = self.member_any(&xi, esid, t, depth + 1)?;
                         Some(Expr::new(Ty::Bool, ExprKind::Forall { bind: i, set: range, body }))
                     }
@@ -683,7 +682,7 @@ impl Lowerer<'_> {
         let mut alts = Vec::new();
         for (i, arm) in arms.iter().enumerate() {
             let asid = self.sid(arm);
-            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), offset: 1 });
+            let payload = Expr::new(Ty::Enc(asid), ExprKind::Slice { base: x.clone(), loc: FieldLoc::Words(1) });
             let m = self.member_any(&payload, asid, set, depth + 1)?;
             if is_false(&m) {
                 continue;
@@ -693,27 +692,27 @@ impl Lowerer<'_> {
         Some(or_any(alts))
     }
 
-    /// Slots of an encoded function/tuple/record, as (key, offset, slot shape).
-    pub(super) fn slots(&mut self, shape: &Shape) -> Option<Vec<(Value, u32, Shape)>> {
-        let mut out = Vec::new();
-        let mut off = 0u32;
+    /// Slots of an encoded function/tuple/record, as (key, location, slot shape).
+    pub(super) fn slots(&mut self, shape: &Shape) -> Option<Vec<(Value, FieldLoc, Shape)>> {
+        let fl = FieldLayout::of_shape(shape)?;
+        let mut out = Vec::with_capacity(fl.locs.len());
         match shape {
             Shape::Fcn { dom, range } => {
-                let w = self.words_of(range);
-                for (i, d) in dom.iter().enumerate() {
-                    out.push((d.clone(), i as u32 * w, (**range).clone()));
+                self.sid(range);
+                for (d, &loc) in dom.iter().zip(fl.locs.iter()) {
+                    out.push((d.clone(), loc, (**range).clone()));
                 }
             }
             Shape::Tuple(es) => {
-                for (i, e) in es.iter().enumerate() {
-                    out.push((Value::Int(i as i64 + 1), off, e.clone()));
-                    off += self.words_of(e);
+                for (i, (e, &loc)) in es.iter().zip(fl.locs.iter()).enumerate() {
+                    self.sid(e);
+                    out.push((Value::Int(i as i64 + 1), loc, e.clone()));
                 }
             }
             Shape::Record(fs) => {
-                for (n, f) in fs.iter() {
-                    out.push((Value::Str(*n), off, f.clone()));
-                    off += self.words_of(f);
+                for ((n, f), &loc) in fs.iter().zip(fl.locs.iter()) {
+                    self.sid(f);
+                    out.push((Value::Str(*n), loc, f.clone()));
                 }
             }
             _ => return None,
@@ -721,10 +720,10 @@ impl Lowerer<'_> {
         Some(out)
     }
 
-    /// The slot of `x` at `off` (of shape `sh`) is in `set`.
-    fn slot_member(&mut self, x: &Expr, off: u32, sh: &Shape, set: &Value, depth: usize) -> Option<Expr> {
+    /// The slot of `x` at `loc` (of shape `sh`) is in `set`.
+    fn slot_member(&mut self, x: &Expr, loc: FieldLoc, sh: &Shape, set: &Value, depth: usize) -> Option<Expr> {
         let ssid = self.sid(sh);
-        let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: x.clone(), offset: off });
+        let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: x.clone(), loc });
         self.member_any(&slot, ssid, set, depth + 1)
     }
 
@@ -800,7 +799,7 @@ impl Lowerer<'_> {
         // A plain word array (the shape only gives its size: a set shape
         // over a small universe would be a bitset).
         let n = encs.len();
-        let ssid = self.sid(&Shape::Seq { elem: Box::new(Shape::Int { lo: 0, hi: 0 }), max_len: (n * ew).max(1) });
+        let ssid = self.sid(&Shape::Seq { elem: Box::new(Shape::Int { lo: i64::MIN, hi: i64::MAX }), max_len: (n * ew).max(1) });
         let mut words = vec![n as u64];
         words.extend(encs.into_iter().flatten());
         words.resize(self.words(ssid) as usize, 0);

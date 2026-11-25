@@ -12,7 +12,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::dynval;
-use crate::layout::{same_domain, sorted_set, MapDims, Miss};
+use crate::layout::{same_domain, sorted_set, FieldLayout, FieldLoc, MapDims, Miss, SlotLayout};
 use crate::shape::{binom, fit_repr, force, set_elems, set_len, Shape, MAX_BITSET_UNIVERSE};
 use tlx_value::{Sym, Value};
 
@@ -57,22 +57,29 @@ enum Kind {
     Fcn {
         dom: Arc<[Value]>,
         range: Box<LayoutNode>,
+        slot: SlotLayout,
     },
     Map {
         key: Box<LayoutNode>,
         range: Box<LayoutNode>,
         /// Key universe size.
         universe: u64,
-        /// Words of the presence bitset (the first slot's offset).
-        bits: usize,
+        dims: MapDims,
     },
-    /// Fields with the word offset of each.
-    Record(Box<[(Sym, LayoutNode, usize)]>),
-    /// Positions with the word offset of each.
-    Tuple(Box<[(LayoutNode, usize)]>),
+    /// Fields with the storage location of each, plus bitmasks for packed words.
+    Record {
+        fields: Box<[(Sym, LayoutNode, FieldLoc)]>,
+        bit_words: Box<[(usize, u64)]>,
+    },
+    /// Positions with the storage location of each, plus bitmasks for packed words.
+    Tuple {
+        elems: Box<[(LayoutNode, FieldLoc)]>,
+        bit_words: Box<[(usize, u64)]>,
+    },
     Seq {
         elem: Box<LayoutNode>,
         max_len: usize,
+        slot: SlotLayout,
         /// `shorter[l]` = number of sequences shorter than `l` (for
         /// `l <= max_len`; only if the shape has a finite cardinality).
         shorter: Option<Box<[u64]>>,
@@ -132,45 +139,32 @@ impl LayoutNode {
                 };
                 (words, Kind::Set { elem, max_card: *max_card, bitset, rank })
             }
-            Shape::Fcn { dom, range } => {
-                let range = Box::new(LayoutNode::new(range));
-                (dom.len() * range.words, Kind::Fcn { dom: dom.clone(), range })
+            Shape::Fcn { dom, range: range_shape } => {
+                let slot = SlotLayout::of(range_shape);
+                let range = Box::new(LayoutNode::new(range_shape));
+                (slot.array_words(dom.len()), Kind::Fcn { dom: dom.clone(), range, slot })
             }
-            Shape::Map { key, range } => {
+            Shape::Map { key, range: range_shape } => {
+                let slot = SlotLayout::of(range_shape);
                 let key = Box::new(LayoutNode::new(key));
-                let range = Box::new(LayoutNode::new(range));
+                let range = Box::new(LayoutNode::new(range_shape));
                 let universe = key.bitset_universe().expect("map key universe");
-                let d = MapDims::new(universe as usize, range.words);
-                (d.words(), Kind::Map { key, range, universe, bits: d.bitset_words })
+                let dims = MapDims::new(universe as usize, slot);
+                (dims.words(), Kind::Map { key, range, universe, dims })
             }
             Shape::Record(fs) => {
-                let mut o = 0;
-                let fields: Box<[_]> = fs
-                    .iter()
-                    .map(|(k, f)| {
-                        let n = LayoutNode::new(f);
-                        let at = o;
-                        o += n.words;
-                        (*k, n, at)
-                    })
-                    .collect();
-                (o, Kind::Record(fields))
+                let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
+                let fields: Box<[_]> = fs.iter().zip(fl.locs.iter()).map(|((k, f), &loc)| (*k, LayoutNode::new(f), loc)).collect();
+                (fl.words, Kind::Record { fields, bit_words: fl.bit_words })
             }
             Shape::Tuple(es) => {
-                let mut o = 0;
-                let elems: Box<[_]> = es
-                    .iter()
-                    .map(|e| {
-                        let n = LayoutNode::new(e);
-                        let at = o;
-                        o += n.words;
-                        (n, at)
-                    })
-                    .collect();
-                (o, Kind::Tuple(elems))
+                let fl = FieldLayout::of_shapes(es.iter());
+                let elems: Box<[_]> = es.iter().zip(fl.locs.iter()).map(|(e, &loc)| (LayoutNode::new(e), loc)).collect();
+                (fl.words, Kind::Tuple { elems, bit_words: fl.bit_words })
             }
-            Shape::Seq { elem, max_len } => {
-                let elem = Box::new(LayoutNode::new(elem));
+            Shape::Seq { elem: elem_shape, max_len } => {
+                let slot = SlotLayout::of(elem_shape);
+                let elem = Box::new(LayoutNode::new(elem_shape));
                 let shorter = card.map(|_| {
                     let c = elem.card.unwrap();
                     let mut acc = 0u64;
@@ -184,7 +178,7 @@ impl LayoutNode {
                         })
                         .collect()
                 });
-                (1 + max_len * elem.words, Kind::Seq { elem, max_len: *max_len, shorter })
+                (1usize.saturating_add(slot.array_words(*max_len)), Kind::Seq { elem, max_len: *max_len, slot, shorter })
             }
             Shape::Union(arms) => {
                 let arms: Box<[LayoutNode]> = arms.iter().map(LayoutNode::new).collect();
@@ -301,47 +295,44 @@ impl LayoutNode {
                     }
                 }
             }
-            (Kind::Fcn { dom, range }, Value::Fcn(ps, _)) => {
+            (Kind::Fcn { dom, range, slot }, Value::Fcn(ps, _)) => {
                 if !same_domain(ps, dom) {
                     return Err(Miss::new(v));
                 }
-                let w = range.words;
                 for (i, (k, x)) in ps.iter().enumerate() {
-                    range.enc(x, &mut out[i * w..]).map_err(|m| m.under(format_args!("[{k}]")))?;
+                    range.enc_loc(x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
                 }
             }
-            (Kind::Map { key, range, bits, .. }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
-                let (bw, w) = (*bits, range.words);
+            (Kind::Map { key, range, dims, .. }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
                 for_each_pair(v, |k, x| {
                     let r = key.rank_finite(k).map_err(|m| m.under("DOMAIN"))?;
                     out[(r / 64) as usize] |= 1u64 << (r % 64);
-                    range.enc(x, &mut out[bw + r as usize * w..]).map_err(|m| m.under(format_args!("[{k}]")))
+                    range.enc_loc(x, out, dims.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))
                 })?;
             }
-            (Kind::Record(fs), Value::Record(vs)) => {
+            (Kind::Record { fields: fs, .. }, Value::Record(vs)) => {
                 if fs.len() != vs.len() || !fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0) {
                     return Err(Miss::new(v));
                 }
                 for (f, x) in fs.iter().zip(vs.iter()) {
-                    f.1.enc(&x.1, &mut out[f.2..]).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
+                    f.1.enc_loc(&x.1, out, f.2).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
                 }
             }
-            (Kind::Tuple(ss), Value::Tuple(vs)) => {
+            (Kind::Tuple { elems: ss, .. }, Value::Tuple(vs)) => {
                 if ss.len() != vs.len() {
                     return Err(Miss::new(v));
                 }
                 for (i, (s, x)) in ss.iter().zip(vs.iter()).enumerate() {
-                    s.0.enc(x, &mut out[s.1..]).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                    s.0.enc_loc(x, out, s.1).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
                 }
             }
-            (Kind::Seq { elem, max_len, .. }, Value::Tuple(vs)) => {
+            (Kind::Seq { elem, max_len, slot, .. }, Value::Tuple(vs)) => {
                 if vs.len() > *max_len {
                     return Err(Miss::new(v));
                 }
                 out[0] = vs.len() as u64;
-                let w = elem.words;
                 for (i, x) in vs.iter().enumerate() {
-                    elem.enc(x, &mut out[1 + i * w..]).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                    elem.enc_loc(x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
                 }
             }
             (Kind::Union { arms, .. }, _) => match arm_for(arms, v) {
@@ -356,6 +347,33 @@ impl LayoutNode {
         Ok(())
     }
 
+    #[inline]
+    fn enc_loc(&self, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
+        match loc {
+            FieldLoc::Words(w) => self.enc(v, &mut out[w..]),
+            FieldLoc::Bits(pos) => {
+                let mut tmp = [0u64];
+                self.enc(v, &mut tmp)?;
+                pos.set_zeroed(out, tmp[0]);
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    fn validate_scalar_raw(&self, raw: u64) -> Result<(), String> {
+        match &self.kind {
+            Kind::Never => Err("no value has shape Never".into()),
+            Kind::Bool if raw <= 1 => Ok(()),
+            Kind::Bool => Err("invalid Bool encoding".into()),
+            Kind::Int { lo, hi } if lo <= hi && (raw as u128) <= (*hi as i128 - *lo as i128) as u128 => Ok(()),
+            Kind::Int { .. } => Err("Int encoding out of range".into()),
+            Kind::Atom(u) if raw < u.len() as u64 => Ok(()),
+            Kind::Atom(_) => Err("Atom encoding out of range".into()),
+            _ => Err("non-scalar in packed bitfield".into()),
+        }
+    }
+
     /// Decode raw words, validating every active Dyn handle first.
     /// Panics for an invalid encoding; no invalid symbol can be constructed.
     pub fn decode(&self, words: &[u64]) -> Value {
@@ -365,12 +383,27 @@ impl LayoutNode {
         unsafe { self.decode_unchecked(words) }
     }
 
-    /// Validate the word layout and every active dynamic handle. Padding and
-    /// absent map slots are not values and need not contain valid handles.
+    /// Validate the word layout, scalar ranges, bitfield padding and every
+    /// active dynamic handle. Word-aligned inactive sequence/map slots are not
+    /// values and need not contain valid handles, whereas unused bits in
+    /// sub-word packed words must be zero.
     pub fn validate_words(&self, words: &[u64]) -> Result<(), String> {
+        self.validate_words_impl::<false>(words)
+    }
+
+    /// Strict canonical validation for untrusted external/checkpoint states:
+    /// runs all checks of [`Self::validate_words`] and additionally requires
+    /// zero words in all inactive word-aligned sequence/set/union tails and
+    /// absent map slots.
+    pub fn validate_canonical_words(&self, words: &[u64]) -> Result<(), String> {
+        self.validate_words_impl::<true>(words)
+    }
+
+    fn validate_words_impl<const STRICT: bool>(&self, words: &[u64]) -> Result<(), String> {
         let words = words.get(..self.words).ok_or("short encoded value")?;
         match &self.kind {
             Kind::Never => return Err("no value has shape Never".into()),
+            Kind::Bool | Kind::Int { .. } | Kind::Atom(_) => self.validate_scalar_raw(words[0])?,
             Kind::Dyn => {
                 dynval::try_lookup(words[0]).ok_or("invalid Dyn handle")?;
             }
@@ -379,53 +412,156 @@ impl LayoutNode {
                     return Err("invalid value store handle".into());
                 }
             }
+            Kind::Set { max_card, bitset: Some(n), .. } => {
+                let rem = (*n % 64) as u32;
+                if rem != 0 && (words[self.words - 1] >> rem) != 0 {
+                    return Err("non-zero padding bits in bitset".into());
+                }
+                let ones: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+                if ones > *max_card {
+                    return Err("set cardinality exceeds max_card".into());
+                }
+            }
             Kind::Set { elem, max_card, bitset: None, .. } => {
                 let n = usize::try_from(words[0]).map_err(|_| "invalid set length")?;
                 if n > *max_card {
                     return Err("invalid set length".into());
                 }
                 for i in 0..n {
-                    elem.validate_words(&words[1 + i * elem.words..])?;
+                    elem.validate_words_impl::<STRICT>(&words[1 + i * elem.words..])?;
+                }
+                if STRICT && words[1 + n * elem.words..].iter().any(|&w| w != 0) {
+                    return Err("non-zero inactive set tail words".into());
                 }
             }
-            Kind::Seq { elem, max_len, .. } => {
+            Kind::Seq { elem, max_len, slot, .. } => {
                 let n = usize::try_from(words[0]).map_err(|_| "invalid sequence length")?;
                 if n > *max_len {
                     return Err("invalid sequence length".into());
                 }
-                for i in 0..n {
-                    elem.validate_words(&words[1 + i * elem.words..])?;
-                }
-            }
-            Kind::Fcn { dom, range } => {
-                for i in 0..dom.len() {
-                    range.validate_words(&words[i * range.words..])?;
-                }
-            }
-            Kind::Map { range, universe, bits, .. } => {
-                for r in 0..*universe as usize {
-                    if words[r / 64] >> (r % 64) & 1 != 0 {
-                        range.validate_words(&words[*bits + r * range.words..])?;
+                match *slot {
+                    SlotLayout::Words(ew) => {
+                        for i in 0..n {
+                            elem.validate_words_impl::<STRICT>(&words[1 + i * ew..])?;
+                        }
+                        if STRICT && words[1 + n * ew..].iter().any(|&w| w != 0) {
+                            return Err("non-zero inactive sequence tail words".into());
+                        }
+                    }
+                    SlotLayout::Bits(b) => {
+                        let data = &words[1..];
+                        for (w, &word) in data.iter().enumerate() {
+                            if (word & !SlotLayout::word_active_mask(b, n, w)) != 0 {
+                                return Err("non-zero padding bits in packed sequence".into());
+                            }
+                        }
+                        for i in 0..n {
+                            elem.validate_scalar_raw(SlotLayout::extract(b, data, i))?;
+                        }
                     }
                 }
             }
-            Kind::Record(fs) => {
-                for (_, n, o) in fs {
-                    n.validate_words(&words[*o..])?;
+            Kind::Fcn { dom, range, slot } => match *slot {
+                SlotLayout::Words(rw) => {
+                    for i in 0..dom.len() {
+                        range.validate_words_impl::<STRICT>(&words[i * rw..])?;
+                    }
+                }
+                SlotLayout::Bits(b) => {
+                    for (w, &word) in words.iter().enumerate() {
+                        if (word & !SlotLayout::word_active_mask(b, dom.len(), w)) != 0 {
+                            return Err("non-zero padding bits in packed function".into());
+                        }
+                    }
+                    for i in 0..dom.len() {
+                        range.validate_scalar_raw(SlotLayout::extract(b, words, i))?;
+                    }
+                }
+            },
+            Kind::Map { range, universe, dims, .. } => {
+                let rem = (*universe % 64) as u32;
+                if rem != 0 && dims.bitset_words > 0 && (words[dims.bitset_words - 1] >> rem) != 0 {
+                    return Err("non-zero padding bits in map domain".into());
+                }
+                match dims.slot {
+                    SlotLayout::Words(rw) => {
+                        for r in 0..*universe as usize {
+                            let start = dims.bitset_words + r * rw;
+                            if words[r / 64] >> (r % 64) & 1 != 0 {
+                                range.validate_words_impl::<STRICT>(&words[start..])?;
+                            } else if STRICT && words[start..start + rw].iter().any(|&w| w != 0) {
+                                return Err("non-zero absent map slot words".into());
+                            }
+                        }
+                    }
+                    SlotLayout::Bits(b) => {
+                        let data = &words[dims.bitset_words..];
+                        let mut active_masks = vec![0u64; data.len()];
+                        for r in 0..*universe as usize {
+                            if words[r / 64] >> (r % 64) & 1 != 0 {
+                                let (w, shift) = SlotLayout::bit_pos(b, r);
+                                active_masks[w] |= crate::layout::bit_mask(b) << shift;
+                                range.validate_scalar_raw(SlotLayout::extract(b, data, r))?;
+                            }
+                        }
+                        for (&word, &mask) in data.iter().zip(active_masks.iter()) {
+                            if (word & !mask) != 0 {
+                                return Err("non-zero padding or absent-slot bits in packed map".into());
+                            }
+                        }
+                    }
                 }
             }
-            Kind::Tuple(ss) => {
-                for (n, o) in ss {
-                    n.validate_words(&words[*o..])?;
+            Kind::Record { fields, bit_words } => {
+                for &(w, mask) in bit_words.iter() {
+                    if (words[w] & !mask) != 0 {
+                        return Err("non-zero padding bits in packed record".into());
+                    }
+                }
+                for (_, n, loc) in fields.iter() {
+                    match *loc {
+                        FieldLoc::Words(o) => n.validate_words_impl::<STRICT>(&words[o..])?,
+                        FieldLoc::Bits(pos) => n.validate_scalar_raw(pos.extract(words))?,
+                    }
+                }
+            }
+            Kind::Tuple { elems, bit_words } => {
+                for &(w, mask) in bit_words.iter() {
+                    if (words[w] & !mask) != 0 {
+                        return Err("non-zero padding bits in packed tuple".into());
+                    }
+                }
+                for (n, loc) in elems.iter() {
+                    match *loc {
+                        FieldLoc::Words(o) => n.validate_words_impl::<STRICT>(&words[o..])?,
+                        FieldLoc::Bits(pos) => n.validate_scalar_raw(pos.extract(words))?,
+                    }
                 }
             }
             Kind::Union { arms, .. } => {
                 let i = usize::try_from(words[0]).map_err(|_| "invalid union tag")?;
-                arms.get(i).ok_or("invalid union tag")?.validate_words(&words[1..])?;
+                let arm = arms.get(i).ok_or("invalid union tag")?;
+                arm.validate_words_impl::<STRICT>(&words[1..1 + arm.words])?;
+                if STRICT && words[1 + arm.words..].iter().any(|&w| w != 0) {
+                    return Err("non-zero union padding words".into());
+                }
             }
-            _ => {}
         }
         Ok(())
+    }
+
+    #[inline]
+    unsafe fn decode_loc_unchecked(&self, words: &[u64], loc: FieldLoc) -> Value {
+        // SAFETY: `loc` selects an active child within `words`, upholding `decode_unchecked`'s contract.
+        unsafe {
+            match loc {
+                FieldLoc::Words(o) => self.decode_unchecked(&words[o..]),
+                FieldLoc::Bits(pos) => {
+                    let tmp = [pos.extract(words)];
+                    self.decode_unchecked(&tmp)
+                }
+            }
+        }
     }
 
     /// Decode the value encoded in `words` (as `layout::decode`).
@@ -460,12 +596,11 @@ impl LayoutNode {
                     }
                     sorted_set(es)
                 }
-                Kind::Fcn { dom, range } => {
-                    let w = range.words;
-                    Value::fcn_decoded(dom.iter().enumerate().map(|(i, d)| (d.clone(), range.decode_unchecked(&words[i * w..]))).collect())
-                }
-                Kind::Map { key, range, universe, bits } => {
-                    let (bw, w) = (*bits, range.words);
+                Kind::Fcn { dom, range, slot } => Value::fcn_decoded(
+                    dom.iter().enumerate().map(|(i, d)| (d.clone(), range.decode_loc_unchecked(words, slot.loc(0, i)))).collect(),
+                ),
+                Kind::Map { key, range, universe, dims } => {
+                    let bw = dims.bitset_words;
                     let mut pairs = Vec::new();
                     for (wi, &word) in words[..bw].iter().enumerate() {
                         let mut m = word;
@@ -473,7 +608,7 @@ impl LayoutNode {
                             let r = wi as u64 * 64 + m.trailing_zeros() as u64;
                             m &= m - 1;
                             if r < *universe {
-                                pairs.push((key.universe_value(r), range.decode_unchecked(&words[bw + r as usize * w..])));
+                                pairs.push((key.universe_value(r), range.decode_loc_unchecked(words, dims.slot_loc(r as usize))));
                             }
                         }
                     }
@@ -481,12 +616,11 @@ impl LayoutNode {
                     // representation (`<<>>`, a tuple for `1..n`, ...).
                     Value::fcn_from_pairs(pairs).expect("distinct keys").with_decoded_dom()
                 }
-                Kind::Record(fs) => Value::Record(fs.iter().map(|f| (f.0, f.1.decode_unchecked(&words[f.2..]))).collect()),
-                Kind::Tuple(ss) => Value::Tuple(ss.iter().map(|s| s.0.decode_unchecked(&words[s.1..])).collect()),
-                Kind::Seq { elem, .. } => {
-                    let w = elem.words;
+                Kind::Record { fields: fs, .. } => Value::Record(fs.iter().map(|f| (f.0, f.1.decode_loc_unchecked(words, f.2))).collect()),
+                Kind::Tuple { elems: ss, .. } => Value::Tuple(ss.iter().map(|s| s.0.decode_loc_unchecked(words, s.1)).collect()),
+                Kind::Seq { elem, slot, .. } => {
                     let len = words[0] as usize;
-                    Value::Tuple((0..len).map(|i| elem.decode_unchecked(&words[1 + i * w..])).collect())
+                    Value::Tuple((0..len).map(|i| elem.decode_loc_unchecked(words, slot.loc(1, i))).collect())
                 }
                 Kind::Union { arms, .. } => arms[words[0] as usize].decode_unchecked(&words[1..]),
                 Kind::Dyn => dynval::lookup_unchecked(words[0]),
@@ -553,7 +687,7 @@ impl LayoutNode {
                     SetRank::None => unreachable!("rank: set shape without finite universe"),
                 }
             }
-            (Kind::Fcn { dom, range }, Value::Fcn(ps, _)) => {
+            (Kind::Fcn { dom, range, .. }, Value::Fcn(ps, _)) => {
                 if !same_domain(ps, dom) {
                     return Err(Miss::new(v));
                 }
@@ -575,7 +709,7 @@ impl LayoutNode {
                 })?;
                 digits.iter().fold(0u64, |acc, d| acc * c + d)
             }
-            (Kind::Record(fs), Value::Record(vs)) => {
+            (Kind::Record { fields: fs, .. }, Value::Record(vs)) => {
                 if fs.len() != vs.len() || !fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0) {
                     return Err(Miss::new(v));
                 }
@@ -585,7 +719,7 @@ impl LayoutNode {
                 }
                 r
             }
-            (Kind::Tuple(ss), Value::Tuple(vs)) => {
+            (Kind::Tuple { elems: ss, .. }, Value::Tuple(vs)) => {
                 if ss.len() != vs.len() {
                     return Err(Miss::new(v));
                 }
@@ -595,7 +729,7 @@ impl LayoutNode {
                 }
                 r
             }
-            (Kind::Seq { elem, max_len, shorter }, Value::Tuple(vs)) => {
+            (Kind::Seq { elem, max_len, shorter, .. }, Value::Tuple(vs)) => {
                 if vs.len() > *max_len {
                     return Err(Miss::new(v));
                 }
@@ -661,16 +795,16 @@ impl LayoutNode {
                 }
                 sorted_set(ranks.into_iter().map(|e| elem.unrank_finite(e)).collect())
             }
-            Kind::Fcn { dom, range } => {
+            Kind::Fcn { dom, range, .. } => {
                 let c = range.card.unwrap();
                 let vals = mixed_radix(r, dom.iter().map(|_| (range.as_ref(), c)));
                 Value::fcn_decoded(dom.iter().cloned().zip(vals).collect())
             }
-            Kind::Record(fs) => {
+            Kind::Record { fields: fs, .. } => {
                 let vals = mixed_radix(r, fs.iter().map(|f| (&f.1, f.1.card.unwrap())));
                 Value::Record(fs.iter().map(|f| f.0).zip(vals).collect())
             }
-            Kind::Tuple(ss) => Value::Tuple(mixed_radix(r, ss.iter().map(|s| (&s.0, s.0.card.unwrap()))).into()),
+            Kind::Tuple { elems: ss, .. } => Value::Tuple(mixed_radix(r, ss.iter().map(|s| (&s.0, s.0.card.unwrap()))).into()),
             Kind::Seq { elem, shorter, .. } => {
                 let c = elem.card.unwrap();
                 let shorter = shorter.as_ref().expect("unrank: finite sequence shape");
@@ -740,25 +874,26 @@ unsafe fn transcode_impl<const TRUSTED: bool>(old: &LayoutNode, new: &LayoutNode
                 dst[0] = v.wrapping_sub(*l1) as u64;
                 *l1 <= v && v <= *h1
             }
-            (Kind::Fcn { dom: d0, range: r0 }, Kind::Fcn { dom: d1, range: r1 }) if d0 == d1 => {
-                (0..d0.len()).all(|i| transcode_impl::<TRUSTED>(r0, r1, &src[i * r0.words..], &mut dst[i * r1.words..]))
+            (Kind::Fcn { dom: d0, range: r0, slot: s0 }, Kind::Fcn { dom: d1, range: r1, slot: s1 }) if d0 == d1 => {
+                (0..d0.len()).all(|i| transcode_field::<TRUSTED>(r0, src, s0.loc(0, i), r1, dst, s1.loc(0, i)))
             }
-            (Kind::Record(f0), Kind::Record(f1)) if f0.len() == f1.len() && f0.iter().zip(f1.iter()).all(|(a, b)| a.0 == b.0) => {
-                f0.iter().zip(f1.iter()).all(|(a, b)| transcode_impl::<TRUSTED>(&a.1, &b.1, &src[a.2..], &mut dst[b.2..]))
+            (Kind::Record { fields: f0, .. }, Kind::Record { fields: f1, .. })
+                if f0.len() == f1.len() && f0.iter().zip(f1.iter()).all(|(a, b)| a.0 == b.0) =>
+            {
+                f0.iter().zip(f1.iter()).all(|(a, b)| transcode_field::<TRUSTED>(&a.1, src, a.2, &b.1, dst, b.2))
             }
-            (Kind::Tuple(t0), Kind::Tuple(t1)) if t0.len() == t1.len() => {
-                t0.iter().zip(t1.iter()).all(|(a, b)| transcode_impl::<TRUSTED>(&a.0, &b.0, &src[a.1..], &mut dst[b.1..]))
+            (Kind::Tuple { elems: t0, .. }, Kind::Tuple { elems: t1, .. }) if t0.len() == t1.len() => {
+                t0.iter().zip(t1.iter()).all(|(a, b)| transcode_field::<TRUSTED>(&a.0, src, a.1, &b.0, dst, b.1))
             }
-            (Kind::Seq { elem: e0, .. }, Kind::Seq { elem: e1, max_len, .. }) => {
+            (Kind::Seq { elem: e0, slot: s0, .. }, Kind::Seq { elem: e1, max_len, slot: s1, .. }) => {
                 let n = src[0] as usize;
                 dst[0] = src[0];
-                n <= *max_len && (0..n).all(|i| transcode_impl::<TRUSTED>(e0, e1, &src[1 + i * e0.words..], &mut dst[1 + i * e1.words..]))
+                n <= *max_len && (0..n).all(|i| transcode_field::<TRUSTED>(e0, src, s0.loc(1, i), e1, dst, s1.loc(1, i)))
             }
             // Maps on the same keys, or on integer ranges: each present slot.
-            (Kind::Map { key: k0, range: r0, universe: u0, bits: b0 }, Kind::Map { key: k1, range: r1, universe: u1, bits: b1 })
+            (Kind::Map { key: k0, range: r0, universe: u0, dims: d0 }, Kind::Map { key: k1, range: r1, universe: u1, dims: d1 })
                 if k0 == k1 || matches!((&k0.kind, &k1.kind), (Kind::Int { .. }, Kind::Int { .. })) =>
             {
-                let (w0, w1) = (r0.words, r1.words);
                 // Rank in the new universe of the key of rank `r` in the old one.
                 let shift = match (&k0.kind, &k1.kind) {
                     (Kind::Int { lo: l0, .. }, Kind::Int { lo: l1, .. }) => l0 - l1,
@@ -768,7 +903,7 @@ unsafe fn transcode_impl<const TRUSTED: bool>(old: &LayoutNode, new: &LayoutNode
                     if src[r / 64] >> (r % 64) & 1 == 1 {
                         let Some(q) = usize::try_from(r as i64 + shift).ok().filter(|&q| (q as u64) < *u1) else { return false };
                         dst[q / 64] |= 1 << (q % 64);
-                        if !transcode_impl::<TRUSTED>(r0, r1, &src[b0 + r * w0..], &mut dst[b1 + q * w1..]) {
+                        if !transcode_field::<TRUSTED>(r0, src, d0.slot_loc(r), r1, dst, d1.slot_loc(q)) {
                             return false;
                         }
                     }
@@ -795,6 +930,41 @@ unsafe fn transcode_impl<const TRUSTED: bool>(old: &LayoutNode, new: &LayoutNode
     }
 }
 
+/// Transcode a single child slot (word-aligned or bit-packed) inside a zeroed
+/// composite destination `dst`.
+unsafe fn transcode_field<const TRUSTED: bool>(
+    old: &LayoutNode,
+    src: &[u64],
+    old_loc: FieldLoc,
+    new: &LayoutNode,
+    dst: &mut [u64],
+    new_loc: FieldLoc,
+) -> bool {
+    // SAFETY: active child slots inherit `transcode_impl`'s contract; packed
+    // bitfields are always scalars (never Dyn/Ref handles).
+    unsafe {
+        let src_tmp;
+        let src_slice = match old_loc {
+            FieldLoc::Words(o0) => &src[o0..],
+            FieldLoc::Bits(p0) => {
+                src_tmp = [p0.extract(src)];
+                &src_tmp[..]
+            }
+        };
+        match new_loc {
+            FieldLoc::Words(o1) => transcode_impl::<TRUSTED>(old, new, src_slice, &mut dst[o1..]),
+            FieldLoc::Bits(p1) => {
+                let mut d_buf = [0u64];
+                if !transcode_impl::<TRUSTED>(old, new, src_slice, &mut d_buf) {
+                    return false;
+                }
+                p1.set_zeroed(dst, d_buf[0]);
+                true
+            }
+        }
+    }
+}
+
 /// Call `f` on the (key, value) pairs of a function value (tuples and
 /// records are functions too), in order, without copying them.
 fn for_each_pair(v: &Value, mut f: impl FnMut(&Value, &Value) -> Result<(), Miss>) -> Result<(), Miss> {
@@ -811,7 +981,7 @@ impl LayoutNode {
     fn fit<'a>(&self, v: std::borrow::Cow<'a, Value>) -> std::borrow::Cow<'a, Value> {
         match self.kind {
             Kind::Fcn { .. } => fit_repr(true, v),
-            Kind::Tuple(_) | Kind::Seq { .. } | Kind::Record(_) => fit_repr(false, v),
+            Kind::Tuple { .. } | Kind::Seq { .. } | Kind::Record { .. } => fit_repr(false, v),
             _ => v,
         }
     }
@@ -827,8 +997,8 @@ fn arm_for(arms: &[LayoutNode], v: &Value) -> Option<usize> {
         | (Kind::Set { .. }, Value::Set(_) | Value::Interval(..))
         | (Kind::Seq { .. }, Value::Tuple(_))
         | (Kind::Fcn { .. } | Kind::Map { .. }, Value::Fcn(..)) => true,
-        (Kind::Tuple(ss), Value::Tuple(vs)) => ss.len() == vs.len(),
-        (Kind::Record(fs), Value::Record(vs)) => fs.len() == vs.len() && fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0),
+        (Kind::Tuple { elems: ss, .. }, Value::Tuple(vs)) => ss.len() == vs.len(),
+        (Kind::Record { fields: fs, .. }, Value::Record(vs)) => fs.len() == vs.len() && fs.iter().zip(vs.iter()).all(|(f, x)| f.0 == x.0),
         _ => false,
     });
     // Tuples and records are functions too: a map arm takes them otherwise,

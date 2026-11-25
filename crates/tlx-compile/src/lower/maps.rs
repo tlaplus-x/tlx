@@ -9,7 +9,6 @@
 //! `[x \in S |-> e]` over a computed domain, `k :> v`, `f @@ g`, membership
 //! in `[D -> R]`, and coercions from the other function encodings.
 
-use tlx_layout::layout::MapDims;
 use tlx_sema::builtins::Builtin as B;
 use tlx_sema::hir::{self, DefKind, ExprKind as H};
 use tlx_value::plan::Absent;
@@ -48,7 +47,7 @@ impl Lowerer<'_> {
     /// bitset at the start of its encoding.
     pub(super) fn map_domain(&mut self, m: Expr, key: &Shape) -> Expr {
         let dsid = self.sid(&map_domain_shape(key));
-        Expr::new(Ty::Enc(dsid), ExprKind::Slice { base: m, offset: 0 })
+        Expr::new(Ty::Enc(dsid), ExprKind::Slice { base: m, loc: FieldLoc::Words(0) })
     }
 
     /// Rank of `x` in the universe of `key` (an integer expression; values
@@ -235,11 +234,11 @@ impl Lowerer<'_> {
                 return None;
             }
             let mut acc = self.zero_enc(sid);
-            for (k, off, sh) in slots {
+            for (k, loc, sh) in slots {
                 // A key outside the universe: the value never fits.
                 let r = tlx_layout::layout::rank(&key, &k).ok()?;
                 let ssid = self.sid(&sh);
-                let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: xs.clone(), offset: off });
+                let slot = Expr::new(Ty::Enc(ssid), ExprKind::Slice { base: xs.clone(), loc });
                 let value = self.coerce_enc(slot, rsid);
                 let plan = self.typing.map_put_plan(Ty::Enc(sid), Absent::Insert);
                 acc = Expr::new(Ty::Enc(sid), ExprKind::MapPut { base: acc, rank: int_lit(r as i64), value, plan });
@@ -254,7 +253,8 @@ impl Lowerer<'_> {
     /// slot is in `range`.
     pub(super) fn map_in_fcn_set(&mut self, x: &Expr, shape: &Shape, dom: &Value, range: &Value, depth: usize) -> Option<Expr> {
         let Shape::Map { key, range: rs } = shape else { return None };
-        let MapDims { bitset_words: bw, slot_words: w, .. } = map_dims(shape)?;
+        let dims = map_dims(shape)?;
+        let bw = dims.bitset_words;
         let ds = tlx_value::ops::enumerate_normalized(dom).ok()?;
         if ds.len() > MAX_COERCED_ENTRIES {
             return None;
@@ -275,7 +275,7 @@ impl Lowerer<'_> {
         let mut parts = vec![eq(dom_x, Expr::new(Ty::Enc(dsid), ExprKind::ConstWords(mask.into())))];
         let rsid = self.sid(rs);
         for r in ranks {
-            let slot = Expr::new(Ty::Enc(rsid), ExprKind::Slice { base: x.clone(), offset: (bw + r * w) as u32 });
+            let slot = Expr::new(Ty::Enc(rsid), ExprKind::Slice { base: x.clone(), loc: dims.slot_loc(r) });
             parts.push(self.member_any(&slot, rsid, range, depth + 1)?);
         }
         Some(and_all(parts))
@@ -338,12 +338,12 @@ impl Lowerer<'_> {
             return None;
         }
         let esid = self.sid(&elem);
-        let ew = self.words(esid);
+        let slot = SlotLayout::of(&elem);
         let (params, body, lenv) = self.sort_comparator(cmp, env)?;
         if !self.sort_no_captures(&body, &params, &lenv) {
             return None;
         }
-        let sort_idx = self.build_sort_fns(seq_sid, esid, ew, max_len as u32, &params, &body, &lenv, st)?;
+        let sort_idx = self.build_sort_fns(seq_sid, esid, slot, max_len as u32, &params, &body, &lenv, st)?;
         let (src, bind) = self.share(src);
         let n = Expr::new(Ty::Int, ExprKind::SeqLen(src.clone()));
         let out = Expr::new(Ty::Enc(seq_sid), ExprKind::Call { func: sort_idx, args: vec![src, n] });
@@ -452,8 +452,8 @@ impl Lowerer<'_> {
     }
 
     /// `<<v>>` in the sequence encoding `sid`.
-    fn sort_singleton(&self, sid: ShapeId, ew: u32, cap: u32, v: Expr) -> Expr {
-        Expr::new(Ty::Enc(sid), ExprKind::SeqAppend { base: self.zero_enc(sid), value: v, elem_words: ew, max_len: cap })
+    fn sort_singleton(&self, sid: ShapeId, slot: SlotLayout, cap: u32, v: Expr) -> Expr {
+        Expr::new(Ty::Enc(sid), ExprKind::SeqAppend { base: self.zero_enc(sid), value: v, slot, max_len: cap })
     }
 
     /// Register the two functions a native `SortSeq` runs — `SortSeq.insert`
@@ -465,7 +465,7 @@ impl Lowerer<'_> {
         &mut self,
         seq_sid: ShapeId,
         esid: ShapeId,
-        ew: u32,
+        slot: SlotLayout,
         cap: u32,
         params: &[LocalId],
         body: &hir::Expr,
@@ -487,7 +487,7 @@ impl Lowerer<'_> {
         let p_ref = temp_ref(s_ty, p_t);
         let e_ref = temp_ref(e_ty, e_t);
         let len = Expr::new(Ty::Int, ExprKind::SeqLen(p_ref.clone()));
-        let last = Expr::new(e_ty, ExprKind::SeqIndex { base: p_ref.clone(), arg: len.clone(), elem_words: ew });
+        let last = Expr::new(e_ty, ExprKind::SeqIndex { base: p_ref.clone(), arg: len.clone(), slot });
         let cenv = lenv.bind(params[0], LBind::Ir(e_ref.clone())).bind(params[1], LBind::Ir(last.clone()));
         let cond = self.bool_expr(body, &cenv, st);
         let typed_cond = cond.ty == Ty::Bool;
@@ -498,19 +498,18 @@ impl Lowerer<'_> {
                 base: p_ref.clone(),
                 lo: int_lit(1),
                 hi: Expr::new(Ty::Int, ExprKind::IntBin(IntOp::Sub, len, int_lit(1))),
-                elem_words: ew,
+                slot,
             },
         );
         let rec = Expr::new(s_ty, ExprKind::Call { func: PENDING_INSERT, args: vec![tail, e_ref.clone()] });
-        let recurse =
-            Expr::new(s_ty, ExprKind::SeqConcat { a: rec, b: self.sort_singleton(seq_sid, ew, cap, last), elem_words: ew, max_len: cap });
+        let recurse = Expr::new(s_ty, ExprKind::SeqConcat { a: rec, b: self.sort_singleton(seq_sid, slot, cap, last), slot, max_len: cap });
         let stop = Expr::new(
             s_ty,
-            ExprKind::SeqConcat { a: p_ref, b: self.sort_singleton(seq_sid, ew, cap, e_ref.clone()), elem_words: ew, max_len: cap },
+            ExprKind::SeqConcat { a: p_ref, b: self.sort_singleton(seq_sid, slot, cap, e_ref.clone()), slot, max_len: cap },
         );
         let ins_body = Expr::new(
             s_ty,
-            ExprKind::If(empty, self.sort_singleton(seq_sid, ew, cap, e_ref), Expr::new(s_ty, ExprKind::If(cond, recurse, stop))),
+            ExprKind::If(empty, self.sort_singleton(seq_sid, slot, cap, e_ref), Expr::new(s_ty, ExprKind::If(cond, recurse, stop))),
         );
         let ins_temps = std::mem::take(&mut self.frame.temps);
         let ins_ptemps = vec![p_t, e_t];
@@ -525,7 +524,7 @@ impl Lowerer<'_> {
         let done = Expr::new(Ty::Bool, ExprKind::Eq(k_ref.clone(), int_lit(0)));
         let prev = Expr::new(Ty::Int, ExprKind::IntBin(IntOp::Sub, k_ref.clone(), int_lit(1)));
         let sorted = Expr::new(s_ty, ExprKind::Call { func: PENDING_SORT, args: vec![s_ref.clone(), prev] });
-        let kth = Expr::new(e_ty, ExprKind::SeqIndex { base: s_ref, arg: k_ref, elem_words: ew });
+        let kth = Expr::new(e_ty, ExprKind::SeqIndex { base: s_ref, arg: k_ref, slot });
         let step = Expr::new(s_ty, ExprKind::Call { func: PENDING_INSERT, args: vec![sorted, kth] });
         let sort_body = Expr::new(s_ty, ExprKind::If(done, self.zero_enc(seq_sid), step));
         let sort_temps = std::mem::take(&mut self.frame.temps);

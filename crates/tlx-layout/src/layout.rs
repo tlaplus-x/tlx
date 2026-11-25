@@ -23,6 +23,9 @@ use std::sync::Arc;
 
 use crate::dynval;
 use crate::layout_tree::LayoutNode;
+pub use crate::pack::{
+    bit_mask, bits_for_max, extract_bits, insert_bits, scalar_bits, BitPos, FieldGroup, FieldLayout, FieldLoc, SlotLayout,
+};
 use crate::shape::{arm_for, binom, fit_shape, force, same_field_names, set_elems, set_len, Shape, MAX_BITSET_UNIVERSE};
 use tlx_value::Value;
 
@@ -117,6 +120,15 @@ impl Layout {
         Ok(())
     }
 
+    /// Strict canonical validation for checkpoint/external state boundaries:
+    /// also rejects non-zero inactive tail and absent map slot words.
+    pub fn validate_canonical_words(&self, words: &[u64]) -> Result<(), String> {
+        for (n, &o) in self.nodes.iter().zip(&self.offsets) {
+            n.validate_canonical_words(words.get(o..).ok_or("short encoded state")?)?;
+        }
+        Ok(())
+    }
+
     /// Decode state words from the encoder or trusted generated code.
     ///
     /// # Safety
@@ -136,46 +148,46 @@ pub fn bitset_universe(elem: &Shape) -> Option<u64> {
 
 /// The encoding of a map (`Shape::Map`): a presence bitset over the key
 /// universe (bit `r` set: the key of rank `r` is in the domain), then one
-/// slot of `slot_words` words per key rank, zero for absent keys. Every
-/// executor of encoded maps (the layout functions, the IR executors, the
-/// JIT and the generated C) follows it.
+/// slot per key rank (`slot`, packed MSB-first when sub-word), zero for
+/// absent keys. Every executor of encoded maps (the layout functions, the IR
+/// executors, the JIT and the generated C) follows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MapDims {
     /// Number of keys (the size of the key universe).
     pub universe: usize,
     /// Words of the presence bitset.
     pub bitset_words: usize,
-    /// Words of a slot (of the range's encoding).
-    pub slot_words: usize,
+    /// Layout of each value slot.
+    pub slot: SlotLayout,
 }
 
 impl MapDims {
-    pub fn new(universe: usize, slot_words: usize) -> MapDims {
-        MapDims { universe, bitset_words: universe.div_ceil(64), slot_words }
+    pub fn new(universe: usize, slot: SlotLayout) -> MapDims {
+        MapDims { universe, bitset_words: universe.div_ceil(64), slot }
     }
 
     /// The dimensions of map shape `s` (None: not a map shape, or keys
     /// without a bitset universe).
     pub fn of(s: &Shape) -> Option<MapDims> {
         let Shape::Map { key, range } = s else { return None };
-        Some(MapDims::new(bitset_universe(key)? as usize, words(range)))
+        Some(MapDims::new(bitset_universe(key)? as usize, SlotLayout::of(range)))
     }
 
     /// The dimensions of maps with keys `key` and values `range`.
     pub fn of_parts(key: &Shape, range: &Shape) -> MapDims {
-        MapDims::new(bitset_universe(key).expect("map key universe") as usize, words(range))
+        MapDims::new(bitset_universe(key).expect("map key universe") as usize, SlotLayout::of(range))
     }
 
     /// Words of the whole encoding.
     #[inline]
     pub fn words(&self) -> usize {
-        self.bitset_words + self.universe * self.slot_words
+        self.bitset_words.saturating_add(self.slot.array_words(self.universe))
     }
 
-    /// First word of the slot of key rank `r`.
+    /// Storage location of the value slot for key rank `r`.
     #[inline]
-    pub fn slot(&self, r: usize) -> usize {
-        self.bitset_words + r * self.slot_words
+    pub fn slot_loc(&self, r: usize) -> FieldLoc {
+        self.slot.loc(self.bitset_words, r)
     }
 }
 
@@ -186,13 +198,13 @@ pub fn words(s: &Shape) -> usize {
         Shape::Bool | Shape::Int { .. } | Shape::Atom(_) | Shape::Dyn | Shape::Ref(_) => 1,
         Shape::Set { elem, max_card } => match bitset_universe(elem) {
             Some(n) => n.div_ceil(64) as usize,
-            None => 1 + max_card * words(elem),
+            None => 1usize.saturating_add(max_card.saturating_mul(words(elem))),
         },
-        Shape::Fcn { dom, range } => dom.len() * words(range),
+        Shape::Fcn { dom, range } => SlotLayout::of(range).array_words(dom.len()),
         Shape::Map { key, range } => MapDims::of_parts(key, range).words(),
-        Shape::Record(fs) => fs.iter().map(|f| words(&f.1)).sum(),
-        Shape::Tuple(es) => es.iter().map(words).sum(),
-        Shape::Seq { elem, max_len } => 1 + max_len * words(elem),
+        Shape::Record(fs) => FieldLayout::of_shapes(fs.iter().map(|(_, f)| f)).words,
+        Shape::Tuple(es) => FieldLayout::of_shapes(es.iter()).words,
+        Shape::Seq { elem, max_len } => 1usize.saturating_add(SlotLayout::of(elem).array_words(*max_len)),
         Shape::Union(arms) => 1 + arms.iter().map(words).max().unwrap_or(0),
     }
 }
@@ -206,23 +218,26 @@ pub fn ref_offsets(s: &Shape, base: usize, out: &mut Vec<usize>) -> Option<()> {
     match s {
         Shape::Ref(_) => out.push(base),
         Shape::Record(fs) => {
-            let mut o = base;
-            for (_, f) in fs.iter() {
-                ref_offsets(f, o, out)?;
-                o += words(f);
+            let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
+            for ((_, f), loc) in fs.iter().zip(fl.locs.iter()) {
+                if let FieldLoc::Words(w) = loc {
+                    ref_offsets(f, base + *w, out)?;
+                }
             }
         }
         Shape::Tuple(es) => {
-            let mut o = base;
-            for e in es.iter() {
-                ref_offsets(e, o, out)?;
-                o += words(e);
+            let fl = FieldLayout::of_shapes(es.iter());
+            for (e, loc) in es.iter().zip(fl.locs.iter()) {
+                if let FieldLoc::Words(w) = loc {
+                    ref_offsets(e, base + *w, out)?;
+                }
             }
         }
         Shape::Fcn { dom, range } => {
-            let w = words(range);
-            for i in 0..dom.len() {
-                ref_offsets(range, base + i * w, out)?;
+            if let SlotLayout::Words(w) = SlotLayout::of(range) {
+                for i in 0..dom.len() {
+                    ref_offsets(range, base + i * w, out)?;
+                }
             }
         }
         Shape::Set { elem: x, .. } | Shape::Seq { elem: x, .. } | Shape::Map { range: x, .. } if has_ref(x) => return None,
@@ -322,9 +337,9 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             if !same_domain(ps, dom) {
                 return Err(Miss::new(v));
             }
-            let w = words(range);
+            let slot = SlotLayout::of(range);
             for (i, (k, x)) in ps.iter().enumerate() {
-                enc(range, x, &mut out[i * w..]).map_err(|m| m.under(format_args!("[{k}]")))?;
+                enc_loc(range, x, out, slot.loc(0, i)).map_err(|m| m.under(format_args!("[{k}]")))?;
             }
         }
         (Shape::Map { key, range }, Value::Fcn(..) | Value::Tuple(_) | Value::Record(_)) => {
@@ -332,27 +347,25 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
             for (k, x) in crate::shape::fcn_pairs(v).expect("function value") {
                 let r = rank_finite(key, &k).map_err(|m| m.under("DOMAIN"))?;
                 out[(r / 64) as usize] |= 1u64 << (r % 64);
-                enc(range, &x, &mut out[d.slot(r as usize)..]).map_err(|m| m.under(format_args!("[{k}]")))?;
+                enc_loc(range, &x, out, d.slot_loc(r as usize)).map_err(|m| m.under(format_args!("[{k}]")))?;
             }
         }
         (Shape::Record(fs), Value::Record(vs)) => {
             if !same_field_names(fs, vs) {
                 return Err(Miss::new(v));
             }
-            let mut o = 0;
-            for (f, x) in fs.iter().zip(vs.iter()) {
-                enc(&f.1, &x.1, &mut out[o..]).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
-                o += words(&f.1);
+            let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
+            for ((f, x), &loc) in fs.iter().zip(vs.iter()).zip(fl.locs.iter()) {
+                enc_loc(&f.1, &x.1, out, loc).map_err(|m| m.under(format_args!(".{}", f.0.as_str())))?;
             }
         }
         (Shape::Tuple(ss), Value::Tuple(vs)) => {
             if ss.len() != vs.len() {
                 return Err(Miss::new(v));
             }
-            let mut o = 0;
-            for (i, (s, x)) in ss.iter().zip(vs.iter()).enumerate() {
-                enc(s, x, &mut out[o..]).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
-                o += words(s);
+            let fl = FieldLayout::of_shapes(ss.iter());
+            for (i, ((s, x), &loc)) in ss.iter().zip(vs.iter()).zip(fl.locs.iter()).enumerate() {
+                enc_loc(s, x, out, loc).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
             }
         }
         (Shape::Seq { elem, max_len }, Value::Tuple(vs)) => {
@@ -360,9 +373,9 @@ fn enc(s: &Shape, v: &Value, out: &mut [u64]) -> Result<(), Miss> {
                 return Err(Miss::new(v));
             }
             out[0] = vs.len() as u64;
-            let w = words(elem);
+            let slot = SlotLayout::of(elem);
             for (i, x) in vs.iter().enumerate() {
-                enc(elem, x, &mut out[1 + i * w..]).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
+                enc_loc(elem, x, out, slot.loc(1, i)).map_err(|m| m.under(format_args!("[{}]", i + 1)))?;
             }
         }
         (Shape::Union(arms), _) => match arm_for(arms, v) {
@@ -416,15 +429,17 @@ pub unsafe fn decode_unchecked(s: &Shape, words: &[u64]) -> Value {
                 sorted_set(es)
             }
             Shape::Fcn { dom, range } => {
-                let w = self::words(range);
-                Value::fcn_decoded(dom.iter().enumerate().map(|(i, d)| (d.clone(), decode_unchecked(range, &words[i * w..]))).collect())
+                let slot = SlotLayout::of(range);
+                Value::fcn_decoded(
+                    dom.iter().enumerate().map(|(i, d)| (d.clone(), decode_loc_unchecked(range, words, slot.loc(0, i)))).collect(),
+                )
             }
             Shape::Map { key, range } => {
                 let d = MapDims::of_parts(key, range);
                 let mut pairs = Vec::new();
                 for r in 0..d.universe as u64 {
                     if words[(r / 64) as usize] >> (r % 64) & 1 == 1 {
-                        pairs.push((unrank_finite(key, r), decode_unchecked(range, &words[d.slot(r as usize)..])));
+                        pairs.push((unrank_finite(key, r), decode_loc_unchecked(range, words, d.slot_loc(r as usize))));
                     }
                 }
                 // Keys come in TLC order; the constructor picks the canonical
@@ -432,37 +447,46 @@ pub unsafe fn decode_unchecked(s: &Shape, words: &[u64]) -> Value {
                 Value::fcn_from_pairs(pairs).expect("distinct keys").with_decoded_dom()
             }
             Shape::Record(fs) => {
-                let mut o = 0;
-                Value::Record(
-                    fs.iter()
-                        .map(|f| {
-                            let x = decode_unchecked(&f.1, &words[o..]);
-                            o += self::words(&f.1);
-                            (f.0, x)
-                        })
-                        .collect(),
-                )
+                let fl = FieldLayout::of_shapes(fs.iter().map(|(_, f)| f));
+                Value::Record(fs.iter().zip(fl.locs.iter()).map(|(f, &loc)| (f.0, decode_loc_unchecked(&f.1, words, loc))).collect())
             }
             Shape::Tuple(ss) => {
-                let mut o = 0;
-                Value::Tuple(
-                    ss.iter()
-                        .map(|s| {
-                            let x = decode_unchecked(s, &words[o..]);
-                            o += self::words(s);
-                            x
-                        })
-                        .collect(),
-                )
+                let fl = FieldLayout::of_shapes(ss.iter());
+                Value::Tuple(ss.iter().zip(fl.locs.iter()).map(|(s, &loc)| decode_loc_unchecked(s, words, loc)).collect())
             }
             Shape::Seq { elem, .. } => {
-                let w = self::words(elem);
+                let slot = SlotLayout::of(elem);
                 let len = words[0] as usize;
-                Value::Tuple((0..len).map(|i| decode_unchecked(elem, &words[1 + i * w..])).collect())
+                Value::Tuple((0..len).map(|i| decode_loc_unchecked(elem, words, slot.loc(1, i))).collect())
             }
             Shape::Union(arms) => decode_unchecked(&arms[words[0] as usize], &words[1..]),
             Shape::Dyn => dynval::lookup_unchecked(words[0]),
             Shape::Ref(store) => store.thaw_slot(words[0]),
+        }
+    }
+}
+
+fn enc_loc(s: &Shape, v: &Value, out: &mut [u64], loc: FieldLoc) -> Result<(), Miss> {
+    match loc {
+        FieldLoc::Words(w) => enc(s, v, &mut out[w..]),
+        FieldLoc::Bits(pos) => {
+            let mut tmp = [0u64];
+            enc(s, v, &mut tmp)?;
+            pos.set_zeroed(out, tmp[0]);
+            Ok(())
+        }
+    }
+}
+
+unsafe fn decode_loc_unchecked(s: &Shape, words: &[u64], loc: FieldLoc) -> Value {
+    // SAFETY: `loc` selects an active child within `words`, upholding `decode_unchecked`'s contract.
+    unsafe {
+        match loc {
+            FieldLoc::Words(w) => decode_unchecked(s, &words[w..]),
+            FieldLoc::Bits(pos) => {
+                let tmp = [pos.extract(words)];
+                decode_unchecked(s, &tmp)
+            }
         }
     }
 }

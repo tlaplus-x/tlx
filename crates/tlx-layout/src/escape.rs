@@ -123,7 +123,7 @@ impl EscapeLayout {
         for i in 0..self.layout.vars.len() {
             let h = words.get(self.layout.words + i).copied().unwrap_or(0);
             if h == 0 {
-                self.layout.node(i).validate_words(&words[self.layout.var_range(i)])?;
+                self.layout.node(i).validate_canonical_words(&words[self.layout.var_range(i)])?;
             } else if !self.store.get().is_some_and(|s| s.is_valid(h)) {
                 return Err("invalid escape handle".into());
             }

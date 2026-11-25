@@ -386,10 +386,14 @@ fn words_per_shape() {
     assert_eq!(words(&sset(sint(0, 4095), 3)), 64);
     assert_eq!(words(&sset(sint(0, 4096), 3)), 1 + 3);
     assert_eq!(words(&sset(Shape::Dyn, 5)), 6);
-    assert_eq!(words(&sset(stup(vec![sint(0, 9999), Shape::Bool]), 2)), 1 + 2 * 2);
-    assert_eq!(words(&sseq(stup(vec![Shape::Bool, Shape::Bool]), 3)), 1 + 6);
-    assert_eq!(words(&sfcn(vec![mv("a"), mv("b")], stup(vec![Shape::Bool; 3]))), 6);
-    assert_eq!(words(&Shape::Bool.join(&stup(vec![Shape::Bool; 3]))), 4);
+    assert_eq!(words(&sset(stup(vec![sint(0, 9999), Shape::Bool]), 2)), 1 + 2);
+    assert_eq!(words(&sseq(stup(vec![Shape::Bool, Shape::Bool]), 3)), 1 + 3);
+    assert_eq!(words(&sfcn(vec![mv("a"), mv("b")], stup(vec![Shape::Bool; 3]))), 2);
+    assert_eq!(words(&Shape::Bool.join(&stup(vec![Shape::Bool; 3]))), 2);
+    assert_eq!(words(&stup(vec![Shape::Bool; 64])), 1);
+    assert_eq!(words(&stup(vec![Shape::Bool; 65])), 2);
+    assert_eq!(words(&sfcn((0..20).map(int).collect(), sint(0, 7))), 1);
+    assert_eq!(words(&sseq(sint(0, 15), 16)), 2);
 }
 
 #[test]
@@ -626,8 +630,8 @@ fn observer_finalize() {
     assert_eq!(f[2], sseq(sint(0, 3), 3));
     assert_eq!(f[3], srec(&[("s", satom(vec![st("x"), st("y"), st("z")]))]));
     let l = Layout::new(f);
-    assert_eq!(l.offsets, vec![0, 1, 2, 6]);
-    assert_eq!(l.words, 7);
+    assert_eq!(l.offsets, vec![0, 1, 2, 4]);
+    assert_eq!(l.words, 5);
     let st0 = [int(5), set(vec![mv("c")]), tup(vec![int(0), int(3), int(2)]), rec(&[("s", st("z"))])];
     let mut out = vec![0; l.words];
     l.encode_state(&st0, &mut out).unwrap();
@@ -771,7 +775,7 @@ fn type_invariant_bounds() {
     let all = satom(vec![st("ack"), st("req"), st("idle")]);
     let seen = sset(srec(&[("from", satom(vec![mv("p")])), ("k", sint(0, 1)), ("type", satom(vec![st("req")]))]), 2);
     let layout = sset(srec(&[("from", satom(vec![mv("p"), mv("q")])), ("k", sint(0, 1000)), ("type", all.clone())]), 4);
-    assert_eq!(words(&layout), 1 + 4 * 3);
+    assert_eq!(words(&layout), 1 + 4);
     assert!(bound_covers(&b, &seen));
     // Refined: a bitset over all messages (the unobserved arm added, the
     // field `type` alike in both arms, exact ranges).
@@ -793,4 +797,237 @@ fn type_invariant_bounds() {
         &srec(&[("k", sint(0, 9)), ("s", satom(vec![st("idle")])), ("q", sseq(sint(1, 2), 4))]),
     );
     assert_eq!(v, srec(&[("k", sint(0, 9)), ("s", all), ("q", sseq(sint(0, 3), 4))]));
+}
+
+#[test]
+fn packed_industrial_shapes_achieve_over_3x_compression_and_canonical_words() {
+    use tlx_layout::permute::PermPlan;
+    use tlx_layout::LayoutNode;
+
+    // 1. ReprMoveRange-style shard descriptor record + per-key routing function:
+    //    Unpacked would take 6 + 8 = 14 words; packed takes 1 + 1 = 2 words (7x).
+    let owners = vec![mv("n1"), mv("n2"), mv("n3")];
+    let phases = satom(vec![st("idle"), st("moving"), st("splitting"), st("ready")]);
+    let move_rec = srec(&[
+        ("active", Shape::Bool),
+        ("epoch", sint(0, 15)),
+        ("hi", sint(0, 31)),
+        ("lo", sint(0, 31)),
+        ("owner", satom(owners.clone())),
+        ("phase", phases),
+    ]);
+    let routing = sfcn((1..=8).map(int).collect(), satom(owners.clone()));
+    let move_layout = Layout::new(vec![move_rec.clone(), routing]);
+    assert_eq!(words(&move_rec), 1);
+    assert_eq!(move_layout.words, 2, "expected 7x compression (14 -> 2 words)");
+
+    // 2. ReprZab-style per-replica scalar functions, replica descriptor record, and zxid sequence:
+    //    Unpacked would take 4 * 5 + 4 + (1 + 8) = 33 words; packed takes 4 * 1 + 1 + 2 = 7 words (4.7x),
+    //    and a function of replica records shrinks 20 -> 5 words (4.0x).
+    let servers: Vec<Value> = (1..=5).map(|i| mv(&format!("s{i}"))).collect();
+    let roles = satom(vec![st("election"), st("following"), st("leading")]);
+    let zab_replica = srec(&[("epoch", sint(0, 7)), ("role", roles.clone()), ("synced", Shape::Bool), ("zxid", sint(0, 31))]);
+    assert_eq!(words(&sfcn(servers.clone(), zab_replica.clone())), 5);
+    let zab_layout = Layout::new(vec![
+        sfcn(servers.clone(), sint(0, 7)),
+        sfcn(servers.clone(), roles),
+        sfcn(servers.clone(), Shape::Bool),
+        sfcn(servers, sint(0, 31)),
+        zab_replica,
+        sseq(sint(0, 31), 8),
+    ]);
+    assert_eq!(zab_layout.words, 7, "expected 4.7x compression (33 -> 7 words)");
+
+    // 3. MultiPaxos_MC-style acceptor state + partial slot maps:
+    //    Unpacked would take 3 * 3 + (1 + 8) + (1 + 8) = 27 words; packed takes 3 + 2 + 2 = 7 words (3.86x).
+    let accs = vec![mv("a1"), mv("a2"), mv("a3")];
+    let vals = vec![mv("v1"), mv("v2")];
+    let acc_state =
+        sfcn(accs, srec(&[("maxBal", sint(-1, 7)), ("maxVBal", sint(-1, 7)), ("maxVal", satom(vec![mv("none"), mv("v1"), mv("v2")]))]));
+    let slot_bal = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(sint(0, 7)) };
+    let slot_val = Shape::Map { key: Box::new(sint(1, 8)), range: Box::new(satom(vals)) };
+    let paxos_layout = Layout::new(vec![acc_state, slot_bal, slot_val]);
+    assert_eq!(paxos_layout.words, 7, "expected >3.8x compression (27 -> 7 words)");
+
+    // Canonical zero-padding and permutation invariance: encoding into dirty buffers yields
+    // identical raw words, and applying a symmetry permutation + inverse restores exact words.
+    let s_val = [
+        fcn(vec![
+            (mv("a1"), rec(&[("maxBal", int(2)), ("maxVBal", int(1)), ("maxVal", mv("v1"))])),
+            (mv("a2"), rec(&[("maxBal", int(-1)), ("maxVBal", int(-1)), ("maxVal", mv("none"))])),
+            (mv("a3"), rec(&[("maxBal", int(4)), ("maxVBal", int(3)), ("maxVal", mv("v2"))])),
+        ]),
+        fcn(vec![(int(1), int(2)), (int(5), int(4))]),
+        fcn(vec![(int(1), mv("v1")), (int(5), mv("v2"))]),
+    ];
+    let (mut w1, mut w2) = (vec![u64::MAX; paxos_layout.words], vec![0xaaaa_5555_aaaa_5555; paxos_layout.words]);
+    paxos_layout.encode_state(&s_val, &mut w1).unwrap();
+    paxos_layout.encode_state(&s_val, &mut w2).unwrap();
+    assert_eq!(w1, w2, "dirty buffer bits leaked into canonical encoding");
+    paxos_layout.validate_words(&w1).unwrap();
+    assert_eq!(paxos_layout.decode_state(&w1), s_val.to_vec());
+
+    // Symmetry permutation (swap a1 <-> a3 and v1 <-> v2 twice = identity) preserves exact words.
+    let atom_perm: tlx_layout::permute::AtomPerm = Arc::new(|v: &Value| match v {
+        Value::ModelValue(m) if m.as_str() == "a1" => mv("a3"),
+        Value::ModelValue(m) if m.as_str() == "a3" => mv("a1"),
+        Value::ModelValue(m) if m.as_str() == "v1" => mv("v2"),
+        Value::ModelValue(m) if m.as_str() == "v2" => mv("v1"),
+        _ => v.clone(),
+    });
+    let state_tup = stup(paxos_layout.vars.to_vec());
+    let perm = PermPlan::compile(&state_tup, &atom_perm).expect("closed symmetry plan");
+    let (mut p1, mut p2) = (vec![0xdead_beef; paxos_layout.words], vec![0xcafe_babe; paxos_layout.words]);
+    perm.apply(&w1, &mut p1);
+    paxos_layout.validate_words(&p1).unwrap();
+    perm.apply(&p1, &mut p2);
+    assert_eq!(p2, w1, "double involution symmetry permutation drifted from canonical words");
+
+    // LayoutNode transcode across packed bit-width growth preserves exact values and zero padding.
+    let wider_node = LayoutNode::new(&srec(&[
+        ("active", Shape::Bool),
+        ("epoch", sint(0, 1023)),
+        ("hi", sint(-100, 500)),
+        ("lo", sint(-100, 500)),
+        ("owner", satom(vec![mv("n1"), mv("n2"), mv("n3"), mv("n4"), mv("n5")])),
+        ("phase", satom(vec![st("done"), st("idle"), st("moving"), st("ready"), st("splitting")])),
+    ]));
+    let narrow_node = LayoutNode::new(&move_rec);
+    let sample =
+        rec(&[("active", Value::TRUE), ("epoch", int(9)), ("hi", int(25)), ("lo", int(3)), ("owner", mv("n2")), ("phase", st("moving"))]);
+    let mut nw = vec![0u64; narrow_node.words()];
+    narrow_node.encode(&sample, &mut nw).unwrap();
+    let mut ww = vec![0u64; wider_node.words()];
+    assert!(tlx_layout::layout_tree::transcode(&narrow_node, &wider_node, &nw, &mut ww));
+    wider_node.validate_words(&ww).unwrap();
+    assert_eq!(wider_node.decode(&ww), sample);
+}
+
+#[test]
+fn validate_words_rejects_corrupted_packed_bits_and_padding() {
+    use tlx_layout::pack::{FieldLayout, FieldLoc, SlotLayout};
+    use tlx_layout::LayoutNode;
+
+    // 1. Packed Record: 3-element Atom (2 bits, valid codes 0..=2), Int 10..12 (2 bits, valid 0..=2), Bool (1 bit).
+    //    Bits 59..64 are used; bits 0..59 are unused padding and must be 0.
+    let rec_shape = srec(&[("atom", satom(vec![st("a"), st("b"), st("c")])), ("flag", Shape::Bool), ("num", sint(10, 12))]);
+    let node = LayoutNode::new(&rec_shape);
+    let fl = FieldLayout::of_shape(&rec_shape).unwrap();
+    let mut valid = vec![0u64; node.words()];
+    node.encode(&rec(&[("atom", st("b")), ("flag", Value::TRUE), ("num", int(12))]), &mut valid).unwrap();
+    node.validate_words(&valid).unwrap();
+
+    // Corrupt a low padding bit.
+    let mut bad_pad = valid.clone();
+    bad_pad[0] |= 1;
+    assert!(node.validate_words(&bad_pad).is_err(), "accepted non-zero padding bit");
+
+    // Corrupt 2-bit Atom code to 3 (universe has 3 elements: 0, 1, 2).
+    let Shape::Record(fields) = &rec_shape else { unreachable!() };
+    let atom_idx = fields.iter().position(|(k, _)| k.as_str() == "atom").unwrap();
+    let num_idx = fields.iter().position(|(k, _)| k.as_str() == "num").unwrap();
+    let FieldLoc::Bits(atom_pos) = fl.locs[atom_idx] else { panic!("expected packed atom") };
+    let mut bad_atom = valid.clone();
+    atom_pos.insert(&mut bad_atom, 3);
+    assert!(node.validate_words(&bad_atom).is_err(), "accepted out-of-range packed atom code");
+
+    // Corrupt 2-bit Int code to 3 (span is 2: valid codes 0, 1, 2).
+    let FieldLoc::Bits(num_pos) = fl.locs[num_idx] else { panic!("expected packed int") };
+    let mut bad_int = valid.clone();
+    num_pos.insert(&mut bad_int, 3);
+    assert!(node.validate_words(&bad_int).is_err(), "accepted out-of-range packed int code");
+
+    // 2. Packed Map: key 1..4, range Int 0..2 (2 bits).
+    //    Absent key slots and presence-word tail bits must be 0.
+    let map_shape = Shape::Map { key: Box::new(sint(1, 4)), range: Box::new(sint(0, 2)) };
+    let map_node = LayoutNode::new(&map_shape);
+    let mut map_w = vec![0u64; map_node.words()];
+    map_node.encode(&fcn(vec![(int(1), int(2)), (int(3), int(1))]), &mut map_w).unwrap();
+    map_node.validate_words(&map_w).unwrap();
+
+    // Corrupt presence tail bit (key universe is 4, so bit 4 is out of range).
+    let mut bad_pres = map_w.clone();
+    bad_pres[0] |= 1 << 4;
+    assert!(map_node.validate_words(&bad_pres).is_err(), "accepted map presence tail bit");
+
+    // Corrupt absent slot 1 (key = 2 is absent) in the packed value word.
+    let mut bad_absent = map_w.clone();
+    SlotLayout::insert(2, &mut bad_absent[1..], 1, 1);
+    assert!(map_node.validate_words(&bad_absent).is_err(), "accepted non-zero absent map slot");
+
+    // 3. Packed Seq: max_len = 5, elem = Int 0..2 (2 bits).
+    //    Inactive tail slot (index >= len) and tail padding bits must be 0.
+    let seq_shape = sseq(sint(0, 2), 5);
+    let seq_node = LayoutNode::new(&seq_shape);
+    let mut seq_w = vec![0u64; seq_node.words()];
+    seq_node.encode(&tup(vec![int(2), int(1)]), &mut seq_w).unwrap();
+    seq_node.validate_words(&seq_w).unwrap();
+
+    let mut bad_tail = seq_w.clone();
+    SlotLayout::insert(2, &mut bad_tail[1..], 2, 1);
+    assert!(seq_node.validate_words(&bad_tail).is_err(), "accepted non-zero inactive sequence slot");
+}
+
+#[test]
+fn packed_zero_width_middle_preserves_symmetry_orbits() {
+    use tlx_layout::permute::{AtomPerm, PermPlan};
+
+    let a = mv("a");
+    let b = mv("b");
+    let atoms = satom(vec![a.clone(), b.clone()]);
+    let swap: AtomPerm = Arc::new({
+        let (a, b) = (a.clone(), b.clone());
+        move |x| if x == &a { b.clone() } else { a.clone() }
+    });
+
+    // Empty tuple between Bool and Atom shares physical word 0: swapping a <-> b
+    // must preserve the leading Bool (`<<TRUE, <<>>, a>>` -> `<<TRUE, <<>>, b>>`).
+    let bool_mid = stup(vec![Shape::Bool, stup(vec![]), atoms.clone()]);
+    assert_eq!(words(&bool_mid), 1);
+    let p_bool = PermPlan::compile(&bool_mid, &swap).unwrap();
+    let src_val = tup(vec![Value::TRUE, tup(vec![]), a.clone()]);
+    let expected = tup(vec![Value::TRUE, tup(vec![]), b.clone()]);
+    let src_w = enc(&bool_mid, &src_val).unwrap();
+    let mut dst_w = vec![0u64; words(&bool_mid)];
+    p_bool.apply(&src_w, &mut dst_w);
+    assert_eq!(decode(&bool_mid, &dst_w), expected);
+
+    // Two atoms separated by an empty tuple stay in one word and keep distinct orbits.
+    let atom_mid = stup(vec![atoms.clone(), stup(vec![]), atoms]);
+    assert_eq!(words(&atom_mid), 1);
+    let p_atom = PermPlan::compile(&atom_mid, &swap).unwrap();
+    let mut dst = vec![0u64; 1];
+    p_atom.apply(&[0], &mut dst);
+    assert_eq!(dst, vec![3 << 62]);
+    let rep = |word: u64| {
+        let mut out = [0];
+        p_atom.apply(&[word], &mut out);
+        word.min(out[0])
+    };
+    assert_ne!(rep(0), rep(1 << 62));
+}
+
+#[test]
+fn transcode_union_payload_to_packed_scalar_field() {
+    use tlx_layout::layout_tree::{transcode, LayoutNode};
+
+    let union = Shape::Union(vec![Shape::Bool, sint(0, 1)].into());
+    let old = LayoutNode::new(&stup(vec![union]));
+    let new = LayoutNode::new(&stup(vec![Shape::Bool]));
+    let value = tup(vec![Value::TRUE]);
+    let mut src = vec![0u64; old.words()];
+    old.encode(&value, &mut src).unwrap();
+    let mut dst = vec![0u64; new.words()];
+    assert!(transcode(&old, &new, &src, &mut dst));
+    new.validate_words(&dst).unwrap();
+    assert_eq!(new.decode(&dst), value);
+}
+
+#[test]
+fn large_child_widths_preserve_host_size_and_map_budget() {
+    let inner = sseq(sint(i64::MIN, i64::MAX), u32::MAX as usize);
+    assert_eq!(words(&inner), 1usize << 32);
+    let outer = sseq(inner.clone(), 1);
+    assert_eq!(words(&outer), (1usize << 32) + 1);
+    assert_eq!(tlx_layout::shape::map_shape(Shape::Bool, inner), Shape::Dyn);
 }

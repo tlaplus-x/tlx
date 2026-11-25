@@ -32,6 +32,7 @@ impl<'c> Compiler<'c> {
             // The set family: bit sets, sorted sets, the ranks, the recodes, union
             // field access and the boxed builders (dispatched to `sets.rs`).
             ExprKind::Concat(..)
+            | ExprKind::Pack { .. }
             | ExprKind::Rank(..)
             | ExprKind::Recode { .. }
             | ExprKind::RankUnion { .. }

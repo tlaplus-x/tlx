@@ -134,3 +134,32 @@ fn simulation_miss_after_last_restart_continues_with_dynamic_values() {
     assert!(out.contains("after 0 restarts; continuing with dynamic values"), "{out}");
     assert!(out.contains("The number of states generated: 15001"), "{out}");
 }
+
+#[test]
+fn packed_zero_width_field_reports_layout_miss_and_invariant_in_c() {
+    let spec = r#"---- MODULE Widen ----
+EXTENDS Naturals
+VARIABLES r, n
+Init == r = <<FALSE, {}>> /\ n \in {0, 100}
+Next == /\ r' = <<TRUE, IF n = 99 THEN {1} ELSE {}>>
+        /\ n' = IF n < 100 THEN n + 1 ELSE n
+Inv == r[2] = {}
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let dir = tlx_testkit::TempDir::with_spec("widening-packed-zero", spec, cfg);
+    let (interp_code, interp_out) = run(&dir, &["-interp"], &[]);
+    assert_eq!(interp_code, 12, "{interp_out}");
+    assert!(interp_out.contains("Invariant Inv is violated"), "{interp_out}");
+
+    for (label, env) in [
+        ("C", &[("TLX_PRERUN", "10"), ("TLX_JIT", "0"), ("TLX_NATIVE_SYNC", "1")][..]),
+        ("JIT", &[("TLX_PRERUN", "10"), ("TLX_JIT", "1"), ("TLX_NATIVE_SYNC", "1")][..]),
+    ] {
+        let (code, out) = run(&dir, &["-compile"], env);
+        assert_eq!(code, 12, "{label}:\n{out}");
+        assert!(out.contains("Invariant Inv is violated"), "{label}:\n{out}");
+        assert!(misses(&out) >= 1, "{label}: expected layout miss on zero-width set field:\n{out}");
+        assert_eq!(counts(&out), counts(&interp_out), "{label}:\n{out}");
+    }
+}
