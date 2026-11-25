@@ -209,3 +209,120 @@ fn io_errors_stop_the_search() {
         assert!(msg.contains("-maxdisk"), "{msg}");
     }
 }
+
+/// Bounded-width parallel levels (`DAG_WIDTH` states per BFS level) over
+/// `0..total`: keeps the frontier tiny (`< 1 MiB`) so `-maxmem 512M` tests
+/// `FpSet` as the dominant resident structure.
+struct BoundedWidthDag {
+    total: u64,
+    acts: Vec<String>,
+}
+
+const DAG_WIDTH: u64 = 32_768;
+
+impl tlx_runtime::StateCodec<u64> for BoundedWidthDag {
+    fn words(&self) -> usize {
+        1
+    }
+    fn encode(&self, s: &u64, out: &mut [u64]) -> u64 {
+        out[0] = *s;
+        self.fingerprint(s)
+    }
+    fn decode(&self, w: &[u64], _depth: u32, _fp: u64) -> u64 {
+        w[0]
+    }
+}
+
+impl Model for BoundedWidthDag {
+    type State = u64;
+    tlx_runtime::model_without_checks!();
+    fn init_states(&self, out: &mut dyn FnMut(u64)) -> Result<(), ModelError> {
+        for s in 0..DAG_WIDTH.min(self.total) {
+            out(s);
+        }
+        Ok(())
+    }
+    fn successors(&self, &s: &u64, out: &mut dyn FnMut(u64, u32) -> bool) -> Result<(), ModelError> {
+        let next = s + DAG_WIDTH;
+        if next < self.total {
+            out(next, 0);
+        }
+        Ok(())
+    }
+    fn fingerprint(&self, &s: &u64) -> u64 {
+        let x = (s ^ (s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+    fn check_invariants(&self, _: &u64) -> Result<Option<usize>, ModelError> {
+        Ok(None)
+    }
+    fn invariant_names(&self) -> &[String] {
+        &[]
+    }
+    fn action_names(&self) -> &[String] {
+        &self.acts
+    }
+    fn render(&self, s: &u64) -> String {
+        format!("x = {s}")
+    }
+    fn caps(&self) -> tlx_runtime::Caps<'_, u64> {
+        tlx_runtime::Caps { format: Some(tlx_runtime::StateFormat::Words(self)), ..Default::default() }
+    }
+}
+
+/// Under `-maxmem 512M`, baseline (`old + new <= room` with 8 B/slot) stopped
+/// growing at `2^25` slots (`256 MiB`) and rotated to disk at `25,165,824`
+/// distinct states (`0.75 * 2^25`). With chunked page reclamation and
+/// `6.4 B/slot` quotiented cache lines, `FpSet` holds >= 1.8x more distinct
+/// states (`46,000,000` > `1.82 * 25,165,824`) purely in RAM with 0 rotations.
+#[test]
+fn maxmem_512m_holds_over_1_8x_baseline_states_purely_in_ram() {
+    if tlx_runtime::mem::physical_bytes() < (2 << 30) {
+        return;
+    }
+    // `MemBudget` samples process-wide `/proc/self/statm` RSS; run in an
+    // isolated child process when invoked inside the parallel integration
+    // suite so sibling tests' allocations are not charged against `-maxmem`.
+    if !std::env::args().any(|a| a == "--exact") {
+        let exe = std::env::current_exe().expect("test binary path");
+        let st = std::process::Command::new(exe)
+            .args(["--exact", "fpset_disk::maxmem_512m_holds_over_1_8x_baseline_states_purely_in_ram", "--nocapture"])
+            .status()
+            .expect("spawn isolated budget child");
+        assert!(st.success(), "isolated -maxmem 512M child failed: {st}");
+        return;
+    }
+    const BASELINE_512M_MAX_IN_RAM: u64 = (1u64 << 25) * 3 / 4; // 25,165,824
+    let target = 46_006_272u64; // 1404 * 32768 = 1.828x baseline
+    assert!(target as f64 >= 1.8 * BASELINE_512M_MAX_IN_RAM as f64);
+
+    let scratch = tlx_testkit::TempDir::new("cap-512m");
+    let dir = scratch.child_path("meta");
+    let sp = Spill::new(SpillConfig { mode: SpillMode::Auto, dir: Some(dir), ..Default::default() });
+    let m = BoundedWidthDag { total: target, acts: vec!["Step".into()] };
+    let budget = 512 << 20;
+    let o = Options {
+        workers: 4,
+        check_deadlock: false,
+        maxmem: budget,
+        fp: FpConfig::growing_within(budget),
+        spill: sp.clone(),
+        ..Default::default()
+    };
+    let (before_rot, _) = disk_counts();
+    let r = explore(&m, &o);
+    sp.wait_for_writes();
+    sp.wait_for_reads();
+    let (after_rot, _) = disk_counts();
+    assert_eq!(r.outcome, Outcome::Ok);
+    assert_eq!(r.stats.distinct, target);
+    assert_eq!(after_rot - before_rot, 0, "expected 0 FpSet disk rotations at {target} states under -maxmem 512M");
+
+    // Also verify configured 1 GiB slot capacity (`>= 1.9x` of baseline's
+    // `50,331,648` high-water mark at `2^26` 8-byte slots).
+    let cfg_1g = FpConfig::growing_within(1 << 30);
+    let high_1g = (cfg_1g.limit as u64) * 3 / 4;
+    let baseline_1g = (1u64 << 26) * 3 / 4; // 50,331,648
+    assert!(high_1g as f64 >= 1.9 * baseline_1g as f64, "1G high-water {high_1g} should be >= 1.9x baseline {baseline_1g}");
+}

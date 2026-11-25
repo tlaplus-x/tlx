@@ -218,7 +218,7 @@ fn recover<'m, M: Model>(
         return Err(format!("the fingerprint files hold {total} fingerprints, the manifest says {}", m.distinct));
     }
     // (Within the memory budget: half of it for the table.)
-    let max_slots = if shared.budget.limited() { shared.budget.total() / 16 } else { usize::MAX };
+    let max_slots = if shared.budget.limited() { crate::fpset::FpSet::slots_for_bytes(shared.budget.total() / 2) } else { usize::MAX };
     // SAFETY (here and below): the workers have not started.
     let in_table = unsafe { seen.reserve(total as usize, max_slots) } || !seen.takes_runs();
     if in_table && total as usize > seen.max_entries() + seen.len() {

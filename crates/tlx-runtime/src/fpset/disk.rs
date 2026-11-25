@@ -447,9 +447,15 @@ impl Disk {
         }
     }
 
-    /// The memory of the old table.
+    /// The memory of the old table (slot array and overflow segments).
     pub(super) fn old_bytes(&self) -> usize {
-        self.old.as_ref().map_or(0, |t| t.bytes())
+        self.old.as_ref().map_or(0, Table::bytes)
+    }
+
+    /// The slot-array bytes of the old table (excluding overflow segments,
+    /// which charge `mem` directly).
+    pub(super) fn old_array_bytes(&self) -> usize {
+        self.old.as_ref().map_or(0, Table::array_bytes_now)
     }
 
     /// The memory of the Bloom filters and indexes (and of a merge in

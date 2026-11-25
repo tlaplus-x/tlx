@@ -118,9 +118,10 @@ RSS sample shows the effect of the previous one:
 | 4 | Frontier, representatives' candidates | Compress new blocks and write the candidates' full segments to disk (VIEW/SYMMETRY with several workers); next cycle still over, spill queue segments (back to normal below 7/8 of budget; with `-spill off` only compress) | Sequential write, sequential read-ahead |
 | 5 | Fingerprint set | Stop growing; rotate full tables into disk runs (§4.2) | Slowest, so last |
 
-Stage 5 is decided at growth time in `grow_seen` (inside a safepoint): if the old and new table do not fit
-in "budget minus other components", it first applies stages 1-4 and otherwise grows to exactly what fits
-(not if that is less than 1.25x the current size) and caps the table there. After a hard stop, `-fpmem`
+Stage 5 is decided at growth time in `grow_seen` (inside a safepoint): if the replacement table and
+bounded rehash chunk slack do not fit in "budget minus other components", it first applies stages 1-4, then
+grows into whatever room remains if that adds at least an eighth more slots, and otherwise enters stage 5
+(rotating to disk, or capping the table there with `-spill off`). After a hard stop, `-fpmem`
 runs say "rerun with a larger -fpmem", others "-maxmem". Stage 1 does not credit the archive bytes until
 the next sample, because spilling is done by the workers on their next tick and segments shared with
 liveness edge records cannot be freed by dropping the archive.
@@ -191,8 +192,13 @@ barrier is one such moment but a level can take minutes, so there are mid-level 
 
 ### 4.1 In-memory table
 
-- One open-addressing table of `AtomicU64`, linear probing, 0 = empty (fingerprint 0 is stored as 1),
-  insert = one CAS. No fingerprint bits are borrowed for flags.
+- One open-addressing table with linear probing, 0 = empty (fingerprint 0 is stored as 1), lock-free.
+  Below 2^21 home slots each slot is an `AtomicU64` (8 B/slot); from 2^21 slots on, slots use lossless
+  low-bit `fastrange` quotienting in 64-byte cache lines (`fpset/table.rs`: 10 slots/line = 6.4 B/slot),
+  storing only the inline probe displacement and low fingerprint bits while recovering the high bits from
+  the home bucket, with wait-free O(1) helping for in-flight publications and a lock-free segmented
+  overflow array (charged live to the set's memory gauge and capped under `-fpmem`) for rare large probe
+  displacements.
 - **Placement by high bits**: `home = (fp * nslots) >> 64` (fastrange). The table is monotone in the
   fingerprint, hence approximately sorted (only probe clusters are unordered), its size need not be a power
   of two (it can fill the budget exactly), and shards are contiguous ranges. Fingerprints are uniform in all
@@ -203,9 +209,12 @@ barrier is one such moment but a level can take minutes, so there are mid-level 
   probed slots against about 8.5 at 0.75, so growth should happen before the hard limit.
 - **Start and growth**: without `-fpmem` the table starts at 2^20 slots (8 MiB) (`TLX_FP_TABLE_MIN` in
   tests); at high-water, in a safepoint, a table of twice the size (or what the budget allows) is allocated
-  and all workers re-insert the old table in parallel by range. When only one worker is active (narrow
-  level) the same number of temporary threads does it for tables of at least 2^20 slots. Peak during growth
-  is the sum of both tables.
+  and all workers re-insert the old table in parallel across page-aligned units (sized by `-fpbits` shards
+  and capped at 2 MiB) from low to high slots, releasing completed old-table pages immediately via
+  `madvise` (`MADV_DONTNEED` / `MADV_FREE_REUSABLE`). Because placement is monotone, new-table pages fault
+  in only as old-table units are discarded, bounding peak resident memory during growth to the larger table
+  plus one active unit per worker instead of the sum of both tables. When only one worker is active (narrow
+  level) the same number of temporary threads does it for tables of at least 2^20 slots.
 - **Entry count** is not a shared counter (a single contended cache line more than doubled the insert cost
   at 8 threads): 64 stripes (by worker number) each flush into the shared count at 64 entries; near the
   marks the shared count is used directly, so high-water and hard limit decisions are exact.
@@ -238,11 +247,11 @@ rejected because it would check invariants on a second concrete state of an old 
 change early-stop counts. It also is unnecessary: with two in-memory generations most duplicates are
 caught in memory.
 
-**Rotation** (`FpSet::rotate`, in a safepoint): the current table is sorted in place (clusters are already
-in order between each other, so sorting within clusters yields a valid probe layout, `Table::sorted_clusters`),
-written as one run by the crew in parallel by slot range, and then kept as the read-only old table; the
-previous old table is freed (its run is already on disk). The invariant is that each fingerprint is in the
-current table or on disk, so the old table can be dropped at any time (`drop_old`).
+**Rotation** (`FpSet::rotate`, in a safepoint): each worker scans its assigned slot ranges read-only,
+sorts each probe cluster into a scratch buffer (`Table::sorted_clusters`), writes it as a piece of one
+sorted run, and then keeps the current table as the read-only old table; the previous old table is freed
+(its run is already on disk). The invariant is that each fingerprint is in the current table or on disk,
+so the old table can be dropped at any time (`drop_old`).
 
 **Runs.** After assembly a run's byte range is mapped read-only (`BlockStore::map`, `MAP_SHARED`,
 `MADV_RANDOM`: a lookup whose page is not in the page cache reads that page, not the system's

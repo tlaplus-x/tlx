@@ -161,7 +161,7 @@ impl Args {
         let c = match self.fpmem {
             Some(mib) => tlx_runtime::FpConfig::fixed_mib(mib),
             None => {
-                let c = tlx_runtime::FpConfig::growing(self.maxmem() / 8);
+                let c = tlx_runtime::FpConfig::growing_within(self.maxmem());
                 let c = self.fp_spill_slots.map_or(c, |n| c.with_disk_slots(n));
                 self.fp_table_min.map_or(c, |n| c.with_initial(n))
             }

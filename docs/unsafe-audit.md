@@ -37,8 +37,8 @@ Locations name files and functions (line numbers drift).
 
 | # | Location | What | Invariant relied on | Status |
 |---|---|---|---|---|
-| 3 | `fpset/mod.rs`: `Slots` (`zeroed`, `Deref`, `Drop`, `unsafe impl Send/Sync`) | the open-addressing table of `AtomicU64`: an anonymous `mmap` (plus `madvise(MADV_HUGEPAGE)` on Linux) for large tables, `alloc_zeroed` otherwise; freed with `munmap`/`dealloc` | `Slots` owns its memory like a `Box<[AtomicU64]>`; zeroed memory is valid `AtomicU64(0)`; the layout is checked (`"fingerprint set too large"`, `handle_alloc_error`); pages are touched only when used, so large `-fpmem` reservations stay cheap | doc on each block and impl |
-| 4 | `fpset/mod.rs`: `Table::slot` (`get_unchecked`) | unchecked slot access on the hot path | callers keep `i < n + OVERFLOW = slots.len()`: the home slot is `fp * n >> 64 < n`, probes never wrap and a probe running past the `OVERFLOW` (4096) slots after the home range finds the table full; inserts are refused (`Full`) at 90% load, a check that is racy by at most `2 (t - 1)` slots with `t` threads, far below `OVERFLOW` | `debug_assert`; doc |
+| 3 | `fpset/table.rs`: `MappedBuf` (`zeroed`, `discard_bytes`, `Drop`, `unsafe impl Send/Sync`); `fpset/overflow.rs`: `alloc_demand_zero`, `free_demand_zero`, `page_size`, `Overflow` (`try_push`, `get`, `Drop`, `fixed_resident_bytes`, `unsafe impl Send/Sync`) | backing storage for open-addressing fingerprint tables (anonymous `mmap` with `MADV_HUGEPAGE` on Linux for `>= 1 MiB`, `alloc_zeroed` otherwise; `madvise` page reclamation on rehashed units; freed with `munmap`/`dealloc`) and lock-free demand-zero overflow storage (single demand-zero mapping for fixed caps, demand-zero segments for growing tables) | `MappedBuf` and `Overflow` uniquely own their allocations and expose shared access only through zero-valid atomics; `discard_bytes` is called only on completed rehash units that no thread touches again, rounded inward to OS page boundaries; `Overflow` publishes demand-zero segments via `AcqRel`/`Acquire` CAS, unmaps losing candidates untouched, and frees exclusively on drop | `# Safety` on `discard_bytes`, `discard_slot_range`, and `free_demand_zero`; doc on each block and impl |
+| 4 | `fpset/table.rs`: `Raw64::slot`, `Compact::line`, `Table::fault_pages` and `Table::resident_bytes` (tests) | unchecked slot and 64-byte cache-line `Line` pointer arithmetic on the hot path; `mincore` page-residency query in tests | callers keep `i < n + OVERFLOW = len` and `g < lines = len.div_ceil(SLOTS_48)`: `home = fp * n >> 64 < n`, probes never wrap and stop at `len`, and inserts are refused (`Full`) at 90% load, far below `OVERFLOW`; `mincore` queries a page-aligned prefix of a live `mmap` with a matching output vector | `debug_assert`; doc |
 | 5 | `fpset/mod.rs`: `UnsafeCell<Table>`, `UnsafeCell<Option<Box<Disk>>>`, `unsafe impl Sync for FpSet`, and the `unsafe fn`s `disk_mut`, `insert_exclusive`, `make_room`, `grow`, `grow_to`, `rotate`, `install_merge`, `drop_old`, `for_each_in_table_part`, `reserve`, `add_run` | `&self` methods read or replace the table and the disk tier | slots are atomics and runs are immutable `Arc`s, so shared use is read-only; replacing or changing the table or disk tier happens only under the **exclusive-access contract**: no other thread uses the set (except atomic counters like `len` and `old_bytes`) | `# Safety` on each `unsafe fn`; SAFETY on each `UnsafeCell` access and the `impl Sync`. High consequence if violated (use after free of a replaced table); no violating path known |
 | 6 | `fpset/disk.rs`: page lookup | `slice::from_raw_parts` over a mapped page of fingerprints | the page holds `n` fingerprints, 8-byte aligned (`map_run`), within the live mapping | doc |
 | 7 | `explore/mod.rs` (`install_merge`, `grow_to`, `rotate`, `drop_old` calls); `explore/checkpoint/write.rs` (`for_each_in_table_part`, `_exit` on a configured abort); `explore/checkpoint/recover.rs` (`reserve`, `add_run`) | calls into `FpSet`'s exclusive-access operations | every active worker is parked (or none runs) and the others hold no reference into the set; checkpoint and recover calls run before the workers start or at a level barrier | doc at every call site |
@@ -248,6 +248,8 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-runtime/src/explore/safepoint.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/fpset/disk.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/fpset/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
+| `crates/tlx-runtime/src/fpset/overflow.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
+| `crates/tlx-runtime/src/fpset/table.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/fpset/tests.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/io/durable.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/io/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
@@ -288,12 +290,16 @@ reuse; it plays no part in evaluation.
 
 ### Fingerprint set
 
-Lock-free open addressing over `AtomicU64` slots with linear probing. The home slot is
-`fp * n >> 64` (no wrap-around; `OVERFLOW` slots follow the `n` home slots), so slot access is
-unchecked on the hot path (row 4). Inserts are refused at 90% load, so probe loops terminate.
-Replacing the table (growth, rotation to the disk tier, checkpoint) is the exclusive-access
-contract of row 5; the explorer meets it by parking every worker at a safepoint (rows 7 and 8).
-The load limits and probing are described in the module comment of `tlx-runtime/src/fpset/mod.rs`.
+Lock-free open addressing with linear probing over `AtomicU64` (`< 2^20` slots) and quotiented
+64-byte cache-line `Line<AtomicU16, 10>` / `Line<AtomicU8, 12>` slots (`>= 2^20` / `>= 2^28` slots,
+with a lock-free segmented `Overflow` store for displacements exceeding inline tag bits). The home
+slot is `fp * n >> 64` (no wrap-around; `OVERFLOW` slots follow the `n` home slots), so slot and
+line indexing is unchecked on the hot path (row 4). Inserts are refused at 90% load, so probe loops
+terminate. During parallel growth, completed page-aligned chunks of the old `mmap` are reclaimed via
+`madvise` once read (row 3). Replacing the table (growth, rotation to the disk tier, checkpoint) is
+the exclusive-access contract of row 5; the explorer meets it by parking every worker at a safepoint
+(rows 7 and 8). The load limits, quotienting and probing are described in `tlx-runtime/src/fpset/mod.rs`
+and `tlx-runtime/src/fpset/table.rs`.
 
 ### Statistics source
 
