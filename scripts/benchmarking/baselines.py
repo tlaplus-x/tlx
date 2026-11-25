@@ -18,11 +18,12 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import statistics
 import time
 
 from benchmarking import machine as bench_machine
 from benchmarking.records import (BASELINES, COMPLETE, ROOT, STORE, VERSION, digest, dump, evidence, instance_info,
-                                  key_complete, key_id, measurement_key, normalize, record_of_record, record_path,
+                                  exit_ok, key_complete, key_id, measurement_key, normalize, scalar, record_of_record, record_path,
                                   store_files, store_stem, write_records)
 from harness.storage import file_lock
 from tlxlib import CORPUS_ROOT_CWD, model_cwd
@@ -35,6 +36,11 @@ from tlxlib import CORPUS_ROOT_CWD, model_cwd
 ROOT_CWD_TOKEN = "corpus-root"
 
 
+def _repetitions_complete(record):
+    reps = record['provenance'].get('repetitions')
+    return not reps or reps.get('completed', 0) >= reps.get('requested', 0)
+
+
 def historical_match(tx, tc):
     """Historical comparison requires same hardware, workers, verdict and complete counts.
 
@@ -42,6 +48,7 @@ def historical_match(tx, tc):
     it does not make a reusable current baseline.
     """
     return (not tx['provenance'].get('count_problems') and not tc['provenance'].get('count_problems')
+            and _repetitions_complete(tx)
             and tc.get('tool') == 'tlc' and tx['model'] == tc['model'] and tx['workers'] == tc['workers']
             and bool(tx['instance']['type']) and tx['instance']['type'] == tc['instance']['type']
             and tx['instance']['arch'] == tc['instance']['arch']
@@ -272,6 +279,17 @@ def instance_arches(root=ROOT):
 _ARCHES = None
 
 
+# TLC lookup honors TLC's distinguishing key dimensions plus tool and hardware
+# invariants, ignoring historical tlx-side metadata (revision, args, env,
+# variant) carried by frozen legacy records at the same TLC filename.
+TLC_KEY_FIELDS = ('tool', 'mode', 'tlc_version', 'model', 'content_digest', 'workers',
+                  'instance_type', 'instance_arch', 'cgroup_mib', 'hogs')
+
+
+def same_tlc_key(a, b):
+    return all(a.get(k) == b.get(k) for k in TLC_KEY_FIELDS)
+
+
 def stored_baseline(model, workers, *, version, instance, root=ROOT, arch=None):
     """The stored entry of a key as written, reusable or not (None if never stored).
 
@@ -288,7 +306,7 @@ def stored_baseline(model, workers, *, version, instance, root=ROOT, arch=None):
         p = Path(root) / (BASELINES + '/' + key_id(key) + '.json')
         if p.exists():
             b = json.loads(p.read_text())
-            if b.get('schema_version') == VERSION and b['key'] == key:
+            if b.get('schema_version') == VERSION and same_tlc_key(b['key'], key):
                 return b
     return None
 
@@ -305,8 +323,42 @@ def raw_baseline(b):
             'tlc_version': r['tlc_version'], 'date': r['date'], 'measurement_revision': r['revision']}
 
 
-def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=None):
+def collect_samples(collect, repetitions, workers):
+    """Retain every attempt; only a complete, consistent set is a timing."""
+    samples = []
+    problems = []
+    for i in range(repetitions):
+        sample = collect()
+        samples.append(sample)
+        if (sample.get('result') not in COMPLETE or (scalar(sample.get('wall_s')) or 0) <= 0
+                or not exit_ok(sample.get('result'), sample.get('exit'))):
+            problems.append(f'sample {i + 1}: incomplete TLC timing')
+            break
+        fields = ['result', 'violated']
+        if workers == 1 or sample['result'] == 'success':
+            fields += ['distinct', 'generated', 'depth']
+        if any(sample.get(k) != samples[0].get(k) for k in fields):
+            problems.append(f'sample {i + 1}: TLC results disagree')
+    raw = {**samples[-1], 'tlc_samples': samples, 'aggregation': 'median',
+           'count_problems': problems, 'tlc_repetitions': repetitions}
+    if problems:
+        raw['aggregation'] = 'last-attempt'
+        raw['result'] = samples[-1].get('result') if samples[-1].get('result') not in COMPLETE else 'error'
+        return raw
+    for field in ('wall_s', 'cpu_s', 'maxrss_mib'):
+        values = [r.get(field) for r in samples]
+        raw[field] = statistics.median(values) if all(v is not None for v in values) else None
+    raw['sample_spread'] = {
+        field: (max(values) - min(values)) / raw[field] if raw[field] else None
+        for field in ('wall_s', 'cpu_s')
+        for values in [[r.get(field) for r in samples]]}
+    return raw
+
+
+def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=None, repetitions=1):
     """The sole performance-TLC collection boundary; a valid key never invokes collect."""
+    if type(repetitions) is not int or repetitions < 1:
+        raise ValueError("TLC repetitions must be a positive integer")
     if version is None or instance is None:
         version = version or bench_machine.tla2tools_info().get('revision') or bench_machine.tla2tools_info().get('short')
         instance = instance or instance_info(bench_machine.machine_desc())['type']
@@ -317,7 +369,7 @@ def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=Non
     with file_lock(lockpath):
         if b := find_baseline(model, workers, root=root, version=version, instance=instance, arch=arch):
             return raw_baseline(b)
-        raw = collect()
+        raw = collect_samples(collect, repetitions, workers) if repetitions > 1 else collect()
         if content_digest(model) != content:
             raise ValueError('benchmark model inputs changed during TLC baseline collection')
         h = {'date': time.strftime('%Y-%m-%d %H:%M:%S'), 'instance_type': instance,

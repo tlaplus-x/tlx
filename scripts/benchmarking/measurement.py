@@ -24,6 +24,21 @@ from tlc import parse
 from tlxlib import CORPUS_ROOT_CWD, mode_args as execution_args, model_cwd, tlx_env
 
 
+@contextlib.contextmanager
+def cache_environment(isolate=False, env=None, *, warmup=False):
+    """One cache per configuration, retained across its warmup and samples."""
+    run_env = dict(env or {})
+    provenance = {'mode': 'inherited' if run_env.get('TLX_CACHE') or os.environ.get('TLX_CACHE') else 'shared-batch',
+                  'initial_state': 'unknown', 'warmup': warmup}
+    if not isolate:
+        yield run_env, provenance
+        return
+    with tempdirs.TemporaryDirectory(prefix='tlx-bench-cache-') as cache:
+        # Synchronous compilation keeps owned builds inside the cache lifetime.
+        run_env.update(TLX_CACHE=cache, TLX_NATIVE_SYNC='1')
+        yield run_env, {'mode': 'fresh-per-model', 'initial_state': 'empty', 'warmup': warmup}
+
+
 def binary_path(path=None):
     """The absolute path of the tlx binary a measured run executes.
 

@@ -144,6 +144,24 @@ class SampleContract(unittest.TestCase):
                                       budget=bench_budget.Budget())
         return records["new"], runs
 
+    def test_isolated_cache_is_shared_with_samples_but_not_other_binary(self):
+        seen = {}
+        def once(bench, m, e, exe, instr, **kw):
+            env = kw['env']
+            path = env['TLX_CACHE']
+            self.assertTrue(os.path.isdir(path))
+            self.assertEqual(env['TLX_NATIVE_SYNC'], '1')
+            seen.setdefault(exe, []).append(path)
+            return self.sample()
+        with patch.object(S, 'measure_once', side_effect=once), contextlib.redirect_stdout(io.StringIO()):
+            records = S.measure_entry(bench, {}, self.entry(), [('base', 'a'), ('new', 'b')], 3,
+                                      False, lambda _: 1, budget=bench_budget.Budget(), isolate_cache=True)
+        self.assertEqual(len(seen['a']), 4)
+        self.assertEqual(len(set(seen['a'])), 1)
+        self.assertNotEqual(seen['a'][0], seen['b'][0])
+        self.assertFalse(os.path.exists(seen['a'][0]))
+        self.assertEqual(records['new']['cache']['mode'], 'fresh-per-model')
+
     def test_first_middle_and_last_sample_mismatches_are_all_reported(self):
         for i in (1, 2, 3):
             script = [self.sample() for _ in range(4)]  # index 0 is the warm-up
@@ -740,6 +758,50 @@ class RunBench(unittest.TestCase):
         key, = runs  # `--models` selects the "custom" tier.
         self.assertEqual(key, f"custom:A:{modes}:1w")
         return runs[key], output.getvalue(), made
+
+    def test_stats_child_uses_the_live_isolated_cache(self):
+        exe = os.path.join(self.tmp.name, 'fake-tlx')
+        log = os.path.join(self.tmp.name, 'children.jsonl')
+        inherited = os.path.join(self.tmp.name, 'inherited')
+        os.mkdir(inherited)
+        write(exe, "#!/usr/bin/env python3\n" + """
+import json, os, sys
+cache = os.environ['TLX_CACHE']
+assert os.path.isdir(cache)
+marker = os.path.join(cache, 'marker')
+seen = os.path.exists(marker)
+with open(marker, 'w') as f:
+    f.write('built')
+record = dict(argv=sys.argv, cache=cache, seen=seen, sync=os.environ.get('TLX_NATIVE_SYNC'))
+with open(os.environ['CHILD_LOG'], 'a') as f:
+    f.write(json.dumps(record) + '\\n')
+for arg in sys.argv:
+    if arg.startswith('json='):
+        with open(arg[5:], 'w') as f:
+            json.dump(record, f)
+print('Model checking completed. No error has been found.')
+print('10 states generated, 5 distinct states found, 0 states left on queue.')
+""")
+        os.chmod(exe, 0o755)
+        a = argparse.Namespace(external=None, models='A', tiers='', per_tier=0, modes='compile', workers='1',
+                               tlc=False, tlc_workers='', tlc_timeout=0, timeout=10, repeat=2,
+                               resume=False, stats=True, isolate_cache=True, out=self.out)
+        with patch.object(bench_models, 'oracle', return_value={'A': self.model}), \
+             patch.dict(os.environ, {'TLX_CACHE': inherited, 'CHILD_LOG': log}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bench.run_bench(a, exe)
+        with open(log) as f:
+            children = [json.loads(line) for line in f]
+        self.assertEqual(len(children), 3)
+        self.assertEqual(len({c['cache'] for c in children}), 1)
+        self.assertEqual([c['seen'] for c in children], [False, True, True])
+        self.assertTrue(all(c['sync'] == '1' for c in children))
+        self.assertIn('-stats', children[-1]['argv'])
+        self.assertFalse(os.path.exists(children[0]['cache']))
+        self.assertEqual(os.listdir(inherited), [])
+        row = next(iter(read(self.out)['runs'].values()))
+        self.assertEqual(row['stats']['cache'], children[0]['cache'])
+        self.assertEqual(row['cache']['mode'], 'fresh-per-model')
 
     def test_every_sample_is_validated_and_an_earlier_mismatch_is_kept(self):
         # HARNESS-07: sample 2 disagrees and is not erased by sample 3.

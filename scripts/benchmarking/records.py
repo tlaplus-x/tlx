@@ -100,7 +100,7 @@ COVERAGE_FIELDS = ('native_share', 'host_time_share', 'host_s', 'host_calls', 'e
                    'fully_native', 'search_thread_s_est')
 CONFIGURATION_FIELDS = ('args', 'env', 'hogs', 'cgroup_mib', 'variant', 'compatibility')
 PROVENANCE_FIELDS = ('source', 'pointer', 'legacy', 'adoption', 'repetitions', 'sample_results',
-                     'measurement_source', 'reused_from', 'metric_sources', 'revision_source', 'count_problems')
+                     'measurement_source', 'reused_from', 'metric_sources', 'revision_source', 'count_problems', 'cache', 'sample_spread')
 INSTANCE_FIELDS = ('type', 'arch', 'description')
 
 
@@ -408,6 +408,9 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
     cpu = raw.get('cpu_s', raw.get('cpu'))
     rss = raw.get('rss_mib', raw.get('maxrss_mib', raw.get('rss')))
     wall = raw.get('walls', raw.get('wall_s', raw.get('wall', raw.get('median', raw.get('min')))))
+    if 'tlc_samples' in raw:
+        wall = [s.get('wall_s') for s in raw['tlc_samples']]
+        cpu = [s.get('cpu_s') for s in raw['tlc_samples']]
     diagnostic = (header.get('diagnostic') or header.get('kind') == 'profile'
                   or raw.get('raw_stats') or '-stats' in args)
     r = {'schema_version': VERSION, 'tool': raw.get('tool', 'tlc' if mode == '-tlc' else 'tlx'), 'model': model, 'mode': mode, 'workers': workers,
@@ -429,6 +432,21 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
     # Preserve the producer's mode-contract check, including earlier samples
     # and warm-ups. COMPLETE only describes termination, not correctness.
     # Absence means unchecked legacy evidence; [] means checked and matched.
+    if 'tlc_samples' in raw:
+        if raw.get('count_problems'):
+            # Rejected repetitions are attempts, not a timing distribution.
+            # Preserve the final attempt's timeout bound for slice ranking.
+            r['metrics']['wall_s'] = scalar(raw.get('wall_s'))
+            r['metrics']['cpu_s'] = scalar(raw.get('cpu_s'))
+        elif any(s.get('cpu_s') is None for s in raw['tlc_samples']):
+            r['metrics']['cpu_s'] = None
+    for field in ('cache', 'sample_spread'):
+        if field in raw:
+            r['provenance'][field] = raw[field]
+    if 'tlc_samples' in raw:
+        r['provenance']['repetitions'] = {
+            'requested': raw['tlc_repetitions'],
+            'completed': sum(s.get('result') in COMPLETE for s in raw['tlc_samples'])}
     if 'count_problems' in raw:
         r['provenance']['count_problems'] = raw['count_problems']
     if 'compatibility' in raw:
@@ -461,6 +479,8 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
         r['provenance']['metric_sources'] = raw['metric_sources']
     if isinstance(raw.get('raw_result'), dict):
         r['raw_result'] = raw['raw_result']
+    elif 'tlc_samples' in raw:
+        r['raw_result'] = {k: v for k, v in raw.items() if k != 'raw_result'}
     # Coverage attributes belong in the same row as the timing they describe:
     # they are only comparable for the run that produced them. A run without a
     # census leaves them absent, so that "unmeasured" never reads as a share of
@@ -544,6 +564,18 @@ def validate(r):
     _fields(r['instance'], INSTANCE_FIELDS, 'instance')
     _fields(r.get('configuration') or {}, CONFIGURATION_FIELDS, 'configuration')
     _fields(r['provenance'], PROVENANCE_FIELDS, 'provenance')
+    if 'cache' in r['provenance']:
+        cache = r['provenance']['cache']
+        if (not isinstance(cache, dict) or cache.get('mode') not in ('fresh-per-model', 'shared-batch', 'inherited')
+                or cache.get('initial_state') != ('empty' if cache['mode'] == 'fresh-per-model' else 'unknown')
+                or type(cache.get('warmup')) is not bool):
+            raise ValueError('invalid cache provenance')
+    if 'sample_spread' in r['provenance']:
+        spread = r['provenance']['sample_spread']
+        if (not isinstance(spread, dict) or set(spread) != {'wall_s', 'cpu_s'}
+                or any(v is not None and (type(v) not in (int, float) or not math.isfinite(v) or v < 0)
+                       for v in spread.values())):
+            raise ValueError('invalid sample spread')
     if 'count_problems' in r['provenance']:
         problems = r['provenance']['count_problems']
         if not isinstance(problems, list) or not all(isinstance(p, str) and p for p in problems):
