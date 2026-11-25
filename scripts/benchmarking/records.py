@@ -237,6 +237,57 @@ def scalar(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
+def peak_rss(row):
+    """A measurement's peak-RSS median in MiB, or None when it has none.
+
+    Prefers a repeated TLC baseline's retained `tlc_samples`, whose per-run
+    measurements are the evidence a stored aggregate may have summarised with
+    an unknown sample; then the aggregate `rss_mib`/`maxrss_mib`/`rss` scalar or
+    flat list; then the timed `samples` of a history written before `run` kept
+    an aggregate RSS. Under `samples` and `tlc_samples`, only named RSS fields
+    of sample dictionaries count: the disk lane reuses `samples` for telemetry
+    vectors whose elapsed time and byte counts are not MiB. Peak RSS is a
+    positive quantity, so zero, missing and non-finite entries are unknown -
+    never a zero-byte footprint - and are dropped before the median. The median
+    of what remains is the statistic the store publishes over the samples.
+    """
+    values = _named_rss(row.get('tlc_samples'))
+    if values:
+        return statistics.median(values)
+    for key in ('rss_mib', 'maxrss_mib', 'rss'):
+        values = _rss_numbers(row.get(key))
+        if values:
+            return statistics.median(values)
+    values = _named_rss(row.get('samples'))
+    return statistics.median(values) if values else None
+
+
+def _rss_numbers(value):
+    """The finite positive numbers of an explicit RSS scalar or flat list."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, list, tuple)):
+        return []
+    if isinstance(value, (int, float)):
+        return [value] if math.isfinite(value) and value > 0 else []
+    return [x for x in value if isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x) and x > 0]
+
+
+def _named_rss(samples):
+    """The named RSS fields of timed sample dictionaries, never telemetry."""
+    if not isinstance(samples, (list, tuple)):
+        return []
+    values = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        for key in ('maxrss_mib', 'rss_mib', 'rss'):
+            value = _rss_numbers(sample.get(key))
+            if value:
+                values.append(value[0])
+                break
+    return values
+
+
 def args_of(value):
     return shlex.split(value) if isinstance(value, str) else value if isinstance(value, list) else []
 
@@ -406,7 +457,6 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
         if not isinstance(workers, int):
             workers = 1
     cpu = raw.get('cpu_s', raw.get('cpu'))
-    rss = raw.get('rss_mib', raw.get('maxrss_mib', raw.get('rss')))
     wall = raw.get('walls', raw.get('wall_s', raw.get('wall', raw.get('median', raw.get('min')))))
     if 'tlc_samples' in raw:
         wall = [s.get('wall_s') for s in raw['tlc_samples']]
@@ -422,7 +472,7 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
          'content_digest': raw.get('content_digest'), 'tlc_version': raw.get('tlc_version') or
              (header.get('tla2tools') or {}).get('revision') or (header.get('tla2tools') or {}).get('short'),
          'counts': {k: raw.get(k) for k in COUNTS},
-         'metrics': {'wall_s': scalar(wall), 'cpu_s': scalar(cpu), 'rss_mib': scalar(rss),
+         'metrics': {'wall_s': scalar(wall), 'cpu_s': scalar(cpu), 'rss_mib': peak_rss(raw),
                      'instructions': scalar(raw.get('instructions', (raw.get('perf') or {}).get('instructions')))},
          'aggregation': raw.get('aggregation', 'median' if isinstance(wall, list) else 'single-or-legacy-scalar'),
          'samples': {'wall_s': wall if isinstance(wall, list) else [wall], 'cpu_s': cpu if isinstance(cpu, list) else [cpu]},

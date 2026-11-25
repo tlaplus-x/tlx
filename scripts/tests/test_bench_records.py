@@ -75,6 +75,42 @@ class RecordsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate(r)
 
+    def test_peak_rss_skips_unknown_samples_and_legacy_spellings(self):
+        # One reader for the store import, the report and history-report: a
+        # zero sample is unknown, so it is dropped instead of averaging into a
+        # real measurement, and the legacy spellings stay readable.
+        header = {'commit': 'abc123', 'date': '2026-10-07', 'machine': 'x86_64, tencent SA5.4XLARGE32'}
+        raw = {'model': 'M', 'mode': 'compile', 'workers': 1, 'walls': [1.0, 2.0],
+               'cpu': [1.0, 2.0], 'result': 'success', 'distinct': 10, 'rss_mib': [0, 100]}
+        r = normalize(header, raw, 'bench/history/a.json', '/runs/M')
+        self.assertEqual(r['metrics']['rss_mib'], 100)
+        self.assertEqual(store.peak_rss({'rss_mib': [100.0, 140.0]}), 120.0)
+        self.assertEqual(store.peak_rss({'rss_mib': [0, 100.0]}), 100.0)
+        self.assertEqual(store.peak_rss({'maxrss_mib': 400.0}), 400.0)
+        self.assertEqual(store.peak_rss({'samples': [{'maxrss_mib': 100.0}, {'maxrss_mib': 140.0}]}), 120.0)
+        # Retained repeated-baseline samples outrank a stored aggregate that
+        # could have been computed with an unknown sample.
+        self.assertEqual(store.peak_rss({'maxrss_mib': 200.0,
+                                         'tlc_samples': [{'maxrss_mib': 0}, {'maxrss_mib': 400.0}]}), 400.0)
+        self.assertIsNone(store.peak_rss({'rss_mib': [0, None]}))
+        self.assertIsNone(store.peak_rss({'rss': 0}))
+
+    def test_disk_telemetry_is_not_read_as_peak_rss(self):
+        # The disk lane reuses `samples` for telemetry vectors: elapsed time,
+        # instantaneous RSS, I/O and disk byte counts, state count, cgroup MiB.
+        # Only named RSS fields under samples are measurements, so a run whose
+        # wait4 usage was lost stays unknown instead of publishing the number
+        # that happens to sit in the read-byte column.
+        header = {'machine': 'x86_64, tencent SA5.4XLARGE32'}
+        raw = {'model': 'M', 'mode': 'compile', 'workers': 1, 'walls': [1.0], 'cpu': [1.0],
+               'result': 'bench-error', 'distinct': 10,
+               'samples': [[1, 64, 4096, 1048576, 2097152, 40000, 128],
+                           [2, 72, 8192, 2097152, 4194304, 50000, 256]]}
+        self.assertIsNone(normalize(header, raw, 'bench/disk/a.json', '/runs/M')['metrics']['rss_mib'])
+        self.assertIsNone(store.peak_rss(raw))
+        raw['samples'] = [{'maxrss_mib': 100.0}, {'maxrss_mib': 140.0}]
+        self.assertEqual(store.peak_rss(raw), 120.0)
+
     def test_explicit_default_semantics_survive_normalization_and_match_tlc_time(self):
         header = {'machine': 'x86_64 SA5.4XLARGE32'}
         raw = {'model': 'M', 'mode': 'compile', 'workers': 1, 'result': 'success',
@@ -632,6 +668,28 @@ class RecordsTest(unittest.TestCase):
         cached_tlc(self.model, 1, measured, **kw)
         self.assertEqual(measured.call_count, 5)
 
+    def test_a_cache_miss_keeps_the_collected_peak_rss(self):
+        # A cache miss runs the collector and stores its record; the peak RSS
+        # the collector measured must reach both the returned row and the store.
+        measured = Mock(return_value={'wall_s': 8, 'cpu_s': 9, 'maxrss_mib': 400,
+                                      'result': 'success', 'distinct': 10})
+        raw = cached_tlc(self.model, 1, measured, root=self.root, version='v', instance='SA5.4XLARGE32')
+        self.assertEqual(raw['maxrss_mib'], 400)
+        self.assertEqual(load_records(self.root)[0]['metrics']['rss_mib'], 400)
+
+    def test_repeated_tlc_baseline_uses_the_positive_sample_median(self):
+        # [0, 100] is one real 100 MiB measurement: the aggregate, the stored
+        # record and the retained samples must all say 100, not the 50 MiB a
+        # plain median including the unknown sample would publish.
+        samples = [dict(result='success', exit=0, distinct=10, wall_s=1, cpu_s=1, maxrss_mib=0),
+                   dict(result='success', exit=0, distinct=10, wall_s=1, cpu_s=1, maxrss_mib=100)]
+        raw = cached_tlc(self.model, 1, Mock(side_effect=samples), root=self.root,
+                         version='v', instance='SA5.4XLARGE32', repetitions=2)
+        self.assertEqual(raw['maxrss_mib'], 100)
+        row = load_records(self.root)[0]
+        self.assertEqual(row['metrics']['rss_mib'], 100)
+        self.assertEqual(raw_baseline({'measurement': row})['maxrss_mib'], 100)
+
     def test_collected_baseline_keeps_the_key_version(self):
         # (TLC prints its version as "2026.10.02.163556 (rev: 1813307)"; the
         # key names the tla2tools revision, and check() requires the
@@ -1095,6 +1153,54 @@ class RecordsTest(unittest.TestCase):
         self.assertIn('../bench/records/', text)
         tc['workers'] = 8
         self.assertNotIn('3.00×', br.render([tx, tc], {'models': []}))
+
+    def test_report_pairs_peak_rss_in_the_summary_and_detail_tables(self):
+        # The stored RSS of both tools is published side by side: the summary's
+        # cohort median and range, and each detail row's TLC footprint and ratio.
+        tx = self.record(category=['corpus'], content_digest='digest')
+        tx['metrics']['rss_mib'] = 100.0
+        tc = self.record(tool='tlc', mode='-tlc', content_digest='digest', tlc_version='v')
+        tc['metrics']['wall_s'] = 9
+        tc['metrics']['rss_mib'] = 400.0
+        tc['id'] += '-tlc'
+        tx['baseline'] = tc['id']
+        text = br.render([tx, tc], {'models': []})
+        summary = text.split('## Summary')[1].split('## ')[0]
+        self.assertIn('Median TLC / tlx RSS', summary)
+        self.assertIn('| 3.00× | 3.00–3.00× | 4.00× | 4.00–4.00× |', summary)
+        detail = text.split('## Compiled tier per model')[1].split('## ')[0]
+        self.assertIn('TLC RSS MiB', detail)
+        # TLC wall/CPU, TLC RSS, wall ratio, RSS ratio: a 400 MiB baseline
+        # against a 100 MiB tlx row is a 4× footprint reduction.
+        self.assertIn('| 9.00 / 2.00 | 400.00 | 3.00× | 4.00× |', detail)
+
+    def test_missing_or_zero_peak_rss_stays_unknown_not_zero(self):
+        # Unknown metadata stays unknown (never 0.00), on either side and in
+        # the summary, which therefore says `—` rather than inventing a ratio.
+        tx = self.record(category=['corpus'], content_digest='digest')
+        tc = self.record(tool='tlc', mode='-tlc', content_digest='digest', tlc_version='v')
+        tc['metrics']['wall_s'] = 9
+        tc['id'] += '-tlc'
+        tx['baseline'] = tc['id']
+        for tlx_rss, tlc_rss in ((None, 400.0), (100.0, None), (0, 400.0), (100.0, 0)):
+            with self.subTest(tlx_rss=tlx_rss, tlc_rss=tlc_rss):
+                tx['metrics']['rss_mib'] = tlx_rss
+                tc['metrics']['rss_mib'] = tlc_rss
+                text = br.render([tx, tc], {'models': []})
+                summary = text.split('## Summary')[1].split('## ')[0]
+                self.assertIn('| 3.00× | 3.00–3.00× | — | — |', summary)
+                detail = text.split('## Compiled tier per model')[1].split('## ')[0]
+                # The tlx footprint cell follows the same unknown rule as the
+                # ratio and the TLC cell: a stored zero is not 0.00 MiB.
+                if tlx_rss in (None, 0):
+                    self.assertIn('| 3.00 | 2.00 | — | — |', detail)
+                else:
+                    self.assertIn('| 3.00 | 2.00 | 100.00 | — |', detail)
+                if tlc_rss in (None, 0):
+                    self.assertIn('| 9.00 / 2.00 | — | 3.00× | — |', detail)
+                else:
+                    self.assertIn('| 9.00 / 2.00 | 400.00 | 3.00× | — |', detail)
+                self.assertNotIn('0.00×', detail)
 
     def reduced_row(self, samples, **changes):
         """A measured row as the store writes it, its samples carrying the line.

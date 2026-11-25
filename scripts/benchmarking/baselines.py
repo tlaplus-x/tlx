@@ -23,8 +23,8 @@ import time
 
 from benchmarking import machine as bench_machine
 from benchmarking.records import (BASELINES, COMPLETE, ROOT, STORE, VERSION, digest, dump, evidence, instance_info,
-                                  exit_ok, key_complete, key_id, measurement_key, normalize, scalar, record_of_record, record_path,
-                                  store_files, store_stem, write_records)
+                                  exit_ok, key_complete, key_id, measurement_key, normalize, peak_rss, scalar,
+                                  record_of_record, record_path, store_files, store_stem, write_records)
 from harness.storage import file_lock
 from tlxlib import CORPUS_ROOT_CWD, model_cwd
 
@@ -345,9 +345,12 @@ def collect_samples(collect, repetitions, workers):
         raw['aggregation'] = 'last-attempt'
         raw['result'] = samples[-1].get('result') if samples[-1].get('result') not in COMPLETE else 'error'
         return raw
-    for field in ('wall_s', 'cpu_s', 'maxrss_mib'):
+    for field in ('wall_s', 'cpu_s'):
         values = [r.get(field) for r in samples]
         raw[field] = statistics.median(values) if all(v is not None for v in values) else None
+    # The shared rule drops an unknown RSS sample before the median instead of
+    # letting a zero halve the baseline's footprint.
+    raw['maxrss_mib'] = peak_rss({'tlc_samples': samples})
     raw['sample_spread'] = {
         field: (max(values) - min(values)) / raw[field] if raw[field] else None
         for field in ('wall_s', 'cpu_s')

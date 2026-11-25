@@ -32,6 +32,7 @@ import testkit
 import tlc
 import tlxlib
 from benchmarking import machine, measurement
+from benchmarking.records import normalize
 from harness.process import ProcResult
 from tlc import parse
 
@@ -249,6 +250,21 @@ class MeasuredChild(unittest.TestCase):
         self.assertNotEqual(r["result"], "success")  # what it is not: a clean sample
         self.assertIn("wait4:", r["problems"][0])
         self.assertEqual(bench_disk.describe(r).split()[4:6], ["cpu", "-"])
+
+    def test_disk_telemetry_without_wait4_has_no_peak_rss(self):
+        # The disk lane's `samples` are telemetry vectors (elapsed seconds,
+        # instantaneous RSS, read/write bytes, disk bytes, state count, cgroup
+        # MiB). Without wait4 usage none of them is this run's peak RSS, and the
+        # importer must not read the read-byte column as MiB.
+        sampler = SimpleNamespace(io={}, peak_disk=0, peak_cg=0,
+                                  samples=[[1, 64, 4096, 1048576, 2097152, 40000, 128]])
+        run = SimpleNamespace(rusage=None, timed_out=False, problems=[], sampler=sampler,
+                              output="Model checking completed. No error has been found.\n",
+                              wall=0.1, returncode=0)
+        r = bench_disk.finish_record(parse(run.output, run.wall, run.returncode), run, 30)
+        self.assertNotIn("maxrss_mib", r)
+        row = normalize({}, r, "bench/disk.json", "/runs/M", model="M", mode="-compile", workers=1)
+        self.assertIsNone(row["metrics"]["rss_mib"])
 
     def test_every_run_closes_the_pipe_it_opened(self):
         before = open_files()
@@ -595,8 +611,11 @@ class TlcCollectorArguments(testkit.GuardedTestCase):
     def test_bench_collect_tlc_passes_the_oracle_arguments(self):
         with patch.object(bench, "run_proc", self.fake_proc), \
              patch.object(tlc, "tlc_cmd", self.capture_tlc_cmd):
-            bench._collect_tlc(self.model, 1, 10)
+            r = bench._collect_tlc(self.model, 1, 10)
         self.assert_oracle_arguments()
+        # A fresh `run --tlc` baseline needs this child's own peak RSS, not just
+        # its CPU time, or the history row and the canonical baseline lose it.
+        self.assertEqual(r["maxrss_mib"], measurement.rss_mib(RUSAGE))
 
     def test_tlcbase_measured_collector_passes_the_oracle_arguments(self):
         with patch.object(bench, "run_proc", self.fake_proc), \
