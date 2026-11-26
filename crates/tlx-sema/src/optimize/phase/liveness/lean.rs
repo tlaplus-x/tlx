@@ -1,11 +1,10 @@
-//! Connect the inferred phase liveness table to explicit record transfers.
+//! Connect the inferred phase liveness table to explicit record and companion transfers.
 mod leaves;
 mod output;
 
 use super::super::{binding, variable, Branch};
-use super::{Analysis, Atom};
+use super::{Analysis, Atom, Control, ObsContext, Slot};
 use crate::{builtins::Builtin as B, hir::*};
-use std::sync::Arc;
 
 pub(super) fn emit(
     a: &Analysis<'_>,
@@ -13,8 +12,8 @@ pub(super) fn emit(
     steps: &[Branch],
     spec: super::super::CheckSpec<'_>,
 ) -> Option<super::super::OpenCert> {
-    let fields: Vec<_> = a.live.keys().filter(|f| f.as_ref() != a.control).cloned().collect();
-    let phases: Vec<_> = a.phases.iter().cloned().collect();
+    let fields: Vec<Slot> = a.data_slots();
+    let phases: Vec<Atom> = a.phases.iter().cloned().collect();
     let mut e = Emitter { a, fields, phases, atoms: vec![] };
     let seeds = initial.iter().map(|b| e.seed(b)).collect::<Option<Vec<_>>>()?;
     let mut cases = vec![];
@@ -27,30 +26,21 @@ pub(super) fn emit(
     if cases.is_empty() || seeds.is_empty() || e.fields.is_empty() || a.keys.is_some_and(|keys| keys.len() > 256) {
         return None;
     }
-    let mut observed = Reads::new(e.fields.len());
-    let observations = spec.invariants.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
-    let init_obs = spec.init_props.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
-    let constraints = spec.constraints.iter().map(|o| e.leaf(o, "observe", None, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let mut observed = vec![vec![false; e.fields.len()]; e.phases.len()];
+    let root_ctx = ObsContext::all(a.phases, a.keys.is_some());
+    let observations = spec.invariants.iter().map(|o| e.obs_leaf(o, "observe", &root_ctx, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let init_obs = spec.init_props.iter().map(|o| e.obs_leaf(o, "observe", &root_ctx, &mut observed)).collect::<Option<Vec<_>>>()?;
+    let constraints = spec.constraints.iter().map(|o| e.obs_leaf(o, "observe", &root_ctx, &mut observed)).collect::<Option<Vec<_>>>()?;
     let action_constraints =
         spec.action_constraints.iter().map(|o| e.action_leaf(o, "actionConstraint", &mut observed)).collect::<Option<Vec<_>>>()?;
     let action_props = spec.action_props.iter().map(|o| e.action_leaf(o, "actionObserve", &mut observed)).collect::<Option<Vec<_>>>()?;
     e.validate(&cases, &observed)?;
-    Some(e.output(
-        seeds,
-        cases,
-        observed.global,
-        observations,
-        init_obs,
-        constraints,
-        action_constraints,
-        action_props,
-        spec.is_constrained(),
-    ))
+    Some(e.output(seeds, cases, observed, observations, init_obs, constraints, action_constraints, action_props, spec.is_constrained()))
 }
 
 struct Emitter<'a, 'd> {
     a: &'a Analysis<'d>,
-    fields: Vec<Arc<str>>,
+    fields: Vec<Slot>,
     phases: Vec<Atom>,
     atoms: Vec<String>,
 }
@@ -80,32 +70,82 @@ struct Seed {
 
 impl Emitter<'_, '_> {
     fn seed(&mut self, b: &Branch) -> Option<Seed> {
-        let rhs = binding(b, self.a.var, false)?;
-        let (record, key) = if let Some(keys) = self.a.keys {
-            let ExprKind::FnConstruct { bounds, body } = &*rhs.kind else { return None };
-            let [bound] = bounds.as_slice() else { return None };
-            let BoundVars::Many(ids) = &bound.vars else { return None };
-            let [id] = ids.as_slice() else { return None };
-            if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) {
-                return None;
+        let (phase, values) = match &self.a.control {
+            Control::RecordField { var, field: ctrl_field } => {
+                let rhs = binding(b, *var, false)?;
+                let (record, key) = if let Some(keys) = self.a.keys {
+                    let ExprKind::FnConstruct { bounds, body } = &*rhs.kind else { return None };
+                    let [bound] = bounds.as_slice() else { return None };
+                    let BoundVars::Many(ids) = &bound.vars else { return None };
+                    let [id] = ids.as_slice() else { return None };
+                    if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) {
+                        return None;
+                    }
+                    (body, Some(*id))
+                } else {
+                    (&rhs, None)
+                };
+                let ExprKind::Record(fs) = &*record.kind else { return None };
+                if fs.len() != self.fields.len() + 1 {
+                    return None;
+                }
+                let phase = self.a.domains.atom_value(&fs.iter().find(|(f, _)| f == ctrl_field)?.1)?;
+                let phase = self.phases.iter().position(|p| *p == phase)?;
+                let mut values = vec![];
+                for slot in &self.fields {
+                    let Slot::RecordField(field) = slot else { return None };
+                    let value = &fs.iter().find(|(f, _)| f == field)?.1;
+                    if self.a.mentions_any_managed(value) {
+                        return None;
+                    }
+                    let id = self.atoms.len();
+                    self.atoms.push(format!("Seed field {field}: {value:#?}\nKey parameter: {key:?}"));
+                    values.push(format!("(sem.seedValue {id} c choice.2 k)"));
+                }
+                (phase, values)
             }
-            (body, Some(*id))
-        } else {
-            (&rhs, None)
+            Control::Var { var: ctrl } => {
+                let ctrl_rhs = binding(b, *ctrl, false)?;
+                let phase_expr = if let Some(keys) = self.a.keys {
+                    let ExprKind::FnConstruct { bounds, body } = &*ctrl_rhs.kind else { return None };
+                    let [bound] = bounds.as_slice() else { return None };
+                    let BoundVars::Many(ids) = &bound.vars else { return None };
+                    let [id] = ids.as_slice() else { return None };
+                    if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) || super::mentions_local(body, *id) {
+                        return None;
+                    }
+                    body
+                } else {
+                    &ctrl_rhs
+                };
+                let phase = self.a.domains.atom_value(phase_expr)?;
+                let phase = self.phases.iter().position(|p| *p == phase)?;
+                let mut values = vec![];
+                for slot in &self.fields {
+                    let Slot::CompanionVar(v) = *slot else { return None };
+                    let rhs = binding(b, v, false)?;
+                    let (value, key) = if let Some(keys) = self.a.keys {
+                        let ExprKind::FnConstruct { bounds, body } = &*rhs.kind else { return None };
+                        let [bound] = bounds.as_slice() else { return None };
+                        let BoundVars::Many(ids) = &bound.vars else { return None };
+                        let [id] = ids.as_slice() else { return None };
+                        if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) {
+                            return None;
+                        }
+                        (body, Some(*id))
+                    } else {
+                        (&rhs, None)
+                    };
+                    if self.a.mentions_any_managed(value) {
+                        return None;
+                    }
+                    let id = self.atoms.len();
+                    self.atoms.push(format!("Seed companion {v:?}: {value:#?}\nKey parameter: {key:?}"));
+                    values.push(format!("(sem.seedValue {id} c choice.2 k)"));
+                }
+                (phase, values)
+            }
         };
-        let ExprKind::Record(fs) = &*record.kind else { return None };
-        let phase = self.a.domains.atom_value(&fs.iter().find(|(f, _)| f.as_ref() == self.a.control)?.1)?;
-        let phase = self.phases.iter().position(|p| *p == phase)?;
-        let mut values = vec![];
-        for field in &self.fields {
-            let value = &fs.iter().find(|(f, _)| f == field)?.1;
-            if leaves::mentions(value, self.a.var) {
-                return None;
-            }
-            let id = self.atoms.len();
-            self.atoms.push(format!("Seed field {field}: {value:#?}\nKey parameter: {key:?}"));
-            values.push(format!("(sem.seedValue {id} c choice.2 k)"));
-        }
         let mut reads = Reads::new(self.fields.len());
         let guard = self.guard(b, false, None, &mut reads)?;
         Some(Seed { guard, phase, values })
@@ -129,7 +169,11 @@ impl Emitter<'_, '_> {
             if primed && self.a.guard(term, actor).is_some() {
                 continue;
             }
-            if matches!(&*term.kind, ExprKind::Builtin { op:B::Eq,args } if args.len()==2 && variable(&args[0],primed)==Some(self.a.var)) {
+            if matches!(
+                &*term.kind,
+                ExprKind::Builtin { op: B::Eq, args }
+                    if args.len() == 2 && variable(&args[0], primed).is_some_and(|v| self.a.is_control_or_projected_var(v))
+            ) {
                 continue;
             }
             let term = if let ExprKind::Builtin { op: B::Unchanged, args } = &*term.kind {
@@ -147,7 +191,7 @@ impl Emitter<'_, '_> {
 
     fn frames(&self, e: &Expr) -> Option<Expr> {
         let kind = match &*e.kind {
-            ExprKind::Var(v) if *v == self.a.var => ExprKind::Tuple(vec![]),
+            ExprKind::Var(v) if self.a.is_control_or_projected_var(*v) => ExprKind::Tuple(vec![]),
             ExprKind::Var(_) => return Some(e.clone()),
             ExprKind::Tuple(es) => ExprKind::Tuple(es.iter().map(|e| self.frames(e)).collect::<Option<_>>()?),
             _ => return None,
@@ -156,7 +200,7 @@ impl Emitter<'_, '_> {
     }
 
     fn cases(&mut self, branch: usize, b: &Branch) -> Option<Vec<Case>> {
-        let transfer = self.a.transfer(&binding(b, self.a.var, true)?, b)?;
+        let transfer = self.a.transfer_branch(b)?;
         let mut allowed = self.a.phases.clone();
         for term in &b.terms {
             if let Some(phases) = self.a.guard(term, transfer.actor) {
@@ -183,12 +227,14 @@ impl Emitter<'_, '_> {
         Some(out)
     }
 
-    fn validate(&self, cases: &[Case], observed: &Reads) -> Option<()> {
+    fn validate(&self, cases: &[Case], observed: &[Vec<bool>]) -> Option<()> {
         // These are also emitted as finite, closed Lean obligations.
-        for (f, field) in self.fields.iter().enumerate() {
-            let live = &self.a.live[field];
-            if observed.global[f] && !self.phases.iter().all(|p| live.contains(p)) {
-                return None;
+        for (f, slot) in self.fields.iter().enumerate() {
+            let live = &self.a.live[slot];
+            for (p_idx, p) in self.phases.iter().enumerate() {
+                if observed[p_idx][f] && !live.contains(p) {
+                    return None;
+                }
             }
             for c in cases {
                 if (c.reads.actor[f] && !live.contains(&self.phases[c.source]))

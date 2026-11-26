@@ -50,7 +50,7 @@ negative mutation checks are explicit.
 | Nested ordered allocation | `NestedCertificate.lean` + `NestedRank.lean`: multiple independent frontier families across fixed records, tuples and finite-domain maps, with constrained action checks over retained core state | Enabled (`-optimize`) |
 | Immutable live versions | `LiveCertificate.lean`: singleton-seeded append-only version table with explicit live-root payload feedback, ranked-table key equivalence, and constrained action checks over retained core state | Enabled (`-optimize`) |
 | Sequence length | `LengthCertificate.lean`: multiple sequences, tuple/copy/append/conditional transfers, and current-length feedback | Enabled (`-optimize`) |
-| Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records or fixed-domain maps, masked reads, kernel-checked (`decide`) liveness tables, and constrained action checks over both endpoints' retained phases and observed values | Enabled (`-optimize`) |
+| Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records, fixed-domain maps of records, scalar phase variables with scalar companions, or fixed-domain phase maps with parallel companion maps; whole-record/`EXCEPT`/singleton-`FnConstruct` transfers; phase-indexed observations (`observed : P → F → Bool`), per-slot monomorphic sentinels, kernel-checked (`decide`) liveness tables, and constrained action checks over both endpoints | Enabled (`-optimize`) |
 | Threshold counters | `ThresholdCounterCertificate.lean`: one or more monotone/resettable scalar natural counters or fixed-domain per-actor counter maps `[Actor -> Nat]` saturated in `VIEW` at `min(n_i, cap_i)` alongside arbitrary retained TLA+ state, with constrained state checks and counter-independent action checks | Enabled (`-optimize`) |
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–7 model values each, product order `<= 5040`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
@@ -613,57 +613,83 @@ and deadlock preservation.
 
 ## Phase-dependent field projection
 
-`phase.rs` derives a finite control-phase field and backward per-phase field liveness `Live[phase,
-field]` for a record variable or a fixed-domain map of records, replacing dead fields with a single
-sentinel in the state key while preserving record field sets, map keys, and control values
-(motivated by `serverStates` in `pragmatic/database-blob` and client records with model-value phases
-and sequence fields in BookKeeper's `LedgerChaining`; see
+`phase.rs` derives a finite control phase and backward per-phase liveness `Live[phase, slot]` for
+(1) a record variable or fixed-domain map of records, or (2) a scalar phase variable or fixed-domain
+phase map governing parallel companion variables over the same domain (such as PlusCal `pc`-governed
+process-local maps). Dead non-singleton slots are replaced with per-slot monomorphic sentinels in the
+state key while preserving record shapes, map keys, and control values (motivated by `serverStates`
+in `pragmatic/database-blob`, client records in BookKeeper's `LedgerChaining`, and PlusCal
+`pc`-governed process maps such as `DijkstraMutex` and `ParReach`; see
 [proofs/field/README.md](../proofs/field/README.md)).
 
 ### Scope
 
-- Record variables or exact fixed-domain maps (up to 256 keys) of records (up to 32 fields) with a
-  control field ranging over at most 32 mutually comparable scalar literals or model values and
-  initialized to constant phases.
+- **Control sources and companion slots:**
+  - Record variables or exact fixed-domain maps (up to 256 keys) of records (up to 32 fields) with a
+    control field ranging over at most 32 mutually comparable scalar literals or model values and
+    initialized to constant phases.
+  - Scalar phase variables (`2 <= |Phases| <= 32`) governing eligible non-singleton scalar companion
+    variables, or exact fixed-domain phase maps `[K -> Phases]` (`1 <= |K| <= 256`,
+    `2 <= |Phases| <= 32`) governing eligible non-singleton parallel companion maps over the exact
+    same domain `K`. Companion variables that are singleton-valued, live in every phase, or updated
+    outside single-actor alignment remain untouched in the retained core `C`.
 - Forward structural domain inference over `Init` and `Next` (tracking integer lower bounds,
   sequence elements, record fields, and function overrides) to verify exact map key sets and
-  discharge always-true structural membership invariants (such as `Seq(Nat)`).
-- Single-binding `EXCEPT` updates on the record or on one bound actor's map entry (up to 512
-  normalized alternatives and 128 phase-expanded certificate cases), expanding `@` only when prior
-  writes provably cannot alias the updated point. When multiple records qualify, selection prefers
-  certified candidates and then the record with the most projected fields.
+  discharge always-true structural membership invariants (such as `Seq(Nat)` or `[Procs -> Nodes]`).
+- Single-binding transfers (up to 512 normalized alternatives with `IF` splitting and 128
+  phase-expanded certificate cases): `UNCHANGED` / self-copy, `EXCEPT` field or entry updates
+  (including nested `[@ EXCEPT !.f = ...]` and partial nested companion updates that preserve source
+  liveness), whole-record literals (`r' = [f1 |-> e1, ...]`), whole-entry map replacements
+  (`[m EXCEPT ![actor] = [f1 |-> e1, ...]]`), and uniform `FnConstruct` resets when `|K| = 1`,
+  expanding `@` only when prior writes provably cannot alias the updated point. All updates to the
+  control and projected companion variables on a branch must agree on at most one actor in `K`.
+- **Phase-guarded state observations:** invariants, init properties, and state constraints may guard
+  slot reads behind phase tests (`ctrl = P => Q(slot)`, `\A k \in K : ctrl[k] = P => Q(m[k])`,
+  `IF ctrl[k] = P THEN ...`, and short-circuiting `/\` / `\/`), recording `observed[p, f]` only in
+  phases where the slot is actually evaluated. Unguarded reads and two-state action checks
+  conservatively mark `observed[p, f] = true` for all phases `p`.
+- **Monomorphic sentinels and profitability:** each projected slot chooses a sentinel from its
+  inferred domain (`0`, `FALSE`, `""`, `{}`, `<<>>`, a constant record of sentinels, or an observed
+  initial constant) so `EncModel` (`view_shape.rs`) infers a monomorphic compiled `VIEW` without
+  widening to `Dyn`. Singleton-valued dead slots are refused so zero-gain masks are never installed.
+  When multiple control candidates qualify, selection prefers certified candidates and then the
+  candidate with the most projected slots.
 
 ### Lowered Rule & Lean Certificate
 
-For each candidate control field, backward dataflow computes `Live[phase, field]` to a least fixed
-point:
+For each candidate control source, backward dataflow computes `Live[phase, slot]` to a least fixed
+point (with fixed-point pruning of all-live or ineligible companion variables back into `C`):
 
-1. Seed liveness from guards, update expressions (scanned even for dead targets so evaluation errors
-   are preserved), and invariants, restricting reads to a phase only after a recognized control
-   guard has been evaluated (keeping by-name operator actuals in the callee's control context).
-2. Seed liveness from unprimed and primed field reads in every `ACTION_CONSTRAINT` and
-   `[][A]_sub` action `PROPERTY`, retaining each read field in every phase and marking it globally
-   observed so the projected endpoint keeps the exact value the check reads.
-3. Summarize recognized single-record or single-actor `EXCEPT` writes whose actor domain lies inside
-   the fixed map domain.
-4. Across every transition from phase `p` to `q`, propagate every field live in `q` that is not
-   overwritten back into `p`; the control field stays live in every phase.
+1. Seed liveness from `Next` guards, quantifier bounds positioned after their preceding phase guards,
+   update expressions (scanned even for dead targets so evaluation errors are preserved), and
+   phase-guarded state predicates (`INVARIANT`, `init_props`, `CONSTRAINT`), restricting reads to a
+   phase only after a recognized control guard has been evaluated (keeping by-name operator actuals
+   in the callee's control context).
+2. Seed liveness from unprimed and primed slot reads in every `ACTION_CONSTRAINT` and `[][A]_sub`
+   action `PROPERTY`, retaining each read slot in every phase and marking it observed across all
+   phases so the projected endpoint keeps the exact value the check reads.
+3. Summarize recognized single-record, whole-record, or single-actor companion writes whose actor
+   domain lies inside the fixed map domain.
+4. Across every transition from phase `p` to `q`, propagate every slot live in `q` that is not
+   overwritten back into `p`; the control phase stays live in every phase.
 
-`phase/liveness/lean.rs` emits the explicit phase, masked-read, write, and observation tables into
-`GeneratedField`, and `FieldCertificate.lean` discharges read, frame, and observation liveness
-obligations via kernel-checked `decide` (never assuming liveness preservation) to prove
-initialization, successor lifting, invariant preservation, counterexample lifting, and deadlock
-correspondence. `FieldRule.Model.actionConstraint` and `actionObserve` take both endpoints'
-retained cores, phase maps, and observed values, so a certified endpoint check is evaluated
-identically on `(s, t)` and on `(project s, project t)` without any triviality premise.
+`phase/liveness/lean.rs` emits the explicit phase, masked-read, write, and phase-indexed observation
+tables (`observed : Phase → Field → Bool`) with per-slot sentinels (`missing : Field → V`) into
+`GeneratedField`, and `FieldCertificate.lean` discharges `actorLive`, `globalLive`, `frameLive`, and
+`observedLive : ∀ p f, observed p f = true → live p f = true` via kernel-checked `decide` (never
+assuming liveness preservation) to prove initialization, successor lifting, invariant preservation,
+counterexample lifting, and deadlock correspondence. `FieldRule.Model.actionConstraint` and
+`actionObserve` take both endpoints' retained cores, phase maps, and observed values, so a certified
+endpoint check is evaluated identically on `(s, t)` and on `(project s, project t)` without any
+triviality premise.
 
-An action-level field read keeps its keyed access in the emitted instance: the hole description
-records the endpoint, the field or phase slot, the source key expression, and the endpoint the key
-itself is evaluated in (for example
+An action-level slot read keeps its keyed access in the emitted instance: the hole description
+records the endpoint, the slot or phase, the source key expression, and the endpoint the key itself
+is evaluated in (for example
 `data field 1, source key Local(7); primed=false; key primed=false`), exactly as the state-read
 emitter records `source key`. Two predicates that differ only in which bound key they read
 (`r[i].mode = r[j].mode` versus `r[i].mode = r[i].mode`) therefore remain distinguishable in the
-generated certificate even though the projection retains the field for every key. So do the two
+generated certificate even though the projection retains the slot for every key. So do the two
 prime scopes: `r'[idx].mode` reads the target map at the source `idx` (`key primed=false`), while
 `(r[idx])'.mode` primes the whole lookup and reads the target map at the target `idx`
 (`key primed=true`); when a step changes `idx` the predicates disagree, and each read is lowered
@@ -672,13 +698,15 @@ against the endpoint it denotes.
 ### Refusals & Trusted Computing Base (TCB)
 
 - **Refusals:** nonconstant initial phases, primed projected reads in state predicates, cross-actor
-  or whole-record uses, uncertain `EXCEPT` / `LET` aliasing, duplicate writes, unknown map domains,
+  unguarded reads, mismatched actors across control/companion maps on the same branch, whole-record
+  or multi-key `FnConstruct` (`|K| > 1`) resets, uncertain `EXCEPT` / `LET` aliasing, duplicate
+  writes, singleton-only dead slots, un-overwritten dead-to-live transitions, unknown map domains,
   higher-order or recursive action expansion, effectful actuals (even if unused), budget exhaustion,
-  and symmetry composition. Action checks refuse whole-record or primed whole-record reads,
-  `UNCHANGED`/`ENABLED`/`@` shapes that would observe an erased field, angle (non-stuttering)
-  actions, and `[A]_sub` subscripts that mention the projected variable.
+  and symmetry composition. Action checks refuse whole-record/map or primed whole-record/map reads,
+  `UNCHANGED`/`ENABLED`/`@` shapes that would observe a managed variable, angle (non-stuttering)
+  actions, and `[A]_sub` subscripts that mention the control or any projected companion variable.
 - **TCB:** HIR call/`LET` expansion and alias checking, forward structural domain/totality
-  inference, leaf interpretation over retained state and recorded field reads, and runtime `VIEW`
+  inference, leaf interpretation over retained state and recorded slot reads, and runtime `VIEW`
   evaluation.
 
 ## Composing projection with symmetry

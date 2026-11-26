@@ -39,6 +39,7 @@ use crate::error::{EResult, EvalError};
 use crate::eval::{same_rep, Ctx, DefCache, StateMemo};
 use crate::interp::Interp;
 pub use checkpoint::{restore_strings, strings_snapshot, STRINGS_FILE};
+pub use optimization::ReducedProbe;
 pub(crate) use report::fmt_state;
 pub use report::{location_record, ActionInfo};
 use spec::PropPart;

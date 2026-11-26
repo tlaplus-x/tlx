@@ -67,11 +67,45 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
         }
         return Ok(None);
     }
-    // Projection keeps priority. A group can join it only when a connected
-    // certificate proves their composition for the exact installed projection.
-    let projection = a.optimize.then(|| model.project_state()).flatten();
-    let reusable = if projection.is_none() { precertified } else { None };
-    let applied = apply(model, &mut an, a.noautosymmetry, reusable)?;
+    // Projection keeps priority when it composes with symmetry or reduces more
+    // states. When `phase-field-projection` does not compose with an eligible
+    // certified symmetry group, compare both reduced graphs on a bounded probe
+    // so `-optimize` does not displace a stronger certified symmetry.
+    let mut unprojected = (a.optimize && !a.noautosymmetry && not_applicable(model, &an).is_none() && !eligible_proven(&an).is_empty())
+        .then(|| model.clone());
+    let mut projection = a.optimize.then(|| model.project_state()).flatten();
+    let reusable = if projection.is_none() { precertified.take() } else { None };
+    let stats_before_apply = tlx_runtime::stats::section("auto symmetry");
+    let mut applied = apply(model, &mut an, a.noautosymmetry, reusable)?;
+    if applied.is_none() && matches!(projection, Some(("phase-field-projection", _))) {
+        if let Some(mut sym_model) = unprojected.take() {
+            let stats_after_proj_apply = tlx_runtime::stats::section("auto symmetry");
+            restore_section("auto symmetry", stats_before_apply.as_deref());
+            let mut an_sym = an.clone();
+            let sym_applied = apply(&mut sym_model, &mut an_sym, false, precertified)?;
+            if sym_applied.is_some() {
+                let t0 = Instant::now();
+                let keep_proj = match (
+                    model.probe_reduced_size(COMPARE_PROBE_STATES, COMPARE_PROBE_DEPTH, COMPARE_PROBE_EDGES, COMPARE_PROBE_TIME),
+                    sym_model.probe_reduced_size(COMPARE_PROBE_STATES, COMPARE_PROBE_DEPTH, COMPARE_PROBE_EDGES, COMPARE_PROBE_TIME),
+                ) {
+                    (Some(proj_probe), Some(sym_probe)) => projection_beats_sym(&proj_probe, &sym_probe),
+                    _ => false,
+                };
+                stats::phase("projection vs symmetry probe", t0.elapsed());
+                if !keep_proj {
+                    note("phase-field-projection: not applied (bounded probe did not show fewer states than certified symmetry)");
+                    *model = sym_model;
+                    projection = None;
+                    applied = sym_applied;
+                } else {
+                    restore_section("auto symmetry", stats_after_proj_apply.as_deref());
+                }
+            } else {
+                restore_section("auto symmetry", stats_after_proj_apply.as_deref());
+            }
+        }
+    }
     if let Some((rule, omitted)) = projection {
         crate::proofs::emit(model, a.proofdir.as_deref(), Some((rule, &omitted)))?;
         let variables = omitted.join(", ");
@@ -159,6 +193,32 @@ const EFFECT_PROBE_STATES: usize = 256;
 const EFFECT_PROBE_DEPTH: u32 = 6;
 const EFFECT_PROBE_EDGES: usize = 10_000;
 const EFFECT_PROBE_TIME: Duration = Duration::from_millis(10);
+
+/// Bounds for the bounded BFS comparison between an uncomposable
+/// `phase-field-projection` and a competing certified automatic symmetry.
+const COMPARE_PROBE_STATES: usize = 1024;
+const COMPARE_PROBE_DEPTH: u32 = 8;
+const COMPARE_PROBE_EDGES: usize = 20_000;
+const COMPARE_PROBE_TIME: Duration = Duration::from_millis(20);
+
+/// Return `true` only when the bounded probes affirmatively show that
+/// `phase-field-projection` explores strictly fewer states than the competing
+/// certified symmetry. Ties, timeouts, and inconclusive incomplete prefixes
+/// keep the default certified symmetry.
+fn projection_beats_sym(proj: &tlx_eval::model::ReducedProbe, sym: &tlx_eval::model::ReducedProbe) -> bool {
+    match (proj.completed, sym.completed) {
+        (true, true) | (true, false) => proj.distinct < sym.distinct,
+        (false, true) => false,
+        (false, false) => {
+            let shared = proj.cumulative_by_depth.len().min(sym.cumulative_by_depth.len());
+            shared > 0 && proj.cumulative_by_depth[shared - 1] < sym.cumulative_by_depth[shared - 1]
+        }
+    }
+}
+
+fn restore_section(name: &str, saved: Option<&str>) {
+    tlx_runtime::stats::set_section(name, saved.unwrap_or_default().to_owned());
+}
 
 fn eligible_proven(an: &Analysis) -> Vec<&autosym::SetResult> {
     an.proven().filter(|s| s.group_order() <= MAX_ORDER).collect()
@@ -885,5 +945,53 @@ mod tests {
         .unwrap();
         assert_eq!(sel4.iter().map(|s| s.candidate.name.as_str()).collect::<Vec<_>>(), vec!["B1", "B2"]);
         assert_eq!(cert4, "cert-len-2");
+    }
+
+    #[test]
+    fn projection_probe_keeps_symmetry_on_inconclusive_or_tied_prefixes() {
+        use tlx_eval::model::ReducedProbe;
+        // Measured projection win (both completed, e.g., 2-actor 9 vs 10): projection wins.
+        assert!(projection_beats_sym(
+            &ReducedProbe { distinct: 9, completed: true, cumulative_by_depth: vec![1, 5, 9] },
+            &ReducedProbe { distinct: 10, completed: true, cumulative_by_depth: vec![1, 5, 10] },
+        ));
+        // Equal completed tie: keep default symmetry.
+        assert!(!projection_beats_sym(
+            &ReducedProbe { distinct: 10, completed: true, cumulative_by_depth: vec![1, 5, 10] },
+            &ReducedProbe { distinct: 10, completed: true, cumulative_by_depth: vec![1, 5, 10] },
+        ));
+        // Equal incomplete prefix (e.g., deterministic startup exhausting depth cap): keep symmetry.
+        let startup = ReducedProbe { distinct: 9, completed: false, cumulative_by_depth: vec![1, 2, 3, 4, 5, 6, 7, 8, 9] };
+        assert!(!projection_beats_sym(&startup, &startup));
+        // Projection completes strictly smaller than symmetry's incomplete cap: projection wins.
+        assert!(projection_beats_sym(
+            &ReducedProbe { distinct: 400, completed: true, cumulative_by_depth: vec![1, 50, 400] },
+            &ReducedProbe { distinct: 1025, completed: false, cumulative_by_depth: vec![1, 100] },
+        ));
+        // Projection finishes but symmetry timed out before reaching projection's count: inconclusive, keep symmetry.
+        assert!(!projection_beats_sym(
+            &ReducedProbe { distinct: 400, completed: true, cumulative_by_depth: vec![1, 50, 400] },
+            &ReducedProbe { distinct: 200, completed: false, cumulative_by_depth: vec![1, 100] },
+        ));
+        // Symmetry finishes while projection is incomplete: keep symmetry.
+        assert!(!projection_beats_sym(
+            &ReducedProbe { distinct: 1025, completed: false, cumulative_by_depth: vec![1, 100] },
+            &ReducedProbe { distinct: 378, completed: true, cumulative_by_depth: vec![1, 20, 378] },
+        ));
+        // No comparable shared BFS level (e.g., symmetry timed out during Init): keep symmetry.
+        assert!(!projection_beats_sym(
+            &ReducedProbe { distinct: 343, completed: false, cumulative_by_depth: vec![343] },
+            &ReducedProbe { distinct: 5, completed: false, cumulative_by_depth: vec![] },
+        ));
+        // Equal shared prefix with an extra level on projection side: keep symmetry.
+        assert!(!projection_beats_sym(
+            &ReducedProbe { distinct: 20, completed: false, cumulative_by_depth: vec![1, 5, 20] },
+            &ReducedProbe { distinct: 5, completed: false, cumulative_by_depth: vec![1, 5] },
+        ));
+        // Strict win at deepest shared completed BFS level: projection wins.
+        assert!(projection_beats_sym(
+            &ReducedProbe { distinct: 20, completed: false, cumulative_by_depth: vec![1, 5, 20] },
+            &ReducedProbe { distinct: 8, completed: false, cumulative_by_depth: vec![1, 8] },
+        ));
     }
 }

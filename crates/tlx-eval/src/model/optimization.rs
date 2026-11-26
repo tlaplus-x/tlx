@@ -11,6 +11,19 @@ use crate::{env::Env, error::EResult, eval::Ctx};
 
 use super::{behavior, Behavior, FpMode, InterpModel, State};
 
+/// Bounded BFS summary of a model's reduced state space, used to compare
+/// mutually exclusive certified reductions (such as `phase-field-projection`
+/// vs. automatic symmetry) without guessing from static counts alone.
+#[derive(Clone, Debug)]
+pub struct ReducedProbe {
+    /// Total distinct reduced states discovered (including initial states).
+    pub distinct: usize,
+    /// Whether the entire reachable reduced graph finished within the budget.
+    pub completed: bool,
+    /// Cumulative distinct reduced states after each completed BFS level `0..=d`.
+    pub cumulative_by_depth: Vec<usize>,
+}
+
 /// One admitted state's verdict in the merge probe (`projection_merges`).
 enum ProbeStep {
     /// Two distinct admitted states share a projected key.
@@ -81,6 +94,129 @@ impl InterpModel {
         tlx_runtime::stats::resume(stats_on);
         self.ip.composed_states.store(generated, Ordering::Relaxed);
         merges
+    }
+
+    /// Bounded level-by-level BFS of this model's reduced state space (`VIEW`
+    /// and/or symmetry). Suspends `-stats` and restores `composed_states` so
+    /// probing never alters search metrics; returns `None` on evaluation error.
+    pub fn probe_reduced_size(
+        &self,
+        max_states: usize,
+        max_depth: u32,
+        max_edges: usize,
+        max_time: std::time::Duration,
+    ) -> Option<ReducedProbe> {
+        use tlx_runtime::Model;
+        let started = std::time::Instant::now();
+        let mut m = self.with_fp_mode(FpMode::Reduced);
+        m.claim = None;
+        let generated = self.ip.composed_states.load(Ordering::Relaxed);
+        let stats_on = tlx_runtime::stats::suspend();
+        let result = (|| {
+            let mut seen: HashSet<u64> = HashSet::new();
+            let mut frontier: Vec<State> = Vec::new();
+            let mut cumulative_by_depth: Vec<usize> = Vec::new();
+            let mut hit_budget = false;
+            let mut failed = false;
+
+            if m.init_states_while(&mut |s| {
+                if started.elapsed() >= max_time {
+                    hit_budget = true;
+                    return false;
+                }
+                match m.constraint(&s) {
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    Err(_) => {
+                        failed = true;
+                        return false;
+                    }
+                }
+                if seen.insert(s.fp) {
+                    frontier.push(s);
+                    if seen.len() > max_states {
+                        hit_budget = true;
+                        return false;
+                    }
+                }
+                true
+            })
+            .is_err()
+                || failed
+            {
+                return None;
+            }
+            if hit_budget {
+                return Some(ReducedProbe { distinct: seen.len(), completed: false, cumulative_by_depth });
+            }
+            cumulative_by_depth.push(seen.len());
+            if frontier.is_empty() {
+                return Some(ReducedProbe { distinct: seen.len(), completed: true, cumulative_by_depth });
+            }
+
+            let mut total_edges = 0usize;
+            for _depth in 0..max_depth {
+                let mut next_frontier = Vec::new();
+                for s in &frontier {
+                    if started.elapsed() >= max_time {
+                        hit_budget = true;
+                        break;
+                    }
+                    if m.successors(s, &mut |t, _| {
+                        total_edges += 1;
+                        if total_edges > max_edges || started.elapsed() >= max_time {
+                            hit_budget = true;
+                            return false;
+                        }
+                        if seen.contains(&t.fp) {
+                            return true;
+                        }
+                        let admitted = match m.constraint(&t) {
+                            Ok(true) => match m.action_constraint(s, &t) {
+                                Ok(ok) => ok,
+                                Err(_) => {
+                                    failed = true;
+                                    return false;
+                                }
+                            },
+                            Ok(false) => false,
+                            Err(_) => {
+                                failed = true;
+                                return false;
+                            }
+                        };
+                        if admitted && seen.insert(t.fp) {
+                            next_frontier.push(t);
+                            if seen.len() > max_states {
+                                hit_budget = true;
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .is_err()
+                        || failed
+                    {
+                        return None;
+                    }
+                    if hit_budget {
+                        break;
+                    }
+                }
+                if hit_budget {
+                    return Some(ReducedProbe { distinct: seen.len(), completed: false, cumulative_by_depth });
+                }
+                cumulative_by_depth.push(seen.len());
+                if next_frontier.is_empty() {
+                    return Some(ReducedProbe { distinct: seen.len(), completed: true, cumulative_by_depth });
+                }
+                frontier = next_frontier;
+            }
+            Some(ReducedProbe { distinct: seen.len(), completed: false, cumulative_by_depth })
+        })();
+        tlx_runtime::stats::resume(stats_on);
+        self.ip.composed_states.store(generated, Ordering::Relaxed);
+        result
     }
 
     #[allow(clippy::too_many_arguments)] // one admission path shared by initial states and successors
@@ -239,16 +375,16 @@ impl InterpModel {
             ("history-summary-projection", opt::history_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("phase-field-projection", opt::phase_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
-        }))
-        .chain(std::iter::once_with(|| {
-            ("sequence-length-projection", opt::sequence_length_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
-        }))
-        .chain(std::iter::once_with(|| {
             ("ordered-allocation-projection", opt::ordered_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
             ("threshold-counter-projection", opt::threshold_counter_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
+        }))
+        .chain(std::iter::once_with(|| {
+            ("phase-field-projection", opt::phase_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
+        }))
+        .chain(std::iter::once_with(|| {
+            ("sequence-length-projection", opt::sequence_length_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }));
         for (rule, candidate) in candidates {
             let Some(projection) = candidate else { continue };

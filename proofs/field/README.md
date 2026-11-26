@@ -15,14 +15,33 @@ The command prints its generated `Optimization.lean` path. Verify it explicitly:
 python3 proofs/check_generated.py --lean /path/to/lean --negative /printed/path/Optimization.lean
 ```
 
-The rule IR retains phases, other variables, actor choices, field writes and all
-recorded reads. Generated finite liveness tables are checked by Lean: actor reads
-must be live in the source phase, other-actor and observation reads must always
-be live, and newly live fields must be overwritten or already live before the
-transition. The resulting certificate proves initialization and successor
-correspondence from every representative, observation preservation, concrete
-counterexample lifting and plain-Next deadlock preservation. Ordinary optimized
-checking generates the proof without invoking Lean.
+The rule IR retains phases, other variables, actor choices, field or companion writes, per-slot
+sentinels (`missing : Field → V`), and all recorded reads. Generated finite liveness tables are
+checked by Lean: actor reads must be live in the source phase, other-actor reads must always be
+live, phase-indexed observation reads (`observed : Phase → Field → Bool`) must be live in every
+observed phase, and newly live slots must be overwritten or already live before the transition. The
+resulting certificate proves initialization and successor correspondence from every representative,
+observation preservation, concrete counterexample lifting and plain-Next deadlock preservation.
+Ordinary optimized checking generates the proof without invoking Lean.
+
+The rule covers both record / map-of-records control fields (including whole-record literals,
+`[m EXCEPT ![actor] = [...]]` whole-entry replacements, and singleton-domain `FnConstruct` resets)
+and standalone scalar or fixed-domain control variables (`pc`, `state`) governing parallel
+non-singleton companion variables over the same domain (such as PlusCal process-local maps).
+
+For example, on the unchanged upstream `tlaplus/Examples` specification
+`specifications/dijkstra-mutex/DijkstraMutex.tla` configured with `Proc = {1, 2, 3}`,
+`defaultInitValue = defaultInitValue`, `SPECIFICATION Spec`, and `INVARIANT MutualExclusion`,
+`tlx check -optimize` certifies `phase-field-projection (temp[*]; ...)` with a native compiled
+`VIEW`, reducing 282,810 generated / 90,882 distinct states (default `tlx check`) to 43,371 /
+13,566 (6.70x fewer distinct states) and improving median single-worker release wall time from
+0.578 s to 0.289 s (2.00x; 1.441 s to 0.454 s, 3.17x, under `-interp`; 1 discarded warmup and 5
+interleaved pairs compiled / 3 pairs `-interp`, `-workers 1`, end-to-end including certificate
+emission and `VIEW` evaluation). On upstream `MisraReachability/ParReach.tla` (5-node directed
+graph `Succ`, 3 processes, upstream phase-guarded `Inv`), `phase-field-projection (u[*]; ...)`
+reduces 4,582,872 generated / 1,105,986 distinct states to 929,465 / 246,841 (4.48x fewer distinct
+states) and improves median single-worker release wall time from 2.792 s to 0.946 s (2.95x). Both
+generated `Optimization.lean` files pass `proofs/check_generated.py --lean lean --negative`.
 
 HIR lowering, inferred domains/totality, independent leaf interpretation and
 runtime VIEW execution remain trusted. The certificate currently requires

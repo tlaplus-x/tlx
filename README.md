@@ -218,8 +218,9 @@ that application:
    preservation:
    - *Unobserved variables:* erases dead variables with literal/copy/frame updates (and can
      [compose with keyed symmetry](proofs/symmetry/README.md) through one shared source model).
-   - *Phase-dependent fields:* [erases record or map fields](proofs/field/README.md) in phases
-     where they are overwritten before their next use, with Lean-checked finite liveness tables.
+   - *Phase-dependent fields:* [erases record, map-of-records, or parallel companion slots](proofs/field/README.md)
+     in phases where they are overwritten before their next use, with Lean-checked finite liveness
+     and phase-indexed observation tables.
    - *Sequence lengths:* merges sequences when every consumer depends only on current lengths.
    - *Ordered allocation and live versions:* reduces scalar or fixed nested allocation frontiers
      ([nested allocation example](proofs/ordered/README.md), 13 states across two families) and
