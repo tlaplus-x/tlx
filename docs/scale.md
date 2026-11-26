@@ -391,6 +391,26 @@ states that cannot spill, the archive is dropped. A later miss then restarts fro
 reports this explicitly, counts restarts after archive loss, and counts previously expanded states
 repeated by searches starting from Init. An explicit zero disables archiving.
 
+**Elision when the layout is closed.** Before the search the driver checks whether any slot can miss
+at all (`enc::closure`): a static closure analysis over-approximates every value `Init`, each action
+and each materialized definition can assign, using the layout shapes themselves as the induction
+hypothesis, and accepts a value only when its shape fits the slot (`tlx-layout::closure`,
+mirroring the encoder's guards). `Dyn`/`Ref` slots accept every finite value (a `Ref` store-full stop
+is not a layout miss). The analysis follows the interpreter's enumeration: definitions are inlined
+where the enumerator expands them, and an unexpanded application is a test, which cannot assign.
+Guards tested before a conjunct or a branch narrow the integer ranges they constrain, so
+`x < N /\ x' = x + 1` is closed when the speculated range covers `N`. A construct the analysis does
+not understand is `Dyn`, and a value for a slot that is not `Dyn`/`Ref` then keeps the archive (a
+proof failure is always safe). When every slot is closed, `retain` is `None` for that layout: no
+archive block is written and nothing is spilled, `-stats` reports `archive retention elided`, a
+`0 B` archive limit and a per-slot decision in the layout-slot report, and the archive's
+`archive peak`/`archived states` lines do not appear. A widened layout is re-proven before the next
+attempt. Liveness runs keep the archive regardless: the levels before a resume point (and a
+checkpoint taken before their replay) are expanded again *from the archive* to record their liveness
+edges (§8.3), a consumer the closure proof does not cover. Under `TLX_PARANOID=1` a layout miss in a
+run the analysis proved closed fails the run (a proof bug); otherwise the driver re-enables the
+archive and restarts from scratch, so a refuted proof changes performance, never results.
+
 - **Resume point** (`ResumePoint`): the archive blocks of every worker, all trace logs and statistics. A
   miss rolls back to the start of the failing level; `transcode` converts old-layout words to the new
   layout block by block in parallel (`sample` estimates the time), and `resume_phase` reads the records,

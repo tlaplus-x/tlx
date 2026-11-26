@@ -67,6 +67,7 @@ mod widening;
 fn all_test_files_registered() {
     const REGISTERED: &[&str] = &[
         "age_projection",
+        "archive_elision",
         "atom_type_widening",
         "autosym",
         "bitset_card",

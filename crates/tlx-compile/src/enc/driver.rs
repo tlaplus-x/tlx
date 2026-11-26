@@ -179,9 +179,54 @@ fn run_check(
                 }
             }
         }
-        // Archive the states while another restart is possible.
+        // Archive the states while another restart is possible. When every
+        // layout slot provably accepts the values Init, Next and the
+        // materialized definitions can produce, no miss can happen and the
+        // archive is pure overhead (scale.md §6).
         let limit = settings.retain_bytes(opts.maxmem);
-        let retain = (!spec.fallback && !settings.escape && limit > 0).then_some(limit);
+        let archive_would_be_on = !spec.fallback && !settings.escape && limit > 0;
+        // Liveness runs keep the archive: after a resume the levels before
+        // the resume point are expanded again *from the archive* to record
+        // their edges (scale.md §8.3), and a checkpoint taken before that
+        // replay carries them there. The closure proof covers layout misses,
+        // not that second consumer; eliding here could lose edges.
+        let liveness = !base.live.is_empty();
+        if liveness && archive_would_be_on {
+            stats::set("archive retention", Metric::Text("kept: a liveness run replays archived levels for their edges".into()));
+        }
+        let closed = if archive_would_be_on && !liveness {
+            if spec.closed.is_none() && !spec.closure_refuted {
+                let (_, layout_defs) = spec.layout_shapes();
+                let proof = super::closure::layout_is_closed(&base, &m.layout.vars, &layout_defs);
+                match &proof {
+                    Ok(()) => {
+                        log("archive retention elided: every compiled layout slot is provably closed");
+                        stats::set(&format!("{}archive memory limit (elided: closed layout)", stats::MEMORY), Metric::Bytes(0));
+                        stats::set("archive retention", Metric::Text("elided: every slot is closed against layout misses".into()));
+                        if tlx_layout::decisions::on() {
+                            for (i, _) in m.layout.vars.iter().enumerate() {
+                                note_for(Slot::Var(i as u32), "archive elided: the slot is provably closed".into());
+                            }
+                            for (d, _) in &layout_defs {
+                                note_for(Slot::Def(d.0), "archive elided: the slot is provably closed".into());
+                            }
+                        }
+                    }
+                    Err(why) => stats::set("archive retention", Metric::Text(format!("kept: {why}"))),
+                }
+                spec.closed = Some(proof);
+            }
+            spec.closed.as_ref().is_some_and(|r| r.is_ok()) && !spec.closure_refuted
+        } else {
+            false
+        };
+        // `m.restartable` intentionally stays set even when the layout is
+        // proven closed: it is also what makes the runtime treat a layout
+        // miss as a resumable interruption rather than a fatal evaluation
+        // error. A refuted proof can then restart (from scratch) instead of
+        // producing a wrong result; the paranoid assertion below turns a
+        // refutation into a test failure.
+        let retain = (archive_would_be_on && !closed).then_some(limit);
         if retain.is_some() {
             let source = if settings.retain_mb.is_some() { "TLX_RETAIN_MB" } else { "-maxmem / 4" };
             stats::set(&format!("{}archive memory limit ({source})", stats::MEMORY), Metric::Bytes(limit as u64));
@@ -208,7 +253,20 @@ fn run_check(
             (None, None) => Start::Init,
         };
         let (r, resume_point) = explore_from(&m, opts, start, retain);
+        // Check store exhaustion before classifying a miss as a refuted
+        // closed-layout proof: a full value store surfaces through `Miss`,
+        // which is a hard budget stop rather than a layout-widening miss.
         spec.check_store(opts.checkpoint.as_deref())?;
+        if closed && matches!(&r.outcome, Outcome::Error(e) if e.is_layout_miss()) {
+            // A proof bug must never turn into a wrong result: paranoid runs
+            // fail loudly, ordinary runs fall back to the archive.
+            if settings.paranoid {
+                crate::paranoid::mismatch(format_args!("a run proved closed against misses stopped with a layout-miss"));
+            }
+            log("closed-layout proof refuted by a layout-miss; keeping the archive for the rest of the run");
+            stats::set("closed-layout proof refuted", Metric::Text("a layout-miss occurred".into()));
+            spec.closure_refuted = true;
+        }
         searched += r.elapsed;
         if !spec.after_run(&m, &r, attempt, max_restarts) {
             base.ip.effects_finish();
@@ -346,6 +404,14 @@ struct Speculation {
     store_all: bool,
     /// Cross-attempt cache for unchanged lowered IR and JIT machine code.
     cache: super::cache::CompileCache,
+    /// The static closed-layout proof for the current shapes (`None`: not
+    /// computed yet, or invalidated by a widening): `Ok` when no slot can
+    /// miss, so the archive is elided; `Err` names the construct that kept
+    /// it.
+    closed: Option<Result<(), String>>,
+    /// A proven-closed run missed anyway (a bug in the proof): never elide
+    /// again for this run, so the archive is available to resume.
+    closure_refuted: bool,
 }
 
 /// The version of `Speculation::encode`, and of the compiled tier's
@@ -459,6 +525,8 @@ impl Speculation {
                 store: None,
                 store_all: false,
                 cache: super::cache::CompileCache::default(),
+                closed: None,
+                closure_refuted: false,
             },
             attempt,
             store_mode,
@@ -488,6 +556,8 @@ impl Speculation {
             store: None,
             store_all: false,
             cache: super::cache::CompileCache::default(),
+            closed: None,
+            closure_refuted: false,
         })
     }
 
@@ -544,6 +614,7 @@ impl Speculation {
                 self.shapes.iter_mut().for_each(|s| *s = Shape::Dyn);
                 self.def_shapes.clear();
                 self.def_misses.clear();
+                self.closed = None;
                 true
             }
             Some(Miss::Var(var, v)) if stopped_by_miss => {
@@ -555,6 +626,7 @@ impl Speculation {
                     // Last attempt: a Dyn slot holds any value.
                     note_for(slot, format!("Dyn: miss {} on the last restart (value {v})", self.misses[var]));
                     self.shapes[var] = Shape::Dyn;
+                    self.closed = None;
                     return true;
                 }
                 let old = self.shapes[var].clone();
@@ -565,6 +637,7 @@ impl Speculation {
                 }
                 widen_alike(&old, &mut self.shapes, var, &mut self.def_shapes);
                 unify(&mut self.shapes, &mut self.def_shapes);
+                self.closed = None;
                 true
             }
             Some(Miss::Def(i, v)) if stopped_by_miss => {
@@ -583,10 +656,12 @@ impl Speculation {
                     // the definition's values are open-ended).
                     self.def_shapes.remove(i);
                     self.def_misses.remove(i);
+                    self.closed = None;
                     return true;
                 }
                 self.def_shapes[i].1 = w;
                 unify(&mut self.shapes, &mut self.def_shapes);
+                self.closed = None;
                 true
             }
             _ => {
@@ -940,6 +1015,8 @@ mod tests {
             store: None,
             store_all: false,
             cache: crate::enc::cache::CompileCache::default(),
+            closed: None,
+            closure_refuted: false,
         };
         let shapes = spec.encode(4);
         let recover = |shapes: &[u8], dynv: &[u8], store: Option<&[u8]>, mode: StoreMode, escape: bool| {
