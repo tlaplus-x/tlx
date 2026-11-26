@@ -11,10 +11,13 @@
 //! - `dynval`: the interner for values stored in `Dyn` slots;
 //! - `scalar`: the immediate scalar handle schema shared by `dynval`,
 //!   `store` and the C/JIT backends;
+//! - `closure`: whether a slot accepts every value of another shape (archive
+//!   elision, scale.md §6);
 //! - `decisions`: why each slot got its shape (`-stats`);
 //! - `store`: the run-owned value store of `Ref` slots (`TLX_VALUE_STORE`);
 //! - `ser`: binary serialization of shapes, layouts and the `Dyn` interner.
 
+pub mod closure;
 pub mod decisions;
 pub mod dynval;
 pub mod escape;

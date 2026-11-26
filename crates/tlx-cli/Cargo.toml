@@ -17,6 +17,10 @@ path = "tests/integration.rs"
 name = "optimization"
 path = "tests/optimization.rs"
 
+[[test]]
+name = "archive_elision"
+path = "tests/archive_elision.rs"
+
 [dependencies]
 tlx-base.workspace = true
 tlx-front.workspace = true

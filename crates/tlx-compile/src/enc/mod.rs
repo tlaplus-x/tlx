@@ -20,10 +20,12 @@
 //! - `speculate`: shape speculation (hints, pre-run, materialization
 //!   candidates);
 //! - `driver`: `check`, the restart loop;
+//! - `closure`: whether a layout can ever miss (archive elision);
 //! - `diag`: diagnostics (coverage logging, IR dumps).
 
 mod adapt;
 mod cache;
+mod closure;
 mod diag;
 mod driver;
 mod escape;
