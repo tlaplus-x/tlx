@@ -3,12 +3,13 @@
 
 use std::cmp::Ordering;
 
+use tlx_base::partition::Partition;
 use tlx_value::order::{self_comparison_is_inert, try_total_cmp};
 use tlx_value::{Sym, Value};
 
 use crate::error::EResult;
 
-use super::factor::{FactorizedGroup, Partition};
+use super::factor::FactorizedGroup;
 use super::{cmp_images_mode, cmp_images_with_mode, CmpMode, ImageOrder, PermMap};
 
 /// Scratch buffers reused across deterministic refinement steps.
@@ -645,7 +646,7 @@ fn refine_set<'a>(
             }
         }
         if any {
-            part.split_by_mask(fg, g, &scratch.in_set, &mut scratch.sort_scratch);
+            part.split_by_pred(fg, g, |k| scratch.in_set[k], &mut scratch.sort_scratch);
         }
     }
     DetOutcome::Done
@@ -670,27 +671,27 @@ fn refine_fcn<'a>(
         return Ok(DetOutcome::NeedBranch(vec![v]));
     };
     if ps.len() < fg.factors[g].keys.len() {
-        part.split_by_mask(fg, g, &scratch.in_set, &mut scratch.sort_scratch);
+        part.split_by_pred(fg, g, |k| scratch.in_set[k], &mut scratch.sort_scratch);
     }
     let payloads_have_unpinned = ps.iter().any(|(_, val)| has_unpinned_atom(val, fg, part));
     if !payloads_have_unpinned {
         let payloads_have_moved = ps.iter().any(|(_, val)| has_any_moved_atom(val, fg));
         let RefineScratch { in_set, payload_idx, sort_scratch, img_buf } = scratch;
         if !payloads_have_moved {
-            part.refine_by_cmp(
+            part.try_refine_by_cmp(
                 fg,
                 g,
-                in_set,
+                |k| in_set[k],
                 |k1, k2| mode.cmp(&ps[payload_idx[k1 as usize].unwrap()].1, &ps[payload_idx[k2 as usize].unwrap()].1),
                 sort_scratch,
             )?;
         } else {
-            part.fill_img(fg, img_buf);
+            part.fill_img_vec(fg, img_buf);
             let pmap = PermMap::Table(fg, img_buf);
-            part.refine_by_cmp(
+            part.try_refine_by_cmp(
                 fg,
                 g,
-                in_set,
+                |k| in_set[k],
                 |k1, k2| {
                     cmp_images_mode(mode, pmap, &ps[payload_idx[k1 as usize].unwrap()].1, pmap, &ps[payload_idx[k2 as usize].unwrap()].1)
                 },
@@ -851,7 +852,7 @@ fn minimize_bounded(
         _ => {
             let parts = minimize_single_value(fg, part, payload, mode)?;
             let mut cur_img = Vec::new();
-            parts[0].fill_img(fg, &mut cur_img);
+            parts[0].fill_img_vec(fg, &mut cur_img);
             match cmp_images_mode(mode, PermMap::Table(fg, &cur_img), payload, PermMap::Table(fg, best_img), best_val)? {
                 Ordering::Greater => Ok(BoundedMin::Pruned),
                 Ordering::Less => Ok(BoundedMin::Kept { parts, strictly_less: true }),
@@ -882,14 +883,14 @@ fn minimize_bounded_candidates(
             BoundedMin::Pruned => {}
             BoundedMin::Kept { parts, strictly_less: beat } => {
                 if beat {
-                    parts[0].fill_img(fg, &mut cur_best_img);
+                    parts[0].fill_img_vec(fg, &mut cur_best_img);
                     best_parts = parts;
                     strictly_less = true;
                 } else if best_parts.is_empty() {
-                    parts[0].fill_img(fg, &mut cur_best_img);
+                    parts[0].fill_img_vec(fg, &mut cur_best_img);
                     best_parts = parts;
                 } else {
-                    parts[0].fill_img(fg, &mut cand_img);
+                    parts[0].fill_img_vec(fg, &mut cand_img);
                     match cmp_images_mode(mode, PermMap::Table(fg, &cand_img), elem, PermMap::Table(fg, &cur_best_img), elem)? {
                         Ordering::Greater => {}
                         Ordering::Equal => best_parts.extend(parts),
@@ -968,12 +969,12 @@ pub(super) fn minimize_across_candidates(
             continue;
         }
         if best_parts.is_empty() {
-            refined[0].fill_img(fg, &mut best_img);
+            refined[0].fill_img_vec(fg, &mut best_img);
             best_parts = refined;
             best_order = None;
             continue;
         }
-        refined[0].fill_img(fg, &mut cur_img);
+        refined[0].fill_img_vec(fg, &mut cur_img);
         match cmp_images_with_mode(mode, PermMap::Table(fg, &cur_img), v, PermMap::Table(fg, &best_img), v, &mut best_order)? {
             Ordering::Greater => {}
             Ordering::Equal => best_parts.extend(refined),
@@ -1125,7 +1126,7 @@ fn filter_min_fixed_prefix<'v, T>(
         return Ok(items);
     }
     let mut img = Vec::new();
-    part.fill_img(ctx.fg, &mut img);
+    part.fill_img_vec(ctx.fg, &mut img);
     let pmap = PermMap::Table(ctx.fg, &img);
     let mut kept: Vec<T> = Vec::with_capacity(items.len());
     for item in items {
@@ -1168,7 +1169,7 @@ fn fcn_dfs<'v>(
         if strictly_less {
             let next_epoch = best.as_ref().map_or(1, |b| b.epoch + 1);
             let mut rep_img = Vec::new();
-            part.fill_img(ctx.fg, &mut rep_img);
+            part.fill_img_vec(ctx.fg, &mut rep_img);
             *best = Some(FcnBest { epoch: next_epoch, rep_img, slot_payloads: cur_payloads.clone(), parts: vec![part] });
         } else {
             best.as_mut().unwrap().parts.push(part);
@@ -1255,7 +1256,7 @@ fn fcn_step_run<'v>(
                         next_beat = Some(b.epoch);
                     } else if run_len > 1 {
                         let mut cur_img = Vec::new();
-                        parts[0].fill_img(ctx.fg, &mut cur_img);
+                        parts[0].fill_img_vec(ctx.fg, &mut cur_img);
                         for r in 1..run_len {
                             match cmp_images_mode(
                                 ctx.mode,
@@ -1301,36 +1302,9 @@ fn is_invariant_under_block_swaps(
     active: &[(usize, usize)],
     mode: CmpMode,
 ) -> EResult<bool> {
-    let mut swap_img = fg.identity_img();
-    let dom = part.dom();
-    let block_hi = part.block_hi();
-    for (g, f) in fg.factors.iter().enumerate() {
-        if !active.iter().any(|&(ag, _)| ag == g) {
-            continue;
-        }
-        let off = f.offset;
-        let n = f.keys.len();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 && (lo..hi).any(|pos| active.contains(&(g, dom[off + pos] as usize))) {
-                for pos in lo..(hi - 1) {
-                    let ka = dom[off + pos];
-                    let kb = dom[off + pos + 1];
-                    swap_img[off + ka as usize] = kb;
-                    swap_img[off + kb as usize] = ka;
-                    let ord = cmp_images_mode(mode, PermMap::Table(fg, &swap_img), v, PermMap::Id, v)?;
-                    swap_img[off + ka as usize] = ka;
-                    swap_img[off + kb as usize] = kb;
-                    if ord != Ordering::Equal {
-                        return Ok(false);
-                    }
-                }
-            }
-            lo = hi;
-        }
-    }
-    Ok(true)
+    part.try_all_active_block_swaps(fg, active, |swap_img| {
+        Ok(cmp_images_mode(mode, PermMap::Table(fg, swap_img), v, PermMap::Id, v)? == Ordering::Equal)
+    })
 }
 
 /// Case B: active-atom branch-and-bound for general recursive values (record-key
@@ -1346,67 +1320,31 @@ pub(super) fn branch_general_value(fg: &FactorizedGroup, part: Partition, v: &Va
         return Ok(vec![part]);
     }
 
-    struct GenCtx<'a> {
-        fg: &'a FactorizedGroup,
-        v: &'a Value,
-        active: &'a [(usize, usize)],
-        mode: CmpMode,
-    }
-
     struct GenBest {
         img: Vec<u16>,
         order: Option<ImageOrder>,
         parts: Vec<Partition>,
     }
 
-    let ctx = GenCtx { fg, v, active: &active, mode };
     let mut best: Option<GenBest> = None;
     let mut cur_img = Vec::new();
-
-    fn dfs(ctx: &GenCtx<'_>, part: Partition, idx: usize, cur_img: &mut Vec<u16>, best: &mut Option<GenBest>) -> EResult<()> {
-        if idx == ctx.active.len() {
-            part.fill_img(ctx.fg, cur_img);
-            match best {
-                None => *best = Some(GenBest { img: cur_img.clone(), order: None, parts: vec![part] }),
-                Some(b) => {
-                    match cmp_images_with_mode(
-                        ctx.mode,
-                        PermMap::Table(ctx.fg, cur_img),
-                        ctx.v,
-                        PermMap::Table(ctx.fg, &b.img),
-                        ctx.v,
-                        &mut b.order,
-                    )? {
-                        Ordering::Greater => {}
-                        Ordering::Equal => b.parts.push(part),
-                        Ordering::Less => {
-                            b.img.clear();
-                            b.img.extend_from_slice(cur_img);
-                            b.order = None;
-                            b.parts.clear();
-                            b.parts.push(part);
-                        }
-                    }
+    part.try_for_each_active_completion(fg, &active, |leaf| -> EResult<()> {
+        leaf.fill_img_vec(fg, &mut cur_img);
+        match &mut best {
+            None => best = Some(GenBest { img: cur_img.clone(), order: None, parts: vec![leaf] }),
+            Some(b) => match cmp_images_with_mode(mode, PermMap::Table(fg, &cur_img), v, PermMap::Table(fg, &b.img), v, &mut b.order)? {
+                Ordering::Greater => {}
+                Ordering::Equal => b.parts.push(leaf),
+                Ordering::Less => {
+                    b.img.clear();
+                    b.img.extend_from_slice(&cur_img);
+                    b.order = None;
+                    b.parts.clear();
+                    b.parts.push(leaf);
                 }
-            }
-            return Ok(());
-        }
-        let (g, k) = ctx.active[idx];
-        let off = ctx.fg.factors[g].offset;
-        let p = part.pos_of()[off + k] as usize;
-        let lo = part.block_lo()[off + p] as usize;
-        let hi = part.block_hi()[off + p] as usize;
-        if hi - lo == 1 {
-            return dfs(ctx, part, idx + 1, cur_img, best);
-        }
-        for slot_pos in lo..hi {
-            let mut next = part.clone();
-            next.pin_to_slot(ctx.fg, g, k, slot_pos);
-            dfs(ctx, next, idx + 1, cur_img, best)?;
+            },
         }
         Ok(())
-    }
-
-    dfs(&ctx, part, 0, &mut cur_img, &mut best)?;
+    })?;
     Ok(best.map_or_else(Vec::new, |b| b.parts))
 }

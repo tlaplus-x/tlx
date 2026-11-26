@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use tlx_base::partition::FactorLayout;
 use tlx_value::{Sym, Value};
 
 use crate::dynval;
@@ -725,6 +726,24 @@ impl FactorGroupSpec {
         let f = &self.factors[g];
         let t = img[f.offset + k] as usize;
         (t != k).then_some(&f.values[t])
+    }
+}
+
+impl FactorLayout for FactorGroupSpec {
+    #[inline]
+    fn total_keys(&self) -> usize {
+        self.total_keys
+    }
+
+    #[inline]
+    fn num_factors(&self) -> usize {
+        self.factors.len()
+    }
+
+    #[inline]
+    fn factor_range(&self, g: usize) -> (usize, usize) {
+        let f = &self.factors[g];
+        (f.offset, f.keys.len())
     }
 }
 

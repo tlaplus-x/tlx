@@ -1,11 +1,11 @@
 //! Factorized representation of disjoint symmetric-group products
-//! `prod_g Sym(K_g)` and ordered block partitions `Partition`.
+//! `prod_g Sym(K_g)`.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use tlx_base::partition::{FactorLayout, Partition, INLINE_KEYS};
 use tlx_sema::builtins::Builtin;
 use tlx_sema::hir::{DefKind, Expr, ExprKind, OpRef};
 use tlx_value::{ops, Sym, Value};
@@ -18,11 +18,6 @@ use crate::interp::Interp;
 #[cfg(test)]
 use super::FastPerm;
 use super::{perm_of, ChosenPerm, Group, Perm, MAX_MATERIALIZED_ORDER};
-
-/// Inline storage capacity (total moved keys across all factors) for `Partition`
-/// and `ChosenPerm`: covers `S_3` through `S_16` and products such as `S_4^3`
-/// or `S_5^3` with zero heap allocation on the hot path.
-pub(super) const INLINE_KEYS: usize = 16;
 
 /// Original generator presentation retained when a `FactorizedGroup` was
 /// constructed from overlapping `Permutations(...)` unions or raw generators,
@@ -503,6 +498,39 @@ impl FactorizedGroup {
         (rank > 0).then_some(rank - 1)
     }
 
+    /// Build a zero-allocation `ChosenPerm` for `self.total_keys <= INLINE_KEYS`,
+    /// or heap-backed for larger groups.
+    pub(super) fn to_chosen_perm(&self, part: &Partition) -> ChosenPerm<'_> {
+        if self.total_keys <= INLINE_KEYS {
+            let mut img = [0u16; INLINE_KEYS];
+            part.fill_img_slice(self, &mut img);
+            ChosenPerm::factor_inline(self, img)
+        } else {
+            let mut img = vec![0u16; self.total_keys];
+            part.fill_img_slice(self, &mut img);
+            ChosenPerm::factor_heap(self, img)
+        }
+    }
+
+    /// Materialize a partition's winning representative permutation as a `FastPerm` (tests).
+    #[cfg(test)]
+    pub(super) fn to_fast_perm(&self, part: &Partition) -> FastPerm {
+        let dom = part.dom();
+        let tgt = part.tgt();
+        let mut entries = Vec::new();
+        for f in &self.factors {
+            let off = f.offset;
+            for pos in 0..f.keys.len() {
+                let k = dom[off + pos] as usize;
+                let t = tgt[off + pos] as usize;
+                if k != t {
+                    entries.push((f.keys[k].id(), f.values[t].clone()));
+                }
+            }
+        }
+        FastPerm(entries)
+    }
+
     /// Lazily visit every non-identity permutation in exact TLC normalized
     /// generator & `close_under_composition` order without capping at order 720.
     /// Stops early if `visit` returns `ControlFlow::Break(())` or once all
@@ -725,478 +753,20 @@ fn lehmer_rank(img: &[u16]) -> usize {
     rank
 }
 
-/// Backing storage for the 5 flat per-key arrays of `Partition`:
-/// `dom`, `tgt`, `pos_of`, `block_lo`, `block_hi` laid out contiguously with
-/// stride `stride = fg.total_keys`.
-#[derive(Clone)]
-enum PartBuf {
-    Inline { buf: [u16; INLINE_KEYS * 5], stride: usize },
-    Heap { buf: Vec<u16>, stride: usize },
-}
-
-impl Default for PartBuf {
-    fn default() -> Self {
-        PartBuf::Inline { buf: [0; INLINE_KEYS * 5], stride: 0 }
-    }
-}
-
-impl PartBuf {
+impl FactorLayout for FactorizedGroup {
     #[inline]
-    fn stride(&self) -> usize {
-        match self {
-            PartBuf::Inline { stride, .. } | PartBuf::Heap { stride, .. } => *stride,
-        }
+    fn total_keys(&self) -> usize {
+        self.total_keys
     }
 
     #[inline]
-    fn raw(&self) -> &[u16] {
-        match self {
-            PartBuf::Inline { buf, stride } => &buf[..stride * 5],
-            PartBuf::Heap { buf, .. } => buf,
-        }
+    fn num_factors(&self) -> usize {
+        self.factors.len()
     }
 
     #[inline]
-    fn split_mut(&mut self) -> (&mut [u16], &mut [u16], &mut [u16], &mut [u16], &mut [u16]) {
-        let s = self.stride();
-        let raw = match self {
-            PartBuf::Inline { buf, .. } => &mut buf[..s * 5],
-            PartBuf::Heap { buf, .. } => buf.as_mut_slice(),
-        };
-        let (dom, rest) = raw.split_at_mut(s);
-        let (tgt, rest) = rest.split_at_mut(s);
-        let (pos_of, rest) = rest.split_at_mut(s);
-        let (block_lo, block_hi) = rest.split_at_mut(s);
-        (dom, tgt, pos_of, block_lo, block_hi)
+    fn factor_range(&self, g: usize) -> (usize, usize) {
+        let f = &self.factors[g];
+        (f.offset, f.keys.len())
     }
-
-    fn alloc(&mut self, stride: usize) {
-        if stride <= INLINE_KEYS {
-            *self = PartBuf::Inline { buf: [0; INLINE_KEYS * 5], stride };
-        } else {
-            let need = stride * 5;
-            match self {
-                PartBuf::Heap { buf, stride: s } => {
-                    buf.resize(need, 0);
-                    *s = stride;
-                }
-                PartBuf::Inline { .. } => {
-                    *self = PartBuf::Heap { buf: vec![0; need], stride };
-                }
-            }
-        }
-    }
-
-    fn heap_bytes(&self) -> usize {
-        match self {
-            PartBuf::Inline { .. } => 0,
-            PartBuf::Heap { buf, .. } => buf.capacity() * std::mem::size_of::<u16>(),
-        }
-    }
-}
-
-/// Ordered block partition of every factor `K_g`: each block `[lo, hi)` maps
-/// the domain keys `dom[off + lo .. off + hi]` bijectively onto the target
-/// slots `tgt[off + lo .. off + hi]`, which are always kept sorted ascending.
-#[derive(Clone, Default)]
-pub(super) struct Partition {
-    buf: PartBuf,
-    /// Number of slots sitting in blocks of size `>= 2`; `0` means complete.
-    pub(super) unpinned: usize,
-}
-
-impl Partition {
-    #[inline]
-    pub(super) fn dom(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[..s]
-    }
-
-    #[inline]
-    pub(super) fn tgt(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[s..2 * s]
-    }
-
-    #[inline]
-    pub(super) fn pos_of(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[2 * s..3 * s]
-    }
-
-    #[inline]
-    pub(super) fn block_lo(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[3 * s..4 * s]
-    }
-
-    #[inline]
-    pub(super) fn block_hi(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[4 * s..5 * s]
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_singleton(&mut self, idx: usize, dom_k: u16, tgt_t: u16, local_pos: u16) {
-        let (dom, tgt, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        dom[idx] = dom_k;
-        tgt[idx] = tgt_t;
-        pos_of[idx] = local_pos;
-        block_lo[idx] = local_pos;
-        block_hi[idx] = local_pos + 1;
-    }
-
-    pub(super) fn reset(&mut self, fg: &FactorizedGroup) {
-        let total = fg.total_keys;
-        self.buf.alloc(total);
-        let (dom, tgt, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        for f in &fg.factors {
-            let off = f.offset;
-            let n = f.keys.len() as u16;
-            for i in 0..n {
-                let idx = off + i as usize;
-                dom[idx] = i;
-                tgt[idx] = i;
-                pos_of[idx] = i;
-                block_lo[idx] = 0;
-                block_hi[idx] = n;
-            }
-        }
-        self.unpinned = total;
-    }
-
-    #[inline]
-    pub(super) fn is_complete(&self) -> bool {
-        self.unpinned == 0
-    }
-
-    #[inline]
-    pub(super) fn is_pinned(&self, fg: &FactorizedGroup, g: usize, k: usize) -> bool {
-        let off = fg.factors[g].offset;
-        let pos = self.pos_of()[off + k] as usize;
-        self.block_hi()[off + pos] - self.block_lo()[off + pos] == 1
-    }
-
-    /// Pin domain key `(g, k)` to the target slot at position `slot_pos` within
-    /// its current block `[lo, hi)`, keeping remaining target slots sorted.
-    pub(super) fn pin_to_slot(&mut self, fg: &FactorizedGroup, g: usize, k: usize, slot_pos: usize) {
-        let off = fg.factors[g].offset;
-        let (dom, tgt, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let p = pos_of[off + k] as usize;
-        let lo = block_lo[off + p] as usize;
-        let hi = block_hi[off + p] as usize;
-        debug_assert!(slot_pos >= lo && slot_pos < hi);
-        if hi - lo == 1 {
-            return;
-        }
-        if p != lo {
-            let other = dom[off + lo] as usize;
-            dom[off + lo] = k as u16;
-            dom[off + p] = other as u16;
-            pos_of[off + k] = lo as u16;
-            pos_of[off + other] = p as u16;
-        }
-        if slot_pos != lo {
-            let t = tgt[off + slot_pos];
-            tgt.copy_within((off + lo)..(off + slot_pos), off + lo + 1);
-            tgt[off + lo] = t;
-        }
-        block_hi[off + lo] = (lo + 1) as u16;
-        for q in (lo + 1)..hi {
-            block_lo[off + q] = (lo + 1) as u16;
-        }
-        self.unpinned -= 1 + usize::from(hi - (lo + 1) == 1);
-    }
-
-    /// Rule 1: pin `(g, k)` to the smallest target slot in its current block.
-    #[inline]
-    pub(super) fn pin_smallest(&mut self, fg: &FactorizedGroup, g: usize, k: usize) {
-        let off = fg.factors[g].offset;
-        let p = self.pos_of()[off + k] as usize;
-        let lo = self.block_lo()[off + p] as usize;
-        self.pin_to_slot(fg, g, k, lo);
-    }
-
-    /// Rule 2: refine every block `B` of factor `g` into `(B \cap S)` followed
-    /// by `(B \setminus S)`, mapping members onto the smallest target slots.
-    pub(super) fn split_by_mask(&mut self, fg: &FactorizedGroup, g: usize, in_set: &[bool], scratch: &mut Vec<u16>) {
-        let off = fg.factors[g].offset;
-        let n = fg.factors[g].keys.len();
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 {
-                scratch.clear();
-                let mut write = lo;
-                for pos in lo..hi {
-                    let k = dom[off + pos];
-                    if in_set[k as usize] {
-                        dom[off + write] = k;
-                        write += 1;
-                    } else {
-                        scratch.push(k);
-                    }
-                }
-                let mid = write;
-                if mid > lo && mid < hi {
-                    dom[off + mid..off + hi].copy_from_slice(scratch);
-                    for pos in lo..hi {
-                        let k = dom[off + pos] as usize;
-                        pos_of[off + k] = pos as u16;
-                    }
-                    for pos in lo..mid {
-                        block_hi[off + pos] = mid as u16;
-                    }
-                    for pos in mid..hi {
-                        block_lo[off + pos] = mid as u16;
-                    }
-                    self.unpinned -= usize::from(mid - lo == 1) + usize::from(hi - mid == 1);
-                }
-            }
-            lo = hi;
-        }
-    }
-
-    /// Place `chosen` (a non-empty subset of `dom[off + lo .. off + hi]`) into
-    /// `[lo, lo + chosen.len())` and the remainder into `[lo + chosen.len(), hi)`.
-    pub(super) fn bulk_place_first(&mut self, fg: &FactorizedGroup, g: usize, lo: usize, chosen: &[u16]) {
-        let off = fg.factors[g].offset;
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let hi = block_hi[off + lo] as usize;
-        let m = chosen.len();
-        debug_assert!(m > 0 && lo + m <= hi);
-        if lo + m == hi {
-            return;
-        }
-        let mut rest = Vec::with_capacity(hi - lo - m);
-        for pos in lo..hi {
-            let k = dom[off + pos];
-            if !chosen.contains(&k) {
-                rest.push(k);
-            }
-        }
-        let mid = lo + m;
-        dom[off + lo..off + mid].copy_from_slice(chosen);
-        dom[off + mid..off + hi].copy_from_slice(&rest);
-        for pos in lo..hi {
-            let k = dom[off + pos] as usize;
-            pos_of[off + k] = pos as u16;
-        }
-        for pos in lo..mid {
-            block_hi[off + pos] = mid as u16;
-        }
-        for pos in mid..hi {
-            block_lo[off + pos] = mid as u16;
-        }
-        self.unpinned -= usize::from(mid - lo == 1) + usize::from(hi - mid == 1);
-    }
-
-    /// Rule 3: for every block `B \subseteq D` of factor `g` with `|B| >= 2`,
-    /// stably sort `B` by fallible `cmp` and split into tied sub-blocks.
-    pub(super) fn refine_by_cmp<F>(
-        &mut self,
-        fg: &FactorizedGroup,
-        g: usize,
-        in_dom: &[bool],
-        mut cmp: F,
-        scratch: &mut Vec<u16>,
-    ) -> EResult<()>
-    where
-        F: FnMut(u16, u16) -> tlx_value::Result<Ordering>,
-    {
-        let off = fg.factors[g].offset;
-        let n = fg.factors[g].keys.len();
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 && in_dom[dom[off + lo] as usize] {
-                fallible_stable_sort(&mut dom[off + lo..off + hi], &mut cmp, scratch)?;
-                for pos in lo..hi {
-                    let k = dom[off + pos] as usize;
-                    pos_of[off + k] = pos as u16;
-                }
-                let mut sub_lo = lo;
-                while sub_lo < hi {
-                    let mut sub_hi = sub_lo + 1;
-                    while sub_hi < hi && cmp(dom[off + sub_hi - 1], dom[off + sub_hi])? == Ordering::Equal {
-                        sub_hi += 1;
-                    }
-                    if sub_lo > lo || sub_hi < hi {
-                        for pos in sub_lo..sub_hi {
-                            block_lo[off + pos] = sub_lo as u16;
-                            block_hi[off + pos] = sub_hi as u16;
-                        }
-                        if sub_hi - sub_lo == 1 {
-                            self.unpinned -= 1;
-                        }
-                    }
-                    sub_lo = sub_hi;
-                }
-            }
-            lo = hi;
-        }
-        Ok(())
-    }
-
-    /// Fill `img` (length `fg.total_keys`) with `img[off + k] = target(k)` for
-    /// this partition's current representative bijection `dom[pos] -> tgt[pos]`.
-    pub(super) fn fill_img(&self, fg: &FactorizedGroup, img: &mut Vec<u16>) {
-        img.resize(fg.total_keys, 0);
-        self.fill_img_slice(fg, img);
-    }
-
-    /// Fill `dst` (`dst.len() >= fg.total_keys`) with `dst[off + k] = target(k)`.
-    pub(super) fn fill_img_slice(&self, fg: &FactorizedGroup, dst: &mut [u16]) {
-        let dom = self.dom();
-        let tgt = self.tgt();
-        for f in &fg.factors {
-            let off = f.offset;
-            for pos in 0..f.keys.len() {
-                let k = dom[off + pos] as usize;
-                dst[off + k] = tgt[off + pos];
-            }
-        }
-    }
-
-    /// Build a zero-allocation `ChosenPerm` for `fg.total_keys <= INLINE_KEYS`,
-    /// or heap-backed for larger groups.
-    pub(super) fn to_chosen_perm<'a>(&self, fg: &'a FactorizedGroup) -> ChosenPerm<'a> {
-        if fg.total_keys <= INLINE_KEYS {
-            let mut img = [0u16; INLINE_KEYS];
-            self.fill_img_slice(fg, &mut img);
-            ChosenPerm::factor_inline(fg, img)
-        } else {
-            let mut img = vec![0u16; fg.total_keys];
-            self.fill_img_slice(fg, &mut img);
-            ChosenPerm::factor_heap(fg, img)
-        }
-    }
-
-    /// True iff the identity permutation is consistent with this partition
-    /// (every domain key `k` lies in a block whose target set contains `k`).
-    pub(super) fn contains_identity(&self, fg: &FactorizedGroup) -> bool {
-        let dom = self.dom();
-        let tgt = self.tgt();
-        let block_lo = self.block_lo();
-        let block_hi = self.block_hi();
-        for f in &fg.factors {
-            let off = f.offset;
-            for pos in 0..f.keys.len() {
-                let k = dom[off + pos];
-                let lo = block_lo[off + pos] as usize;
-                let hi = block_hi[off + pos] as usize;
-                if hi - lo == 1 {
-                    if tgt[off + lo] != k {
-                        return false;
-                    }
-                } else if tgt[off + lo..off + hi].binary_search(&k).is_err() {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Sort `dom[lo..hi]` ascending inside any remaining unpinned block so the
-    /// representative permutation maximizes fixed points and is deterministic.
-    pub(super) fn canonicalize_unpinned_blocks(&mut self, fg: &FactorizedGroup) {
-        let (dom, _, pos_of, _, block_hi) = self.buf.split_mut();
-        for f in &fg.factors {
-            let off = f.offset;
-            let n = f.keys.len();
-            let mut lo = 0usize;
-            while lo < n {
-                let hi = block_hi[off + lo] as usize;
-                if hi - lo > 1 {
-                    dom[off + lo..off + hi].sort_unstable();
-                    for pos in lo..hi {
-                        let k = dom[off + pos] as usize;
-                        pos_of[off + k] = pos as u16;
-                    }
-                }
-                lo = hi;
-            }
-        }
-    }
-
-    /// Materialize the winning representative permutation as a `FastPerm` (tests).
-    #[cfg(test)]
-    pub(super) fn to_fast_perm(&self, fg: &FactorizedGroup) -> FastPerm {
-        let dom = self.dom();
-        let tgt = self.tgt();
-        let mut entries = Vec::new();
-        for f in &fg.factors {
-            let off = f.offset;
-            for pos in 0..f.keys.len() {
-                let k = dom[off + pos] as usize;
-                let t = tgt[off + pos] as usize;
-                if k != t {
-                    entries.push((f.keys[k].id(), f.values[t].clone()));
-                }
-            }
-        }
-        FastPerm(entries)
-    }
-
-    /// Approximate heap bytes for `BagCache` memory accounting.
-    pub(super) fn heap_bytes(&self) -> usize {
-        self.buf.heap_bytes()
-    }
-}
-
-/// Fallible stable sort: insertion sort for small slices (`<= 16`), bottom-up
-/// merge sort using `scratch` for larger blocks.
-fn fallible_stable_sort<F>(slice: &mut [u16], cmp: &mut F, scratch: &mut Vec<u16>) -> EResult<()>
-where
-    F: FnMut(u16, u16) -> tlx_value::Result<Ordering>,
-{
-    let n = slice.len();
-    if n <= 16 {
-        for i in 1..n {
-            let key = slice[i];
-            let mut j = i;
-            while j > 0 && cmp(key, slice[j - 1])? == Ordering::Less {
-                slice[j] = slice[j - 1];
-                j -= 1;
-            }
-            slice[j] = key;
-        }
-        return Ok(());
-    }
-    scratch.resize(n, 0);
-    let mut width = 1usize;
-    while width < n {
-        let mut lo = 0usize;
-        while lo < n {
-            let mid = (lo + width).min(n);
-            let hi = (lo + 2 * width).min(n);
-            let (mut i, mut j, mut out) = (lo, mid, lo);
-            while i < mid && j < hi {
-                if cmp(slice[j], slice[i])? == Ordering::Less {
-                    scratch[out] = slice[j];
-                    j += 1;
-                } else {
-                    scratch[out] = slice[i];
-                    i += 1;
-                }
-                out += 1;
-            }
-            while i < mid {
-                scratch[out] = slice[i];
-                i += 1;
-                out += 1;
-            }
-            while j < hi {
-                scratch[out] = slice[j];
-                j += 1;
-                out += 1;
-            }
-            slice[lo..hi].copy_from_slice(&scratch[lo..hi]);
-            lo = hi;
-        }
-        width *= 2;
-    }
-    Ok(())
 }

@@ -1,4 +1,6 @@
-use super::factor::{lex_permutations, Partition};
+use tlx_base::partition::Partition;
+
+use super::factor::lex_permutations;
 use super::*;
 
 fn s3_perms(atoms: &[Sym; 3]) -> Vec<Perm> {
@@ -322,26 +324,30 @@ fn factorized_rank_matches_materialized_symmetry_maps() {
     assert_eq!(maps.len(), 3 * 2 * 2 - 1);
     let n0 = fg.factors[0].keys.len();
     let n1 = fg.factors[1].keys.len();
-    let off0 = fg.factors[0].offset;
-    let off1 = fg.factors[1].offset;
+    let pin_factor = |part: &mut Partition, g: usize, perm: &[u16]| {
+        let off = fg.factors[g].offset;
+        for (k, &t) in perm.iter().enumerate() {
+            let p = part.pos_of()[off + k] as usize;
+            let lo = part.block_lo()[off + p] as usize;
+            let hi = part.block_hi()[off + p] as usize;
+            let slot_pos = (lo..hi).find(|&q| part.tgt()[off + q] == t).expect("target in block");
+            part.pin_to_slot(fg, g, k, slot_pos);
+        }
+    };
     for p0 in lex_permutations(n0) {
         for p1 in lex_permutations(n1) {
             let mut part = Partition::default();
             part.reset(fg);
-            for (k, &t) in p0.iter().enumerate() {
-                part.set_singleton(off0 + k, k as u16, t, k as u16);
-            }
-            for (k, &t) in p1.iter().enumerate() {
-                part.set_singleton(off1 + k, k as u16, t, k as u16);
-            }
-            part.unpinned = 0;
+            pin_factor(&mut part, 0, &p0);
+            pin_factor(&mut part, 1, &p1);
+            assert!(part.is_complete());
             let rank = fg.rank_of(&part);
             let is_id = p0.iter().enumerate().all(|(i, &t)| t as usize == i) && p1.iter().enumerate().all(|(i, &t)| t as usize == i);
             if is_id {
                 assert_eq!(rank, None);
             } else {
                 let r = rank.expect("non-identity rank");
-                let fp = part.to_fast_perm(fg);
+                let fp = fg.to_fast_perm(&part);
                 let expected = FastPerm::new(&maps[r]);
                 for &s in a.iter().chain(b.iter()) {
                     assert_eq!(fp.get(s), expected.get(s), "rank={r}, sym={s:?}");
