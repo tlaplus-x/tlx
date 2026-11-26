@@ -440,8 +440,11 @@ def add_result_args(ap):
     ap.add_argument("--suite", help="expected-failure suite name (normally inferred from the run mode)")
 
 
-def finish_cases(cases, selected, path=None, *, coverage=None):
-    """The shared gate: validate the completion manifest, count statuses and decide exit."""
+def finish_cases(cases, selected, path=None, *, coverage=None, suite=None):
+    """The shared gate: validate the completion manifest, count statuses and decide exit.
+
+    `suite` (the expected-failure suite name) is recorded in the report, so a
+    downloaded JSON file identifies the run mode independently of its name."""
     from dataclasses import asdict
     cases, selected = list(cases), list(selected)
     ids = [c.id for c in cases]
@@ -455,7 +458,7 @@ def finish_cases(cases, selected, path=None, *, coverage=None):
         errors.append("no case executed")
     if coverage and (coverage.get("missing", 0) or coverage.get("stale", 0)):
         errors.append("incomplete oracle coverage")
-    report = {"version": 1, "selected": selected, "cases": [asdict(c) for c in cases],
+    report = {"version": 1, "suite": suite, "selected": selected, "cases": [asdict(c) for c in cases],
               "counts": counts, "coverage": coverage or {}, "errors": errors,
               "exit_code": int(bool(errors) or any(c.status in BAD_STATUSES for c in cases))}
     if path:

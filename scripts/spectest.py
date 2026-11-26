@@ -315,8 +315,14 @@ def run_specs(a, names, binary):
                     contract.skipped["trace validity"] = note
             # A known difference (docs/compat.md): `# xfail ID` in NAME.flags.
             xfail = next((line.split()[2] for line in lines if line.startswith("# xfail ")), None)
+            known = {"reason": xfail} if xfail else None
+            if known and workers != 1:
+                # With several workers the comparator skips the fields a race
+                # can change, so the marked difference may go unobserved: a
+                # passing run does not mean the difference is gone (no XPASS).
+                known["flaky"] = True
             case = judge_case(CaseResult(n, "fail" if diff else "pass", {"kind": got["result"], "differs": diff, "note": note, **contract.details()}),
-                              entries, suite, known={"reason": xfail} if xfail else None)
+                              entries, suite, known=known)
             status = case.status.upper()
             show = lambda r: {k: r[k] for k in ("result", "violated", "exit", "distinct", "generated", "depth")}
             lines_out.append(f'{status} {n:12} tlc={show(want)} tlx={show(got)}' + (f" differs: {diff}" if diff else "")
@@ -360,7 +366,7 @@ def run_specs(a, names, binary):
             json.dump(validated, f, indent=1, sort_keys=True)
             f.write("\n")
     counts = ", ".join(f"{v} {k}" for k, v in sorted(notes.items()) if k)
-    report = finish_cases(results, names, a.results_json)
+    report = finish_cases(results, names, a.results_json, suite=suite)
     fails = sum(c.status in ("fail", "xpass", "error", "timeout") for c in results)
     print(f"{len(names) - fails}/{len(names)} passed" + (f" ({counts})" if counts else ""))
     print(case_summary(report))

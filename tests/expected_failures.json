@@ -107,6 +107,26 @@
    "reason": "with several workers, which of the level's two errors (the tableau predicate's \\div by 0, the invariant) is found first depends on timing; on main e730267 too (6 of 10 runs report the \\div error)"
   },
   {
+   "suite": "spectest*-w8",
+   "id": "FzWorkersAPropFirst",
+   "result": "property failure",
+   "flaky": true,
+   "reason": "D-3: the invariant and the action property are violated in the same BFS level, so which worker's violation stops the multi-worker search decides the result kind and name (tlx reports the action property, TLC with 1 or 4 workers the invariant); both are valid tier-3 choices"
+  },
+  {
+   "suite": "spectest*-w8",
+   "id": "LZS2",
+   "result": "liveness failure",
+   "reason": "D-1/D-2: TLC's simulator reports the liveness violation without a property name, and a multi-worker run does not validate tlx's lasso, so the comparator only accepts a named violation; the single-worker suite compares the lasso instead"
+  },
+  {
+   "suite": "spectest*-w8",
+   "id": "SN21",
+   "result": "deadlock",
+   "flaky": true,
+   "reason": "D-31: with several workers the comparator accepts TLC's representation-dependent comparison error against tlx's deadlock as an error/violation race (D-3), so the documented difference is not compared and the case passes"
+  },
+  {
    "suite": "corpus-ext*-w8",
    "id": "ext/pragmatic/specjuniorv1",
    "flaky": true,

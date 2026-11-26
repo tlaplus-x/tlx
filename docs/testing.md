@@ -19,16 +19,24 @@ summary check aggregates Linux x86_64, Linux arm64 and macOS arm64 Rust/spec tes
 job (formatting, Clippy, Python driver tests, documentation and benchmark-report checks).
 Actions are pinned by commit and run with read-only repository permissions. The workflow does not
 use cloud credentials or run performance benchmarks. Corpus-wide model-checking runs remain separate cloud jobs.
-The `main` branch permits direct pushes and force pushes, but rejects merge commits and deletion.
-CI runs after each push; its result is not a precondition for pushing.
+The `main` branch accepts changes only through pull requests with a linear history; squash
+merging is the only enabled merge method, and direct pushes, force pushes, merge commits and
+deletion are rejected. CI runs after each push; its result is not a precondition for pushing.
 
 The Python quality job uses `bash scripts/fetch-deps.sh --tests-only`, without the Examples corpus.
 Rust jobs use the full dependency fetch because their parser and resolver corpus tests require it;
 these front-end checks do not exhaustively model-check the corpus. The exact TLC oracle jar and
 its license are retained in `tests/deps/` and verified
 against the pin in `scripts/dependencies.py`; the mutable upstream release asset is not trusted to
-supply the historical oracle bytes. Spec tests still exercise interpreter, compiled and paranoid
-compiled modes, with Java available for trace validation.
+supply the historical oracle bytes. With Java available for trace validation, spec tests run all
+seven `spectest` modes on every OS/architecture runner, matching the suites of `scripts/verify.py`:
+interpreter (`-interp`), compiled with default tiering, paranoid compiled (`TLX_PARANOID=1`, C
+tier), paranoid JIT compiled (`TLX_JIT=1 TLX_PARANOID=1`, Cranelift codegen), C-only without
+pre-run reuse (`TLX_JIT=0 TLX_PRERUN_REUSE=0 TLX_NATIVE_SYNC=1`, run after the paranoid suite has
+built the C libraries into the shared cache, which the synchronous load then reuses), multi-worker
+compiled (`-compile -workers 8`), and default mode
+(`--default-mode`, automatic symmetry with its Lean certificates written to an isolated
+`TLX_PROOF_DIR`). Each mode writes its own report under `target/ci/`, uploaded with the run.
 
 ## What belongs in a test
 
@@ -289,7 +297,9 @@ unknown spec name also exits 2 with a "did you mean" hint instead of running any
   (for example `TLX_PRERUN=1` to force layout misses in compiled mode); `# deterministic` makes a
   simulation/generate spec also compare the generated count; `# xfail ID` marks a known tier 1
   difference listed in [compat.md](compat.md) (the spec reports XFAIL while it differs and XPASS,
-  a failure, once it is fixed so the marker can be removed). Other `#` lines are comments.
+  a failure, once it is fixed so the marker can be removed). A multi-worker run compares fewer
+  fields, so its marker may go unobserved: a passing case then stays a pass rather than XPASS.
+  Other `#` lines are comments.
 - **Multi-worker mode** (`--extra="-workers N"`, N > 1) compares only what must hold with several
   workers: result kind (an evaluation error TLC stops at may lose the race to a violation, so any
   non-success failure is accepted then) and violated names; counts and depth only for complete
@@ -985,7 +995,9 @@ suite's own settings win; it is recorded in `summary.json`).
 
 Spec, corpus and TLC-suite drivers share a structured `CaseResult` protocol: an id, a status
 (`pass`, `fail`, `xfail`, `xpass`, `error`, `skip`, `timeout`) and details. `--results-json PATH`
-writes the selected-case manifest, per-case results, status counts and exit judgment. The same
+writes the selected-case manifest, per-case results, status counts and exit judgment, and the
+driver's suite name (the `--suite` identifier), so a downloaded report identifies its run mode
+without relying on the file name. The same
 judgment is used for standalone exits and by `verify.py`; readable PASS/FAIL/XFAIL/XPASS lines
 are only a rendering. A zero selection, missing case results, execution errors, unacknowledged
 XPASS or a failed driver process fails the gate. A model's expected evaluation error is a
@@ -999,6 +1011,7 @@ result kind. A non-`flaky` entry must fail: if the model passes, `verify.py` rep
 |---|---|
 | nondeterministic TLC reference | `SpanningTree/SpanTreeRandom` (random seed changes TLC's graph); `KnuthYao/SimKnuthYao` (statistical POSTCONDITION, flaky in TLC too) |
 | specs that assume one TLC worker | `DieHard/MCDieHardest`, `KnuthYao/SimKnuthYao` in `*-w8` suites; `LZT1` in `spectest*-w8` |
+| multi-worker same-level choices (D-3), unnamed simulator lassos (D-1/D-2) | `FzWorkersAPropFirst` (invariant vs action property at the same level), `SN21` (D-31 error/violation race) and `LZS2` in `spectest*-w8` |
 | interpreter timeouts under load | a few slow models in `corpus-interp*` and `corpus-paranoid` (flaky) |
 | open bugs found by fuzzing | `replay/Fz*/MODE` in `fuzz*` (minimized regressions in `tests/fuzz/specs`) |
 
