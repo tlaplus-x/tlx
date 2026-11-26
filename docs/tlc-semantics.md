@@ -278,7 +278,8 @@ tlx: `tlx-eval/src/eval.rs` (`QuantUnbounded` and unbounded CHOOSE produce the s
   more than `-maxSetSize` elements (default 10^6, `V/ValueVec.java:88-92`) is TLC's "too many
   elements" error. What raises the *overflow* is `size()`/`Cardinality`, materializing
   (`SubsetValue.toSetEnum` asks `size()`, `:304`; the tuple and record enumerators convert every
-  constituent with `toSetEnum`) and the paths that still hold a whole set (`CHOOSE` normalizes it).
+  constituent with `toSetEnum`) and the paths that still hold a whole set (a bound of several
+  variables).
 
   tlx: `tlx-value/src/ops/enumerate.rs` (`for_each_enumerated` streams such a set in the default
   order; `enumerate` refuses it and `materialization_error` reports the overflow),
@@ -291,8 +292,9 @@ tlx: `tlx-eval/src/eval.rs` (`QuantUnbounded` and unbounded CHOOSE produce the s
   interval (`(1..n) \cup {}` reports the bound), while enforcing `-maxSetSize` on canonical
   distinct elements of homogeneous explicit sets in `\cup`, `\cap` and `\` rather than imitating
   TLC's mutable in-place normalization aliasing ([compat.md](compat.md) D-35). `x' \subseteq S`
-  (and `x \subseteq S` in `Init`, outside `-generate`) streams `SUBSET S` in normalized order; a
-  `CHOOSE` and a bound of several variables still keep the overflow (see [compat.md](compat.md) section 5).
+  (and `x \subseteq S` in `Init`, outside `-generate`) and `CHOOSE x \in S` stream `SUBSET S` (and
+  `kSubset(k, S)` for `CHOOSE`) in normalized order; a bound of several variables still keeps the
+  overflow (see [compat.md](compat.md) section 5).
 
 tlx: `tlx_value::arith` (`add`, `sub`, `mul`, `pow`, `neg`, `modulo`, `div_floor`, `div_naturals`;
 values are `i64` with an i32 range check per operation; generated C uses `tlx_add` etc. from

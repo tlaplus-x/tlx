@@ -103,8 +103,9 @@ fn constant_expressions() {
 /// too (`SubsetValue` implements the normalized enumeration by streaming), so
 /// that case agrees. A `[S -> T]` domain is materialized by both: its size
 /// overflows TLC's int, and TLC's growing `ValueVec` reports its
-/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE` and a
-/// bound of several variables still need the whole set.
+/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE` streams
+/// `SUBSET S` in normalized order as well; a bound of several variables still
+/// needs the whole set.
 #[test]
 fn quantifiers_stream_subsets_whose_size_overflows() {
     let body = "\
@@ -120,9 +121,83 @@ Pair == \\E x, y \\in SUBSET (1..31) : x = y";
         "BigFcn: {}",
         out[1]
     );
-    for (i, what) in [(2, "Cardinality"), (3, "CHOOSE"), (4, "a bound of two variables")] {
+    assert_eq!(out[3], "{}", "{out:?}");
+    for (i, what) in [(2, "Cardinality"), (4, "a bound of two variables")] {
         assert!(out[i].starts_with("ERROR:") && out[i].contains("Overflow when computing the number of elements in"), "{what}: {}", out[i]);
     }
+}
+
+#[test]
+fn choose_streams_normalized_subset_and_ksubset() {
+    let body = "\
+EXTENDS Naturals, FiniteSets, FiniteSetsExt\n\
+PickEmpty == CHOOSE s \\in SUBSET (1..31) : s = {}\n\
+PickTwo == CHOOSE s \\in SUBSET (1..31) : 2 \\in s\n\
+PickTrue == CHOOSE s \\in SUBSET (1..31) : TRUE\n\
+PickParam(k) == CHOOSE s \\in SUBSET (1..31) : k \\in s\n\
+PickParamTwo == PickParam(2)\n\
+PickKSubFirst == CHOOSE s \\in kSubset(10, 1..30) : 1 \\in s\n\
+PickKSubSecond == CHOOSE s \\in kSubset(10, 1..30) : 11 \\in s\n\
+PickKSubZeroNat == CHOOSE s \\in kSubset(0, Nat) : TRUE\n\
+PickKSubEmpty == CHOOSE s \\in kSubset(2, {1}) : TRUE\n\
+PickSubsetNat == CHOOSE s \\in SUBSET Nat : TRUE\n\
+PickTupleOnSubset == CHOOSE <<a, b>> \\in SUBSET (1..31) : TRUE\n\
+PickBigFcn == CHOOSE f \\in [1..5 -> 1..121] : TRUE\n";
+    let (_dir, path) = write_spec("M", body);
+    let mut prog = Program::load(&path, &[]).unwrap_or_else(|e| panic!("{e:?}"));
+    let names = [
+        "PickEmpty",
+        "PickTwo",
+        "PickTrue",
+        "PickParamTwo",
+        "PickKSubFirst",
+        "PickKSubSecond",
+        "PickKSubZeroNat",
+        "PickKSubEmpty",
+        "PickSubsetNat",
+        "PickTupleOnSubset",
+        "PickBigFcn",
+    ];
+    let ids: Vec<_> = names
+        .iter()
+        .map(|n| match prog.lookup_root(n) {
+            Some(RootSymbol::Def(d)) => d,
+            _ => panic!("{n} not defined"),
+        })
+        .collect();
+    let ip = Interp::new(prog, Default::default()).unwrap_or_else(|e| panic!("{e}"));
+    let out: Vec<String> = ids
+        .iter()
+        .map(|d| {
+            let e = tlx_sema::hir::Expr::new(ExprKind::Apply { op: OpRef::Def(*d), args: vec![] }, Default::default());
+            match ip.eval(&e, &Env::default(), &Ctx::NONE) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("ERROR: {e}"),
+            }
+        })
+        .collect();
+    assert_eq!(out[0], "{}", "PickEmpty: {out:?}");
+    assert_eq!(out[1], "{2}", "PickTwo: {out:?}");
+    assert_eq!(out[2], "{}", "PickTrue: {out:?}");
+    assert_eq!(out[3], "{2}", "PickParamTwo: {out:?}");
+    assert_eq!(out[4], "{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}", "PickKSubFirst: {out:?}");
+    assert_eq!(out[5], "{1, 2, 3, 4, 5, 6, 7, 8, 9, 11}", "PickKSubSecond: {out:?}");
+    assert_eq!(out[6], "{}", "PickKSubZeroNat: {out:?}");
+    assert!(out[7].starts_with("ERROR:") && out[7].contains("no element of S satisfied P"), "PickKSubEmpty: {}", out[7]);
+    assert!(out[8].starts_with("ERROR:") && out[8].contains("non-enumerable"), "PickSubsetNat: {}", out[8]);
+    assert!(out[9].starts_with("ERROR:") && out[9].contains("non-tuple"), "PickTupleOnSubset: {}", out[9]);
+    assert!(
+        out[10].starts_with("ERROR:") && out[10].contains("Attempted to construct a set with too many elements (>1000000)"),
+        "PickBigFcn: {}",
+        out[10]
+    );
+    // Also exercise the uncompiled tree-walker path (`eval_tree` on a
+    // synthetic `ExprKind::Choose` not in `prog`'s `code_of` table).
+    let tlx_sema::hir::DefKind::Op(pick_two_body) = &ip.prog.defs[ids[1].idx()].kind else {
+        panic!("PickTwo is an operator");
+    };
+    let synthetic = tlx_sema::hir::Expr::new((*pick_two_body.kind).clone(), pick_two_body.span);
+    assert_eq!(ip.eval(&synthetic, &Env::default(), &Ctx::NONE).unwrap().to_string(), "{2}");
 }
 
 #[test]
