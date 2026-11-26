@@ -67,6 +67,27 @@ the generated `GeneratedThresholdCounter` file against the standard axioms,
 rejecting the off-by-one-cap, dropped-increment, discarded-guard-feedback and
 changed-observation mutations.
 
+### Composition with automatic symmetry (`ThresholdSymCertificate.lean`)
+
+When `Actor` is configured as a set of model values (for example
+`Actor = {a1, a2, a3, a4, a5}`) and `-optimize` runs with automatic symmetry
+enabled, `threshold-counter-projection` composes directly with certified
+equivariant symmetry via `ThresholdSymCertificate.lean`
+(`GeneratedThresholdSymmetry`, unconstrained and constrained) over one shared
+concrete source model. Symmetric-group counter slots carry kernel-checked uniform
+caps (`capUniform : by decide`) so `saturate` commutes with `GroupPerm`, and `tlx`
+projects before orbit canonicalization while reconstructing un-capped concrete
+counterexample traces. On `ThresholdProtocol.tla` with `Actor = {a1..a5}` (release
+build, `-workers 1`, 1 warmup + 5 interleaved rounds), threshold saturation alone
+explores 543,097 generated / 90,143 distinct states (median 0.764 s), whereas
+composed `threshold-counter-projection (retries<=3, failures<=3)` ×
+`Permutations(Actor)` explores 30,485 generated / 4,959 distinct states (median
+0.369 s — 18.18x fewer distinct states and 2.07x faster). Both unconstrained and
+constrained `GeneratedThresholdSymmetry` certificates are audited by
+`python3 proofs/check_generated.py --lean lean --negative`, rejecting asymmetric
+per-key counter caps, weakened `Cmp.reqCap`, dropped `Transfer.add`, broken slot
+renamings, and disconnected intermediate models.
+
 ### External evidence
 
 `scripts/fetch-deps.sh` installs the upstream tlaplus/Examples corpus. The

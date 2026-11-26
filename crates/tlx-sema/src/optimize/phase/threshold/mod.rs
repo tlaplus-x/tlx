@@ -9,6 +9,7 @@
 //! are preserved exactly.
 
 mod lean;
+pub(super) mod sym;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -55,27 +56,15 @@ pub fn threshold_counter_projection(
     threshold_counter_projection_with_spec(program, cfg, init, next, CheckSpec::invariants_only(observations))
 }
 
-/// Prove an in-place threshold-counter saturation projection covering invariants,
-/// init properties, state constraints, and counter-independent action checks.
-pub fn threshold_counter_projection_with_spec(
+pub(super) fn analyze_counters(
     program: &Program,
     cfg: &Config,
-    init: &Expr,
-    next: &Expr,
-    spec: CheckSpec<'_>,
-) -> Option<FieldProjection> {
-    if !super::cfg_constants_supported(program, cfg) {
-        return None;
-    }
-    let mut expand = Normalizer::with_config_threshold(program, cfg);
-    let initial = branches_with_if(&expand.root(init)?)?;
-    let steps = branches_with_if(&expand.root(next)?)?;
-    if initial.is_empty() || steps.is_empty() {
-        return None;
-    }
-    let norm = spec.try_map(|e| expand.root(e))?;
-    let norm_spec = norm.as_spec();
-    let domains = Domains::infer(program, cfg, &initial, &steps)?;
+    initial: &[Branch],
+    steps: &[Branch],
+    norm_spec: CheckSpec<'_>,
+    opaque_cache: &mut HashMap<DefId, Option<BTreeSet<VarId>>>,
+) -> Option<(Domains, Vec<CounterSpec>)> {
+    let domains = Domains::infer(program, cfg, initial, steps)?;
 
     let mut candidates = BTreeMap::new();
     for (i, dom) in domains.vars.iter().enumerate() {
@@ -136,12 +125,12 @@ pub fn threshold_counter_projection_with_spec(
             domains: &domains,
             candidates: &mut candidates,
             invalid: BTreeSet::new(),
-            opaque_cache: expand.opaque_vars_cache_mut(),
+            opaque_cache,
             remaining: MAX_CHECK_WORK,
             aborted: false,
         };
 
-        checker.check_all(&initial, &steps, norm_spec);
+        checker.check_all(initial, steps, norm_spec);
         if checker.aborted {
             return None;
         }
@@ -157,7 +146,7 @@ pub fn threshold_counter_projection_with_spec(
         let mut to_prune = Vec::new();
         let vars: Vec<VarId> = candidates.keys().copied().collect();
         for v in vars {
-            let (ub, eval_ub) = compute_bounds(&domains, &candidates[&v], &initial, &steps, norm_spec.constraints);
+            let (ub, eval_ub) = compute_bounds(&domains, &candidates[&v], initial, steps, norm_spec.constraints);
             let spec_c = candidates.get_mut(&v).unwrap();
             spec_c.upper_bound = ub;
             spec_c.eval_upper_bound = eval_ub;
@@ -189,6 +178,30 @@ pub fn threshold_counter_projection_with_spec(
     if total_slots == 0 || total_slots > MAX_TOTAL_SLOTS {
         return None;
     }
+    Some((domains, counters))
+}
+
+/// Prove an in-place threshold-counter saturation projection covering invariants,
+/// init properties, state constraints, and counter-independent action checks.
+pub fn threshold_counter_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config_threshold(program, cfg);
+    let initial = branches_with_if(&expand.root(init)?)?;
+    let steps = branches_with_if(&expand.root(next)?)?;
+    if initial.is_empty() || steps.is_empty() {
+        return None;
+    }
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
+    let (domains, counters) = analyze_counters(program, cfg, &initial, &steps, norm_spec, expand.opaque_vars_cache_mut())?;
 
     if spec.is_constrained() && !super::sym_totality::check_projection_observations_total(program, cfg, init, next, spec) {
         return None;
@@ -207,7 +220,7 @@ pub fn threshold_counter_projection_with_spec(
     Some(FieldProjection { ordered: None, view, fields, certificate: Some(certificate), mathematical_counter_arithmetic })
 }
 
-fn build_view(program: &Program, counters: &[CounterSpec], span: Span) -> Expr {
+pub(super) fn build_view(program: &Program, counters: &[CounterSpec], span: Span) -> Expr {
     let by_var: HashMap<VarId, &CounterSpec> = counters.iter().map(|c| (c.var, c)).collect();
     let mut next_local = program.locals.len() as u32;
     let values = program

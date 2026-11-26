@@ -27,7 +27,11 @@ pub(crate) fn emit(model: &InterpModel, proofdir: Option<&Path>, applied: Option
         std::process::ExitCode::from(2)
     })?;
     let coverage = if model.has_projected_symmetry() && model.projection_certificate().is_some() {
-        if model.projection_certificate().is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedErasedEquivSymmetry")) {
+        if model.projection_certificate().is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedFieldSymmetry")) {
+            "parametric phase-field/equivariant-symmetry composition certificate; lowering, totality, group closure and runtime remain trusted"
+        } else if model.projection_certificate().is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedThresholdSymmetry")) {
+            "parametric threshold-counter/equivariant-symmetry composition certificate; lowering, totality, group closure and runtime remain trusted"
+        } else if model.projection_certificate().is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedErasedEquivSymmetry")) {
             "parametric erasure/equivariant-symmetry composition certificate; lowering, totality, group closure and runtime remain trusted"
         } else {
             "parametric erasure/keyed-symmetry composition certificate; lowering, totality, group closure and runtime remain trusted"

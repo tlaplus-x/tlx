@@ -5,8 +5,8 @@
 //! products of full permutation groups (order <= 5040). Used as a certified
 //! fallback when the narrower `keyed` certificate does not apply.
 
-mod lower;
-mod output;
+pub(in crate::optimize::phase) mod lower;
+pub(in crate::optimize::phase) mod output;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub(in crate::optimize::phase) struct GroupInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum AtomKey {
+pub(in crate::optimize::phase) enum AtomKey {
     Int(i128),
     Str(Arc<str>),
     Bool(bool),
@@ -35,7 +35,7 @@ pub(super) enum AtomKey {
 }
 
 impl AtomKey {
-    pub(super) fn describe(&self) -> String {
+    pub(in crate::optimize::phase) fn describe(&self) -> String {
         match self {
             Self::Int(n) => format!("int:{n}"),
             Self::Str(s) => format!("str:{s:?}"),
@@ -277,7 +277,10 @@ pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option
     Some((groups, all_keys))
 }
 
-fn collect_const_bindings<'a>(program: &Program, cfg: &'a Config) -> Option<BTreeMap<ConstId, &'a CfgValue>> {
+pub(in crate::optimize::phase) fn collect_const_bindings<'a>(
+    program: &Program,
+    cfg: &'a Config,
+) -> Option<BTreeMap<ConstId, &'a CfgValue>> {
     if super::sym_totality::cfg_overrides_or_tables(program, cfg) {
         return None;
     }

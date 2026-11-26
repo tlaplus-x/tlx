@@ -6,6 +6,7 @@
 //! fixed-domain companion variables governed by a shared control variable.
 
 mod lean;
+pub(super) mod sym;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -172,15 +173,14 @@ impl PhaseGuards {
     }
 }
 
-pub(super) fn derive(
-    program: &Program,
-    domains: &Domains,
+pub(super) fn derive_analysis<'a>(
+    domains: &'a Domains,
     control: Control,
-    phases: &BTreeSet<Atom>,
-    keys: Option<&BTreeSet<Atom>>,
+    phases: &'a BTreeSet<Atom>,
+    keys: Option<&'a BTreeSet<Atom>>,
     branches: (&[Branch], &[(Branch, Vec<usize>)]),
     spec: super::CheckSpec<'_>,
-) -> Option<(FieldProjection, Option<super::OpenCert>)> {
+) -> Option<Analysis<'a>> {
     let (initial, step_pos) = branches;
     if initial.is_empty() || step_pos.is_empty() {
         return None;
@@ -216,9 +216,7 @@ pub(super) fn derive(
                     }
                 }
             }
-            let projection = a.view(program, initial)?;
-            let cert = lean::emit(&a, initial, &steps, spec);
-            Some((projection, cert))
+            Some(a)
         }
         Control::Var { var: ctrl } => {
             // Verify the control variable itself has constant initial phases and valid transfers.
@@ -353,11 +351,78 @@ pub(super) fn derive(
                 }
                 break a;
             };
-            let projection = final_analysis.view(program, initial)?;
-            let cert = lean::emit(&final_analysis, initial, &steps, spec);
-            Some((projection, cert))
+            Some(final_analysis)
         }
     }
+}
+
+/// Ordered control-source candidates eligible for phase-dependent field masking
+/// (record field, fixed-domain map-of-records field, fixed-domain control map,
+/// and scalar control variable). Single owner shared by the `VIEW` installer
+/// (`phase.rs`) and symmetry composition matcher (`liveness/sym.rs`).
+pub(super) fn control_candidates(domains: &Domains, span: Span) -> Vec<(Control, &BTreeSet<Atom>, Option<&BTreeSet<Atom>>)> {
+    let mut out = Vec::new();
+    let eligible_phases = |phases: &BTreeSet<Atom>, min: usize| -> bool {
+        (min..=32).contains(&phases.len())
+            && super::domain::compatible(phases)
+            && phases.iter().all(|p| domains.atom_expr(p, span).is_some())
+    };
+    for (i, d) in domains.vars.iter().enumerate() {
+        let var = VarId(i as u32);
+        match d {
+            Domain::Record(fs) if fs.len() <= 32 => {
+                for (control, values) in fs {
+                    if let Some(phases) = values.atoms() {
+                        if eligible_phases(phases, 1) {
+                            out.push((Control::RecordField { var, field: control.clone() }, phases, None));
+                        }
+                    }
+                }
+            }
+            Domain::Function(keys, range) if !keys.is_empty() && keys.len() <= 256 && super::domain::compatible(keys) => match &**range {
+                Domain::Record(fs) if fs.len() <= 32 => {
+                    for (control, values) in fs {
+                        if let Some(phases) = values.atoms() {
+                            if eligible_phases(phases, 1) {
+                                out.push((Control::RecordField { var, field: control.clone() }, phases, Some(keys)));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(phases) = range.atoms() {
+                        if eligible_phases(phases, 2) {
+                            out.push((Control::Var { var }, phases, Some(keys)));
+                        }
+                    }
+                }
+            },
+            Domain::Atoms(phases) if eligible_phases(phases, 2) => {
+                out.push((Control::Var { var }, phases, None));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn derive(
+    program: &Program,
+    domains: &Domains,
+    control: Control,
+    phases: &BTreeSet<Atom>,
+    keys: Option<&BTreeSet<Atom>>,
+    branches: (&[Branch], &[(Branch, Vec<usize>)]),
+    spec: super::CheckSpec<'_>,
+    avoid_keys: Option<&BTreeSet<Arc<str>>>,
+) -> Option<(FieldProjection, Option<super::OpenCert>)> {
+    let (initial, step_pos) = branches;
+    let a = derive_analysis(domains, control, phases, keys, branches, spec)?;
+    let steps: Vec<Branch> = step_pos.iter().map(|(b, _)| b.clone()).collect();
+    let projection = a.view(program, initial, avoid_keys)?;
+    let cert = lean::emit(&a, initial, &steps, spec);
+    Some((projection, cert))
 }
 
 fn is_empty_domain(d: &Domain) -> bool {
@@ -401,7 +466,7 @@ fn mentions_any_var(e: &Expr, vars: &BTreeSet<VarId>) -> bool {
     found
 }
 
-fn mentions_local(e: &Expr, local: LocalId) -> bool {
+pub(in crate::optimize::phase) fn mentions_local(e: &Expr, local: LocalId) -> bool {
     if matches!(&*e.kind, ExprKind::Local(l) if *l == local) {
         return true;
     }
@@ -1772,12 +1837,55 @@ impl Analysis<'_> {
         }
     }
 
-    fn sentinel_expr(&self, dom: &Domain, init_seed: Option<&Expr>, span: Span) -> Expr {
+    fn is_avoided_atom(a: &Atom, avoid_keys: Option<&BTreeSet<Arc<str>>>) -> bool {
+        matches!(a, Atom::Model(m) if avoid_keys.is_some_and(|s| s.contains(m)))
+    }
+
+    fn expr_mentions_avoided_key(&self, e: &Expr, avoid_keys: Option<&BTreeSet<Arc<str>>>) -> bool {
+        let Some(avoid) = avoid_keys.filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        match &*e.kind {
+            ExprKind::Const(_) => {
+                if let Some(a) = self.domains.atom_value(e) {
+                    return Self::is_avoided_atom(&a, Some(avoid));
+                }
+                if let Some(set) = self.domains.exact_set(e) {
+                    return set.iter().any(|a| Self::is_avoided_atom(a, Some(avoid)));
+                }
+                true
+            }
+            _ => {
+                if let Some(a) = self.domains.atom_value(e) {
+                    if Self::is_avoided_atom(&a, Some(avoid)) {
+                        return true;
+                    }
+                }
+                let mut found = false;
+                visit::children(e, &mut |c| found |= self.expr_mentions_avoided_key(c, Some(avoid)));
+                found
+            }
+        }
+    }
+
+    pub(super) fn sentinel_for_slot(
+        &self,
+        slot: &Slot,
+        initial: &[Branch],
+        avoid_keys: Option<&BTreeSet<Arc<str>>>,
+        span: Span,
+    ) -> Option<Expr> {
+        let dom = self.slot_domain(slot)?;
+        let init_seed = self.init_seed_for_slot(slot, initial);
+        Some(self.sentinel_expr(dom, init_seed.as_ref(), avoid_keys, span))
+    }
+
+    fn sentinel_expr(&self, dom: &Domain, init_seed: Option<&Expr>, avoid_keys: Option<&BTreeSet<Arc<str>>>, span: Span) -> Expr {
         match dom {
             Domain::Atoms(atoms) if !atoms.is_empty() => {
                 if let Some(seed) = init_seed {
                     if let Some(a) = self.domains.atom_value(seed) {
-                        if atoms.contains(&a) {
+                        if atoms.contains(&a) && !Self::is_avoided_atom(&a, avoid_keys) {
                             if let Some(e) = self.domains.atom_expr(&a, span) {
                                 return e;
                             }
@@ -1792,8 +1900,10 @@ impl Analysis<'_> {
                     }
                 }
                 for a in atoms {
-                    if let Some(e) = self.domains.atom_expr(a, span) {
-                        return e;
+                    if !Self::is_avoided_atom(a, avoid_keys) {
+                        if let Some(e) = self.domains.atom_expr(a, span) {
+                            return e;
+                        }
                     }
                 }
             }
@@ -1814,14 +1924,18 @@ impl Analysis<'_> {
                         }
                     }
                 }
-                let built: Vec<(Arc<str>, Expr)> =
-                    fs.iter().map(|(k, d)| (k.clone(), self.sentinel_expr(d, init_fields.get(k.as_ref()).copied(), span))).collect();
+                let built: Vec<(Arc<str>, Expr)> = fs
+                    .iter()
+                    .map(|(k, d)| (k.clone(), self.sentinel_expr(d, init_fields.get(k.as_ref()).copied(), avoid_keys, span)))
+                    .collect();
                 return Expr::new(ExprKind::Record(built), span);
             }
             _ => {}
         }
         if let Some(seed) = init_seed {
-            return seed.clone();
+            if !self.expr_mentions_avoided_key(seed, avoid_keys) {
+                return seed.clone();
+            }
         }
         Expr::new(ExprKind::Bool(false), span)
     }
@@ -1853,7 +1967,7 @@ impl Analysis<'_> {
         }
     }
 
-    fn view(&self, program: &Program, initial: &[Branch]) -> Option<FieldProjection> {
+    pub(super) fn view(&self, program: &Program, initial: &[Branch], avoid_keys: Option<&BTreeSet<Arc<str>>>) -> Option<FieldProjection> {
         let mut next_local = program.locals.len() as u32;
         match &self.control {
             Control::RecordField { var, field: ctrl_field } => {
@@ -1877,7 +1991,7 @@ impl Analysis<'_> {
                         continue;
                     }
                     let init_seed = self.init_seed_for_slot(slot, initial);
-                    let sentinel = self.sentinel_expr(dom, init_seed.as_ref(), span);
+                    let sentinel = self.sentinel_expr(dom, init_seed.as_ref(), avoid_keys, span);
                     let ctrl_expr = Expr::new(ExprKind::Field { record: record.clone(), field: ctrl_field.clone() }, span);
                     let old = Expr::new(ExprKind::Field { record: record.clone(), field: field.clone() }, span);
                     let value = self.masked_value_expr(ctrl_expr, old, live, sentinel, span)?;
@@ -1926,7 +2040,7 @@ impl Analysis<'_> {
                     let v_span = program.vars[v.idx()].span;
                     let v_expr = Expr::new(ExprKind::Var(v), v_span);
                     let init_seed = self.init_seed_for_slot(slot, initial);
-                    let sentinel = self.sentinel_expr(dom, init_seed.as_ref(), v_span);
+                    let sentinel = self.sentinel_expr(dom, init_seed.as_ref(), avoid_keys, v_span);
                     let projected = if self.keys.is_some() {
                         let local = LocalId(next_local);
                         next_local += 1;

@@ -31,6 +31,8 @@ SUPPORTED_NAMESPACES = (
     "GeneratedErasedSymmetry",
     "GeneratedErasedEquivSymmetry",
     "GeneratedThresholdCounter",
+    "GeneratedFieldSymmetry",
+    "GeneratedThresholdSymmetry",
 )
 # Representative tracked specifications covering every supported generated
 # certificate namespace when check_generated.py is invoked without explicit files.
@@ -60,6 +62,31 @@ DEFAULT_CASES = (
     ("GeneratedErasedSymmetry", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize"), (0,)),
     ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/ErasedMultiKey.tla", None, ("-interp", "-optimize"), (0,)),
     ("GeneratedThresholdCounter", "check", "proofs/counter/ThresholdProtocol.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    ("GeneratedFieldSymmetry", "check", "proofs/field/ActionChecks.tla", None, ("-interp", "-optimize"), (0,)),
+    (
+        "GeneratedFieldSymmetry",
+        "check",
+        "proofs/field/ActionChecks.tla",
+        "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTANT Actors = {a1, a2, a3}\nCONSTANT Rounds = 2\nCONSTANT Values = {0, 1}\nCHECK_DEADLOCK FALSE\n",
+        ("-interp", "-optimize"),
+        (0,),
+    ),
+    (
+        "GeneratedThresholdSymmetry",
+        "check",
+        "proofs/counter/ThresholdProtocol.tla",
+        "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2, a3}\nINVARIANTS\n  TypeOK\n  EscalatedImpliesRetries\n  DegradedImpliesFailure\nCHECK_DEADLOCK TRUE\n",
+        ("-interp", "-optimize"),
+        (0,),
+    ),
+    (
+        "GeneratedThresholdSymmetry",
+        "check",
+        "proofs/counter/ThresholdProtocol.tla",
+        "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2, a3}\nINVARIANTS\n  TypeOK\n  EscalatedImpliesRetries\n  DegradedImpliesFailure\nCONSTRAINT TypeOK\nCHECK_DEADLOCK TRUE\n",
+        ("-interp", "-optimize"),
+        (0,),
+    ),
 )
 THEOREMS = {
     "certificate", "optimization_correct", "specification_correct",
@@ -123,18 +150,27 @@ def replace_gen_regex(gen_block, pattern, repl, path, label):
     return gen_block[:m.start()] + repl(m) + gen_block[m.end():]
 
 
-def field_write_can_break_frame(lean, path, source, lean_pool=None):
+def field_write_can_break_frame(lean, path, source, namespace="GeneratedField", lean_pool=None):
     """Whether clearing the write table can violate `frameLive`.
     `frameLive` needs `live (target b) f = true -> live (source b) f = true`; only a
     dead-to-live write (`live (target b) f` and not `live (source b) f`) makes
     clearing `writes` unsound. Instance-level frame mutations on a certificate
     without such a transition would be accepted by Lean, so scope them out.
     """
+    if namespace == "GeneratedFieldSymmetry":
+        binders = (
+            "(b : Fin TlxOptimization.GeneratedFieldSymmetry.BranchCount)"
+            " (f : Fin TlxOptimization.GeneratedFieldSymmetry.FieldCount)"
+        )
+    else:
+        binders = (
+            f"(b : TlxOptimization.{namespace}.BranchId)"
+            f" (f : TlxOptimization.{namespace}.Field)"
+        )
     probe = source + (
-        "\n#eval decide (∃ (b : TlxOptimization.GeneratedField.BranchId)"
-        " (f : TlxOptimization.GeneratedField.Field),"
-        " TlxOptimization.GeneratedField.live (TlxOptimization.GeneratedField.target b) f = true ∧"
-        " TlxOptimization.GeneratedField.live (TlxOptimization.GeneratedField.source b) f = false)\n")
+        f"\n#eval decide (∃ {binders},"
+        f" TlxOptimization.{namespace}.live (TlxOptimization.{namespace}.target b) f = true ∧"
+        f" TlxOptimization.{namespace}.live (TlxOptimization.{namespace}.source b) f = false)\n")
     with tempfile.TemporaryDirectory(prefix="tlx-frame-probe-") as tmp:
         probe_path = Path(tmp) / "Probe.lean"
         probe_path.write_text(probe)
@@ -200,12 +236,19 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
         raise RuntimeError(f"{path}: mismatched constSubstDeclared/constSubstExpanded declarations")
 
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
-    if namespace in {"GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry", "GeneratedErasedEquivSymmetry"}:
+    if namespace in {
+        "GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry",
+        "GeneratedErasedEquivSymmetry", "GeneratedFieldSymmetry", "GeneratedThresholdSymmetry",
+    }:
         theorems |= {"orbit_key_equivalent"}
     if namespace == "GeneratedChooseSymmetry":
         theorems |= {"inductive_invariant", "orbit_key_equivalent"}
     if namespace in {"GeneratedErasedSymmetry", "GeneratedErasedEquivSymmetry"}:
         theorems |= {"erasure_certificate"}
+    if namespace == "GeneratedFieldSymmetry":
+        theorems |= {"field_certificate", "symmetry_certificate"}
+    if namespace == "GeneratedThresholdSymmetry":
+        theorems |= {"threshold_certificate", "symmetry_certificate"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
         theorems |= {"select_concrete", "select_reduced"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_bind:
@@ -220,6 +263,10 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
             "constrained_step_counterexample_lifts",
             "admitted_deadlock_preserved",
         }
+        if namespace == "GeneratedFieldSymmetry":
+            theorems |= {"field_constrained_certificate", "symmetry_constrained_certificate"}
+        if namespace == "GeneratedThresholdSymmetry":
+            theorems |= {"threshold_constrained_certificate", "symmetry_constrained_certificate"}
     if has_erasure_constrained:
         theorems |= {"erasure_constrained_certificate"}
     if has_const_declared:
@@ -349,6 +396,24 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                 ("| .add d => min (a i + d) (cap i)", "| .add d => min (a i) (cap i)", "dropped increment in reduced transfer"),
                 ("(m.guard a.1 b.1 w).eval a.2", "(m.guard a.1 b.1 w).eval (fun _ => 0)", "discarded threshold guard feedback"),
             ] if namespace == "GeneratedThresholdCounter" else [
+                ("evalExpr m.ops emptyCoreState emptyCoreState emptyEnv (m.sentinelExpr f)", "keyElemToVal m.fixedAtom m.defaultKey", "non-equivariant dead-field sentinel"),
+                ("if m.live (p k) f then v k f else m.missing f", "if m.live (p k) f then m.missing f else v k f", "erased live fields"),
+                ("if m.observed (p k) f then v k f else m.missing f", "v k f", "dropped observation phase mask"),
+                ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
+                ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
+                ("| .key k => .key (p.toFun k)", "| .key k => .key k", "failed to rename keys"),
+                ("| .inr ⟨k, hk⟩ => .inr ⟨p.toFun k, hk⟩", "| .inr ⟨k, hk⟩ => .inr ⟨k, hk⟩", "failed to rename field-map keys"),
+                ("next q r := ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "next q r := False ∧ ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "discarded quotient successors"),
+                ("initial q := ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "initial q := False ∧ ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "discarded quotient initialization"),
+            ] if namespace == "GeneratedFieldSymmetry" else [
+                ("| .le, t => t + 1", "| .le, t => t", "off-by-one cap on <= comparison"),
+                ("| .add d => min (a i + d) (cap i)", "| .add d => min (a i) (cap i)", "dropped increment in reduced transfer"),
+                ("(m.guard a.1 b.1 w).eval a.2", "(m.guard a.1 b.1 w).eval (fun _ => 0)", "discarded threshold guard feedback"),
+                ("| .key k => .key (p.toFun k)", "| .key k => .key k", "failed to rename keys"),
+                ("fun i => n (m.permSlot p.inverse i)", "fun i => n i", "failed to permute symmetric counter slots"),
+                ("next q r := ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "next q r := False ∧ ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "discarded quotient successors"),
+                ("initial q := ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "initial q := False ∧ ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "discarded quotient initialization"),
+            ] if namespace == "GeneratedThresholdSymmetry" else [
                 ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
                 ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
             ])
@@ -389,7 +454,7 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
             for before, after, label in preamble_changes:
                 add_preamble_mutation(before, after, label)
 
-            if namespace == "GeneratedField":
+            if namespace in {"GeneratedField", "GeneratedFieldSymmetry"}:
                 # A dead-to-live write is the frame obligation's sharpest case:
                 # abandoning the write must break `advance_commutes`, not just
                 # the read tables.
@@ -403,7 +468,7 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     lambda _: "  readsActor := fun _ _ => true",
                     "read dead actor fields",
                 )
-                if field_write_can_break_frame(lean, path, preamble + ns_open + gen_block + ns_close + suffix, lean_pool):
+                if field_write_can_break_frame(lean, path, preamble + ns_open + gen_block + ns_close + suffix, namespace, lean_pool):
                     add_gen_decl_mutation(
                         r"^  writes := writes$",
                         lambda _: "  writes := fun _ _ => false",
@@ -419,6 +484,29 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     lambda _: "  observed := fun _ _ => true",
                     "observed dead field in a dead phase",
                 )
+
+            if namespace == "GeneratedThresholdSymmetry":
+                sym_slot_match = re.search(r"(?m)^  \| (\d+) => some \(", gen_block)
+                if sym_slot_match is not None:
+                    slot_idx = sym_slot_match.group(1)
+                    add_gen_decl_mutation(
+                        rf"^(def cap \(k : Fin SlotCount\) : Nat :=\n  match k\.val with\n(?:  \| [^\n]*\n)*?  \| {slot_idx} => )(\d+)$",
+                        lambda m: f"{m.group(1)}{int(m.group(2)) + 1}",
+                        "asymmetric per-key counter cap",
+                    )
+
+            if namespace in {"GeneratedFieldSymmetry", "GeneratedThresholdSymmetry"}:
+                add_gen_decl_mutation(
+                    r"^def intermediate := \(model sem\)\.intermediate$",
+                    lambda _: "def intermediate := { (model sem).intermediate with next := fun _ _ => False }",
+                    "disconnected intermediate model",
+                )
+                if is_constrained:
+                    add_gen_decl_mutation(
+                        r"^def constrainedIntermediate := \(model sem\)\.constrainedIntermediate$",
+                        lambda _: "def constrainedIntermediate := { (model sem).constrainedIntermediate with constraint := fun _ => True }",
+                        "disconnected constrained intermediate model",
+                    )
 
             after_pat = r"^def after := \(model sem\)\.reduced$"
             if namespace == "GeneratedLive":

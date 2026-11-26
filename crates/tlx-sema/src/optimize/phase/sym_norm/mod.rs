@@ -33,7 +33,7 @@ use crate::{
 
 pub(in crate::optimize::phase) use folds::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
 pub(in crate::optimize::phase) use helpers::{
-    block_non_target, block_unchanged_tuple, exact_tuple_arity, lookup_resolved_root, mentions_local,
+    block_non_target, block_unchanged_tuple, desugar_except_at, exact_tuple_arity, lookup_resolved_root, mentions_local,
 };
 pub use helpers::{infer_var_domains, proves_var_membership};
 

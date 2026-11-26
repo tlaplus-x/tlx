@@ -220,7 +220,8 @@ that application:
      [compose with keyed symmetry](proofs/symmetry/README.md) through one shared source model).
    - *Phase-dependent fields:* [erases record, map-of-records, or parallel companion slots](proofs/field/README.md)
      in phases where they are overwritten before their next use, with Lean-checked finite liveness
-     and phase-indexed observation tables.
+     and phase-indexed observation tables (and composes with automatic equivariant symmetry over
+     one shared source model).
    - *Sequence lengths:* merges sequences when every consumer depends only on current lengths.
    - *Ordered allocation and live versions:* reduces scalar or fixed nested allocation frontiers
      ([nested allocation example](proofs/ordered/README.md), 13 states across two families) and
@@ -233,8 +234,9 @@ that application:
      with dynamic filter domains and dependent transfers).
    - *Threshold counters:* [saturates scalar or fixed-domain](proofs/counter/README.md) monotone and
      resettable natural counters at `min(c, K)` in the `VIEW` when every read is a threshold
-     comparison, keeping concrete un-capped counter values in traces (and forgetting a monotone
-     counter no accepted predicate reads, `K = 0`).
+     comparison, keeping concrete un-capped counter values in traces (forgetting a monotone
+     counter no accepted predicate reads, `K = 0`, and composing with automatic equivariant
+     symmetry over one shared source model).
 3. **[Counter export](proofs/counter/README.md) (`tlx optimize`).** Emits closed Lean proofs
    for each actual cleanup and threshold-saturation pass plus their composition. The generated
    finite model can be checked separately; export does not itself check safety.
