@@ -566,6 +566,14 @@ impl InterpModel {
         self.group.symmetry_maps()
     }
 
+    /// Indices into `symmetry_maps()` in the order the interpreter visits the
+    /// non-identity permutations when a TLC comparison may fail; a compiled
+    /// encodings-based path must follow it so both tiers hit the same
+    /// incomparable-value error. `None` when the group has no explicit maps.
+    pub fn symmetry_maps_tlc_order(&self) -> Option<Vec<usize>> {
+        self.group.symmetry_maps_tlc_order()
+    }
+
     pub fn has_view(&self) -> bool {
         self.view.is_some()
     }

@@ -508,6 +508,34 @@ impl Group {
         }
     }
 
+    /// Indices into `symmetry_maps()` in the order the fallible ordered walk
+    /// visits the non-identity permutations (`for_each_perm_tlc_order`). The
+    /// interpreter uses this order whenever a TLC comparison may fail, so a
+    /// compiled path that decides on encodings must visit permutations the
+    /// same way: the first incomparable pair it reaches (and the resulting
+    /// evaluation error) depends on it.
+    ///
+    /// `None` when the group is too large to materialize (no explicit maps).
+    pub(super) fn symmetry_maps_tlc_order(&self) -> Option<Vec<usize>> {
+        match &self.kind {
+            GroupKind::Empty => Some(Vec::new()),
+            GroupKind::Explicit { perms, .. } => Some((0..perms.len()).collect()),
+            GroupKind::Factorized(fg) => {
+                if fg.order > MAX_MATERIALIZED_ORDER {
+                    return None;
+                }
+                let mut order = Vec::with_capacity(fg.order.saturating_sub(1) as usize);
+                fg.for_each_perm_tlc_order(|img| {
+                    let rank = fg.rank_of_img(img).expect("a non-identity permutation has a rank");
+                    order.push(rank);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                })
+                .ok()?;
+                Some(order)
+            }
+        }
+    }
+
     /// The permutation giving the least state (in TLC's value order, comparing
     /// the variables one by one in `order`) of the orbit of `vals`, or `None`
     /// when that is `vals` itself.

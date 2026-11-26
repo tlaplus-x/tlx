@@ -11,13 +11,26 @@ use tlx_value::Value;
 
 use super::SemFp;
 
+/// Plans applying each SYMMETRY element to the state layout, with the order
+/// its permutations must be visited in a fallible-by-value selection.
+pub(super) struct SymmetryPlans {
+    /// One plan per variable, indexed like `InterpModel::symmetry_maps()`.
+    pub(super) group: Vec<Vec<PermPlan>>,
+    /// Indices into `group` in the interpreter's fallible comparison order
+    /// (`InterpModel::symmetry_maps_tlc_order`).
+    pub(super) visit: Vec<usize>,
+}
+
 /// Plans applying each SYMMETRY element to the state layout (`None` if the
 /// model has no symmetry or some variable's shape cannot be permuted).
-pub(super) fn compile_symmetry(base: &InterpModel, layout: &Layout, notes: &mut Vec<String>) -> Option<Vec<Vec<PermPlan>>> {
+pub(super) fn compile_symmetry(base: &InterpModel, layout: &Layout, notes: &mut Vec<String>) -> Option<SymmetryPlans> {
     let maps = base.symmetry_maps();
     if maps.is_empty() {
         return None;
     }
+    // The by-value fallback (and the error a comparison of incompatible values
+    // raises) depends on the order permutations are visited; keep it.
+    let visit = base.symmetry_maps_tlc_order()?;
     let mut group = Vec::with_capacity(maps.len());
     for m in maps {
         let m = m.clone();
@@ -38,7 +51,12 @@ pub(super) fn compile_symmetry(base: &InterpModel, layout: &Layout, notes: &mut 
         }
         group.push(plans);
     }
-    Some(group)
+    if visit.len() != group.len() {
+        // The orders must agree on the permutation set; otherwise fall back to
+        // the interpreter rather than silently skipping orbit members.
+        return None;
+    }
+    Some(SymmetryPlans { group, visit })
 }
 
 thread_local! {

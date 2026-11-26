@@ -63,9 +63,9 @@ impl ProjectionOrbit {
         if super::SemFp::of(&layout, None).is_some() {
             return None;
         }
-        let group = super::symmetry::compile_symmetry(base, &layout, notes)?;
+        let plans = super::symmetry::compile_symmetry(base, &layout, notes)?;
         let order = super::symmetry::symmetry_order(&layout);
-        Some(Self { group, order, layout })
+        Some(Self { group: plans.group, order, layout })
     }
 
     pub(super) fn fingerprint(&self, words: &[u64]) -> u64 {

@@ -1023,6 +1023,11 @@ fn nine_pairs_rank_and_closure_order_and_tagged_status_fast_path() {
         })
         .unwrap();
     assert_eq!(ov_got, ov_want, "overlapping union must match close_under_composition");
+    // The compiled VIEW+SYMMETRY path visits permutations in this order, so it
+    // must be exposed as indices into the materialized `symmetry_maps`.
+    let ov_ranks: Vec<usize> = ov_got.iter().map(|img| ov_fg.rank_of_img(img).expect("non-identity rank")).collect();
+    assert_eq!(ov_g.symmetry_maps_tlc_order().unwrap(), ov_ranks);
+    assert_eq!(ov_g.symmetry_maps().len(), ov_ranks.len());
 
     // 3. Tagged-variant status map on S_9 (`<<0, FALSE>>` vs `<<1, 42>>`) is
     // provably orbit-comparison-safe and stays on the O(n log n) refinement path.

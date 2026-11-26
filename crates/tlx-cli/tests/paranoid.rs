@@ -130,6 +130,47 @@ fn internal_error_message_is_clean() {
     assert!(out.contains(&format!("tlx: internal error: {MISMATCH}")), "{out}");
 }
 
+/// A tied minimum under VIEW + SYMMETRY: two permutations of the declared
+/// (overlapping-union) group map `x = b` to the same least state, so the
+/// interpreter and the compiled word-level walk can select different
+/// permutation indices. The cross-check compares the selected states, not the
+/// indices, and both tiers still report the same counts.
+#[test]
+fn paranoid_accepts_tied_symmetry_representatives() {
+    const TIE: &str = r#"---- MODULE TiedMinimum ----
+EXTENDS TLC
+CONSTANTS a,b,c
+VARIABLE x
+Sym == Permutations({a,c}) \cup Permutations({b,c})
+V == x
+Init == x \in {a,b,c}
+Next == UNCHANGED x
+====
+"#;
+    const TIE_CFG: &str = "CONSTANTS a = a b = b c = c\nINIT Init\nNEXT Next\nSYMMETRY Sym\nVIEW V\n";
+    let dir = tlx_testkit::TempDir::with_spec("paranoid-tied-symmetry", TIE, TIE_CFG);
+    let run = |args: &[&str], paranoid: bool| {
+        let mut cmd = tlx_testkit::tlx!();
+        cmd.check("TiedMinimum.tla").cfg("TiedMinimum.cfg").args(["-tlc", "-workers", "1"]).args(args).dir(dir.path());
+        if paranoid {
+            cmd.env("TLX_PARANOID", "1");
+        }
+        cmd.run()
+    };
+    let interp = run(&["-interp"], false);
+    assert_eq!(interp.code, 0, "interp:\n{}", interp.text());
+    let compiled = run(&["-compile"], true);
+    assert_eq!(compiled.code, 0, "paranoid -compile:\n{}", compiled.text());
+    assert!(!compiled.text().contains(MISMATCH), "{}", compiled.text());
+    assert_eq!(
+        tlx_testkit::cli::result_lines(&compiled.text()),
+        tlx_testkit::cli::result_lines(&interp.text()),
+        "paranoid -compile:\n{}\ninterp:\n{}",
+        compiled.text(),
+        interp.text()
+    );
+}
+
 /// After layout misses (a tiny pre-run), in a search resumed in a widened
 /// layout.
 #[test]

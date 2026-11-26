@@ -132,8 +132,9 @@ pub(super) enum Fingerprint {
     /// the least state of the orbit in TLC's value order (`order` = TLC's
     /// variable order), chosen directly on encoded words (`LayoutNode::cmp_tlc_words`)
     /// with fallback to `InterpModel::least_perm` when a compared variable
-    /// cannot be ordered on words.
-    SymView { group: Vec<Vec<PermPlan>>, order: Vec<usize>, view: View },
+    /// cannot be ordered on words. `visit` is the interpreter's fallible
+    /// permutation order, indexed like `group`.
+    SymView { group: Vec<Vec<PermPlan>>, visit: Vec<usize>, order: Vec<usize>, view: View },
     /// By value: the interpreter's (reduced) fingerprint, for a VIEW or
     /// SYMMETRY not handled on encodings (states are decoded for it).
     Values,
@@ -184,7 +185,7 @@ impl EncModel {
                 }
                 Ok(orbit_fp(group, order, &self.layout, words, self.sem.as_ref()))
             }
-            Fingerprint::SymView { group, order, view } => self.sym_view_fp(group, order, view, words, level),
+            Fingerprint::SymView { group, visit, order, view } => self.sym_view_fp(group, visit, order, view, words, level),
             Fingerprint::Words | Fingerprint::Values => Ok(match &self.sem {
                 Some(sem) => sem.fp_state(&self.layout, words),
                 None => fp_words(words),
@@ -266,14 +267,23 @@ impl EncModel {
 
     /// Fingerprint of the VIEW of the least state of the SYMMETRY orbit of
     /// the state `words` (see `Fingerprint::SymView`).
-    fn sym_view_fp(&self, group: &[Vec<PermPlan>], order: &[usize], v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
+    #[allow(clippy::too_many_arguments)] // group, visit order, variable order, VIEW, words, level
+    fn sym_view_fp(
+        &self,
+        group: &[Vec<PermPlan>],
+        visit: &[usize],
+        order: &[usize],
+        v: &View,
+        words: &[u64],
+        level: u32,
+    ) -> Result<u64, ModelError> {
         if self.paranoid {
             self.check_permutations(group, words);
         }
         let word_res = PERM_BUF.with(|b| {
             let mut b = b.borrow_mut();
             let (best_buf, cand_buf) = &mut *b;
-            let least = self.least_perm_words(group, order, words, best_buf, cand_buf)?;
+            let least = self.least_perm_words(group, visit, order, words, best_buf, cand_buf)?;
             if self.paranoid {
                 self.check_sym_view_least(group, words, least, best_buf);
             }
@@ -310,8 +320,10 @@ impl EncModel {
     }
 
     /// Select the TLC-least orbit representative directly on encoded words,
-    /// comparing variables in `order` (TLC's variable order) and permuting
-    /// each variable lazily only while earlier variables tie.
+    /// visiting the permutations in `visit` (the interpreter's fallible
+    /// order, so the first incomparable pair is the same in both tiers) and
+    /// comparing variables in `order` (TLC's variable order), permuting each
+    /// variable lazily only while earlier variables tie.
     ///
     /// Returns `Some(None)` if `words` itself is least, `Some(Some(p))` if
     /// `group[p]` is least (with the full permuted encoding written into
@@ -321,6 +333,7 @@ impl EncModel {
     fn least_perm_words(
         &self,
         group: &[Vec<PermPlan>],
+        visit: &[usize],
         order: &[usize],
         words: &[u64],
         best_buf: &mut Vec<u64>,
@@ -332,7 +345,8 @@ impl EncModel {
         let mut best: Option<usize> = None;
         let mut best_computed: usize = 0;
 
-        'perm: for (pi, plans) in group.iter().enumerate() {
+        'perm: for &pi in visit {
+            let plans = &group[pi];
             for (k, &i) in order.iter().enumerate() {
                 let r = self.layout.var_range(i);
                 let plan_id = plans[i].is_identity();
@@ -406,24 +420,60 @@ impl EncModel {
     }
 
     /// Paranoid: word-level `least_perm_words` agrees with `InterpModel::least_perm`
-    /// on the chosen orbit representative and its permuted words.
+    /// on the chosen orbit representative and its permuted words. Different
+    /// permutation indices are fine when they select the same tied minimum:
+    /// the compared state decides, while an evaluation error or a genuinely
+    /// different representative is still a mismatch.
     fn check_sym_view_least(&self, group: &[Vec<PermPlan>], words: &[u64], word_least: Option<usize>, best_buf: &[u64]) {
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
+        let original = unsafe { self.layout.decode_state_unchecked(words) };
         let decode = |i: usize| unsafe { self.layout.node(i).decode_unchecked(&words[self.layout.offsets[i]..]) };
         let mut vals = StateVals::decoded(self.layout.vars.len(), &decode);
         let want = self.base.least_perm(&mut vals);
         drop(vals);
-        match want {
-            Ok(interp_least) if interp_least == word_least => {}
-            other => {
-                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
-                let st = unsafe { self.layout.decode_state_unchecked(words) };
-                mismatch(format_args!(
-                    "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter: {other:?}\ncompiled:    Ok({word_least:?})",
-                    state_list(&self.base, &[st])
-                ));
+        let interp_least = match want {
+            Ok(p) => p,
+            Err(e) => mismatch(format_args!(
+                "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter: Err({e:?})\ncompiled:    Ok({word_least:?})",
+                state_list(&self.base, std::slice::from_ref(&original))
+            )),
+        };
+        // The state the compiled walk selected: its permuted words, or `words`
+        // itself for the identity.
+        // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+        let compiled = unsafe { self.layout.decode_state_unchecked(if word_least.is_some() { best_buf } else { words }) };
+        // The state the interpreter selected: its permutation applied to the
+        // original values (the identity leaves them unchanged).
+        let interp = match interp_least {
+            None => original.clone(),
+            Some(p) => {
+                let Some(perm) = self.base.symmetry_maps().get(p) else {
+                    mismatch(format_args!(
+                        "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter selected permutation {p} beyond symmetry_maps()",
+                        state_list(&self.base, std::slice::from_ref(&original))
+                    ))
+                };
+                let mut out = Vec::with_capacity(original.len());
+                for v in &original {
+                    match tlx_value::ops::permute(v, &|s| perm.get(&s).cloned()) {
+                        Ok(x) => out.push(x),
+                        Err(e) => mismatch(format_args!(
+                            "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter permutation {p}: {e:?}\ncompiled:    Ok({word_least:?})",
+                            state_list(&self.base, std::slice::from_ref(&original))
+                        )),
+                    }
+                }
+                out
             }
+        };
+        if interp != compiled {
+            mismatch(format_args!(
+                "VIEW+SYMMETRY least_perm on state\n{}\ninterpreter ({interp_least:?}):\n{}\ncompiled ({word_least:?}):\n{}",
+                state_list(&self.base, std::slice::from_ref(&original)),
+                state_list(&self.base, std::slice::from_ref(&interp)),
+                state_list(&self.base, std::slice::from_ref(&compiled))
+            ));
         }
         if let Some(p) = word_least {
             let mut want_words = vec![0u64; words.len()];
