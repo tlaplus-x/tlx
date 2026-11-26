@@ -168,7 +168,7 @@ impl<'c> Compiler<'c> {
 
     /// `\E` (`want` = true) or `\A` (`want` = false).
     pub(super) fn quantifier(&mut self, want: bool, bind: Temp, set: &Expr, body: &Expr) -> C<BoolF> {
-        let src = self.src_how(set, super::super::stmt::ValIter::Lazy)?;
+        let src = self.src_how(set, super::super::stmt::ValIter::Bound)?;
         let bind = self.slots[bind as usize];
         let body = self.bool_(body)?;
         Ok(Box::new(move |fx| {

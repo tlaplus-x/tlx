@@ -79,7 +79,23 @@ impl Value {
     /// A set expression. TLC does not compare its elements at construction.
     /// Homogeneous values can keep the canonical representation; defer the
     /// others so membership and set algebra can inspect them without sorting.
+    ///
+    /// TLC builds such a set in a `ValueVec` that may grow only up to
+    /// `setBound` (`-maxSetSize`), so a set of more elements is an error
+    /// (`ValueVec.ensureCapacity`).
     pub fn set_enum(elems: Vec<Value>) -> crate::Result<Value> {
+        crate::limits::check_set_size(elems.len())?;
+        Self::set_enum_unbounded(elems)
+    }
+
+    /// A set literal `{e1, ..., en}`: TLC preallocates its `ValueVec` to the
+    /// literal's length, so `setBound` (`-maxSetSize`) never applies to it —
+    /// `ensureCapacity` is reached only when a vector grows.
+    pub fn set_literal(elems: Vec<Value>) -> crate::Result<Value> {
+        Self::set_enum_unbounded(elems)
+    }
+
+    fn set_enum_unbounded(elems: Vec<Value>) -> crate::Result<Value> {
         if elems.first().is_none_or(|first| elems.iter().all(|e| same_comparison_family(first, e))) {
             Self::set_from(elems)
         } else {
@@ -439,7 +455,7 @@ impl Value {
 
 /// A conservative, transitive family in which sorting cannot fail. In
 /// particular, a lazy value is not certified by its outer representation.
-fn same_comparison_family(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_comparison_family(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(_), Value::Int(_))
         | (Value::Str(_), Value::Str(_))

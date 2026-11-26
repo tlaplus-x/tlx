@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tlx_base::knobs;
 
 /// The first line of the usage message.
-pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
+pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxSetSize N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
 
 /// `tlx check -h`.
 const HELP_OPTIONS: &str = "\
@@ -47,6 +47,15 @@ Options shared with TLC (same names and meaning):
                        8 MiB and grows within the -maxmem budget)
   -fpbits N            the fingerprint set's shards: 2^N ranges of high
                        fingerprint bits (0 to 30, default 0)
+  -maxSetSize N        the largest set tlx materializes (default: 1000000,
+                       as TLC): a [S -> T], S \\X T, record set, set former
+                       or set filter over an enumerable set, union or
+                       difference, or a quantifier bound over one, with more
+                       elements is an error (a set grown element by element
+                       keeps TLC's initial ten slots, so up to max(10, N)
+                       fit). Sets that are enumerated element by element are
+                       not affected: x' \\in S, {x \\in S : P}, a SUBSET S or
+                       kSubset(k, S) bound, a set literal, and intervals
   -tool                wrap messages in TLC's -tool message delimiters
   -nowarning           do not print warnings
   -metadir DIR         the directory of the spill files (default: a new

@@ -119,7 +119,7 @@ impl Lowerer<'_> {
             let rest = self.cont(k, st)?;
             let t = self.temp(Ty::Int);
             let set = Expr::new(Ty::Val, ExprKind::IntRange(int_lit(1), n));
-            return Ok(Stmt::ForEach { bind: t, set, sorted: false, body: Box::new(rest) });
+            return Ok(Stmt::ForEach { bind: t, set, iter: IterMode::Enumerate, body: Box::new(rest) });
         }
         if !st.partial
             && self.cont_nontrivial(k, st)
@@ -135,7 +135,7 @@ impl Lowerer<'_> {
                     let rest = self.cont(k, st)?;
                     let t = self.temp(Ty::Int);
                     let set = Expr::new(Ty::Val, ExprKind::IntRange(int_lit(1), n));
-                    return Ok(Stmt::ForEach { bind: t, set, sorted: false, body: Box::new(rest) });
+                    return Ok(Stmt::ForEach { bind: t, set, iter: IterMode::Enumerate, body: Box::new(rest) });
                 }
                 Ok(_) | Err(_) => {
                     self.frame.restore(mark);
@@ -384,7 +384,7 @@ impl Lowerer<'_> {
         };
         let t = self.temp(ety);
         let body = self.assign(v, temp_ref(ety, t), k, st)?;
-        let each = Stmt::ForEach { bind: t, set, sorted: false, body: Box::new(body) };
+        let each = Stmt::ForEach { bind: t, set, iter: IterMode::Enumerate, body: Box::new(body) };
         Ok(match outer {
             Some((temp, value)) => Stmt::Let { temp, value, body: Box::new(each) },
             None => each,
@@ -398,7 +398,7 @@ impl Lowerer<'_> {
         let subsets = Expr::new(Ty::Val, ExprKind::ValOp { op: B::Subset, args: vec![set] });
         let t = self.temp(Ty::Val);
         let body = self.assign(v, temp_ref(Ty::Val, t), k, st)?;
-        Ok(Stmt::ForEach { bind: t, set: subsets, sorted: true, body: Box::new(body) })
+        Ok(Stmt::ForEach { bind: t, set: subsets, iter: IterMode::Normalized, body: Box::new(body) })
     }
 
     /// Application of a lazily expanded function constructor (TLC
@@ -776,7 +776,10 @@ impl Lowerer<'_> {
             let looped = slots.into_iter().fold(inner, |s, (t, set, check)| Stmt::ForEach {
                 bind: t,
                 set,
-                sorted: false,
+                // A quantifier's bound domain is TLC's normalized enumeration,
+                // not a streamed assignment: `-maxSetSize` applies where TLC
+                // materializes it (`x' \in S` stays default-order streaming).
+                iter: IterMode::Bound,
                 body: Box::new(binders::checked_stmt(check, s)),
             });
             upfront.into_iter().rev().fold(looped, |body, (temp, value)| Stmt::Let { temp, value, body: Box::new(body) })

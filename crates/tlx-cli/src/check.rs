@@ -48,6 +48,11 @@ struct Prepared {
 /// `Err` is an already reported exit, including successful non-search commands.
 fn prepare(started: Instant) -> Result<Prepared, ExitCode> {
     let mut a = parse_args();
+    // TLC's set bound (`TLCGlobals.setBound`), before anything is evaluated:
+    // the configuration's own constants are evaluated while the model loads.
+    if let Some(n) = a.max_set_size {
+        tlx_value::limits::set_max_set_size(n);
+    }
     if let Some(o) = &a.stats {
         stats::enable(o.clone());
     }

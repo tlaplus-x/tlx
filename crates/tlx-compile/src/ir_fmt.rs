@@ -105,7 +105,7 @@ pub fn stmt(s: &Stmt, depth: usize, out: &mut String) {
         Stmt::If { .. } => "if".to_string(),
         Stmt::Then { .. } => "then".to_string(),
         Stmt::Let { temp, .. } => format!("let t{temp}"),
-        Stmt::ForEach { bind, sorted, .. } => format!("foreach t{bind}{}", if *sorted { " sorted" } else { "" }),
+        Stmt::ForEach { bind, iter, .. } => format!("foreach t{bind} {iter:?}"),
         Stmt::Assign { var, .. } => format!("assign var' {var}"),
         Stmt::Error(m) => format!("error {m:?}"),
         Stmt::Repeat { id, bind, .. } => format!("repeat {id} t{bind}"),

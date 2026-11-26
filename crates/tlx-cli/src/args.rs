@@ -55,6 +55,9 @@ pub(crate) struct Args {
     pub(crate) maxmem: Option<usize>,
     /// `-fpbits N`: the fingerprint set's shards.
     pub(crate) fpbits: u32,
+    /// `-maxSetSize N`: the most elements a materialized set may have (TLC's
+    /// `setBound`; default `tlx_value::limits::DEFAULT_MAX_SET_SIZE`).
+    pub(crate) max_set_size: Option<i64>,
     /// `-simulate [num=N]`: the number of behaviors to generate.
     pub(crate) simulate: Option<u64>,
     /// `-generate`: simulation with random choices within actions.
@@ -275,6 +278,7 @@ pub(crate) fn parse_args() -> Args {
         fpmem: None,
         maxmem: None,
         fpbits: 0,
+        max_set_size: None,
         simulate: None,
         generate: false,
         depth: 100,
@@ -339,6 +343,10 @@ pub(crate) fn parse_args() -> Args {
             "-fpmem" => a.fpmem = Some(opt_value(&x, it.next(), parse_fpmem)),
             "-maxmem" => a.maxmem = Some(opt_value(&x, it.next(), tlx_runtime::mem::parse_budget)),
             "-fpbits" => a.fpbits = opt_value(&x, it.next(), |v| v.parse().ok().filter(|b| *b <= tlx_runtime::fpset::MAX_BITS)),
+            // As TLC: a positive int (in the range of an int).
+            "-maxSetSize" => {
+                a.max_set_size = Some(opt_value(&x, it.next(), |v| v.parse().ok().filter(|n| (1..=i32::MAX as i64).contains(n))))
+            }
             // TLC options without effect in tlx (the spill directory is
             // removed at the end of a run; no trace-exploration spec).
             "-cleanup" | "-noGenerateSpecTE" => {}

@@ -21,8 +21,10 @@ type IntoS1 = Box<dyn Fn(&mut Fx, usize) -> R<()> + Send + Sync>;
 /// How boxed sets are enumerated (as the tree-walking executor does).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValIter {
-    /// `ops::for_each_element` (quantifiers).
-    Lazy,
+    /// A quantifier's bound domain, as the interpreter's `bound_elems`
+    /// materializes it (`ops::enumerate`, so `-maxSetSize` applies); a
+    /// `SUBSET S` too large to hold and an interval stream instead.
+    Bound,
     /// `ops::enumerate` order, streamed by `ops::for_each_enumerated`
     /// (`x' \in S`: a set filter over a set that is not enumerated is not
     /// materialized, as in the interpreter).
@@ -323,11 +325,10 @@ impl Src {
                     Ok(())
                 };
                 match how {
-                    ValIter::Lazy | ValIter::Enumerate => {
+                    ValIter::Bound | ValIter::Enumerate => {
                         let mut done = true;
                         let mut err = None;
-                        let each = if *how == ValIter::Lazy { ops::for_each_element } else { ops::for_each_enumerated };
-                        each(&v, &mut |x| {
+                        let mut visit = |x: Value| {
                             let r = put(fx, x).and_then(|()| f(fx));
                             match r {
                                 Ok(true) => Ok(true),
@@ -340,7 +341,34 @@ impl Src {
                                     Ok(false)
                                 }
                             }
-                        })?;
+                        };
+                        if *how == ValIter::Bound {
+                            // A quantifier's domain, exactly as the
+                            // interpreter's `bound_elems`: `ops::bound_kind`
+                            // decides whether TLC streams the domain, shares
+                            // it, or materializes it (where the `-maxSetSize`
+                            // bound applies, and an error anywhere in the
+                            // domain surfaces before the body runs). Sharing
+                            // and streaming both iterate without building the
+                            // set.
+                            match ops::bound_kind(&v) {
+                                ops::BoundKind::Share | ops::BoundKind::Stream => {
+                                    ops::for_each_enumerated(&v, &mut visit)?;
+                                }
+                                ops::BoundKind::Materialize => {
+                                    for x in ops::enumerate(&v)? {
+                                        if !visit(x)? {
+                                            break;
+                                        }
+                                    }
+                                }
+                                ops::BoundKind::Overflow => {
+                                    return Err(tlx_value::limits::too_many_elements().into());
+                                }
+                            }
+                        } else {
+                            ops::for_each_enumerated(&v, &mut visit)?;
+                        }
                         match err {
                             Some(e) => Err(e),
                             None => Ok(done),
@@ -459,8 +487,13 @@ impl Compiler<'_> {
                     body(fx, emit)
                 })
             }
-            Stmt::ForEach { bind, set, sorted, body } => {
-                let src = self.src_how(set, if *sorted { ValIter::Normalized } else { ValIter::Enumerate })?;
+            Stmt::ForEach { bind, set, iter, body } => {
+                let how = match iter {
+                    IterMode::Enumerate => ValIter::Enumerate,
+                    IterMode::Bound => ValIter::Bound,
+                    IterMode::Normalized => ValIter::Normalized,
+                };
+                let src = self.src_how(set, how)?;
                 let slot = self.slots[*bind as usize];
                 let body = self.stmt(body)?;
                 Box::new(move |fx, emit| src.run(fx, slot, &mut |fx| body(fx, emit)))

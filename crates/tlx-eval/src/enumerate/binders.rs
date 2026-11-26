@@ -23,7 +23,7 @@ impl<'a> Enumerator<'a> {
                     // The domain cannot be materialized: stream it
                     // (`for_each_enumerated`; see `BoundElems`) and stop when
                     // the continuation does.
-                    BoundElems::Stream(v, _) => {
+                    BoundElems::Stream(v) => {
                         let mut go_on = true;
                         let mut err = None;
                         ops::for_each_enumerated(&v, &mut |x| match self.go(body, &env.bind_val(*l, x), k) {

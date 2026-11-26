@@ -39,13 +39,56 @@ pub fn for_each_element(s: &Value, f: &mut dyn FnMut(Value) -> Result<bool>) -> 
     }
 }
 
+/// One component of a product, record set or set of functions: its elements
+/// in the enumeration order the odometer must follow. An interval is read by
+/// index instead of being copied (TLC's enumerators convert a constituent
+/// only when the whole set is materialized, and an interval is exactly sized
+/// there), so a bounded traversal over `1..4000000 \X {1}` stops at the
+/// limit without allocating the interval.
+#[derive(Clone)]
+enum Comp<'a> {
+    Slice(&'a [Value]),
+    Range(i64, usize),
+    Owned(Arc<[Value]>),
+}
+
+impl Comp<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Comp::Slice(es) => es.len(),
+            Comp::Range(_, n) => *n,
+            Comp::Owned(es) => es.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> Value {
+        match self {
+            Comp::Slice(es) => es[i].clone(),
+            Comp::Range(lo, _) => Value::Int(lo + i as i64),
+            Comp::Owned(es) => es[i].clone(),
+        }
+    }
+}
+
+/// The component view of a set (`Comp`): an enumerated set or an interval is
+/// read in place, any other lazy set is materialized in its enumeration order
+/// (the order TLC's enumerators use) — without the materialization bound,
+/// which applies to the set being enumerated, not to its pieces.
+fn comp_of(v: &Value) -> Result<Comp<'_>> {
+    Ok(match v {
+        Value::Set(es) => Comp::Slice(es),
+        Value::Interval(lo, hi) => Comp::Range(*lo, interval_len(*lo, *hi)? as usize),
+        _ => Comp::Owned(Arc::from(enumerate_unbounded(v)?)),
+    })
+}
+
 /// Odometer over component enumerations, last component fastest.
-fn odometer(comps: &[Vec<Value>], f: &mut dyn FnMut(&[Value]) -> Result<bool>) -> Result<bool> {
-    if comps.iter().any(|c| c.is_empty()) {
+fn odometer(comps: &[Comp<'_>], f: &mut dyn FnMut(&[Value]) -> Result<bool>) -> Result<bool> {
+    if comps.iter().any(|c| c.len() == 0) {
         return Ok(true);
     }
     let mut idx = vec![0usize; comps.len()];
-    let mut cur: Vec<Value> = comps.iter().map(|c| c[0].clone()).collect();
+    let mut cur: Vec<Value> = comps.iter().map(|c| c.get(0)).collect();
     loop {
         if !f(&cur)? {
             return Ok(false);
@@ -58,11 +101,11 @@ fn odometer(comps: &[Vec<Value>], f: &mut dyn FnMut(&[Value]) -> Result<bool>) -
             i -= 1;
             idx[i] += 1;
             if idx[i] < comps[i].len() {
-                cur[i] = comps[i][idx[i]].clone();
+                cur[i] = comps[i].get(idx[i]);
                 break;
             }
             idx[i] = 0;
-            cur[i] = comps[i][0].clone();
+            cur[i] = comps[i].get(0);
         }
     }
 }
@@ -95,6 +138,89 @@ fn build_fcn(shape: &FcnShape, vals: &[Value]) -> Value {
     }
 }
 
+/// Whether a component can be read by index in place (`Comp`): an enumerated
+/// set or an interval. Any other set is streamed by `for_each_product`.
+fn indexable(v: &Value) -> bool {
+    matches!(v, Value::Set(_) | Value::Interval(..))
+}
+
+/// What is known about a set's emptiness without enumerating it:
+/// `Some(true)` empty, `Some(false)` certainly non-empty, `None` undecided.
+/// The infinite built-in sets (`Seq(S)`, `Nat`, `Int`, `STRING`, `Any`) are
+/// certainly non-empty; a finite size decides; an unknown shape stays
+/// undecided (`SUBSET {}` is one element, not empty).
+fn empty_fact(v: &Value) -> Option<bool> {
+    match v {
+        Value::LazySet(l) if matches!(&**l, LazySet::Seq(_) | LazySet::Nat | LazySet::Int | LazySet::StringSet | LazySet::Any) => {
+            Some(false)
+        }
+        _ => match size_fact(v) {
+            SizeFact::Known(0) => Some(true),
+            SizeFact::Known(_) | SizeFact::Overflow => Some(false),
+            SizeFact::Unknown => None,
+        },
+    }
+}
+
+/// Whether a component is empty, at traversal time: a size fact decides
+/// without evaluating, and an undecided lazy set asks TLC's `isEmpty`, which
+/// looks for the first element (a filter's predicate runs only up to it).
+/// Non-sets are left to the enumerability check that follows.
+fn is_empty_component(v: &Value) -> Result<bool> {
+    match v {
+        Value::Set(es) => Ok(es.is_empty()),
+        Value::Interval(lo, hi) => Ok(hi < lo),
+        Value::LazySet(_) => match empty_fact(v) {
+            Some(b) => Ok(b),
+            None => crate::ops::is_empty_checked(v),
+        },
+        _ => Ok(false),
+    }
+}
+
+/// Traverse a product, record set or set of functions over components that
+/// may be lazy, last component fastest: each component is enumerated with
+/// `for_each_element`, which stops when the consumer does, so an outer
+/// collector's limit stops a lazy component before it is evaluated in full
+/// (`NestedStop` must report the bound, not a later predicate's error).
+fn for_each_product(
+    comps: &[Value],
+    cur: &mut Vec<Value>,
+    build: &dyn Fn(&[Value]) -> Result<Value>,
+    f: &mut dyn FnMut(Value) -> Result<bool>,
+) -> Result<bool> {
+    fn go(
+        comps: &[Value],
+        level: usize,
+        cur: &mut Vec<Value>,
+        build: &dyn Fn(&[Value]) -> Result<Value>,
+        f: &mut dyn FnMut(Value) -> Result<bool>,
+    ) -> Result<bool> {
+        if level == comps.len() {
+            return f(build(cur)?);
+        }
+        let mut done = true;
+        // (`for_each_enumerated` streams each component in TLC's order,
+        // matching `SetOfTuplesValue`/`SetOfRcdsValue` enumerators, so the
+        // consumer's early stop stops before visiting the rest of a component.)
+        for_each_enumerated(&comps[level], &mut |x| {
+            cur.push(x);
+            let r = go(comps, level + 1, cur, build, f);
+            cur.pop();
+            match r {
+                Ok(true) => Ok(true),
+                Ok(false) => {
+                    done = false;
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            }
+        })?;
+        Ok(done)
+    }
+    go(comps, 0, cur, build, f)
+}
+
 fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool>) -> Result<bool> {
     match l {
         LazySet::Enum(es) => {
@@ -108,32 +234,15 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
         }
         LazySet::KSubset(k, base) => super::ksubset::ksubset_for_each(*k, base, f),
         LazySet::Subset(base) => {
-            let elems = match (is_enumerable(base), set_elems(base)) {
-                (true, Ok(Some(e))) => e,
-                (true, Err(e)) => return Err(e),
-                _ => {
-                    return err(format!(
-                        "Attempted to compute the value of an expression of form\nSUBSET S, but S is a non-enumerable value:\n{base}"
-                    ))
-                }
-            };
-            let n = elems.len();
-            for k in 0..=n {
-                let mut idx: Vec<usize> = (0..k).collect();
-                loop {
-                    let subset: Arc<[Value]> = idx.iter().map(|&i| elems.get(i).into_owned()).collect();
-                    if !f(Value::Set(subset))? {
-                        return Ok(false);
-                    }
-                    if !next_combination(&mut idx, n) {
-                        break;
-                    }
-                }
-            }
-            Ok(true)
+            let elems = subset_base_elems(base)?;
+            for_each_subset_of(&elems, f)
         }
         LazySet::FcnSet(dom, range) => {
-            if is_empty_set(s) {
+            // `[D -> R]` is empty iff D is non-empty and R is empty; the
+            // domain decides first (`[{} -> R]` is the singleton of the empty
+            // function, not empty), and an empty range ends the traversal
+            // before the domain is enumerated.
+            if !is_empty_component(dom)? && is_empty_component(range)? {
                 return Ok(true);
             }
             let d = match (is_enumerable(dom), set_elems(dom)) {
@@ -152,29 +261,49 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
             if !is_enumerable(range) {
                 return err(format!("Attempted to enumerate a set of the form [D -> R],but the range R:\n{range}\ncannot be enumerated."));
             }
-            let r = enumerate(range)?;
-            let comps = vec![r; d.len()];
+            let n = d.len();
             let shape = shape_of(dom, d);
-            odometer(&comps, &mut |vals| f(build_fcn(&shape, vals)))
+            if indexable(range) {
+                let r = comp_of(range)?;
+                let comps = vec![r; n];
+                return odometer(&comps, &mut |vals| f(build_fcn(&shape, vals)));
+            }
+            let comps = vec![range.clone(); n];
+            let build = |vals: &[Value]| Ok(build_fcn(&shape, vals));
+            let mut cur = Vec::with_capacity(comps.len());
+            for_each_product(&comps, &mut cur, &build, f)
         }
         LazySet::Product(sets) => {
-            if sets.iter().any(is_empty_set) {
-                return Ok(true);
+            // TLC's enumerator converts each constituent in order and stops at
+            // the first empty one; the emptiness test looks for the first
+            // element (a filter's predicate runs only up to it), before the
+            // enumerability checks and before any sibling traversal.
+            for c in sets {
+                if is_empty_component(c)? {
+                    return Ok(true);
+                }
             }
-            let mut comps = Vec::with_capacity(sets.len());
             for (i, c) in sets.iter().enumerate() {
                 if !is_enumerable(c) {
                     return err(format!("Attempted to enumerate a set of the form s1 \\X s2 ... \\X sn,\nbut can't enumerate s{i}:\n{c}"));
                 }
-                comps.push(enumerate(c)?);
             }
-            odometer(&comps, &mut |vals| f(Value::Tuple(Arc::from(vals))))
+            let build = |vals: &[Value]| Ok(Value::Tuple(Arc::from(vals)));
+            if sets.iter().all(indexable) {
+                let comps: Vec<Comp> = sets.iter().map(comp_of).collect::<Result<_>>()?;
+                return odometer(&comps, &mut |vals| f(Value::Tuple(Arc::from(vals))));
+            }
+            let mut cur = Vec::with_capacity(sets.len());
+            for_each_product(sets, &mut cur, &build, f)
         }
         LazySet::RecordSet(fields) => {
-            if fields.iter().any(|(_, c)| is_empty_set(c)) {
-                return Ok(true);
+            // (As products: an empty field empties the record set before the
+            // other fields are traversed.)
+            for (_, c) in fields.iter() {
+                if is_empty_component(c)? {
+                    return Ok(true);
+                }
             }
-            let mut comps = Vec::with_capacity(fields.len());
             for (name, c) in fields.iter() {
                 if !is_enumerable(c) {
                     return err(format!(
@@ -182,10 +311,16 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
                         name.as_str()
                     ));
                 }
-                comps.push(enumerate(c)?);
             }
             let shape = if fields.is_empty() { FcnShape::Tuple } else { FcnShape::Record(fields.iter().map(|(n, _)| *n).collect()) };
-            odometer(&comps, &mut |vals| f(build_fcn(&shape, vals)))
+            if fields.iter().all(|(_, c)| indexable(c)) {
+                let comps: Vec<Comp> = fields.iter().map(|(_, c)| comp_of(c)).collect::<Result<_>>()?;
+                return odometer(&comps, &mut |vals| f(build_fcn(&shape, vals)));
+            }
+            let sets: Vec<Value> = fields.iter().map(|(_, c)| c.clone()).collect();
+            let build = |vals: &[Value]| Ok(build_fcn(&shape, vals));
+            let mut cur = Vec::with_capacity(sets.len());
+            for_each_product(&sets, &mut cur, &build, f)
         }
         LazySet::Seq(_) | LazySet::Nat | LazySet::Int | LazySet::StringSet | LazySet::Any => {
             err(format!("TLC encountered the non-enumerable quantifier bound\n{s}."))
@@ -241,20 +376,139 @@ fn for_each_lazy(s: &Value, l: &LazySet, f: &mut dyn FnMut(Value) -> Result<bool
 /// set-formers see). For `Set`/`Interval` this is the normalized order; lazy
 /// sets follow §1.5 (e.g. `\X` last component fastest; `Cup`/`Union` may
 /// repeat elements). Errors if the set is infinite / not enumerable.
+///
+/// This materializes a lazy set, as TLC's `toSetEnum` does for the normalized
+/// order, so it is limited by [`crate::limits::growth_limit`] — except where
+/// TLC does not build the set that way: `SUBSET S` and `kSubset(k, S)`
+/// enumerate lazily in the normalized order, an enumerated set is already
+/// built, and an interval is copied into an exactly sized array (TLC's
+/// `IntervalValue.toSetEnum`), which its `ValueVec` never has to grow.
+///
+/// The collection streams a set filter (`for_each_enumerated`), so the
+/// predicate runs only on the elements reached and a predicate error after
+/// the limit is never evaluated, as in TLC's materializing `SetPredValue`.
 pub fn enumerate(s: &Value) -> Result<Vec<Value>> {
+    enumerate_impl(s, true)
+}
+
+/// `enumerate` of a piece of a streamed traversal (a product's component, a
+/// set of functions' range): TLC's enumerators stream those, and the bound
+/// applies to the set being enumerated, not to its pieces. The size overflow
+/// of the piece still reports its own error.
+fn enumerate_unbounded(s: &Value) -> Result<Vec<Value>> {
+    enumerate_impl(s, false)
+}
+
+fn subset_base_elems(base: &Value) -> Result<crate::repr::Elems<'_>> {
+    match (is_enumerable(base), set_elems(base)) {
+        (true, Ok(Some(e))) => Ok(e),
+        (true, Err(e)) => Err(e),
+        _ => err(format!("Attempted to compute the value of an expression of form\nSUBSET S, but S is a non-enumerable value:\n{base}")),
+    }
+}
+
+fn for_each_subset_of(elems: &crate::repr::Elems<'_>, f: &mut dyn FnMut(Value) -> Result<bool>) -> Result<bool> {
+    let n = elems.len();
+    for k in 0..=n {
+        let mut idx: Vec<usize> = (0..k).collect();
+        loop {
+            let subset: Arc<[Value]> = idx.iter().map(|&i| elems.get(i).into_owned()).collect();
+            if !f(Value::Set(subset))? {
+                return Ok(false);
+            }
+            if !next_combination(&mut idx, n) {
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `v`'s cardinality is computed from its parts without materializing
+/// `v` itself (`ops::sets::size` never enumerates `v`, only its operands).
+/// Checking `size` before collecting `SUBSET v` avoids building an exponential
+/// or large compositional base (such as `SUBSET {x \in 1..20 : P}` or
+/// `[1..5 -> {x \in 1..2 : P}]`) only to discover that the outer powerset
+/// overflows TLC's 32-bit size (`SubsetValue.toSetEnum` asks `size()` first).
+fn has_compositional_size(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::LazySet(l)
+            if matches!(**l, LazySet::Subset(_) | LazySet::KSubset(..) | LazySet::FcnSet(..) | LazySet::Product(_) | LazySet::RecordSet(_))
+    )
+}
+
+/// Collect `SUBSET base` into a `Vec`: unlike the streaming visitor, a full
+/// collection must refuse a base with 31 or more distinct elements before
+/// allocating any output subsets (TLC's `SubsetValue.toSetEnum` checks
+/// `size()` first), even when `size_fact(base)` was `Unknown` (e.g. a
+/// deferred `LazySet::Enum` or a compositional set over a lazy filter).
+fn enumerate_subset(s: &Value, base: &Value) -> Result<Vec<Value>> {
+    if size_fact(s) == SizeFact::Overflow || has_compositional_size(base) {
+        if let Some(e) = materialization_error(s) {
+            return Err(e);
+        }
+    }
+    let elems = subset_base_elems(base)?;
+    if elems.len() >= 31 {
+        let s = s.clone();
+        return Err(ValueError::lazy(ValueErrorKind::Overflow, move || format!("Overflow when computing the number of elements in:\n{s}")));
+    }
+    let mut out = Vec::new();
+    for_each_subset_of(&elems, &mut |subset| {
+        out.push(subset);
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+fn enumerate_impl(s: &Value, bounded: bool) -> Result<Vec<Value>> {
     match s {
         Value::Set(elems) => return Ok(elems.to_vec()),
         Value::Interval(lo, hi) => {
             let n = interval_len(*lo, *hi)?;
             return Ok((0..n as i64).map(|i| Value::Int(lo + i)).collect());
         }
-        _ => check_enumerable_size(s)?,
+        Value::LazySet(l) => {
+            if let LazySet::Subset(base) = &**l {
+                return enumerate_subset(s, base);
+            }
+        }
+        _ => {}
     }
+    let bounded = bounded && !streams_normalized(s) && !matches!(s, Value::LazySet(l) if matches!(**l, LazySet::Enum(_)));
+    if !bounded {
+        // (The preallocated/streamed traversals report the size overflow; a
+        // bounded materialization decides the bound first, below.)
+        check_enumerable_size(s)?;
+    }
+    if bounded {
+        // A size the components decide (`[D -> R]`, `D \X R`, a record set) is
+        // known before anything is built: TLC appends through the whole set,
+        // so an oversized one is the error without materializing its pieces
+        // (a product over `1..4000000` must not copy the interval). An
+        // unknown size is left to the bounded visitor, which stops at the
+        // limit without evaluating a filter predicate while sizing.
+        match size_fact(s) {
+            SizeFact::Overflow => return Err(crate::limits::too_many_elements()),
+            SizeFact::Known(n) if n > crate::limits::growth_limit() => return Err(crate::limits::too_many_elements()),
+            SizeFact::Known(_) | SizeFact::Unknown => {}
+        }
+    }
+    let limit = if bounded { Some(crate::limits::growth_limit()) } else { None };
     let mut out = Vec::new();
-    for_each_element(s, &mut |e| {
+    let mut over = false;
+    for_each_enumerated(s, &mut |e| {
+        if limit.is_some_and(|limit| out.len() as i64 >= limit) {
+            over = true;
+            return Ok(false);
+        }
         out.push(e);
         Ok(true)
     })?;
+    if over {
+        return Err(crate::limits::too_many_elements());
+    }
     Ok(out)
 }
 
@@ -373,7 +627,7 @@ pub fn for_each_enumerated_seqs(s: &Value, v: &mut dyn SeqsVisitor) -> Result<bo
 fn seqs_with(s: &Value, dom: &Value, range: &Value, v: &mut dyn SeqsVisitor) -> Result<bool> {
     if let Value::Interval(1, n) = dom {
         if *n >= 1 && is_enumerable(range) && !is_empty_set(range) {
-            if let Ok(r) = enumerate(range) {
+            if let Ok(r) = enumerate_unbounded(range) {
                 if let Some(done) = v.seqs(*n as usize, &r)? {
                     return Ok(done);
                 }
@@ -388,6 +642,12 @@ fn seqs_with(s: &Value, dom: &Value, range: &Value, v: &mut dyn SeqsVisitor) -> 
 /// for `size()` too). Enumeration itself does not: `Enumerable.elements()`
 /// never calls `size()`, so `for_each_enumerated` streams such a set.
 fn check_enumerable_size(s: &Value) -> Result<()> {
+    // (`size_fact` decides from the shape alone: computing the exact error
+    // enumerates a lazy component, and a filter component would evaluate its
+    // predicate while only checking the size.)
+    if size_fact(s) != SizeFact::Overflow {
+        return Ok(());
+    }
     match materialization_error(s) {
         Some(e) => Err(e),
         None => Ok(()),
@@ -430,6 +690,230 @@ pub fn normalize_enumerated(s: &Value, elems: Vec<Value>) -> Result<Vec<Value>> 
         Value::LazySet(l) if matches!(**l, LazySet::Subset(_) | LazySet::KSubset(..)) => Ok(elems),
         Value::LazySet(_) => normalize_vec(elems),
         _ => err(format!("Attempted to enumerate a non-set value:\n{s}")),
+    }
+}
+
+/// Whether TLC enumerates `s` in the normalized order without materializing
+/// it: `SUBSET S` and `kSubset(k, S)`, whose `elements(Ordering.NORMALIZED)`
+/// stream (`SubsetValue` overrides it, and `KSubsetValue` inherits that).
+/// They are the sets a quantifier's bound does not build, so `-maxSetSize`
+/// does not limit them.
+pub fn streams_normalized(s: &Value) -> bool {
+    matches!(s, Value::LazySet(l) if matches!(**l, LazySet::Subset(_) | LazySet::KSubset(..)))
+}
+
+/// How a quantifier's bound domain must be enumerated. TLC asks for
+/// `elements(Ordering.NORMALIZED)` (`TI/Tool.java` `contexts`), which
+/// `EnumerableValue` implements by `toSetEnum`: `SubsetValue` and
+/// `KSubsetValue` override it to stream, `SetEnumValue` is already enumerated
+/// and `IntervalValue` fills an exactly sized array, while every other lazy
+/// set is built element by element in a growing `ValueVec`, so `-maxSetSize`
+/// applies — and a size over TLC's int is that error rather than a reason to
+/// stream, because the growth reaches the bound first.
+///
+/// Both the interpreter (`Interp::bound_elems`) and the compiled tier's
+/// boxed-domain iteration ask this, so the two tiers cannot disagree on where
+/// a domain errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundKind {
+    /// An enumerated set or an interval: its elements are already there.
+    Share,
+    /// `SUBSET S` / `kSubset(k, S)`: TLC streams them in the normalized
+    /// order.
+    Stream,
+    /// A lazy set TLC materializes: `enumerate`, which applies the bound.
+    Materialize,
+    /// A function, tuple or record set whose size overflows TLC's int.
+    Overflow,
+}
+
+/// [`BoundKind`] of the value of a quantifier's domain (`v`).
+pub fn bound_kind(v: &Value) -> BoundKind {
+    match v {
+        Value::Set(_) | Value::Interval(..) => BoundKind::Share,
+        Value::LazySet(_) if streams_normalized(v) => BoundKind::Stream,
+        Value::LazySet(_) if size_fact(v) == SizeFact::Overflow => BoundKind::Overflow,
+        _ => BoundKind::Materialize,
+    }
+}
+
+/// What is known about a set's number of elements without enumerating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeFact {
+    /// The number of elements.
+    Known(i64),
+    /// More than TLC's int (its `size()` overflows).
+    Overflow,
+    /// Not decided by the set's shape: a union, intersection, difference or
+    /// set filter — or a product with such a component. Counting it would take
+    /// the enumeration this exists to avoid (and would evaluate a filter's
+    /// predicate while sizing), so callers fall back to the bounded visitor.
+    Unknown,
+}
+
+/// [`SizeFact`] of `s`, computed from the components' facts only: a product,
+/// record set or set of functions is decided by its parts, and an unknown
+/// part leaves the whole unknown (unless a part is known empty, which decides
+/// the empty product).
+pub fn size_fact(s: &Value) -> SizeFact {
+    use SizeFact::{Known, Overflow, Unknown};
+    match s {
+        Value::Set(es) => Known(es.len() as i64),
+        Value::Interval(lo, hi) => match interval_len(*lo, *hi) {
+            Ok(n) => Known(n as i64),
+            Err(_) => Overflow,
+        },
+        Value::LazySet(l) => match &**l {
+            // Do not sort or normalize a deferred enumeration during sizing:
+            // sorting can enumerate contained lazy sets (e.g. a set filter).
+            LazySet::Enum(es) => match es.len() {
+                0 => Known(0),
+                1 => Known(1),
+                _ => Unknown,
+            },
+            LazySet::KSubset(k, base) => ksubset_fact(*k, base),
+            LazySet::Subset(base) => match size_fact(base) {
+                Known(n) if n >= 31 => Overflow,
+                Known(n) => Known(1i64 << n),
+                Overflow => Overflow,
+                Unknown => Unknown,
+            },
+            LazySet::FcnSet(d, r) => {
+                let df = size_fact(d);
+                let rf = size_fact(r);
+                match df {
+                    // An empty domain makes `[{} -> R]` the singleton of the
+                    // empty function, whatever the range's size is (TLC does
+                    // not ask for it).
+                    Known(0) => Known(1),
+                    Known(dn) => match rf {
+                        Known(0) => Known(0),
+                        Known(1) => Known(1),
+                        Known(rn) => {
+                            let mut sz: i64 = 1;
+                            for _ in 0..dn {
+                                sz = sz.saturating_mul(rn);
+                                if sz > i32::MAX as i64 {
+                                    return Overflow;
+                                }
+                            }
+                            Known(sz)
+                        }
+                        // (A domain of size >= 1 and a range over the int.)
+                        Overflow => Overflow,
+                        Unknown => Unknown,
+                    },
+                    Overflow => match rf {
+                        Known(0) => Known(0),
+                        Known(1) => Known(1),
+                        Known(_) | Overflow => Overflow,
+                        Unknown => Unknown,
+                    },
+                    // (Whether the domain is empty is undecided: with an empty
+                    // range the set holds 1 or 0 elements, and with a larger
+                    // range 1 or many.)
+                    Unknown => match rf {
+                        Known(1) => Known(1),
+                        Known(_) | Overflow | Unknown => Unknown,
+                    },
+                }
+            }
+            LazySet::Product(sets) => product_fact(sets.iter().map(size_fact)),
+            LazySet::RecordSet(fields) => product_fact(fields.iter().map(|(_, c)| size_fact(c))),
+            LazySet::Union(_)
+            | LazySet::Cup(..)
+            | LazySet::Cap(..)
+            | LazySet::Diff(..)
+            | LazySet::Custom(_)
+            | LazySet::Seq(_)
+            | LazySet::Nat
+            | LazySet::Int
+            | LazySet::StringSet
+            | LazySet::Any => Unknown,
+        },
+        _ => Unknown,
+    }
+}
+
+/// [`size_fact`] of a product of facts (TLC's product of the component sizes
+/// with its int overflow): a known empty factor makes the product empty
+/// whatever the other factors are, an unknown factor leaves it unknown, and
+/// the rest multiply.
+fn product_fact(facts: impl Iterator<Item = SizeFact>) -> SizeFact {
+    use SizeFact::{Known, Overflow, Unknown};
+    let facts: Vec<SizeFact> = facts.collect();
+    if facts.contains(&Known(0)) {
+        return Known(0);
+    }
+    if facts.contains(&Unknown) {
+        return Unknown;
+    }
+    if facts.contains(&Overflow) {
+        return Overflow;
+    }
+    let mut sz: i64 = 1;
+    for f in facts {
+        let Known(n) = f else { unreachable!("filtered above") };
+        sz = sz.saturating_mul(n);
+        if sz > i32::MAX as i64 {
+            return Overflow;
+        }
+    }
+    Known(sz)
+}
+
+/// [`size_fact`] of `kSubset(k, base)` from the base's fact alone: `k < 0`
+/// and `k == 0` decide without the base, and the binomial needs its size,
+/// which must not be enumerated (`KSubsetValue.count` reads `size(base)` in
+/// TLC, but asking for it here would materialize a lazy base).
+fn ksubset_fact(k: i64, base: &Value) -> SizeFact {
+    use SizeFact::{Known, Overflow, Unknown};
+    if k < 0 {
+        return Known(0);
+    }
+    if k == 0 {
+        return Known(1);
+    }
+    match size_fact(base) {
+        Known(n) => {
+            if k > n {
+                return Known(0);
+            }
+            match super::ksubset::choose(n, k) {
+                Some(c) if c <= i32::MAX as u128 => Known(c as i64),
+                _ => Overflow,
+            }
+        }
+        Overflow => Overflow,
+        Unknown => Unknown,
+    }
+}
+
+/// The number of elements of `s` when it is known without enumerating it.
+pub fn size_if_known(s: &Value) -> Option<i64> {
+    match size_fact(s) {
+        SizeFact::Known(n) => Some(n),
+        SizeFact::Overflow | SizeFact::Unknown => None,
+    }
+}
+
+/// Whether materializing `s` the way `enumerate` does would fail the set
+/// bound (`limits::growth_limit`, TLC's `-maxSetSize`): `s` is a lazy set
+/// that TLC materializes (not `SUBSET S`, `kSubset(k, S)` or an enumerated
+/// set) and its size is over the limit or overflows TLC's int.
+///
+/// A caller that would answer a materialization from the set itself — the
+/// compiler, whose layouts enumerate constant sets once at compile time —
+/// asks this to leave the expression to the interpreter instead, which
+/// materializes (and so reports TLC's "too many elements") where TLC does.
+/// The size of a union, intersection or difference is not computed here: it
+/// would take the enumeration this exists to avoid, and building one of them
+/// eagerly (`ops::sets::union`) applies the bound already.
+pub fn over_set_bound(s: &Value) -> bool {
+    match bound_kind(s) {
+        BoundKind::Overflow => true,
+        BoundKind::Materialize => matches!(size_fact(s), SizeFact::Known(n) if n > crate::limits::growth_limit()),
+        BoundKind::Share | BoundKind::Stream => false,
     }
 }
 

@@ -9,7 +9,7 @@ use crate::intern::Sym;
 use crate::lazy::LazySet;
 use crate::order::{cmp_tlc, self_comparison_is_inert};
 use crate::repr::{interval_len, set_elems, Elems};
-use crate::value::{normalize_vec, Value};
+use crate::value::{normalize_vec, same_comparison_family, Value};
 use crate::Result;
 
 /// `Cardinality(s)`: TLC's FiniteSets.Cardinality refuses a set that is not
@@ -219,17 +219,19 @@ fn merge_sorted(a: &Elems, b: &Elems) -> Result<Option<Vec<Value>>> {
         let order = cmp_tlc(&y, &x)?;
         match order {
             Ordering::Less => {
-                let out = out.get_or_insert_with(|| {
-                    let mut prefix = Vec::with_capacity(a.len() + b.len());
+                if out.is_none() {
+                    // The consumed prefix is exactly the output so far.
+                    crate::limits::check_set_size(i)?;
+                    let mut prefix = Vec::with_capacity((a.len() + b.len()).min(crate::limits::growth_limit() as usize));
                     prefix.extend((0..i).map(|k| a.get(k).into_owned()));
-                    prefix
-                });
-                out.push(y.into_owned());
+                    out = Some(prefix);
+                }
+                crate::limits::push(out.as_mut().expect("allocated above"), y.into_owned())?;
                 j += 1;
             }
             Ordering::Greater | Ordering::Equal => {
                 if let Some(out) = &mut out {
-                    out.push(x.into_owned());
+                    crate::limits::push(out, x.into_owned())?;
                 }
                 // Do not compare twice: a lazy value can evaluate effects.
                 // Equal consumes both operands; Greater consumes only a.
@@ -241,11 +243,14 @@ fn merge_sorted(a: &Elems, b: &Elems) -> Result<Option<Vec<Value>>> {
         }
     }
     if j < b.len() && out.is_none() {
-        let mut prefix = Vec::with_capacity(a.len() + b.len() - j);
+        crate::limits::check_set_size(i)?;
+        let mut prefix = Vec::with_capacity((a.len() + b.len() - j).min(crate::limits::growth_limit() as usize));
         prefix.extend((0..i).map(|k| a.get(k).into_owned()));
         out = Some(prefix);
     }
     if let Some(out) = &mut out {
+        // Every remaining element is appended: the result's length is known.
+        crate::limits::check_set_size(out.len() + (a.len() - i) + (b.len() - j))?;
         out.extend((i..a.len()).map(|k| a.get(k).into_owned()));
         out.extend((j..b.len()).map(|k| b.get(k).into_owned()));
     }
@@ -261,10 +266,13 @@ pub fn union(s: &Value, t: &Value) -> Result<Value> {
     if let Value::LazySet(l) = s {
         if let LazySet::Enum(es) = &**l {
             if is_reducible(t) {
+                // TLC's `SetEnumValue.cup` appends the left side first: the
+                // bound applies before the right operand is converted.
+                crate::limits::check_set_size(es.len())?;
                 let mut out = es.clone();
                 for_each_element(t, &mut |e| {
                     if !member(&e, s)? {
-                        out.push(e);
+                        crate::limits::push(&mut out, e)?;
                     }
                     Ok(true)
                 })?;
@@ -277,15 +285,36 @@ pub fn union(s: &Value, t: &Value) -> Result<Value> {
             return Ok(t.clone());
         }
         if is_reducible(t) {
-            let (a, b) = (set_elems(s)?.unwrap(), set_elems(t)?.unwrap());
+            // TLC's `IntervalValue.cup`/`SetEnumValue.cup` append the left
+            // side into a fresh vector before touching the right, so the bound
+            // applies to it before any conversion or comparison.
+            let a = set_elems(s)?.unwrap();
+            crate::limits::check_set_size(a.len())?;
+            let b = set_elems(t)?.unwrap();
             let out = match merge_sorted(&a, &b)? {
                 Some(out) => out,
-                // None proves that the result retains every left witness in
-                // order. Identity reuse still requires inert self-comparison:
-                // otherwise it can hide later errors/effects in an untouched tail.
-                None if matches!(s, Value::Set(_)) && self_comparison_is_inert(s) => return Ok(s.clone()),
-                None => (0..a.len()).map(|k| a.get(k).into_owned()).collect(),
+                None => {
+                    // No right-hand element is new: the result is `s`. TLC's
+                    // `SetEnumValue.cup`/`IntervalValue.cup` copy `s` into a
+                    // fresh `ValueVec` even then, so the set bound applies
+                    // (`(1..n) \cup {}` fails for `n` over `-maxSetSize`); only
+                    // the copy is skipped here, not the check.
+                    crate::limits::check_set_size(a.len())?;
+                    // Only an enumerated set may stand for the result: TLC's
+                    // cup builds a `SetEnumValue`, and an interval kept as an
+                    // interval would be a different value to a consumer that
+                    // distinguishes the representation (a function constructor
+                    // makes an enumerated-domain function, so an `EXCEPT` at an
+                    // absent model-value key leaves it unchanged).
+                    if matches!(s, Value::Set(_)) && self_comparison_is_inert(s) {
+                        return Ok(s.clone());
+                    }
+                    (0..a.len()).map(|k| a.get(k).into_owned()).collect()
+                }
             };
+            // (TLC's `IntervalValue.cup`/`SetCupValue.toSetEnum` add the
+            // elements to a growing `ValueVec`, so the bound applies.)
+            crate::limits::check_set_size(out.len())?;
             return Ok(Value::Set(Arc::from(out)));
         }
         return Ok(lazy(LazySet::Cup(s.clone(), t.clone())));
@@ -305,24 +334,27 @@ fn filter_reducible(src: &Value, keep: &mut dyn FnMut(&Value) -> Result<bool>) -
             let mut out = Vec::new();
             for e in es {
                 if keep(e)? {
-                    out.push(e.clone());
+                    crate::limits::push(&mut out, e.clone())?;
                 }
             }
             return Value::set_enum(out);
         }
     }
     let elems = set_elems(src)?.unwrap();
-    let mut out = Vec::with_capacity(elems.len());
+    let mut out = Vec::with_capacity(elems.len().min(crate::limits::growth_limit() as usize));
     for i in 0..elems.len() {
         let e = elems.get(i);
         if keep(&e)? {
-            out.push(e.into_owned());
+            crate::limits::push(&mut out, e.into_owned())?;
         }
     }
     // (All kept: the same set.)
     if out.len() == elems.len() && matches!(src, Value::Set(_)) {
         return Ok(src.clone());
     }
+    // (TLC's `IntervalValue.diff`/`cap` and `SetDiffValue.toSetEnum` add the
+    // elements to a growing `ValueVec`, so the bound applies.)
+    crate::limits::check_set_size(out.len())?;
     Ok(Value::Set(Arc::from(out)))
 }
 
@@ -384,9 +416,133 @@ pub fn powerset(s: &Value) -> Result<Value> {
     Ok(lazy(LazySet::Subset(s.clone())))
 }
 
+struct MergeHead {
+    value: Value,
+    set: usize,
+    pos: usize,
+}
+
+fn heap_sift_up(heap: &mut [MergeHead], mut i: usize) -> Result<()> {
+    while i > 0 {
+        let p = (i - 1) / 2;
+        if cmp_tlc(&heap[i].value, &heap[p].value)? == Ordering::Less {
+            heap.swap(i, p);
+            i = p;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn heap_sift_down(heap: &mut [MergeHead], mut i: usize) -> Result<()> {
+    let n = heap.len();
+    loop {
+        let l = 2 * i + 1;
+        if l >= n {
+            break;
+        }
+        let r = l + 1;
+        let smallest = if r < n && cmp_tlc(&heap[r].value, &heap[l].value)? == Ordering::Less { r } else { l };
+        if cmp_tlc(&heap[smallest].value, &heap[i].value)? == Ordering::Less {
+            heap.swap(i, smallest);
+            i = smallest;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn heap_pop(heap: &mut Vec<MergeHead>) -> Result<Option<MergeHead>> {
+    let Some(last) = heap.pop() else {
+        return Ok(None);
+    };
+    if heap.is_empty() {
+        return Ok(Some(last));
+    }
+    let first = std::mem::replace(&mut heap[0], last);
+    heap_sift_down(heap, 0)?;
+    Ok(Some(first))
+}
+
+/// The distinct union of normalized member sets: one sort when the total
+/// occurrences fit the bound, otherwise a k-way min-heap merge that stops
+/// immediately at distinct element `growth_limit() + 1` without flattening
+/// every occurrence into memory.
+fn union_normalized(lists: &[&[Value]], occurrences: usize) -> Result<Value> {
+    let limit = crate::limits::growth_limit();
+    if occurrences as i64 <= limit {
+        let mut all = Vec::with_capacity(occurrences);
+        for x in lists {
+            all.extend(x.iter().cloned());
+        }
+        let all = normalize_vec(all)?;
+        crate::limits::check_set_size(all.len())?;
+        return Ok(Value::Set(Arc::from(all)));
+    }
+    let mut heap: Vec<MergeHead> = Vec::with_capacity(lists.len());
+    for (si, x) in lists.iter().enumerate() {
+        if let Some(first) = x.first() {
+            heap.push(MergeHead { value: first.clone(), set: si, pos: 0 });
+            let i = heap.len() - 1;
+            heap_sift_up(&mut heap, i)?;
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(head) = heap_pop(&mut heap)? {
+        let x = lists[head.set];
+        let next_pos = head.pos + 1;
+        let distinct = match out.last() {
+            Some(last) => !crate::order::eq_tlc(last, &head.value)?,
+            None => true,
+        };
+        if distinct {
+            crate::limits::push(&mut out, head.value)?;
+        }
+        if next_pos < x.len() {
+            heap.push(MergeHead { value: x[next_pos].clone(), set: head.set, pos: next_pos });
+            let i = heap.len() - 1;
+            heap_sift_up(&mut heap, i)?;
+        }
+    }
+    Ok(Value::Set(Arc::from(out)))
+}
+
 /// `UNION s`
 pub fn big_union(s: &Value) -> Result<Value> {
     if let Some(sets) = s.enum_elements() {
+        // A family of differently sized normalized sets (e.g. `{{1, 2}, {2, 3, 4}}`)
+        // stays `LazySet::Enum` at the outer level; when every member is a
+        // normalized `Value::Set` and all elements share a comparison family,
+        // `union_normalized` computes the same distinct union in O(N log k)
+        // without allocating past the bound.
+        if matches!(s, Value::LazySet(_)) && sets.iter().all(|e| matches!(e, Value::Set(_))) {
+            let mut total: usize = 0;
+            let mut lists: Vec<&[Value]> = Vec::with_capacity(sets.len());
+            let mut first: Option<&Value> = None;
+            let mut comparable = true;
+            for e in sets {
+                let Value::Set(x) = e else { unreachable!("checked above") };
+                total = total.saturating_add(x.len());
+                if comparable {
+                    for elem in x.iter() {
+                        match first {
+                            None => first = Some(elem),
+                            Some(f) if !same_comparison_family(f, elem) => {
+                                comparable = false;
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                lists.push(x);
+            }
+            if comparable {
+                return union_normalized(&lists, total);
+            }
+        }
         if sets.iter().all(|e| e.enum_elements().is_some())
             && (matches!(s, Value::LazySet(_)) || sets.iter().any(|e| matches!(e, Value::LazySet(_))))
         {
@@ -403,7 +559,7 @@ pub fn big_union(s: &Value) -> Result<Value> {
                         }
                     }
                     if !found {
-                        out.push(e.clone());
+                        crate::limits::push(&mut out, e.clone())?;
                     }
                 }
             }
@@ -412,13 +568,17 @@ pub fn big_union(s: &Value) -> Result<Value> {
     }
     if let Value::Set(sets) = s {
         if sets.iter().all(|e| matches!(e, Value::Set(_))) {
-            let mut all = Vec::new();
+            // TLC's eager `UnionValue.union` adds an element only when the
+            // result does not already contain it, so the bound applies to the
+            // distinct elements, not to the occurrences.
+            let mut occurrences: usize = 0;
+            let mut lists: Vec<&[Value]> = Vec::with_capacity(sets.len());
             for e in sets.iter() {
-                if let Value::Set(x) = e {
-                    all.extend(x.iter().cloned());
-                }
+                let Value::Set(x) = e else { unreachable!("checked above") };
+                occurrences = occurrences.saturating_add(x.len());
+                lists.push(x);
             }
-            return Ok(Value::Set(Arc::from(normalize_vec(all)?)));
+            return union_normalized(&lists, occurrences);
         }
     }
     Ok(lazy(LazySet::Union(s.clone())))

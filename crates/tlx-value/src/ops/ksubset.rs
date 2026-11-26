@@ -36,7 +36,7 @@ pub(crate) fn no_elements(k: i64, base: &Value) -> Result<bool> {
 }
 
 /// `n` choose `k`, or None beyond u128.
-fn choose(n: i64, k: i64) -> Option<u128> {
+pub(crate) fn choose(n: i64, k: i64) -> Option<u128> {
     let k = k.min(n - k);
     let mut c: u128 = 1;
     for i in 0..k {

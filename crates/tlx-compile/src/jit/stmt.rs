@@ -87,14 +87,23 @@ impl Gen<'_, '_, '_> {
                 let v = self.expr(value)?;
                 self.with_temp(*temp, v, |g| g.stmt(body))?;
             }
-            Stmt::ForEach { bind, set, sorted, body } => {
+            Stmt::ForEach { bind, set, iter, body } => {
                 // A guarded body does nothing where its guard is false.
                 let pred = match &**body {
                     Stmt::Guard { cond, .. } => Some((cond, false)),
                     _ => None,
                 };
                 let spec = self.spec_stmt(body, *bind);
-                self.foreach(*bind, set, Some(*sorted), pred, spec, &mut |g| g.stmt(body))?;
+                let sorted = match iter {
+                    IterMode::Enumerate => Some(false),
+                    IterMode::Normalized => Some(true),
+                    // A quantifier's bound domain: in mixed mode `HostFn::Elems`
+                    // calls `ops::enumerate`, which enforces `-maxSetSize` and
+                    // falls back to the interpreter on overflow or streaming
+                    // domains (`SUBSET S`).
+                    IterMode::Bound => Some(false),
+                };
+                self.foreach(*bind, set, sorted, pred, spec, &mut |g| g.stmt(body))?;
             }
             Stmt::Assign { var, value, body } => {
                 // Computed in place into the next state, nothing restored

@@ -689,7 +689,7 @@ fn hash_stmt(h: &mut Hashing, s: &Stmt) {
         }
         Stmt::Branches(bs) => h.u64(bs.len() as u64),
         Stmt::Let { temp, .. } => h.u64(*temp as u64),
-        Stmt::ForEach { bind, sorted, .. } => h.u64((*bind as u64) << 1 | *sorted as u64),
+        Stmt::ForEach { bind, iter, .. } => h.u64((*bind as u64) << 2 | *iter as u64),
         Stmt::Assign { var, .. } => h.u64(*var as u64),
         Stmt::Error(m) => h.str(m),
         Stmt::Repeat { id, bind, .. } => h.u64((*id as u64) << 32 | *bind as u64),

@@ -49,8 +49,8 @@ fn open_recovery(dir: &Path) -> Result<tlx_runtime::Recovery, String> {
 
 /// What a checkpoint must agree on with the run that recovers from it: the
 /// tier, the mode (`-tlc` or not), the modules of the spec and the cfg (their contents), deadlock
-/// checking, the seed (of constant-level random choices), and the symmetry applied without a
-/// declaration (`autosym`).
+/// checking, the seed (of constant-level random choices), the set bound
+/// (`-maxSetSize`) and the symmetry applied without a declaration (`autosym`).
 pub(crate) fn run_identity(
     a: &Args,
     model: &InterpModel,
@@ -72,6 +72,7 @@ pub(crate) fn run_identity(
         ("configuration".into(), format!("{cfg:016x}")),
         ("deadlock".into(), if check_deadlock { "checked" } else { "not checked" }.into()),
         ("seed".into(), (seed as i64).to_string()),
+        ("maxSetSize".into(), tlx_value::limits::max_set_size().to_string()),
         ("symmetry".into(), symmetry.map_or_else(|| "none".to_string(), |s| s.group.clone())),
         ("projection".into(), if model.has_automatic_projection() { "applied" } else { "none" }.into()),
     ]

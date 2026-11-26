@@ -21,6 +21,7 @@ pub mod fingerprint;
 pub mod fmt;
 pub mod intern;
 pub mod lazy;
+pub mod limits;
 pub mod ops;
 pub mod order;
 pub mod plan;
