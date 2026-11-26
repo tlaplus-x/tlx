@@ -15,17 +15,18 @@ cloud-provider commands additionally need their SDKs, described in [cloud-verifi
 ## Continuous integration
 
 GitHub Actions runs on pushes to `main`, pull requests and manual dispatches. The `CI`
-summary check aggregates Linux x86_64, Linux arm64 and macOS arm64 Rust/spec tests plus the Linux quality
-job (formatting, Clippy, Python driver tests, documentation and benchmark-report checks).
+summary check aggregates Linux x86_64, Linux arm64 and macOS arm64 Rust test and spec-conformance
+jobs, sharded Linux Lean 4 certificate verification jobs, and the Linux quality job (formatting,
+Clippy, Python driver tests, documentation and benchmark-report checks).
 Actions are pinned by commit and run with read-only repository permissions. The workflow does not
 use cloud credentials or run performance benchmarks. Corpus-wide model-checking runs remain separate cloud jobs.
 The `main` branch accepts changes only through pull requests with a linear history; squash
 merging is the only enabled merge method, and direct pushes, force pushes, merge commits and
 deletion are rejected. CI runs after each push; its result is not a precondition for pushing.
 
-The Python quality job uses `bash scripts/fetch-deps.sh --tests-only`, without the Examples corpus.
-Rust jobs use the full dependency fetch because their parser and resolver corpus tests require it;
-these front-end checks do not exhaustively model-check the corpus. The exact TLC oracle jar and
+The Python quality and spec-conformance jobs use `bash scripts/fetch-deps.sh --tests-only`, without
+the Examples corpus. Rust test jobs use the full dependency fetch because their parser and resolver
+corpus tests require it; these front-end checks do not exhaustively model-check the corpus. The exact TLC oracle jar and
 its license are retained in `tests/deps/` and verified
 against the pin in `scripts/dependencies.py`; the mutable upstream release asset is not trusted to
 supply the historical oracle bytes. With Java available for trace validation, spec tests run all

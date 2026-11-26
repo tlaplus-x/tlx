@@ -150,10 +150,18 @@ def field_write_can_break_frame(lean, path, source, lean_pool=None):
     return values[0] == "true"
 
 
-def verify(lean, path, negative, lean_pool=None):
+def parse_shard(spec):
+    match = re.fullmatch(r"(\d+)/(\d+)", spec)
+    if not match:
+        raise argparse.ArgumentTypeError(f"invalid --shard {spec!r}: expected INDEX/TOTAL (e.g. 1/4)")
+    index, total = int(match.group(1)), int(match.group(2))
+    if total < 1 or not (1 <= index <= total):
+        raise argparse.ArgumentTypeError(f"invalid --shard {spec!r}: require 1 <= INDEX <= TOTAL")
+    return index, total
+
+
+def check_positive(lean, path, namespace, theorems, lean_pool=None):
     # Check the exact standalone bytes without a checkout-specific import path.
-    source = path.read_text()
-    namespace, preamble, ns_open, gen_block, ns_close, suffix = split_certificate(path, source)
     result = (lean_pool.submit(invoke, lean, path).result()
               if lean_pool is not None else invoke(lean, path))
     if result.returncode:
@@ -173,7 +181,14 @@ def verify(lean, path, negative, lean_pool=None):
         result.stdout,
     ):
         axioms[name] = []
+    if set(axioms) != theorems:
+        raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
+    return axioms
 
+
+def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
+    source = path.read_text()
+    namespace, preamble, ns_open, gen_block, ns_close, suffix = split_certificate(path, source)
     has_select = has_preamble_decl(preamble, "def Test.select")
     has_bind = has_preamble_decl(preamble, "theorem Test.bind_concrete")
     has_commutes = has_preamble_decl(preamble, "theorem Decision.commutes")
@@ -211,12 +226,10 @@ def verify(lean, path, negative, lean_pool=None):
         theorems |= {"const_subst_bindings_match", "const_subst_sound"}
         if is_constrained:
             theorems |= {"const_subst_constrained_sound"}
-    if set(axioms) != theorems:
-        raise RuntimeError(f"{path}: incomplete theorem audit:\n{result.stdout}")
 
-    mutations = []
+    axioms = check_positive(lean, path, namespace, theorems, lean_pool) if run_positive else None
+    mutated_sources = []
     if negative:
-        mutated_sources = []
 
         def add_preamble_mutation(before, after, label):
             new_preamble = replace_once_in(preamble, before, after, path, label)
@@ -443,23 +456,31 @@ def verify(lean, path, negative, lean_pool=None):
                     "disconnected constant substitution model expansion",
                 )
 
-        def check_mutation(item):
-            mutated, label = item
-            with tempfile.TemporaryDirectory(prefix="tlx-generated-proof-") as tmp:
-                bad = Path(tmp) / "Broken.lean"
-                bad.write_text(mutated)
-                rejected = invoke(lean, bad)
-            if rejected.returncode == 0 or not any(
-                marker in rejected.stdout for marker in
-                ("error: Tactic", "error: 'change' tactic failed", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal", "error: invalid `▸` notation")
-            ):
-                raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
-            return {"change": label, "diagnostic": rejected.stdout}
+    return namespace, theorems, axioms, mutated_sources
 
+
+def check_mutation(lean, path, item):
+    mutated, label = item
+    with tempfile.TemporaryDirectory(prefix="tlx-generated-proof-") as tmp:
+        bad = Path(tmp) / "Broken.lean"
+        bad.write_text(mutated)
+        rejected = invoke(lean, bad)
+    if rejected.returncode == 0 or not any(
+        marker in rejected.stdout for marker in
+        ("error: Tactic", "error: 'change' tactic failed", "error: Type mismatch", "error: type mismatch", "error: Application type mismatch", "error: unsolved goals", "error: omega could not prove the goal", "error: invalid `▸` notation")
+    ):
+        raise RuntimeError(f"{path}: mutation was not rejected: {label}\n{rejected.stdout}")
+    return {"change": label, "diagnostic": rejected.stdout}
+
+
+def verify(lean, path, negative, lean_pool=None):
+    namespace, theorems, axioms, mutated_sources = plan_certificate(lean, path, negative, lean_pool, run_positive=True)
+    mutations = []
+    if negative:
         if lean_pool is not None:
-            mutations = list(lean_pool.map(check_mutation, mutated_sources))
+            mutations = list(lean_pool.map(lambda item: check_mutation(lean, path, item), mutated_sources))
         else:
-            mutations = [check_mutation(item) for item in mutated_sources]
+            mutations = [check_mutation(lean, path, item) for item in mutated_sources]
 
     print(f"PASS: {path} ({len(theorems)} theorem audits, {len(mutations)} rejected mutations)")
     return {
@@ -469,6 +490,65 @@ def verify(lean, path, negative, lean_pool=None):
                   if namespace == "GeneratedPipeline" else
                   f"Parametric {namespace} rule IR; lowering, totality and runtime remain trusted."),
     }
+
+
+def verify_sharded(lean, paths, negative, workers, shard_index, shard_total):
+    """Run a deterministic round-robin shard of all positive and negative Lean checks.
+
+    Sharding at the individual-check level balances heavy certificate families
+    evenly across shards while ensuring that shards 1/N..N/N together run the
+    exact same checks as an unsharded run.
+    """
+    specs = []
+    tasks = []
+    for cert_idx, path in enumerate(paths):
+        namespace, theorems, _, mutated_sources = plan_certificate(lean, path, negative, lean_pool=None, run_positive=False)
+        specs.append((path, namespace, theorems))
+        tasks.append(("pos", cert_idx, None))
+        for item in mutated_sources:
+            tasks.append(("neg", cert_idx, item))
+
+    selected = [task for i, task in enumerate(tasks) if i % shard_total == (shard_index - 1)]
+
+    def run_task(task):
+        kind, cert_idx, payload = task
+        path, namespace, theorems = specs[cert_idx]
+        if kind == "pos":
+            return ("pos", cert_idx, check_positive(lean, path, namespace, theorems))
+        return ("neg", cert_idx, check_mutation(lean, path, payload))
+
+    if workers == 1:
+        outcomes = [run_task(t) for t in selected]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as lean_pool:
+            outcomes = list(lean_pool.map(run_task, selected))
+
+    by_cert = {i: {"axioms": None, "mutations": []} for i in range(len(specs))}
+    pos_count = neg_count = 0
+    for kind, cert_idx, value in outcomes:
+        if kind == "pos":
+            by_cert[cert_idx]["axioms"] = value
+            pos_count += 1
+        else:
+            by_cert[cert_idx]["mutations"].append(value)
+            neg_count += 1
+
+    results = []
+    for cert_idx, (path, namespace, theorems) in enumerate(specs):
+        entry = by_cert[cert_idx]
+        if entry["axioms"] is None and not entry["mutations"]:
+            continue
+        audits = len(theorems) if entry["axioms"] is not None else 0
+        print(f"PASS: {path} ({audits} theorem audits, {len(entry['mutations'])} rejected mutations)")
+        results.append({
+            "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "axioms": entry["axioms"] or {}, "rejected_mutations": entry["mutations"],
+            "scope": ("Closed counter-pipeline IR; source lowering, TLA+ emission and runtime remain trusted."
+                      if namespace == "GeneratedPipeline" else
+                      f"Parametric {namespace} rule IR; lowering, totality and runtime remain trusted."),
+        })
+    print(f"Shard {shard_index}/{shard_total}: {pos_count} positive, {neg_count} negative checks passed")
+    return results
 
 
 def find_lean(requested):
@@ -544,6 +624,7 @@ def main():
     parser.add_argument("--lean", default="lean")
     parser.add_argument("--tlx", default="", help="tlx binary used to generate certificates when no files are given")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 4), help="parallel Lean verifications (default: min(cpus, 4))")
+    parser.add_argument("--shard", type=parse_shard, default=None, metavar="INDEX/TOTAL", help="run only deterministic 1-based shard INDEX of TOTAL across all checks")
     parser.add_argument("--negative", action="store_true", help="also require deliberately broken proofs to fail")
     parser.add_argument("--report", type=Path, help="write a JSON receipt after all checks pass")
     args = parser.parse_args()
@@ -561,7 +642,9 @@ def main():
                     raise RuntimeError("tlx binary not found; build with `cargo build --profile test-release -p tlx-cli` or pass --tlx")
                 paths = generate_default_certificates(tlx, Path(tmp))
             workers = max(1, args.jobs)
-            if workers == 1:
+            if args.shard is not None and args.shard[1] > 1:
+                results = verify_sharded(lean, paths, args.negative, workers, args.shard[0], args.shard[1])
+            elif workers == 1:
                 results = [verify(lean, p, args.negative) for p in paths]
             else:
                 with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as outer_pool, \

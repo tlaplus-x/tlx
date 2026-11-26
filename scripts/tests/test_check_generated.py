@@ -103,6 +103,78 @@ class LeanConcurrency(unittest.TestCase):
                 self.assertEqual((positives, probes, negatives, active), (2, 1, 12, 0))
                 self.assertLessEqual(peak, jobs)
 
+    def test_sharding_partitions_all_positive_and_negative_checks(self):
+        source = "\n".join([
+            "fun i => s.2 i ∧ q i e",
+            "m.step s.1 t.1 w s.2",
+            "m.transfer s.1 t.1 w s.2",
+            "namespace TlxOptimization.GeneratedHistory",
+            "def after := (model sem).reduced",
+            "end TlxOptimization.GeneratedHistory",
+        ]) + "\n"
+        field_source = "\n".join([
+            "def mask (p : K → P) (v : K → F → V) : K → F → V :=",
+            "  fun k f => if m.live (p k) f then v k f else m.missing",
+            "def seed (c : C) (b : B) (w : W) : State C K P F V :=",
+            "  s = m.project (m.seed c b w)",
+            "def advance (s : State C K P F V) (d : C) (b : B) (w : W) : State C K P F V :=",
+            "  t = m.project (m.advance s t.1 b w)",
+            "    fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
+            "namespace TlxOptimization.GeneratedField",
+            "def model : FieldRule.Model C Key Phase Field V BranchId W where",
+            "  readsActor := readsActor",
+            "  writes := writes",
+            "  readsGlobal := readsGlobal",
+            "def after := (model sem).reduced",
+            "end TlxOptimization.GeneratedField",
+        ]) + "\n"
+        with TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / name for name in ("Field.lean", "Fast.lean")]
+            for path in paths:
+                path.write_text(field_source if path.name == "Field.lean" else source)
+
+            seen_pos = []
+            seen_neg = []
+            lock = threading.Lock()
+
+            def invoke(lean, path):
+                text = path.read_text()
+                if path.name == "Probe.lean":
+                    return subprocess.CompletedProcess([], 0, "true\n")
+                if path.name == "Broken.lean":
+                    with lock:
+                        seen_neg.append(text)
+                    return subprocess.CompletedProcess([], 1, "error: unsolved goals")
+                with lock:
+                    seen_pos.append(path.name)
+                namespace = (
+                    "GeneratedField" if "namespace TlxOptimization.GeneratedField" in text
+                    else "GeneratedHistory")
+                output = "\n".join(
+                    f"'TlxOptimization.{namespace}.{name}' does not depend on any axioms"
+                    for name in checker.THEOREMS)
+                return subprocess.CompletedProcess([], 0, output)
+
+            total = 3
+            for idx in range(1, total + 1):
+                argv = ["check_generated.py", *map(str, paths), "--negative", "--jobs", "2", "--shard", f"{idx}/{total}"]
+                with patch.object(sys, "argv", argv), \
+                     patch.object(checker, "find_lean", return_value="fake-lean"), \
+                     patch.object(checker.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Lean test")), \
+                     patch.object(checker, "invoke", side_effect=invoke), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    checker.main()
+
+            self.assertEqual(sorted(seen_pos), ["Fast.lean", "Field.lean"])
+            self.assertEqual(len(seen_neg), 12)
+            self.assertEqual(len(set(seen_neg)), 12)
+
+    def test_parse_shard_rejects_invalid_specs(self):
+        for bad in ("0/4", "5/4", "1/0", "abc", "1/2/3"):
+            with self.subTest(bad=bad), self.assertRaises(checker.argparse.ArgumentTypeError):
+                checker.parse_shard(bad)
+        self.assertEqual(checker.parse_shard("2/4"), (2, 4))
+
 
 
 if __name__ == "__main__":
