@@ -1407,6 +1407,26 @@ impl Table {
         }
     }
 
+    /// Keep this table's mapping out of transparent huge pages.
+    ///
+    /// `MADV_DONTNEED` over a range that only partially covers a huge page
+    /// splits the huge page and defers freeing the remaining subpages until
+    /// memory pressure, so the exact residency a completed rehash unit releases
+    /// is not observable from `mincore` on a huge-page-backed mapping. Tests
+    /// that assert that release measure a base-page mapping instead; production
+    /// keeps the `MADV_HUGEPAGE` hint.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn disable_huge_pages(&self) {
+        let buf = self.buf();
+        if !buf.mapped {
+            return;
+        }
+        // SAFETY: `buf.ptr` and `buf.layout.size()` name the live mapping owned
+        // by this table, and the advice neither reads nor writes it.
+        let rc = unsafe { libc::madvise(buf.ptr.as_ptr().cast(), buf.layout.size(), libc::MADV_NOHUGEPAGE) };
+        assert_eq!(rc, 0, "madvise(MADV_NOHUGEPAGE) failed");
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn resident_bytes(&self) -> usize {
         let buf = self.buf();
