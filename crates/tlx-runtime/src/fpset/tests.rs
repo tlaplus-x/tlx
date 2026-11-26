@@ -1196,6 +1196,11 @@ fn concurrent_overflow_displacements_across_segments() {
 /// Chunked parallel rehash (`madvise` page reclamation) keeps both accounted
 /// `peak_bytes` and per-mapping physical page residency (`mincore`) bounded by
 /// `new_table + slack` across every rehash step rather than `old + new`.
+///
+/// The `mincore` measurements run on base pages (`MADV_NOHUGEPAGE`): Linux
+/// splits a huge page on a partial-range `MADV_DONTNEED` and defers freeing the
+/// remaining subpages until memory pressure, so asserting the exact residency
+/// a chunk releases on a huge-page-backed mapping is kernel-dependent.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn chunked_grow_bounds_peak_bytes_and_rss() {
@@ -1233,10 +1238,18 @@ fn chunked_grow_bounds_peak_bytes_and_rss() {
     {
         let g = Arc::new(Gauge::new());
         let old = super::table::Table::new(initial, 0, g.clone(), usize::MAX);
+        // Measure exact physical release on base pages: a partial-range
+        // `MADV_DONTNEED` on a huge page splits it and leaves the rest resident
+        // until memory pressure, which makes the `mincore` counts below depend
+        // on the kernel's huge-page decisions instead of on the chunked rehash.
+        old.disable_huge_pages();
         for i in 0..fill {
             old.place(norm(fp(i + 1)));
         }
         let new = super::table::Table::new(target, 0, g, usize::MAX);
+        // Likewise, a huge-page fault in `new` would materialize 2 MiB per
+        // touched block and blur the measured peak with untouched pages.
+        new.disable_huge_pages();
         assert!(old.resident_bytes() >= old_bytes * 9 / 10, "old table should be resident before rehash");
         assert_eq!(new.resident_bytes(), 0, "new table mmap starts non-resident");
         let chunk = old.rehash_chunk_slots();
