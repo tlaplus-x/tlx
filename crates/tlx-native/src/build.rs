@@ -15,6 +15,12 @@ const CANCEL_POLL: Duration = Duration::from_millis(20);
 /// How long a killed compiler group may take to be reaped.
 const CANCEL_REAP: Duration = Duration::from_millis(500);
 
+/// The compiler flags of a sanitized build (`BuildOptions::debug`): generated
+/// C compiled at a debug-friendly optimization level with the address and
+/// undefined-behavior sanitizers. Part of the cache key (`cache_slot`), so a
+/// sanitized library never stands in for a normal one.
+const SANITIZER_CFLAGS: &str = "-O1 -g -fsanitize=address,undefined";
+
 /// Options for the C compiler.
 #[derive(Clone, Debug)]
 pub struct BuildOptions {
@@ -66,7 +72,7 @@ fn dylib_ext() -> &'static str {
 /// Where the build of `source` with `opts` is cached: (directory, library
 /// path, compiler flags).
 fn cache_slot<'a>(source: &str, opts: &'a BuildOptions) -> (PathBuf, PathBuf, &'a str) {
-    let flags = if opts.debug { "-O1 -g -fsanitize=address,undefined" } else { opts.opt.as_str() };
+    let flags = if opts.debug { SANITIZER_CFLAGS } else { opts.opt.as_str() };
     let key = content_hash(&[source.as_bytes(), crate::ABI_HEADER.as_bytes(), opts.cc.as_bytes(), flags.as_bytes()]);
     let dir = opts.cache_dir.join(format!("{key:016x}"));
     let lib = dir.join(format!("model.{}", dylib_ext()));
@@ -218,6 +224,16 @@ impl Files {
     }
 }
 
+/// Keep a sanitizer runtime that was preloaded into `tlx` out of `cmd` and its
+/// descendants. tlx itself is not instrumented: it loads the ASan runtime with
+/// `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES` to `dlopen` a sanitized model
+/// (`BuildOptions::debug`), and the preload would otherwise instrument the C
+/// compiler too -- every child `clang` would initialize ASan's shadow memory
+/// for a compilation that runs once per model (see docs/testing.md section 11).
+fn without_sanitizer_preload(cmd: &mut Command) {
+    cmd.env_remove("LD_PRELOAD").env_remove("DYLD_INSERT_LIBRARIES");
+}
+
 /// Start building `source` with `opts` in the background (see `build`);
 /// `Build::wait` waits for the library.
 ///
@@ -272,6 +288,7 @@ pub fn start(source: &str, opts: &BuildOptions) -> Result<Build, String> {
     let tmp = dir.join(format!("{stem}.{}", dylib_ext()));
     let log = dir.join(format!("{stem}.log"));
     let mut cmd = Command::new("sh");
+    without_sanitizer_preload(&mut cmd);
     cmd.arg("-c")
         .arg(r#"cc="$1"; shift; "$cc" "$@" 2>"$TLX_LOG" && mv -f "$TLX_TMP" "$TLX_LIB" && { mv -f "$TLX_SRC" "$TLX_KEEP" || true; rm -f "$TLX_LOG"; } || { rm -f "$TLX_TMP" "$TLX_SRC"; exit 1; }"#)
         .arg("sh")
@@ -769,5 +786,22 @@ mod tests {
         let diagnostics = std::fs::read_to_string(&log);
         let _ = std::fs::remove_file(log);
         assert_eq!(diagnostics.unwrap(), "compiler diagnostics");
+    }
+
+    /// A sanitizer runtime preloaded into tlx (as the generated-C ASan run
+    /// needs, docs/testing.md section 11) must not be inherited by the
+    /// compiler the build spawns: every child `clang` would initialize ASan
+    /// for a compilation that does not need it, at a large cost per build.
+    #[test]
+    fn the_compiler_child_drops_preloaded_sanitizer_runtimes() {
+        let mut cmd = Command::new("sh");
+        // (Set on this command only: the test process keeps its environment.)
+        cmd.env("LD_PRELOAD", "/nonexistent/libasan.so")
+            .env("DYLD_INSERT_LIBRARIES", "/nonexistent/libasan.dylib")
+            .args(["-c", r#"printf '%s|%s' "${LD_PRELOAD-unset}" "${DYLD_INSERT_LIBRARIES-unset}""#]);
+        without_sanitizer_preload(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "the fixture shell failed: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|unset");
     }
 }

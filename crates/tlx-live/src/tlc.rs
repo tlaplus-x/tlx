@@ -356,7 +356,9 @@ mod tests {
         let base = [Ltl::True, Ltl::False, st(0), st(1), Ltl::Action(0)];
         let mut layer = base.to_vec();
         let mut all = base.to_vec();
-        for _ in 0..2 {
+        // Miri checks the one-layer corpus across all three fairness modes;
+        // the two-layer 26,145-decomposition corpus runs natively.
+        for _ in 0..if cfg!(miri) { 1 } else { 2 } {
             let mut next = Vec::new();
             for a in &layer {
                 next.push(Ltl::Not(Box::new(a.clone())));
@@ -468,7 +470,9 @@ mod tests {
         assert!(!reports_early(&mixed_cases[3], &[]));
         // Wide flat disjunction (100,000 copies of `[]p0`, negated to one flat
         // conjunction) must not overflow the call stack.
-        let wide = Ltl::Or(vec![al(st(0)); 100_000]);
+        // Miri's interpreter cannot afford the 100,000-entry disjunction; the
+        // same merge path runs on a shorter one.
+        let wide = Ltl::Or(vec![al(st(0)); if cfg!(miri) { 100 } else { 100_000 }]);
         assert!(check_size(&wide, &[]).is_ok());
         assert_eq!(tableau_state_atoms(&wide, &[]), vec![0]);
         assert_eq!(crate::branches([&wide]), 1);

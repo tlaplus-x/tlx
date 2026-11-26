@@ -875,23 +875,67 @@ identifies a change in execution paths, not a semantic error or a proven slowdow
 
 ## 11. Sanitizer and Miri runs
 
-These are not part of `verify.py`.
+These are not part of `verify.py`. [`.github/workflows/sanitizers.yml`](../.github/workflows/sanitizers.yml)
+runs them nightly, on pushes to `main`, on manual dispatch, and on pull requests that touch
+`crates/**`, `tests/specs/**`, the test drivers or the dependency pins.
 
 - **Generated C under ASan + UBSan**: `TLX_CC_SANITIZE=1` builds the generated C with sanitizers
-  (`-O1 -g`; part of the build cache key, so sanitized and normal builds never mix). On macOS the
-  host must preload the runtime:
+  (`-O1 -g -fsanitize=address,undefined`; part of the build cache key, so sanitized and normal
+  builds never mix). `tlx` itself is uninstrumented, so the host must preload the runtime to
+  `dlopen` the instrumented library. The generated C must also be built by Clang
+  (`CC=clang`): GCC links its own dynamic `libasan.so` into the model library, so
+  the process would carry a second ASan runtime beside the preloaded one and abort
+  with `Shadow memory range interleaves with an existing memory mapping`. On Linux:
 
   ```sh
-  TLX_CC_SANITIZE=1 TLX_NATIVE_SYNC=1 TLX_CACHE=/tmp/tlx-asan \
-  DYLD_INSERT_LIBRARIES=$(cc -print-file-name=libclang_rt.asan_osx_dynamic.dylib) \
-  ASAN_OPTIONS=detect_leaks=0 tlx check Spec.tla -compile
+  ASAN_RT="$(clang -print-file-name="libclang_rt.asan-$(uname -m).so")"
+  CC=clang LD_PRELOAD="$ASAN_RT" \
+  ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:disable_coredump=1:allow_user_segv_handler=1:print_stacktrace=1" \
+  UBSAN_OPTIONS="halt_on_error=1:disable_coredump=1:print_stacktrace=1" \
+  TLX_CC_SANITIZE=1 TLX_NATIVE_SYNC=1 TLX_JIT=0 TLX_PRERUN_REUSE=0 TLX_CACHE=/tmp/tlx-asan \
+  tlx check Spec.tla -compile -workers 1
   ```
 
-  Do not also preload the standalone UBSan runtime, and do not go through a SIP-protected wrapper
-  (it strips `DYLD_*`).
-- **Miri** over the pure-Rust crates with `unsafe` (`cargo +nightly miri test -p tlx-value`, `-p
-  tlx-live`, and `-p tlx-runtime --lib` with skips for tests that use files, `mmap`, FFI or stack
-  switching): see [unsafe-audit.md](unsafe-audit.md) for the recorded results and the skip list.
+  On macOS the host preloads the runtime instead with
+  `DYLD_INSERT_LIBRARIES=$(cc -print-file-name=libclang_rt.asan_osx_dynamic.dylib)`, the same
+  `ASAN_OPTIONS`/`UBSAN_OPTIONS`, and no `LD_PRELOAD`. Do not also preload the standalone UBSan
+  runtime, and do not go through a SIP-protected wrapper (it strips `DYLD_*`).
+
+  The options are not optional. `UBSAN_OPTIONS=halt_on_error=1` overrides Clang's default of
+  printing `runtime error:` and exiting zero; `ASAN_OPTIONS=halt_on_error=1` makes an ASan report
+  fail the run; `allow_user_segv_handler=1` keeps tlx's alternate-stack fault handler
+  (`STK1`-`STK3`, [unsafe-audit.md](unsafe-audit.md)) installed under ASan; `detect_leaks=0` and
+  `disable_coredump=1` avoid leak reports for a search that does not tear down every allocation and
+  avoid coredumps on the CI runner.
+
+  The preload is scoped to `tlx`: `crates/tlx-native/src/build.rs` removes `LD_PRELOAD` and
+  `DYLD_INSERT_LIBRARIES` from the C-compiler child (every `clang` would otherwise initialize ASan
+  shadow memory for a one-off compilation), and `scripts/tlc.py` removes them from TLC JVM launches
+  (trace validation; the JVM conflicts with the Clang ASan runtime). The workflow runs the compiled
+  spec suite twice with one sanitized cache, single-worker with `TLX_PARANOID=1` and eight-worker,
+  and requires at least one cached `model.so`. Both passes run with `--require-native`, so a case
+  whose tlx run reports that generated C was not used (native code disabled, a failed C build or
+  load, or a whole-model compiler fallback) fails before parity or expected-failure classification.
+  The job first builds A1 into a fresh cache and requires that library to reference `__asan_init`
+  (so a model is instrumented, not merely run under a preloaded runtime), then runs A1 with and
+  without the preload, which must pass and fail respectively.
+  `crates/tlx-native/tests/sanitizer_selftest.rs` builds a probe through the production C builder
+  (`BuildOptions { debug: true, .. }`), loads it into a preloaded child, and requires an injected
+  out-of-bounds read (ASan) and signed overflow (UBSan) to halt with a diagnostic. The child
+  allocates the four integers and passes them to the probe, so only the probe library's own address
+  instrumentation can report the overrun (a preloaded runtime alone sees nothing). It is
+  `#[ignore]`d in the ordinary `cargo test` matrix (which need not install compiler-rt) and run by
+  the workflow as `cargo test -p tlx-native --test sanitizer_selftest -- --ignored`; a missing
+  runtime fails under `CI` instead of skipping.
+- **Miri** over the pure-Rust crates with `unsafe`: `cargo +nightly miri test -p tlx-value`,
+  `-p tlx-live`, `-p tlx-layout --test raw_handles`, `-p tlx-compile --lib encoded_order::`, and
+  `-p tlx-runtime --lib` with skips for tests that use files, `mmap`, FFI or stack switching, and
+  `--test-threads=1` for every command. Pure-safe stress tests are scaled under `cfg!(miri)` (native
+  coverage unchanged), and the five invocations run as separate parallel jobs, each with a
+25-minute timeout, so the workflow's wall time is the slowest invocation rather than their sum.
+  See [unsafe-audit.md](unsafe-audit.md) for the recorded results, the raw-handle and ordering
+  targets, and the skip list; the workflow requires every filtered invocation to execute at least
+  one test so a renamed symbol cannot pass as `running 0 tests`.
 
 ## Helper drivers: exit codes
 

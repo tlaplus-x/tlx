@@ -24,6 +24,21 @@ CLASSPATH = os.pathsep.join([os.path.join(TP, "tla2tools.jar"),
                              os.path.join(CLASSPATH_DIRS[0], "modules.jar"),
                              *CLASSPATH_DIRS[1:]])
 
+# Sanitizer runtimes preloaded into the driver that runs the generated C
+# (docs/testing.md section 11) must not reach a JVM: the JVM's own signal
+# handling and alternate signal stack conflict with the Clang ASan runtime.
+PRELOAD_VARS = ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES")
+
+
+def jvm_env(environ=None):
+    """The environment of a TLC JVM launch: `environ` (default: this
+    process's) without the sanitizer runtimes preloaded into the driver."""
+    env = dict(os.environ if environ is None else environ)
+    for name in PRELOAD_VARS:
+        env.pop(name, None)
+    return env
+
+
 # "Temporal property P was violated." / "Temporal properties P and Q were
 # violated." / "Temporal properties P, Q, and R were violated." / "Temporal
 # properties were violated." (naming none). Groups: 2 = a single name,
@@ -56,7 +71,7 @@ def run_tlc_raw(spec, args, timeout=None, features=(), scratch=False, *, cwd=Non
     check_tlc_model(cmd, run_dir, allow_local_heavy=allow_local_heavy)
     with scratch_dir(run_dir if scratch else None) as staged:
         p = run_proc(cmd, cwd=staged or run_dir, timeout=timeout,
-                     allow_local_heavy=allow_local_heavy)
+                     allow_local_heavy=allow_local_heavy, env=jvm_env())
     return p.stdout + p.stderr, p.returncode, p.wall
 
 

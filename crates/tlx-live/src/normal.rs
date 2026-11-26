@@ -350,7 +350,9 @@ mod tests {
         let base = [Ltl::True, Ltl::False, p(0), p(1), Ltl::Action(0), Ltl::And(Vec::new()), Ltl::Or(Vec::new())];
         let mut out: Vec<Ltl> = base.to_vec();
         let mut layer: Vec<Ltl> = base.to_vec();
-        for _ in 0..2 {
+        // Miri checks one combination layer (126 formulas) to stay fast; the
+        // two-layer 28,805-formula corpus runs natively.
+        for _ in 0..if cfg!(miri) { 1 } else { 2 } {
             let mut next = Vec::new();
             for a in &layer {
                 next.push(Ltl::Not(Box::new(a.clone())));
@@ -366,10 +368,10 @@ mod tests {
             out.extend(next.iter().cloned());
             layer = next;
         }
-        // 7 + 119 + (119 * 3 + 119 * 119 * 2) = 28_805; pinned so a change to
-        // the corpus shows up in the test instead of shrinking coverage
-        // silently (HARNESS-21).
-        assert_eq!(out.len(), 28_805);
+        // 7 + 119 = 126 with one layer; 7 + 119 + (119 * 3 + 119 * 119 * 2) =
+        // 28_805 natively. Pinned so a change to the corpus shows up in the
+        // test instead of shrinking coverage silently (HARNESS-21).
+        assert_eq!(out.len(), if cfg!(miri) { 126 } else { 28_805 });
         out
     }
 
@@ -396,7 +398,8 @@ mod tests {
         // eager DNF built all 2^n rows; the traversal sees the same 2^n
         // disjuncts but never holds more than n conjuncts at once (CODE-15).
         let product = |n: usize| -> Ltl { Ltl::And((0..n).map(|i| Ltl::Or(vec![p(2 * i as u32), p(2 * i as u32 + 1)])).collect()) };
-        for n in 12..=16usize {
+        // Miri's interpreter cannot afford the 2^12..2^16 row products.
+        for n in if cfg!(miri) { 6..=8usize } else { 12..=16usize } {
             let f = product(n);
             let (mut visits, mut max_len, mut min_len) = (0usize, 0usize, usize::MAX);
             let mut visit = |c: &[&Ltl]| -> bool {
@@ -453,8 +456,11 @@ mod tests {
         assert_eq!(branches([&mixed]), 2);
         // Deep mixed chain with PEM siblings at every layer and one ordinary
         // atom at the bottom runs in linear time without quadratic re-scans.
+        // Miri keeps far more per layer, so it checks a shorter chain of the
+        // same shape.
         let mut chain = p(0);
-        for i in 0..2_000u32 {
+        let depth = if cfg!(miri) { 200u32 } else { 2_000 };
+        for i in 0..depth {
             chain = Ltl::Or(vec![eventually(always(p(i % 8))), chain]);
         }
         assert_eq!(branches([&chain]), 1);

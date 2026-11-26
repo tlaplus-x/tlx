@@ -49,7 +49,7 @@ import tempdirs
 import hashlib, itertools, math, os, re, shutil, subprocess, tempfile
 
 from modelcheck import structure
-from tlc import JAVA, parse, tlc_cmd
+from tlc import JAVA, jvm_env, parse, tlc_cmd
 from tlxlib import run_proc
 
 CACHE_FORMAT = "1"
@@ -524,7 +524,7 @@ def check(spec_dir, name, cfg, kind, states, loop=None, names=None, *, variables
         features = ["action composition"] if "\\cdot" in spec_text else []
         cmd = tlc_cmd("tlxTC.tla", ["-workers", "1", "-tool", "-config", "tlxTC.cfg"], features, state_dir=os.path.join(tmp, "states"))
         try:
-            p = run_proc(cmd, timeout, cwd=d)
+            p = run_proc(cmd, timeout, cwd=d, env=jvm_env())
         except subprocess.TimeoutExpired:
             return "unchecked", f"TLC timed out after {timeout} s"
     out = p.stdout + p.stderr

@@ -51,6 +51,14 @@ thread_local! {
     static REGISTRATION: RefCell<Option<Registration>> = const { RefCell::new(None) };
 }
 
+#[cfg(miri)]
+pub(super) fn install() -> io::Result<()> {
+    // Miri cannot emulate the alternate signal stack, `sigaction` or `mmap`;
+    // the fallback is exercised by the native tests (docs/unsafe-audit.md).
+    Ok(())
+}
+
+#[cfg(not(miri))]
 pub(super) fn install() -> io::Result<()> {
     REGISTRATION.with(|registration| {
         let mut registration = registration.borrow_mut();

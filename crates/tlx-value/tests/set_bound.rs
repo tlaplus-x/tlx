@@ -456,34 +456,40 @@ fn an_interval_union_is_enumerated_like_tlcs() {
 
 #[test]
 fn big_union_merges_normalized_families_incrementally() {
-    // Overlapping neighborhoods: 512 sets of 512 elements (262,144 occurrences),
-    // shifting by 1 each time -> 1,023 distinct elements. At bound 512, the
-    // k-way merge stops as soon as distinct element 513 is reached without
-    // flattening every occurrence; at bound 1,023 it succeeds.
-    let neighborhoods: Vec<Value> = (0..512).map(|i| set(i..i + 512)).collect();
+    // Overlapping neighborhoods: `count` sets of `width` elements, shifting by
+    // 1 each time -> `count + width - 1` distinct elements. At the bound of one
+    // set, the k-way merge stops as soon as the next distinct element is
+    // reached without flattening every occurrence; at the full distinct count
+    // it succeeds. Miri scales both dimensions down (64 sets of 64 -> 127
+    // distinct) and keeps the same overlap and bound boundaries.
+    let (count, width): (i64, i64) = if cfg!(miri) { (64, 64) } else { (512, 512) };
+    let neighborhoods: Vec<Value> = (0..count).map(|i| set(i..i + width)).collect();
     let family = Value::set_literal(neighborhoods).unwrap();
     {
-        let _b = Bound::new(512);
+        let _b = Bound::new(width);
         let e = ops::big_union(&family).unwrap_err();
         assert!(e.to_string().contains("too many elements"), "{e}");
     }
     {
-        let _b = Bound::new(1023);
+        let _b = Bound::new(count + width - 1);
         let u = ops::big_union(&family).unwrap();
-        assert_eq!(ops::size(&u).unwrap(), 1023);
+        assert_eq!(ops::size(&u).unwrap(), count + width - 1);
     }
 
-    // Sparse ring: 4,095 two-element edges covering 4,096 distinct nodes
-    // (8,190 occurrences > bound 4,096, distinct == 4,096).
-    let edges: Vec<Value> = (0..4095).map(|i| set([i, i + 1])).collect();
+    // Sparse ring: `edges` two-element edges covering `edges + 1` distinct
+    // nodes (twice as many occurrences as nodes, so the occurrence bound is
+    // exceeded while the distinct count fits). Miri uses 255 edges -> 256
+    // distinct nodes.
+    let (edges_n, ok_bound, fail_bound): (i64, i64, i64) = if cfg!(miri) { (255, 256, 255) } else { (4095, 4096, 4095) };
+    let edges: Vec<Value> = (0..edges_n).map(|i| set([i, i + 1])).collect();
     let ring = Value::set_literal(edges).unwrap();
     {
-        let _b = Bound::new(4096);
+        let _b = Bound::new(ok_bound);
         let u = ops::big_union(&ring).unwrap();
-        assert_eq!(ops::size(&u).unwrap(), 4096);
+        assert_eq!(ops::size(&u).unwrap(), edges_n + 1);
     }
     {
-        let _b = Bound::new(4095);
+        let _b = Bound::new(fail_bound);
         let e = ops::big_union(&ring).unwrap_err();
         assert!(e.to_string().contains("too many elements"), "{e}");
     }

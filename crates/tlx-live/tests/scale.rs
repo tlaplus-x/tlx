@@ -106,8 +106,9 @@ fn waiting_states_are_not_built() {
     // A ring of n states with atoms p_i (state % 100 == i) and q_i (state
     // % 100 not in i..i + 5) for 8 properties p_i ~> q_i: their negations
     // each wait in a state without literals, which would copy the ring 8
-    // times (16 with the nested `<>` of `~>` under `[]`).
-    let n = 20_000u32;
+    // times (16 with the nested `<>` of `~>` under `[]`). Miri keeps four
+    // 100-state period cycles.
+    let n = if cfg!(miri) { 400u32 } else { 20_000u32 };
     let k = 8;
     let states: Vec<u64> = (0..n)
         .map(|s| {
@@ -144,8 +145,8 @@ fn waiting_states_are_not_built() {
 fn parts_over_the_budget_together_run_one_at_a_time() {
     use tlx_live::{check_lasso_csr_stats, CheckStats, Csr};
     // 8 properties p_i ~> q_i on a ring (as above), without fairness: a
-    // violation in every part.
-    let n = 20_000u32;
+    // violation in every part. Miri keeps four 100-state period cycles.
+    let n = if cfg!(miri) { 400u32 } else { 20_000u32 };
     let k = 8u32;
     let states: Vec<u64> = (0..n)
         .map(|s| {
@@ -225,7 +226,9 @@ fn nested_tail_conditions_and_strong_fairness_startup_scale_linearly() {
     // `[]( \E k \in 0..16 : s_k => <>[]r_k )` (`bcastFolklore`'s ReliableChan
     // pattern scaled to k = 16): without hoisting `[]<>~r_k` out of `<>`, the
     // negation `<>( /\ (s_k /\ []<>~r_k) )` builds >= 2^16 tableau states.
-    let n = 1000u32;
+    // Miri scales the ring and the startup metadata workload; the same
+    // helpers and shapes are exercised at a fraction of the size.
+    let n = if cfg!(miri) { 100u32 } else { 1000u32 };
     let k = 16u32;
     let all_s = (1u64 << k) - 1;
     // State 0 sets all s_k; subsequent states cycle through clearing one r_k at
@@ -282,8 +285,13 @@ fn nested_tail_conditions_and_strong_fairness_startup_scale_linearly() {
     assert_eq!(branches([&pem_conj]), 1);
 
     // 13 binary choices (8,192 distinct rows) must deduplicate in O(rows), not O(rows^2).
-    let bin13 = or((0..13).map(|i| and(vec![always(st(2 * i)), always(st(2 * i + 1))])).collect());
-    assert_eq!(tableau_state_atoms(&bin13, &[]).len(), 26);
-    assert_eq!(branches([&bin13]), 1 << 13);
+    // Miri checks 7 choices (128 rows); it cannot afford 8,192.
+    let bin_k = if cfg!(miri) { 7 } else { 13 };
+    let bin = or((0..bin_k).map(|i| and(vec![always(st(2 * i)), always(st(2 * i + 1))])).collect());
+    assert_eq!(tableau_state_atoms(&bin, &[]).len(), 2 * bin_k as usize);
+    assert_eq!(branches([&bin]), 1 << bin_k);
+    // A wall-clock bound measures native performance; interpreter overhead
+    // must not be mistaken for a regression.
+    #[cfg(not(miri))]
     assert!(t0.elapsed().as_secs_f64() < 1.0, "startup metadata took {:?}", t0.elapsed());
 }

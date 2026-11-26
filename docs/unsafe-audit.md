@@ -15,8 +15,10 @@ reinterpretation of plain-old-data; and lifetime erasure for scoped job and stat
 Where an `unsafe fn` or `unsafe trait` is declared, the caller contract is a `# Safety` doc
 section; `unsafe` blocks and `unsafe impl`s carry a `// SAFETY:` comment directly above them.
 Tool results in [Miri](#miri) and [Tools](#tools) are historical reports, not
-current-revision certification. File coverage and local contract review do not establish
-absence of undefined behavior or execute those tools.
+current-revision certification. [`.github/workflows/sanitizers.yml`](../.github/workflows/sanitizers.yml)
+now reruns them on `main`, nightly and the pull-request paths that can change `unsafe` code, and a
+passing run certifies that revision only. File coverage and local contract review do not establish
+absence of undefined behavior.
 
 Status values: **doc** = invariant documented as `SAFETY`/`# Safety` and checked at the call paths;
 **assert** = a runtime check or `debug_assert` backs it; **test** = a test exercises the contract;
@@ -384,65 +386,121 @@ the runtime's generic state ownership and public model construction APIs.
 
 ## Miri
 
-Miri (nightly, with the `miri` and `rust-src` components) was run over the pure-Rust crates that
-contain `unsafe`: `tlx-value`, `tlx-live` and `tlx-runtime`. No undefined behavior was reported;
-the only diagnostic is a benign "integer-to-pointer cast" warning inside the `parking_lot_core`
-dependency, not tlx code. Commands (default isolation, no `MIRIFLAGS`):
+Miri (nightly, with the `miri` and `rust-src` components) runs over the pure-Rust crates that
+contain `unsafe`; [`.github/workflows/sanitizers.yml`](../.github/workflows/sanitizers.yml) runs
+every command below nightly, on pushes to `main`, on manual dispatch, and on pull requests that
+can change Rust `unsafe` code, and fails a filtered invocation that executes no tests (so a
+renamed test cannot pass silently as `running 0 tests`). The five invocations run as separate
+parallel jobs (a 25-minute timeout each), so the workflow's wall time is the slowest invocation
+instead of their sum. Commands (default isolation, no `MIRIFLAGS`):
 
 ```sh
-cargo +nightly miri test -p tlx-value
+cargo +nightly miri test -p tlx-value -- --skip fresh_process_reproduces_fingerprints_only_after_restoring_the_order
 cargo +nightly miri test -p tlx-live
+cargo +nightly miri test -p tlx-layout --test raw_handles
+cargo +nightly miri test -p tlx-compile --lib encoded_order:: -- --skip c_declarations_match_schema
 cargo +nightly miri test -p tlx-runtime --lib -- --skip <the tests listed below>
 ```
 
-A run of the three crates reported no undefined behavior. Miri runs roughly 1000 times slower
+`raw_handles` exercises the unchecked layout entry points (inventory row 2) and `encoded_order::`
+the encoded-word ordering of `tlx-compile`.
+
+The runs that established the skip list covered `tlx-value`, `tlx-live` and `tlx-runtime` and
+reported no undefined behavior; the only diagnostic was a benign "integer-to-pointer cast" warning
+inside the `parking_lot_core` dependency, not tlx code. Miri runs roughly 1000 times slower
 than native and cannot emulate `mmap`, `flock`, `proc_pid_rusage`, a panic crossing a pthread, or
 platform pthread stack queries and alternate signal stacks, so the `tlx-runtime` run skips (`--skip`)
 the tests below (the stack-guard module `stack.rs` and its `deep_recursion_reports_low_stack` test
 moved from `tlx-runtime` to `tlx-base/src/stack.rs`, where native `cargo test -p tlx-base --lib`
 runs them and Miri requires `--skip deep_recursion_reports_low_stack --skip borrowed_work_and_panics_cross_the_stack_thread`);
-a skip is a limit of Miri, not a verdict about the code.
+a skip is a limit of Miri, not a verdict about the code. Under Miri, `crates/tlx-base/src/stack.rs`
+reports unknown stack bounds and `stack/overflow.rs` skips installing the fatal fallback
+(`cfg(miri)`), so the pool-based runtime tests still run; the signal handler itself remains covered
+by the native tests only.
 
 - tests using files, disk or FFI: `mem::tests` (this substring also filters `cache_mem::tests`,
-  which has no `unsafe`), `io::tests`,
-  `rotating_to_disk_matches_a_hash_set`, `sections_rebuild_the_set`, `rotating_without_the_old_table`,
-  `a_large_table_written_in_ranges`, `a_failed_rotation_leaves_the_set_full`,
-  `concurrent_inserts_while_rotating`, `concurrent_inserts_while_growing`,
-  `spilled_records_give_the_same_graph`, `spilled_levels_read_back_in_order`,
-  `concurrent_claims_of_spilled_segments`, `failed_writes_keep_segments`,
-  `corrupt_segment_fails_its_claim`;
+  which has no `unsafe`), the `io::tests`, `io::durable`, `io::spillvec` and `explore::checkpoint`
+  modules (file-backed stores, directory commits, checkpoint sorting), `a_corrupt_page_of_a_run_is_detected`,
+  `pressure_drains_idle_queue_segments`, `first_rotation_at_slot_limit_drains_idle_queue_segments`,
+  `relieve_requests_drop_old_while_frontier_spills`, `encoded_candidates_roundtrip`,
+  `pending_and_failed_writes_stay_charged_in_queue_mem`, `drained_non_aligned_queue_levels_reclaim_quota`,
+  `overlapping_levels_reuse_quota_across_rotations`, `rotating_to_disk_matches_a_hash_set`,
+  `sections_rebuild_the_set`, `rotating_without_the_old_table`, `a_large_table_written_in_ranges`,
+  `a_failed_rotation_leaves_the_set_full`, `concurrent_inserts_while_rotating`,
+  `concurrent_inserts_while_growing`, `compact_tiers_round_trip_boundaries_collisions_and_overflow`,
+  `concurrent_overflow_displacements_across_segments`, `spilled_records_give_the_same_graph`,
+  `spilled_levels_read_back_in_order`, `concurrent_claims_of_spilled_segments`,
+  `failed_writes_keep_segments`, `corrupt_segment_fails_its_claim`;
+- a test that queries host memory (`size::tests::memory_fraction`, Miri's
+  `sysconf(_SC_PHYS_PAGES)` is unimplemented; the native suite keeps it);
+- a test that spawns a child process and writes a file in `tlx-value`:
+  `fresh_process_reproduces_fingerprints_only_after_restoring_the_order` (`--skip`, the child reader
+  itself is `#[ignore]`d);
+- `tlx-value`'s `malformed_input_is_rejected` (`--skip`): it spawns a thread with a 64 MiB native
+  stack and decodes deliberately deep nesting at `MAX_DEPTH`, which Miri does not model; it is the
+  longest Miri test, and the hosted Miri job was terminated while running it. The test keeps its
+  ordinary `cargo test` coverage;
+- `explore::safepoint::tests` (`--skip`): the current Miri rejects
+  `parking_lot_core` 0.9.12's `syscall(SYS_futex, ...)` call as a c-variadic
+  argument-type mismatch (it passes `&AtomicI32` where the kernel ABI is
+  `*mut u32`; 0.10 passes the cast, but parking_lot 0.13 requires Rust 1.95).
+  Every safepoint test parks a worker on that condvar, so the module's park
+  protocol stays covered by the native tests and by hand audit; the rest of
+  the runtime suite still runs under Miri;
 - tests too slow in memory (large fills, quadratic under Miri): `write_install_read_in_order`,
-  `concurrent_claims`, `xor_blocks_compress`.
+  `concurrent_claims`, `xor_blocks_compress`, `claims_take_parts_of_blocks` (16 configurations of
+  40,000 queued `Vec<u64>` states; `install_keeps_unclaimed`, `auto_switches_kinds_in_order` and the
+  `queue::block`/`queue::codec` tests still exercise the queue under Miri), the `explore::frontier`
+  tests (batch staging over tens of MiB of states; the module has no `unsafe`, so Miri adds nothing
+  there) and `cleared_candidates_keep_capacity_charged_until_pressure_reclaims_it` (5000 pushes
+  with per-state allocations).
 
 Heavy loops are reduced under `cfg!(miri)` (same code paths, smaller scale) in `tlx-value`
-(`intern`, `arith_fp_fmt`, `order`, `ser`), `tlx-live` (`random`, `scale`), `explore::edges`,
-`fpset::bloom` and the `fpset` table tests. Where reducing the scale would defeat the test, it is
+(`intern`, `arith_fp_fmt`, `order`, `ser`, and the `set_bound` union family), `tlx-live`
+(`normal`, `random`, `scale`, and `tlc`, whose 100,000-entry disjunction runs at 100 under Miri), `tlx-runtime` (`explore::levels` spin rounds and
+`explore::safepoint` task iterations), `explore::edges`, `fpset::bloom` and the `fpset` table tests.
+The workflow also passes `--test-threads=1`: Miri emulates one CPU, so serializing the tests costs
+no wall time and bounds the peak memory of the guest threads (the deep-tableau regression held
+several GiB with the default thread count). Each Miri job has a 25-minute timeout, with the five
+parallel jobs expected to finish in roughly six to ten minutes. `tlx-layout`'s store also keeps a tiny
+radix grid under Miri (`DIR_BITS`/`ROOT_BITS` = 4, so `MAX_NODES` = 65,536 and `Store::new`
+initializes 16 inline `OnceLock`s instead of 4,096): handle packing uses `INDEX_SHIFT`, so the same
+paths run without the interpreter spending minutes initializing the production-sized table. Where reducing the scale would defeat the test, it is
 `#[cfg_attr(miri, ignore)]` with a comment: `random::agrees_with_brute_force` (exponential brute
 force), `tlx-base::frame::frame_round_trip_and_checks` and
 `tlx-base::frame::frame_refuses_other_build` (`frame::build_id` hashes the executable; the tests
 moved with the framing code out of `tlx-value`'s `ser` into `tlx-base`, alongside
-`tlx-base/src/stack.rs`, which the three-crate run above does not cover), and `fpset::tests::watermarks` (filling to the 90%
-watermark takes thousands of probe-heavy inserts). `grow_serially_up_to_the_limit` and
-`grow_with_helper_threads` still exercise the rehash-and-swap path and the helper threads, growing
-explicitly at low load.
+`tlx-base/src/stack.rs`, which the three-crate run above does not cover),
+`fpset::tests::watermarks` (filling to the 90% watermark takes thousands of probe-heavy inserts),
+`tlx-live::search::automaton::sparse_keys_spread_past_two_to_the_26_buckets` (a pure `FxHasher`
+spread over 2^20 entries; shrinking the sample would defeat testing bucket bits 26-27, while
+`node_map_keys_by_state_and_slot` still covers `sparse_key` and `NodeMap::Sparse` under Miri).
+`grow_serially_up_to_the_limit` and `grow_with_helper_threads` still exercise the rehash-and-swap
+path and the helper threads, growing explicitly at low load.
 
 Not covered by Miri (it cannot run them; audited by hand above): `io/` (`mmap`, files, `flock`),
 `mem.rs`, `explore/checkpoint/` (files), `tlx-base/src/stack.rs` and `tlx-base/src/stack/overflow.rs`
 (pthread stack-bounds queries, evaluation-stack threads and alternate-stack signal handling), and the
 queue's disk and spill paths. `tlx-value` and `tlx-live` are covered in full. Miri did exercise the string
 interner's append-only table (single-threaded and concurrent), the fingerprint table's
-insert/probe/grow paths including concurrent inserts, the safepoint spin/park protocol, and the
-`transmute` plus raw-pointer deref in `live.rs`.
+insert/probe/grow paths including concurrent inserts, the explore level barriers' spin/park protocol, and the
+`transmute` plus raw-pointer deref in `live.rs`; the `parking_lot`-based park
+protocol in `explore/safepoint.rs` is native-only until parking_lot moves to
+`parking_lot_core` 0.10 (see the skip above).
 
 ## Tools
 
-- **Miri**: see above.
+- **Miri**: automated by [`.github/workflows/sanitizers.yml`](../.github/workflows/sanitizers.yml);
+  see above.
 - **Rust-side ASan** (`-Zsanitizer=address`): not run; Miri covers the pure-Rust crates and the
   generated C is covered by the build below.
-- **ASan + UBSan on generated C**: `TLX_CC_SANITIZE=1` with `-compile`, 2-3 workers and the native
-  code built synchronously (`TLX_NATIVE_SYNC=1`); command in [testing.md](testing.md) section 11.
-  Run over the `tests/specs` models, also with `TLX_PARANOID=1`, and over corpus models with
-  records as unlike each other as Bakery, Paxos, MultiPaxos, Disruptor and the sliding puzzles: no
+- **ASan + UBSan on generated C**: `TLX_CC_SANITIZE=1` with `-compile`, the native code built
+  synchronously (`TLX_NATIVE_SYNC=1`) and the runtime preloaded into the host; the commands and
+  the required `ASAN_OPTIONS`/`UBSAN_OPTIONS` are in [testing.md](testing.md) section 11.
+  `.github/workflows/sanitizers.yml` runs the `tests/specs` suite this way, single-worker with
+  `TLX_PARANOID=1` and with eight workers, after a negative self-test proves both sanitizers halt
+  on an injected defect. The historical manual runs also covered corpus models with records as
+  unlike each other as Bakery, Paxos, MultiPaxos, Disruptor and the sliding puzzles: no
   sanitizer report, and state counts equal to `corpus/out/tlx-compile.json` (except runs that stop
   at a violation, which depend on worker timing, and MCDieHardest, whose ASSUME requires one
   worker).
