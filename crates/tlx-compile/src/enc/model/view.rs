@@ -38,7 +38,7 @@ pub(super) struct View {
 }
 
 pub(super) struct ProjectionOrbit {
-    group: Vec<Vec<tlx_layout::permute::PermPlan>>,
+    engine: super::symmetry::SymmetryEngine,
     order: Vec<usize>,
     layout: Layout,
 }
@@ -63,14 +63,14 @@ impl ProjectionOrbit {
         if super::SemFp::of(&layout, None).is_some() {
             return None;
         }
-        let plans = super::symmetry::compile_symmetry(base, &layout, notes)?;
+        let engine = super::symmetry::compile_symmetry(base, &layout, notes)?;
         let order = super::symmetry::symmetry_order(&layout);
-        Some(Self { group: plans.group, order, layout })
+        Some(Self { engine, order, layout })
     }
 
     pub(super) fn fingerprint(&self, words: &[u64]) -> u64 {
         assert_eq!(words.len(), self.layout.words);
-        super::symmetry::orbit_fp(&self.group, &self.order, &self.layout, words, None, None)
+        super::symmetry::orbit_fp(&self.engine, &self.order, &self.layout, words, None, None)
             .expect("orbit fingerprint without value-store digests cannot fail")
     }
 }

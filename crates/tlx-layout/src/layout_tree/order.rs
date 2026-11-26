@@ -23,6 +23,10 @@ pub(super) struct OrderFacts {
     /// pair in the universe is TLC-comparable (used for bitset sets and `Map`
     /// key domains).
     pub(super) rank_in_tlc_order: bool,
+    /// Every valid pair of encodings of this node (including images under any
+    /// type-preserving model-value permutation) is guaranteed TLC-comparable
+    /// and ordered by `cmp_tlc_words` without error or `None` fallback.
+    pub(super) orbit_cmp_safe: bool,
     /// This node or an active child may hold a `Dyn` or `Ref` handle.
     pub(super) has_dyn_or_ref: bool,
 }
@@ -30,20 +34,26 @@ pub(super) struct OrderFacts {
 impl OrderFacts {
     pub(super) fn of(kind: &Kind, card: Option<u64>) -> OrderFacts {
         match kind {
-            Kind::Never => OrderFacts { raw_word_order: false, rank_in_tlc_order: false, has_dyn_or_ref: false },
-            Kind::Bool => OrderFacts { raw_word_order: true, rank_in_tlc_order: true, has_dyn_or_ref: false },
+            Kind::Never => OrderFacts { raw_word_order: false, rank_in_tlc_order: false, orbit_cmp_safe: false, has_dyn_or_ref: false },
+            Kind::Bool => OrderFacts { raw_word_order: true, rank_in_tlc_order: true, orbit_cmp_safe: true, has_dyn_or_ref: false },
             Kind::Int { lo, hi } => {
                 let ok = lo <= hi;
-                OrderFacts { raw_word_order: ok, rank_in_tlc_order: ok, has_dyn_or_ref: false }
+                OrderFacts { raw_word_order: ok, rank_in_tlc_order: ok, orbit_cmp_safe: ok, has_dyn_or_ref: false }
             }
             Kind::Atom(u) => {
                 let ok = !u.is_empty() && atom_all_comparable(u);
-                OrderFacts { raw_word_order: ok, rank_in_tlc_order: ok, has_dyn_or_ref: false }
+                OrderFacts { raw_word_order: ok, rank_in_tlc_order: ok, orbit_cmp_safe: ok, has_dyn_or_ref: false }
             }
-            Kind::Dyn | Kind::Ref(_) => OrderFacts { raw_word_order: false, rank_in_tlc_order: false, has_dyn_or_ref: true },
+            Kind::Dyn | Kind::Ref(_) => {
+                OrderFacts { raw_word_order: false, rank_in_tlc_order: false, orbit_cmp_safe: false, has_dyn_or_ref: true }
+            }
             Kind::Set { elem, max_card, bitset, .. } => OrderFacts {
                 raw_word_order: bitset.is_none() && (*max_card == 0 || elem.order.raw_word_order),
                 rank_in_tlc_order: false,
+                orbit_cmp_safe: match bitset {
+                    Some(_) => elem.order.rank_in_tlc_order,
+                    None => *max_card == 0 || elem.order.raw_word_order || (*max_card <= 64 && elem.order.orbit_cmp_safe),
+                },
                 has_dyn_or_ref: *max_card > 0 && elem.order.has_dyn_or_ref,
             },
             Kind::Fcn { dom, range, witness, key_variants, .. } => {
@@ -51,27 +61,33 @@ impl OrderFacts {
                 OrderFacts {
                     raw_word_order: no_extra && (dom.is_empty() || range.order.raw_word_order),
                     rank_in_tlc_order: card.is_some() && no_extra && (dom.is_empty() || range.order.rank_in_tlc_order),
+                    orbit_cmp_safe: key_variants.is_empty()
+                        && (dom.is_empty() || (fcn_dom_orbit_cmp_safe(dom) && range.order.orbit_cmp_safe)),
                     has_dyn_or_ref: !dom.is_empty() && range.order.has_dyn_or_ref,
                 }
             }
             Kind::Map { key, range, .. } => OrderFacts {
                 raw_word_order: false,
                 rank_in_tlc_order: false,
+                orbit_cmp_safe: key.order.rank_in_tlc_order && range.order.orbit_cmp_safe,
                 has_dyn_or_ref: key.order.has_dyn_or_ref || range.order.has_dyn_or_ref,
             },
             Kind::Record { fields, .. } => OrderFacts {
                 raw_word_order: fields.iter().all(|(_, n, _)| n.order.raw_word_order),
                 rank_in_tlc_order: card.is_some() && fields.iter().all(|(_, n, _)| n.order.rank_in_tlc_order),
+                orbit_cmp_safe: fields.iter().all(|(_, n, _)| n.order.orbit_cmp_safe),
                 has_dyn_or_ref: fields.iter().any(|(_, n, _)| n.order.has_dyn_or_ref),
             },
             Kind::Tuple { elems, .. } => OrderFacts {
                 raw_word_order: elems.iter().all(|(n, _)| n.order.raw_word_order),
                 rank_in_tlc_order: card.is_some() && elems.iter().all(|(n, _)| n.order.rank_in_tlc_order),
+                orbit_cmp_safe: elems.iter().all(|(n, _)| n.order.orbit_cmp_safe),
                 has_dyn_or_ref: elems.iter().any(|(n, _)| n.order.has_dyn_or_ref),
             },
             Kind::Seq { elem, max_len, .. } => OrderFacts {
                 raw_word_order: *max_len == 0 || elem.order.raw_word_order,
                 rank_in_tlc_order: card.is_some() && (*max_len == 0 || elem.order.rank_in_tlc_order),
+                orbit_cmp_safe: *max_len == 0 || elem.order.orbit_cmp_safe,
                 has_dyn_or_ref: *max_len > 0 && elem.order.has_dyn_or_ref,
             },
             Kind::Union { arms, .. } => {
@@ -79,6 +95,7 @@ impl OrderFacts {
                 OrderFacts {
                     raw_word_order: ordered && arms.iter().all(|a| a.order.raw_word_order),
                     rank_in_tlc_order: card.is_some() && ordered && arms.iter().all(|a| a.order.rank_in_tlc_order),
+                    orbit_cmp_safe: ordered && arms.iter().all(|a| a.order.orbit_cmp_safe),
                     has_dyn_or_ref: arms.iter().any(|a| a.order.has_dyn_or_ref),
                 }
             }
@@ -91,6 +108,21 @@ impl LayoutNode {
     #[inline]
     pub fn has_dyn_or_ref(&self) -> bool {
         self.order.has_dyn_or_ref
+    }
+
+    /// Whether raw unsigned slice comparison agrees unconditionally with
+    /// `cmp_tlc` on canonical encodings of this node.
+    #[inline]
+    pub fn is_raw_word_order(&self) -> bool {
+        self.order.raw_word_order
+    }
+
+    /// Whether every valid pair of encodings of this node (including images
+    /// under any type-preserving model-value permutation) is guaranteed
+    /// TLC-comparable and ordered by `cmp_tlc_words` without error.
+    #[inline]
+    pub fn is_orbit_cmp_safe(&self) -> bool {
+        self.order.orbit_cmp_safe
     }
 
     /// Compare two canonical encodings of this node's shape in TLC's value
@@ -389,6 +421,72 @@ fn is_untyped_mv_in_atom(kind: &Kind, words: &[u64]) -> bool {
 /// pair of distinct arm indices `i < j`.
 fn union_arms_strictly_tlc_ordered(arms: &[LayoutNode]) -> bool {
     arms.windows(2).all(|w| cmp_static_union_arms(&w[0].kind, &w[1].kind) == Some(Ordering::Less))
+}
+
+/// Whether `dom` of a `Shape::Fcn` is strictly ascending in `cmp_tlc` and
+/// every pair of keys (including images under any type-preserving model-value
+/// permutation) is guaranteed TLC-comparable.
+fn fcn_dom_orbit_cmp_safe(dom: &[Value]) -> bool {
+    if !dom.iter().all(tlx_value::order::self_comparison_is_inert)
+        || !dom.windows(2).all(|w| tlx_value::order::cmp_tlc(&w[0], &w[1]).ok() == Some(Ordering::Less))
+    {
+        return false;
+    }
+    // Scalar domain: all non-untyped-model-value entries must share one TLC kind.
+    let mut kind: Option<u8> = None;
+    let mut mv_ty: Option<char> = None;
+    let mut all_scalar = true;
+    for v in dom {
+        match v {
+            Value::Bool(_) => {
+                if kind.is_some_and(|k| k != 1) {
+                    return false;
+                }
+                kind = Some(1);
+            }
+            Value::Int(_) => {
+                if kind.is_some_and(|k| k != 2) {
+                    return false;
+                }
+                kind = Some(2);
+            }
+            Value::Str(_) => {
+                if kind.is_some_and(|k| k != 3) {
+                    return false;
+                }
+                kind = Some(3);
+            }
+            Value::ModelValue(s) => {
+                if let Some(t) = s.model_value_type() {
+                    if kind.is_some_and(|k| k != 4) || mv_ty.is_some_and(|p| p != t) {
+                        return false;
+                    }
+                    kind = Some(4);
+                    mv_ty = Some(t);
+                }
+            }
+            _ => {
+                all_scalar = false;
+                break;
+            }
+        }
+    }
+    if all_scalar {
+        return true;
+    }
+    // Compound domain keys: safe unconditionally when no model value appears
+    // (fixed under all symmetry permutations).
+    fn has_model_value(v: &Value) -> bool {
+        match v {
+            Value::ModelValue(_) => true,
+            Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+            Value::Set(es) | Value::Tuple(es) => es.iter().any(has_model_value),
+            Value::Record(fs) => fs.iter().any(|(_, e)| has_model_value(e)),
+            Value::Fcn(ps, _) => ps.iter().any(|(k, e)| has_model_value(k) || has_model_value(e)),
+            Value::LazySet(_) | Value::LazyFcn(_) => true,
+        }
+    }
+    !dom.iter().any(has_model_value)
 }
 
 /// Whether every pair of atoms in `u` (already sorted by `Value::cmp`) is

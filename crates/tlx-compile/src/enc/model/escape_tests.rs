@@ -289,3 +289,61 @@ V == IF x = 0 THEN <<0, 1>> ELSE IF x = 1 THEN [i \in {1, 2} |-> i - 1] ELSE "ou
     assert_eq!(fp2_inline, fp2_escaped);
     assert_ne!(fp0, fp2_inline);
 }
+
+#[test]
+fn escape_fp_large_factorized_symmetry_matches_inline_and_outliers() {
+    let src = r#"---- MODULE EscapeLargeSym ----
+EXTENDS Integers, TLC
+CONSTANT N
+VARIABLES x, y
+Sym == Permutations(N)
+V == <<x, y>>
+Init == x = 0 /\ y \in N
+Next == UNCHANGED <<x, y>>
+===="#;
+    let cfg_noview = "CONSTANT N = {n1, n2, n3, n4, n5, n6, n7}\nINIT Init\nNEXT Next\nSYMMETRY Sym\n";
+    let cfg_view = format!("{cfg_noview}VIEW V\n");
+    let mut n_vals: Vec<Value> = (1..=7).map(|i| Value::ModelValue(tlx_value::Sym::new(&format!("n{i}")))).collect();
+    n_vals.sort();
+    let x_shape = Shape::Int { lo: 0, hi: 1 };
+    let y_shape = Shape::Atom(n_vals.clone().into());
+    let settings = Settings::from_lookup(|k| match k {
+        "TLX_ESCAPE" | "TLX_NO_NATIVE" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
+
+    // No-VIEW: inline, force-escaped, and genuine outlier states across S_7 (order 5040 > 720).
+    let base_nv = Arc::new(load(src, cfg_noview));
+    assert!(base_nv.symmetry_maps().is_empty());
+    let model_nv = EncModel::new(base_nv, Arc::new(Layout::new(vec![x_shape.clone(), y_shape.clone()])), vec![], &settings);
+    assert!(matches!(model_nv.fp, Fingerprint::Symmetry { .. }));
+    let codec = &model_nv.escape.as_ref().unwrap().codec;
+    let fp_inline_0 = model_nv.words_fp(&codec.encode(&[Value::Int(0), n_vals[0].clone()]).unwrap(), 1).unwrap();
+    let fp_outlier_0 = model_nv.words_fp(&codec.encode(&[Value::Int(999), n_vals[0].clone()]).unwrap(), 1).unwrap();
+    assert_ne!(fp_inline_0, fp_outlier_0);
+    for v in &n_vals {
+        let inline = codec.encode(&[Value::Int(0), v.clone()]).unwrap();
+        let forced = codec.force_escape(&[Value::Int(0), v.clone()]).unwrap();
+        let outlier = codec.encode(&[Value::Int(999), v.clone()]).unwrap();
+        assert_eq!(model_nv.words_fp(&inline, 1).unwrap(), fp_inline_0);
+        assert_eq!(model_nv.words_fp(&forced, 1).unwrap(), fp_inline_0);
+        assert_eq!(model_nv.words_fp(&outlier, 1).unwrap(), fp_outlier_0);
+    }
+
+    // With VIEW: SymView on S_7 handles both force-escaped and genuine outliers.
+    let base_v = Arc::new(load(src, &cfg_view));
+    let view_def = super::super::speculate::view_def(&base_v).unwrap();
+    let view_shape = Shape::Tuple(vec![x_shape.clone(), y_shape.clone()].into());
+    let model_v = EncModel::new(base_v, Arc::new(Layout::new(vec![x_shape, y_shape])), vec![(view_def, view_shape)], &settings);
+    assert!(matches!(model_v.fp, Fingerprint::SymView { .. }));
+    let codec_v = &model_v.escape.as_ref().unwrap().codec;
+    let vfp_inline = model_v.words_fp(&codec_v.encode(&[Value::Int(0), n_vals[0].clone()]).unwrap(), 1).unwrap();
+    let vfp_outlier = model_v.words_fp(&codec_v.encode(&[Value::Int(999), n_vals[0].clone()]).unwrap(), 1).unwrap();
+    for v in &n_vals {
+        let forced = codec_v.force_escape(&[Value::Int(0), v.clone()]).unwrap();
+        let outlier = codec_v.encode(&[Value::Int(999), v.clone()]).unwrap();
+        assert_eq!(model_v.words_fp(&forced, 1).unwrap(), vfp_inline);
+        assert_eq!(model_v.words_fp(&outlier, 1).unwrap(), vfp_outlier);
+    }
+}

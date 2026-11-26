@@ -12,7 +12,10 @@ use tlx_runtime::stats::{self, C, T};
 use tlx_runtime::{Model, ModelError};
 use tlx_value::Value;
 
-use super::symmetry::{orbit_fp, RefDigests};
+use super::symmetry::{
+    apply_factor_img, least_perm_words_factorized, orbit_fp, orbit_fp_explicit, orbit_fp_factorized, FactorSymmetry, RefDigests,
+    SymmetryEngine,
+};
 use super::{EState, EncModel, View};
 use crate::paranoid::{mismatch, state_list};
 
@@ -29,6 +32,8 @@ pub(in crate::enc) struct SemFp {
     pub(in crate::enc) view: Box<[usize]>,
     /// Per variable: its slot is one handle.
     pub(in crate::enc) ref_vars: Box<[bool]>,
+    /// Per variable: range into `state` of that variable's handle offsets.
+    pub(in crate::enc) var_refs: Box<[std::ops::Range<usize>]>,
 }
 
 thread_local! {
@@ -45,16 +50,21 @@ impl SemFp {
         }
         let mut state = Vec::new();
         let mut v = Vec::new();
+        let mut var_refs = Vec::with_capacity(layout.vars.len());
         if store.is_some() {
             for (s, off) in layout.vars.iter().zip(&layout.offsets) {
+                let start = state.len();
                 tlx_layout::layout::ref_offsets(s, *off, &mut state).expect("value store handles at fixed positions");
+                var_refs.push(start..state.len());
             }
             if let Some(s) = view {
                 tlx_layout::layout::ref_offsets(s, 0, &mut v).expect("value store handles at fixed positions");
             }
+        } else {
+            var_refs.resize(layout.vars.len(), 0..0);
         }
         let ref_vars = layout.vars.iter().map(|s| matches!(s, Shape::Ref(_))).collect();
-        Some(SemFp { store, state: state.into(), view: v.into(), ref_vars })
+        Some(SemFp { store, state: state.into(), view: v.into(), ref_vars, var_refs: var_refs.into() })
     }
 
     pub(in crate::enc) fn state_needs_canonical(&self, layout: &Layout) -> bool {
@@ -127,20 +137,19 @@ impl SemFp {
 pub(super) enum Fingerprint {
     /// `fp_words` of the encoding (no VIEW or SYMMETRY).
     Words,
-    /// SYMMETRY on encodings: per group element, one plan per variable. The
-    /// fingerprint is that of the least encoding in the orbit (`orbit_fp`,
-    /// comparing the variables in `order`, narrowest first).
-    Symmetry { group: Vec<Vec<PermPlan>>, order: Vec<usize> },
+    /// SYMMETRY on encodings: factorized partition-refinement or explicit
+    /// per-element plans (`orbit_fp`, comparing variables in `order`,
+    /// narrowest first).
+    Symmetry { engine: SymmetryEngine, order: Vec<usize> },
     /// VIEW computed into an encoding: the fingerprint is that of the
     /// VIEW's encoding.
     View(View),
     /// VIEW with SYMMETRY: the fingerprint of the VIEW (as in `View`) of
     /// the least state of the orbit in TLC's value order (`order` = TLC's
     /// variable order), chosen directly on encoded words (`LayoutNode::cmp_tlc_words`)
-    /// with fallback to `InterpModel::least_perm` when a compared variable
-    /// cannot be ordered on words. `visit` is the interpreter's fallible
-    /// permutation order, indexed like `group`.
-    SymView { group: Vec<Vec<PermPlan>>, visit: Vec<usize>, order: Vec<usize>, view: View },
+    /// with fallback to `InterpModel::least_factor_perm` / `least_perm` when a
+    /// compared variable cannot be ordered on words.
+    SymView { engine: SymmetryEngine, order: Vec<usize>, view: View },
     /// By value: the interpreter's (reduced) fingerprint, for a VIEW or
     /// SYMMETRY not handled on encodings (states are decoded for it).
     Values,
@@ -185,31 +194,47 @@ impl EncModel {
         }
         match &self.fp {
             Fingerprint::View(v) => self.view_fp(v, words, level),
-            Fingerprint::Symmetry { group, order } => {
-                let has_store = self.value_store().is_some();
-                if has_store {
-                    tlx_layout::store::clear_full_hit();
-                }
-                if has_store && self.store_pressure() {
-                    return self.symmetry_fp_values(group, order, words);
-                }
-                if self.paranoid {
-                    self.check_permutations(group, words);
-                    if has_store && tlx_layout::store::take_full_hit() {
-                        return self.symmetry_fp_values(group, order, words);
+            Fingerprint::Symmetry { engine, order } => match engine {
+                SymmetryEngine::Factorized(fsym) => {
+                    let fp = orbit_fp_factorized(fsym, &self.layout, words, self.sem.as_ref());
+                    if self.paranoid {
+                        let has_store = self.value_store().is_some();
+                        if has_store {
+                            tlx_layout::store::clear_full_hit();
+                        }
+                        self.check_factor_generators(fsym, words, Some(fp));
+                        if has_store {
+                            let _ = tlx_layout::store::take_full_hit();
+                        }
                     }
+                    Ok(fp)
                 }
-                let fp = orbit_fp(group, order, &self.layout, words, self.sem.as_ref(), None)?;
-                if has_store && tlx_layout::store::take_full_hit() {
-                    // The failed insertion requested a collection: subsequent
-                    // fingerprints take the digest path until it runs. Finish
-                    // this one from decoded values instead of rematerializing
-                    // the image on a retry.
-                    return self.symmetry_fp_values(group, order, words);
+                SymmetryEngine::Explicit(plans) => {
+                    let has_store = self.value_store().is_some();
+                    if has_store {
+                        tlx_layout::store::clear_full_hit();
+                    }
+                    if has_store && self.store_pressure() {
+                        return self.symmetry_fp_values(&plans.group, order, words);
+                    }
+                    if self.paranoid {
+                        self.check_permutations(&plans.group, words);
+                        if has_store && tlx_layout::store::take_full_hit() {
+                            return self.symmetry_fp_values(&plans.group, order, words);
+                        }
+                    }
+                    let fp = orbit_fp_explicit(&plans.group, order, &self.layout, words, self.sem.as_ref(), None)?;
+                    if has_store && tlx_layout::store::take_full_hit() {
+                        // The failed insertion requested a collection: subsequent
+                        // fingerprints take the digest path until it runs. Finish
+                        // this one from decoded values instead of rematerializing
+                        // the image on a retry.
+                        return self.symmetry_fp_values(&plans.group, order, words);
+                    }
+                    Ok(fp)
                 }
-                Ok(fp)
-            }
-            Fingerprint::SymView { group, visit, order, view } => self.sym_view_fp(group, visit, order, view, words, level),
+            },
+            Fingerprint::SymView { engine, order, view } => self.sym_view_fp(engine, order, view, words, level),
             Fingerprint::Words | Fingerprint::Values => Ok(match &self.sem {
                 Some(sem) => sem.fp_state(&self.layout, words),
                 None => fp_words(words),
@@ -222,33 +247,43 @@ impl EncModel {
         match &self.fp {
             Fingerprint::View(v) => self.escape_view_fp(v, &vals, level),
             Fingerprint::SymView { view, .. } => {
-                let decode = |i: usize| vals[i].clone();
-                let mut state = StateVals::decoded(vals.len(), &decode);
-                let least = self.base.least_perm(&mut state).inspect_err(|_| self.base.count_generated())?;
-                let vals = match least {
-                    Some(p) => self.escape_permute(&vals, p)?,
-                    None => vals,
-                };
+                let least = self.base.least_state_in_orbit(&vals).inspect_err(|_| self.base.count_generated())?;
+                let vals = least.unwrap_or(vals);
                 self.escape_view_fp(view, &vals, level)
             }
-            Fingerprint::Symmetry { order, .. } => {
-                let mut best = e.codec.key(words);
-                for p in 0..self.base.symmetry_maps().len() {
-                    let vals = self.escape_permute(&vals, p)?;
-                    let words = e.codec.encode(&vals).map_err(|x| ModelError::new(format!("escape store: {x:?}")))?;
-                    let key = e.codec.key(&words);
-                    let cmp = order.iter().find_map(|&i| {
-                        let r = self.layout.var_range(i);
-                        let c = key[r.clone()].cmp(&best[r]);
-                        let c =
-                            c.then_with(|| key.get(self.layout.words + i).unwrap_or(&0).cmp(best.get(self.layout.words + i).unwrap_or(&0)));
-                        (c != std::cmp::Ordering::Equal).then_some(c)
-                    });
-                    if cmp == Some(std::cmp::Ordering::Less) {
-                        best = key;
+            Fingerprint::Symmetry { engine, order } => {
+                let key = e.codec.key(words);
+                if key.len() == self.layout.words {
+                    return orbit_fp(engine, order, &self.layout, &key, self.sem.as_ref(), None);
+                }
+                match engine {
+                    SymmetryEngine::Factorized(_) => {
+                        let canon = self.base.canonical_total_orbit(&vals, order)?;
+                        let canon_vals = canon.as_deref().unwrap_or(&vals);
+                        let canon_words = e.codec.encode(canon_vals).map_err(|x| ModelError::new(format!("escape store: {x:?}")))?;
+                        Ok(fp_words(&e.codec.key(&canon_words)))
+                    }
+                    SymmetryEngine::Explicit(_) => {
+                        let mut best = key;
+                        for p in 0..self.base.symmetry_maps().len() {
+                            let vals = self.escape_permute(&vals, p)?;
+                            let words = e.codec.encode(&vals).map_err(|x| ModelError::new(format!("escape store: {x:?}")))?;
+                            let key = e.codec.key(&words);
+                            let cmp = order.iter().find_map(|&i| {
+                                let r = self.layout.var_range(i);
+                                let c = key[r.clone()].cmp(&best[r]);
+                                let c = c.then_with(|| {
+                                    key.get(self.layout.words + i).unwrap_or(&0).cmp(best.get(self.layout.words + i).unwrap_or(&0))
+                                });
+                                (c != std::cmp::Ordering::Equal).then_some(c)
+                            });
+                            if cmp == Some(std::cmp::Ordering::Less) {
+                                best = key;
+                            }
+                        }
+                        Ok(fp_words(&best))
                     }
                 }
-                Ok(fp_words(&best))
             }
             Fingerprint::Words => Ok(fp_words(&e.codec.key(words))),
             Fingerprint::Values => {
@@ -303,8 +338,70 @@ impl EncModel {
 
     /// Fingerprint of the VIEW of the least state of the SYMMETRY orbit of
     /// the state `words` (see `Fingerprint::SymView`).
+    fn sym_view_fp(&self, engine: &SymmetryEngine, order: &[usize], v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
+        match engine {
+            SymmetryEngine::Factorized(fsym) => self.sym_view_fp_factorized(fsym, order, v, words, level),
+            SymmetryEngine::Explicit(plans) => self.sym_view_fp_explicit(&plans.group, &plans.visit, order, v, words, level),
+        }
+    }
+
+    fn sym_view_fp_factorized(
+        &self,
+        fsym: &FactorSymmetry,
+        order: &[usize],
+        v: &View,
+        words: &[u64],
+        level: u32,
+    ) -> Result<u64, ModelError> {
+        let has_store = self.value_store().is_some();
+        if has_store && self.store_pressure() {
+            return self.sym_view_fp_values(v, words, level);
+        }
+        if has_store {
+            tlx_layout::store::clear_full_hit();
+        }
+        if self.paranoid {
+            self.check_factor_generators(fsym, words, None);
+            if has_store && tlx_layout::store::take_full_hit() {
+                return self.sym_view_fp_values(v, words, level);
+            }
+        }
+        let word_res = PERM_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            let best_buf = &mut b.0;
+            let non_id = least_perm_words_factorized(fsym, order, &self.layout, words, best_buf)?;
+            if self.paranoid {
+                self.check_sym_view_least_state(words, non_id, best_buf);
+            }
+            Some(if non_id { self.view_fp(v, best_buf, level) } else { self.view_fp(v, words, level) })
+        });
+        if let Some(fp) = word_res {
+            return fp;
+        }
+        // Fallback: decode variables lazily and delegate to `InterpModel::least_factor_perm`
+        // (already factorized in `tlx-eval` and supports arbitrary group orders).
+        // SAFETY: the matching encoder/program produced these words.
+        // Active Dyn handles were published before this call.
+        let decode = |i: usize| unsafe { self.layout.node(i).decode_unchecked(&words[self.layout.offsets[i]..]) };
+        let mut vals = StateVals::decoded(self.layout.vars.len(), &decode);
+        let least = self.base.least_factor_perm(&mut vals).inspect_err(|_| self.base.count_generated())?;
+        drop(vals);
+        let Some(img) = least else {
+            return self.view_fp(v, words, level);
+        };
+        PERM_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            let buf = &mut b.0;
+            apply_factor_img(fsym, &self.layout, &img, words, buf);
+            if has_store && tlx_layout::store::take_full_hit() {
+                return self.sym_view_fp_values(v, words, level);
+            }
+            self.view_fp(v, buf, level)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)] // group, visit order, variable order, VIEW, words, level
-    fn sym_view_fp(
+    fn sym_view_fp_explicit(
         &self,
         group: &[Vec<PermPlan>],
         visit: &[usize],
@@ -395,7 +492,7 @@ impl EncModel {
     /// decoded value instead of interning the image.
     fn symmetry_fp_values(&self, group: &[Vec<PermPlan>], order: &[usize], words: &[u64]) -> Result<u64, ModelError> {
         let digests = RefDigests::new(&self.layout, words, self.base.symmetry_maps());
-        orbit_fp(group, order, &self.layout, words, self.sem.as_ref(), Some(&digests))
+        orbit_fp_explicit(group, order, &self.layout, words, self.sem.as_ref(), Some(&digests))
     }
 
     /// `SymView` fingerprint under persistent value-store pressure: select the
@@ -406,14 +503,9 @@ impl EncModel {
     fn sym_view_fp_values(&self, v: &View, words: &[u64], level: u32) -> Result<u64, ModelError> {
         // SAFETY: the matching encoder/program produced these words.
         // Active Dyn handles were published before this call.
-        let mut vals = unsafe { self.layout.decode_state_unchecked(words) };
-        let least = {
-            let mut state = StateVals::Given(&vals);
-            self.base.least_perm(&mut state)?
-        };
-        if let Some(p) = least {
-            vals = self.escape_permute(&vals, p)?;
-        }
+        let vals = unsafe { self.layout.decode_state_unchecked(words) };
+        let least = self.base.least_state_in_orbit(&vals)?;
+        let vals = least.unwrap_or(vals);
         self.view_values_fp(v, &vals, level)
     }
 
@@ -626,6 +718,84 @@ impl EncModel {
                     "VIEW+SYMMETRY permuted words (perm {p}) on state\n{}\nexpected: {want_words:?}\ngot:      {best_buf:?}",
                     state_list(&self.base, &[st])
                 ));
+            }
+        }
+    }
+
+    /// Paranoid: factorized word-level `SymView` agrees with
+    /// `InterpModel::least_state_in_orbit` for any group order (including `|G| > 720`).
+    fn check_sym_view_least_state(&self, words: &[u64], non_id: bool, best_buf: &[u64]) {
+        // SAFETY: the matching encoder/program produced these words.
+        // Active Dyn handles were published before this call.
+        let original = unsafe { self.layout.decode_state_unchecked(words) };
+        let interp = match self.base.least_state_in_orbit(&original) {
+            Ok(Some(v)) => v,
+            Ok(None) => original.clone(),
+            Err(e) => mismatch(format_args!(
+                "VIEW+SYMMETRY least_state_in_orbit on state\n{}\ninterpreter: Err({e:?})\ncompiled:    Ok(non_id={non_id})",
+                state_list(&self.base, std::slice::from_ref(&original))
+            )),
+        };
+        // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+        let compiled = unsafe { self.layout.decode_state_unchecked(if non_id { best_buf } else { words }) };
+        if interp != compiled {
+            mismatch(format_args!(
+                "VIEW+SYMMETRY factorized least representative on state\n{}\ninterpreter:\n{}\ncompiled (non_id={non_id}):\n{}",
+                state_list(&self.base, std::slice::from_ref(&original)),
+                state_list(&self.base, std::slice::from_ref(&interp)),
+                state_list(&self.base, std::slice::from_ref(&compiled))
+            ));
+        }
+    }
+
+    /// Paranoid: verify every adjacent transposition generator `(k, k+1)` of
+    /// every factor applies identically to value-level `ops::permute`, and
+    /// (for `Fingerprint::Symmetry`) preserves the exact orbit fingerprint.
+    /// Since adjacent transpositions generate `prod_g Sym(K_g)`, this verifies
+    /// full orbit invariance in `O(sum_g n_g)` checks even when `|G| > 720`.
+    fn check_factor_generators(&self, fsym: &FactorSymmetry, words: &[u64], check_orbit: Option<u64>) {
+        let has_store = self.value_store().is_some();
+        // SAFETY: the matching encoder/program produced these words.
+        // Active Dyn handles were published before this call.
+        let vals = unsafe { self.layout.decode_state_unchecked(words) };
+        let mut gen_img = fsym.fg.identity_img();
+        let mut buf = Vec::with_capacity(words.len());
+        for factor in fsym.fg.factors.iter() {
+            let off = factor.offset;
+            for k in 0..factor.keys.len() - 1 {
+                gen_img[off + k] = (k + 1) as u16;
+                gen_img[off + k + 1] = k as u16;
+                apply_factor_img(fsym, &self.layout, &gen_img, words, &mut buf);
+                if has_store && tlx_layout::store::peek_full_hit() {
+                    return;
+                }
+                // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
+                let got = unsafe { self.layout.decode_state_unchecked(&buf) };
+                let want: Vec<Value> =
+                    vals.iter().map(|v| tlx_value::ops::permute(v, &|m| fsym.fg.map_sym(m, &gen_img).cloned()).expect("permute")).collect();
+                if got != want {
+                    mismatch(format_args!(
+                        "SYMMETRY (factorized): generator swap ({}, {}) on\n{}\ndecodes to\n{}\ninstead of\n{}",
+                        factor.keys[k].as_str(),
+                        factor.keys[k + 1].as_str(),
+                        state_list(&self.base, std::slice::from_ref(&vals)),
+                        state_list(&self.base, &[got]),
+                        state_list(&self.base, &[want])
+                    ));
+                }
+                if let Some(expected_fp) = check_orbit {
+                    let gen_fp = orbit_fp_factorized(fsym, &self.layout, &buf, self.sem.as_ref());
+                    if gen_fp != expected_fp {
+                        mismatch(format_args!(
+                            "SYMMETRY (factorized): orbit_fp not invariant under generator swap ({}, {}) on\n{}\noriginal fp: {expected_fp:#018x}\nswapped fp:  {gen_fp:#018x}",
+                            factor.keys[k].as_str(),
+                            factor.keys[k + 1].as_str(),
+                            state_list(&self.base, std::slice::from_ref(&vals))
+                        ));
+                    }
+                }
+                gen_img[off + k] = k as u16;
+                gen_img[off + k + 1] = (k + 1) as u16;
             }
         }
     }
