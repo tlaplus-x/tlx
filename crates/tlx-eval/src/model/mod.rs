@@ -580,15 +580,17 @@ impl InterpModel {
     /// (`autosym`); the model must not have a declared SYMMETRY. Under
     /// `TLX_SYMMETRY_PARANOID=N` one expanded state in N is checked against
     /// it (`check_symmetry_claim`).
-    pub fn apply_symmetry(&mut self, gens: Vec<std::collections::HashMap<Sym, Value>>) {
+    pub fn apply_symmetry(&mut self, gens: Vec<std::collections::HashMap<Sym, Value>>) -> EResult<()> {
         assert!(self.group.is_empty(), "apply_symmetry with a declared SYMMETRY");
         let every = tlx_base::knobs::Env::process().opt_num("TLX_SYMMETRY_PARANOID").ok().flatten();
-        if let Some(every) = every.filter(|n| *n > 0) {
+        let claim = every.filter(|n| *n > 0).map(|every| {
             let plain = InterpModel { claim: None, ..self.with_fp_mode(FpMode::Plain) };
-            self.claim = Some(Arc::new(Claim { plain, gens: gens.clone(), every, seen: Default::default() }));
-        }
-        self.group = Group::from_generators(gens);
+            Arc::new(Claim { plain, gens: gens.clone(), every, seen: Default::default() })
+        });
+        self.group = Group::from_generators(gens)?;
+        self.claim = claim;
         self.fp_mode = FpMode::Reduced;
+        Ok(())
     }
 
     /// Whether the state being expanded is to be checked against the

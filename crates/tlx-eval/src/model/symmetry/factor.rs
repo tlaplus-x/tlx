@@ -66,7 +66,7 @@ pub(in crate::model) fn symmetry_group(ip: &Arc<Interp>, e: &Expr) -> EResult<Gr
             }
             let fallback =
                 if normalized_sets == factors { FallbackOrder::DisjointFull } else { FallbackOrder::OverlappingSets(normalized_sets) };
-            return Ok(Group::from_factors_with_fallback(factors, fallback));
+            return Group::from_factors_with_fallback(factors, fallback);
         }
     }
     let set = ip.eval(e, &Env::default(), &Ctx::NONE)?;
@@ -77,7 +77,7 @@ pub(in crate::model) fn symmetry_group(ip: &Arc<Interp>, e: &Expr) -> EResult<Gr
             gens.push(m);
         }
     }
-    Ok(Group::from_generators(gens))
+    Group::from_generators(gens)
 }
 
 /// Syntactically recognize `Permutations(S)`, unions (`\cup`), empty sets, and
@@ -344,7 +344,15 @@ pub(super) struct FactorizedGroup {
 }
 
 impl FactorizedGroup {
-    pub(super) fn new(raw_factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> FactorizedGroup {
+    pub(super) fn new(raw_factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> EResult<FactorizedGroup> {
+        // Factor ids are zero-based, but partition blocks also store the exclusive
+        // end of each factor in a u16.
+        if raw_factors.len() > usize::from(u16::MAX) + 1 {
+            return Err(EvalError::new(format!("SYMMETRY has {} factors, exceeding the limit of 65536", raw_factors.len())));
+        }
+        if let Some(keys) = raw_factors.iter().find(|keys| keys.len() > usize::from(u16::MAX)) {
+            return Err(EvalError::new(format!("SYMMETRY factor has {} model values, exceeding the limit of 65535", keys.len())));
+        }
         let mut factors = Vec::with_capacity(raw_factors.len());
         let mut key_index = Vec::new();
         let mut offset = 0usize;
@@ -365,7 +373,7 @@ impl FactorizedGroup {
         key_index.sort_unstable_by_key(|&(id, _, _)| id);
         let min_id = key_index.first().map_or(u32::MAX, |&(id, _, _)| id);
         let max_id = key_index.last().map_or(0, |&(id, _, _)| id);
-        FactorizedGroup { factors, key_index, min_id, max_id, total_keys: offset, order, fallback }
+        Ok(FactorizedGroup { factors, key_index, min_id, max_id, total_keys: offset, order, fallback })
     }
 
     /// Encode a single `Perm` into this group's flat image table.

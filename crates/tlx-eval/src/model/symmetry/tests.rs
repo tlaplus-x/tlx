@@ -32,7 +32,7 @@ fn explicit_group() -> (Group, [Sym; 3]) {
 
 fn factorized_group() -> (Group, [Sym; 3]) {
     let atoms = [Sym::new("bag_a"), Sym::new("bag_b"), Sym::new("bag_c")];
-    let g = Group::from_generators(adjacent_transpositions(&atoms));
+    let g = Group::from_generators(adjacent_transpositions(&atoms)).unwrap();
     assert!(matches!(g.kind, GroupKind::Factorized(_)));
     (g, atoms)
 }
@@ -316,7 +316,7 @@ fn factorized_rank_matches_materialized_symmetry_maps() {
     let b = [Sym::new("rk_b0"), Sym::new("rk_b1")];
     let mut gens = adjacent_transpositions(&a);
     gens.extend(adjacent_transpositions(&b));
-    let g = Group::from_generators(gens);
+    let g = Group::from_generators(gens).unwrap();
     let GroupKind::Factorized(fg) = &g.kind else { panic!("expected factorized group") };
     let maps = g.symmetry_maps();
     assert_eq!(maps.len(), 3 * 2 * 2 - 1);
@@ -356,7 +356,7 @@ fn non_full_subgroups_fall_back_to_explicit() {
     let a = [Sym::new("cyc_a"), Sym::new("cyc_b"), Sym::new("cyc_c")];
     let b = [Sym::new("cyc_d"), Sym::new("cyc_e")];
     let c3 = vec![HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[2])), (a[2], Value::ModelValue(a[0]))])];
-    let g_c3 = Group::from_generators(c3);
+    let g_c3 = Group::from_generators(c3).unwrap();
     assert!(matches!(g_c3.kind, GroupKind::Explicit { .. }));
     assert_eq!(g_c3.symmetry_maps().len(), 2);
 
@@ -366,7 +366,7 @@ fn non_full_subgroups_fall_back_to_explicit() {
         (b[0], Value::ModelValue(b[1])),
         (b[1], Value::ModelValue(b[0])),
     ])];
-    let g_diag = Group::from_generators(diag);
+    let g_diag = Group::from_generators(diag).unwrap();
     assert!(matches!(g_diag.kind, GroupKind::Explicit { .. }));
     assert_eq!(g_diag.symmetry_maps().len(), 1);
 
@@ -374,7 +374,7 @@ fn non_full_subgroups_fall_back_to_explicit() {
         HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[2])), (a[2], Value::ModelValue(a[0]))]),
         HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[0]))]),
     ];
-    let g_s3 = Group::from_generators(s3_2gen);
+    let g_s3 = Group::from_generators(s3_2gen).unwrap();
     assert!(matches!(g_s3.kind, GroupKind::Factorized(_)));
     assert_eq!(g_s3.symmetry_maps().len(), 5);
 }
@@ -383,7 +383,7 @@ fn non_full_subgroups_fall_back_to_explicit() {
 fn parity_with_brute_across_s4_keyed_sets_fcns_and_endomorphisms() {
     let a = [Sym::new("s4_0"), Sym::new("s4_1"), Sym::new("s4_2"), Sym::new("s4_3")];
     let gens = adjacent_transpositions(&a);
-    let fg = Group::from_generators(gens.clone());
+    let fg = Group::from_generators(gens.clone()).unwrap();
     assert!(matches!(fg.kind, GroupKind::Factorized(_)));
     let explicit = Group::explicit(closure(gens));
     let GroupKind::Explicit { perms, .. } = &explicit.kind else { unreachable!() };
@@ -445,7 +445,7 @@ fn parity_with_brute_across_multi_factor_s3_x_s3_including_nested_maps_and_total
     let k2 = [Sym::new("mf_b0"), Sym::new("mf_b1"), Sym::new("mf_b2")];
     let mut gens = adjacent_transpositions(&k1);
     gens.extend(adjacent_transpositions(&k2));
-    let fg = Group::from_generators(gens.clone());
+    let fg = Group::from_generators(gens.clone()).unwrap();
     assert!(matches!(fg.kind, GroupKind::Factorized(_)));
     let explicit = Group::explicit(closure(gens));
     let GroupKind::Explicit { perms, .. } = &explicit.kind else { unreachable!() };
@@ -501,7 +501,7 @@ fn parity_with_brute_across_multi_factor_s3_x_s3_including_nested_maps_and_total
 #[test]
 fn large_disjoint_products_scale_without_enumerating_group() {
     let s8: Vec<Sym> = (0..8).map(|i| Sym::new(&format!("big_n{i}"))).collect();
-    let g_s8 = Group::from_generators(adjacent_transpositions(&s8));
+    let g_s8 = Group::from_generators(adjacent_transpositions(&s8)).unwrap();
     let GroupKind::Factorized(fg8) = &g_s8.kind else { panic!("expected factorized S_8") };
     assert_eq!(fg8.order, 40_320);
     assert!(g_s8.symmetry_maps().is_empty(), "order > 720 must not materialize symmetry_maps");
@@ -523,7 +523,7 @@ fn large_disjoint_products_scale_without_enumerating_group() {
     let mut gens = adjacent_transpositions(&txns);
     gens.extend(adjacent_transpositions(&keys));
     gens.extend(adjacent_transpositions(&nodes));
-    let g_prod = Group::from_generators(gens);
+    let g_prod = Group::from_generators(gens).unwrap();
     let GroupKind::Factorized(fg_prod) = &g_prod.kind else { panic!("expected factorized S_4^3") };
     assert_eq!(fg_prod.order, 13_824);
     assert!(g_prod.symmetry_maps().is_empty());
@@ -560,7 +560,7 @@ fn large_disjoint_products_scale_without_enumerating_group() {
 #[test]
 fn decoded_state_skips_later_variables_once_partition_is_complete() {
     let a = [Sym::new("dec_a"), Sym::new("dec_b"), Sym::new("dec_c")];
-    let fg = Group::from_generators(adjacent_transpositions(&a));
+    let fg = Group::from_generators(adjacent_transpositions(&a)).unwrap();
     let vals = [
         Value::fcn_from_pairs(vec![
             (Value::ModelValue(a[0]), Value::Int(2)),
@@ -586,7 +586,7 @@ fn decoded_state_skips_later_variables_once_partition_is_complete() {
 #[test]
 fn typed_and_mixed_model_value_factors_behave_soundly() {
     let typed = [Sym::new("t_a"), Sym::new("t_b"), Sym::new("t_c")];
-    let g_typed = Group::from_generators(adjacent_transpositions(&typed));
+    let g_typed = Group::from_generators(adjacent_transpositions(&typed)).unwrap();
     assert!(matches!(g_typed.kind, GroupKind::Factorized(_)));
     let explicit_typed = Group::explicit(closure(adjacent_transpositions(&typed)));
     let GroupKind::Explicit { perms, .. } = &explicit_typed.kind else { unreachable!() };
@@ -603,7 +603,7 @@ fn typed_and_mixed_model_value_factors_behave_soundly() {
     );
 
     let mixed = [Sym::new("t_mix1"), Sym::new("untyped_mix2")];
-    let g_mixed = Group::from_generators(adjacent_transpositions(&mixed));
+    let g_mixed = Group::from_generators(adjacent_transpositions(&mixed)).unwrap();
     assert!(matches!(g_mixed.kind, GroupKind::Explicit { .. }));
 }
 
@@ -687,7 +687,7 @@ fn tagged_rows_short_circuit_losing_payloads_before_incomparable_tails() {
     let cd = [Sym::new("tr_c"), Sym::new("tr_d")];
     let mut gens = adjacent_transpositions(&ab);
     gens.extend(adjacent_transpositions(&cd));
-    let fg = Group::from_generators(gens.clone());
+    let fg = Group::from_generators(gens.clone()).unwrap();
     let explicit = Group::explicit(closure(gens));
     let GroupKind::Explicit { perms, .. } = &explicit.kind else { unreachable!() };
 
@@ -740,7 +740,7 @@ fn identity_and_self_equivariant_maps_keep_compact_stabilizer_and_preserve_freed
     // scalar `x = n_7` must run in milliseconds with 1 compact stabilizer
     // partition and map `x` to `n_0` while fixing `[i \in N |-> i]`.
     let n9: Vec<Sym> = (0..9).map(|i| Sym::new(&format!("id9_{i}"))).collect();
-    let g9 = Group::from_generators(adjacent_transpositions(&n9));
+    let g9 = Group::from_generators(adjacent_transpositions(&n9)).unwrap();
     let id_fcn = Value::fcn_from_pairs(n9.iter().map(|&k| (Value::ModelValue(k), Value::ModelValue(k))).collect()).unwrap();
     let self_rec_fcn = Value::fcn_from_pairs(
         n9.iter()
@@ -774,7 +774,7 @@ fn identity_and_self_equivariant_maps_keep_compact_stabilizer_and_preserve_freed
     // Exhaustive S_4 brute parity on partial identity + self-equivariant record maps.
     let s4 = [Sym::new("id4_0"), Sym::new("id4_1"), Sym::new("id4_2"), Sym::new("id4_3")];
     let gens4 = adjacent_transpositions(&s4);
-    let g4 = Group::from_generators(gens4.clone());
+    let g4 = Group::from_generators(gens4.clone()).unwrap();
     let exp4 = Group::explicit(closure(gens4));
     let GroupKind::Explicit { perms, .. } = &exp4.kind else { unreachable!() };
     for mask in 1..16usize {
@@ -801,7 +801,7 @@ fn identity_and_self_equivariant_maps_keep_compact_stabilizer_and_preserve_freed
     // must still refine `{b, c}` so `c -> b` minimizes `f[a]`.
     let s3 = [Sym::new("s3_a"), Sym::new("s3_b"), Sym::new("s3_c")];
     let gens3 = adjacent_transpositions(&s3);
-    let g3 = Group::from_generators(gens3.clone());
+    let g3 = Group::from_generators(gens3.clone()).unwrap();
     let exp3 = Group::explicit(closure(gens3));
     let GroupKind::Explicit { perms: perms3, .. } = &exp3.kind else { unreachable!() };
     for &p0 in &s3 {
@@ -839,7 +839,7 @@ fn unknown_prefix_candidates_and_set_prefix_errors_match_tlc() {
     let low = Sym::new("fp_low");
     let high = Sym::new("fp_high");
     let gens = adjacent_transpositions(&[a, b, c]);
-    let fg = Group::from_generators(gens.clone());
+    let fg = Group::from_generators(gens.clone()).unwrap();
     let exp = Group::explicit(closure(gens));
     let GroupKind::Explicit { perms, .. } = &exp.kind else { unreachable!() };
     let f1 = Value::fcn_from_pairs(vec![
@@ -867,7 +867,7 @@ fn unknown_prefix_candidates_and_set_prefix_errors_match_tlc() {
     let z = Sym::new("ro_z");
     let mut ro_gens = adjacent_transpositions(&keys);
     ro_gens.extend(adjacent_transpositions(&peers));
-    let ro_fg = Group::from_generators(ro_gens.clone());
+    let ro_fg = Group::from_generators(ro_gens.clone()).unwrap();
     let ro_exp = Group::explicit(closure(ro_gens));
     let GroupKind::Explicit { perms: ro_perms, .. } = &ro_exp.kind else { unreachable!() };
     let mut orbit_imgs = Vec::new();
@@ -1007,7 +1007,8 @@ fn nine_pairs_rank_and_closure_order_and_tagged_status_fast_path() {
     let oa = Sym::new("ov_a");
     let ob = Sym::new("ov_b");
     let oc = Sym::new("ov_c");
-    let ov_g = Group::from_factors_with_fallback(vec![vec![oa, ob, oc]], FallbackOrder::OverlappingSets(vec![vec![oa, ob], vec![ob, oc]]));
+    let ov_g = Group::from_factors_with_fallback(vec![vec![oa, ob, oc]], FallbackOrder::OverlappingSets(vec![vec![oa, ob], vec![ob, oc]]))
+        .unwrap();
     let GroupKind::Factorized(ov_fg) = &ov_g.kind else { unreachable!() };
     let ov_gens = vec![
         HashMap::from([(oa, Value::ModelValue(ob)), (ob, Value::ModelValue(oa))]),
@@ -1058,7 +1059,8 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // 1. Subset7 (`Permutations(N7) \cup Permutations({n5, n6})`): all 5039
     // non-identity perms are already generators, so BFS performs 0 compositions.
     let n7: Vec<Sym> = (0..7).map(|i| Sym::new(&format!("rm7_{i}"))).collect();
-    let g_sub7 = Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7.clone()]));
+    let g_sub7 =
+        Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7.clone()])).unwrap();
     let msg_sub = Value::tuple(vec![
         Value::ModelValue(n7[0]),
         Value::fcn_from_pairs(vec![(Value::ModelValue(n7[0]), Value::Bool(true)), (Value::ModelValue(n7[1]), Value::Int(0))]).unwrap(),
@@ -1071,7 +1073,8 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // only 2 observed atoms (`n0, n1` or `n5, n6`), only 41 non-identity ordered
     // pairs exist, so subgroup-skip + 41-pair saturation stops BFS early.
     let g_roles7 =
-        Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7[..6].to_vec()]));
+        Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7[..6].to_vec()]))
+            .unwrap();
     BFS_COMPOSITIONS.with(|c| c.set(0));
     let _ = g_roles7.least_perm(&mut StateVals::Given(std::slice::from_ref(&msg_sub)), &[0]).unwrap();
     let comps_r1 = BFS_COMPOSITIONS.with(std::cell::Cell::get);
@@ -1092,7 +1095,8 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // order even when two overlapping sets share 2 elements (`{a,b,c}` and `{b,c,d}`).
     let o4 = [Sym::new("ov4_a"), Sym::new("ov4_b"), Sym::new("ov4_c"), Sym::new("ov4_d")];
     let g_ov4 =
-        Group::from_factors_with_fallback(vec![o4.to_vec()], FallbackOrder::OverlappingSets(vec![o4[0..3].to_vec(), o4[1..4].to_vec()]));
+        Group::from_factors_with_fallback(vec![o4.to_vec()], FallbackOrder::OverlappingSets(vec![o4[0..3].to_vec(), o4[1..4].to_vec()]))
+            .unwrap();
     let GroupKind::Factorized(fg_ov4) = &g_ov4.kind else { unreachable!() };
     let mut ov4_gens = Vec::new();
     for s in [&o4[0..3], &o4[1..4]] {
@@ -1125,7 +1129,8 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     let k_enabled = Sym::new("ws_enabled");
     let k_epoch = Sym::new("ws_epoch");
     let g_w8 =
-        Group::from_factors_with_fallback(vec![w8.clone()], FallbackOrder::OverlappingSets(vec![vec![w8[0], w8[7]], w8[..7].to_vec()]));
+        Group::from_factors_with_fallback(vec![w8.clone()], FallbackOrder::OverlappingSets(vec![vec![w8[0], w8[7]], w8[..7].to_vec()]))
+            .unwrap();
     let GroupKind::Factorized(fg_w8) = &g_w8.kind else { unreachable!() };
     let worker_status = Value::fcn_from_pairs(
         w8.iter()
@@ -1171,4 +1176,28 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     assert!(t1.elapsed() < std::time::Duration::from_millis(50), "Heartbeats S_9 took {:?}", t1.elapsed());
     assert_eq!(img[0], bag);
     assert_eq!(img[1], Value::ModelValue(h9[0]));
+}
+
+#[test]
+fn factorized_symmetry_checks_partition_index_limits() {
+    let max = usize::from(u16::MAX);
+    let atoms: Vec<_> = (0..max + 2).map(|i| Sym::new(&format!("indexLimit{i}"))).collect();
+    let build = |n| FactorizedGroup::new(vec![atoms[..n].to_vec()], FallbackOrder::DisjointFull);
+    let group = build(max).unwrap();
+    assert_eq!(group.lookup(atoms[max - 1]), Some((0, max - 1)));
+    let mut part = Partition::default();
+    part.reset(&group);
+    assert_eq!(part.block_hi()[max - 1], u16::MAX);
+    for n in [max + 1, max + 2] {
+        let err = build(n).err().expect("oversized factor accepted");
+        assert!(err.message.contains(&format!("{n} model values")));
+    }
+}
+
+#[test]
+fn factorized_symmetry_rejects_unrepresentable_factor_id() {
+    let pair = vec![Sym::new("limitA"), Sym::new("limitB")];
+    let factors = vec![pair; usize::from(u16::MAX) + 2];
+    let err = FactorizedGroup::new(factors, FallbackOrder::DisjointFull).err().expect("excess factor id accepted");
+    assert!(err.message.contains("65537 factors"));
 }

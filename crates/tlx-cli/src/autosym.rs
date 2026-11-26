@@ -215,7 +215,10 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
             return Ok(None);
         }
     }
-    model.apply_symmetry(gens);
+    if let Err(e) = model.apply_symmetry(gens) {
+        note(&format!("not applied: {}", e.message));
+        return Ok(None);
+    }
     model.record_symmetry_certificate(certificate);
     Ok(Some(Applied { group: text }))
 }

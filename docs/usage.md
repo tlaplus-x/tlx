@@ -528,6 +528,11 @@ current load; on an x86 SMT machine 16 threads were measured 20-35% faster than 
 
 ### 6.1. Checking a symmetry declaration
 
+When tlx applies a declared symmetry as a product of full permutation groups, it supports up to
+65,536 factors with up to 65,535 model values per factor. Overlapping permutation sets count
+as one factor per connected component. A declaration that exceeds either limit produces an error
+before exploration.
+
 TLC trusts `SYMMETRY`. A definition that selects a particular model value, for example
 `CHOOSE a \in Acceptors : TRUE`, can make transitions depend on the representative of an orbit.
 Reduced searches can then miss behavior; parallel searches may give different counts.

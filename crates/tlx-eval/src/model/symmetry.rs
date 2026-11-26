@@ -439,30 +439,34 @@ impl Group {
 
     #[cfg(test)]
     fn from_factors(factors: Vec<Vec<Sym>>) -> Group {
-        Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull)
+        Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull).unwrap()
     }
 
-    fn from_factors_with_fallback(factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> Group {
+    fn from_factors_with_fallback(factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> EResult<Group> {
         if factors.is_empty() {
-            return Group::default();
+            return Ok(Group::default());
         }
-        Group { kind: GroupKind::Factorized(FactorizedGroup::new(factors, fallback)), maps: Arc::new(OnceLock::new()), id: Self::next_id() }
+        Ok(Group {
+            kind: GroupKind::Factorized(FactorizedGroup::new(factors, fallback)?),
+            maps: Arc::new(OnceLock::new()),
+            id: Self::next_id(),
+        })
     }
 
     /// Build a group from a generator list, recognizing disjoint symmetric-group
     /// products without running group closure, and falling back to explicit
     /// closure for arbitrary subgroups.
-    pub(super) fn from_generators(gens: Vec<Perm>) -> Group {
+    pub(super) fn from_generators(gens: Vec<Perm>) -> EResult<Group> {
         if gens.iter().all(HashMap::is_empty) {
-            return Group::default();
+            return Ok(Group::default());
         }
         if let Some(factors) = recognize_disjoint_factors(&gens) {
-            let mut fg = FactorizedGroup::new(factors, FallbackOrder::DisjointFull);
+            let mut fg = FactorizedGroup::new(factors, FallbackOrder::DisjointFull)?;
             let flat_gens: Vec<Vec<u16>> = gens.iter().filter(|p| !p.is_empty()).map(|p| fg.perm_to_img(p)).collect();
             fg.set_fallback(FallbackOrder::ExplicitGens(flat_gens));
-            return Group { kind: GroupKind::Factorized(fg), maps: Arc::new(OnceLock::new()), id: Self::next_id() };
+            return Ok(Group { kind: GroupKind::Factorized(fg), maps: Arc::new(OnceLock::new()), id: Self::next_id() });
         }
-        Self::explicit(closure(gens))
+        Ok(Self::explicit(closure(gens)))
     }
 
     fn explicit(raw: Vec<Perm>) -> Group {
