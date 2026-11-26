@@ -257,17 +257,17 @@ private theorem mem_seqPairsAux {K A : Type} (natAtom : Nat → A) :
     ∀ (base : Nat) (xs : List (RawVal K A)) (kv : RawVal K A × RawVal K A),
       kv ∈ seqPairsAux natAtom base xs ↔
         ∃ (j : Nat) (hj : j < xs.length), kv = (.atom (natAtom (base + j)), xs[j])
-  | _, [], _ => by simp [seqPairsAux]
+  | _, [], _ => Iff.intro (fun h => nomatch h) (fun ⟨_, hj, _⟩ => nomatch hj)
   | base, x :: xs, kv => by
     simp only [seqPairsAux, List.mem_cons, mem_seqPairsAux natAtom (base + 1) xs]
     constructor
     · rintro (rfl | ⟨j, hj, rfl⟩)
-      · exact ⟨0, Nat.zero_lt_succ _, by simp⟩
+      · exact ⟨0, Nat.zero_lt_succ _, rfl⟩
       · refine ⟨j + 1, Nat.succ_lt_succ hj, ?_⟩
         simp only [List.getElem_cons_succ, Nat.add_assoc, Nat.add_comm 1 j]
     · rintro ⟨j, hj, rfl⟩
       cases j with
-      | zero => left; simp
+      | zero => left; rfl
       | succ j' =>
         right
         refine ⟨j', Nat.lt_of_succ_lt_succ hj, ?_⟩
@@ -336,10 +336,13 @@ private theorem valEqAux_fnPairs {K A : Type} [HasNatAtom A] {n : Nat} {x y : Ra
     {ps qs : List (RawVal K A × RawVal K A)}
     (hx : rawFnPairs x = some ps) (hy : rawFnPairs y = some qs) :
     ValEqAux (n + 1) x y ↔ fnPairsEq (ValEqAux n) ps qs := by
-  cases x <;> cases y <;> simp only [rawFnPairs, Option.some.injEq] at hx hy
-  all_goals try cases hx
-  all_goals try cases hy
-  all_goals exact Iff.rfl
+  cases x with
+  | fn _ | seq _ =>
+    cases hx
+    cases y with
+    | fn _ | seq _ => cases hy; exact Iff.rfl
+    | _ => cases hy
+  | _ => cases hx
 
 theorem ValEqAux_irrel {K A : Type} [HasNatAtom A] :
     ∀ (n m : Nat) (x y : RawVal K A), rawDepth x < n → rawDepth x < m →
@@ -375,34 +378,38 @@ theorem ValEqAux_irrel {K A : Type} [HasNatAtom A] :
           rcases rawDepth_mem_rawFnPairs hx ha with ⟨hd1, hd2⟩
           exact ⟨a, ha, (ValEqAux_irrel n m a.1 b.1 (by omega) (by omega)).mpr h1,
                         (ValEqAux_irrel n m a.2 b.2 (by omega) (by omega)).mpr h2⟩
-    cases x <;> cases y
-    all_goals try exact Iff.rfl
-    case set.set xs ys =>
-      simp only [ValEqAux]
-      simp only [rawDepth] at hn hm
-      apply and_congr
-      · constructor
-        · intro h a ha
-          have hd := rawDepth_mem_list ha
-          rcases h a ha with ⟨b, hb, hab⟩
-          exact ⟨b, hb, (ValEqAux_irrel n m a b (by omega) (by omega)).mp hab⟩
-        · intro h a ha
-          have hd := rawDepth_mem_list ha
-          rcases h a ha with ⟨b, hb, hab⟩
-          exact ⟨b, hb, (ValEqAux_irrel n m a b (by omega) (by omega)).mpr hab⟩
-      · constructor
-        · intro h b hb
-          rcases h b hb with ⟨a, ha, hab⟩
-          have hd := rawDepth_mem_list ha
-          exact ⟨a, ha, (ValEqAux_irrel n m a b (by omega) (by omega)).mp hab⟩
-        · intro h b hb
-          rcases h b hb with ⟨a, ha, hab⟩
-          have hd := rawDepth_mem_list ha
-          exact ⟨a, ha, (ValEqAux_irrel n m a b (by omega) (by omega)).mpr hab⟩
-    case seq.seq xs ys => exact hfp rfl rfl
-    case seq.fn xs qs => exact hfp rfl rfl
-    case fn.seq ps ys => exact hfp rfl rfl
-    case fn.fn ps qs => exact hfp rfl rfl
+    cases x with
+    | err => cases y <;> exact Iff.rfl
+    | atom _ => cases y <;> exact Iff.rfl
+    | key _ => cases y <;> exact Iff.rfl
+    | set xs =>
+      cases y with
+      | set ys =>
+        simp only [rawDepth] at hn hm
+        apply and_congr
+        · constructor
+          · intro h a ha
+            have hd := rawDepth_mem_list ha
+            rcases h a ha with ⟨b, hb, hab⟩
+            exact ⟨b, hb, (ValEqAux_irrel n m a b (by omega) (by omega)).mp hab⟩
+          · intro h a ha
+            have hd := rawDepth_mem_list ha
+            rcases h a ha with ⟨b, hb, hab⟩
+            exact ⟨b, hb, (ValEqAux_irrel n m a b (by omega) (by omega)).mpr hab⟩
+        · constructor
+          · intro h b hb
+            rcases h b hb with ⟨a, ha, hab⟩
+            have hd := rawDepth_mem_list ha
+            exact ⟨a, ha, (ValEqAux_irrel n m a b (by omega) (by omega)).mp hab⟩
+          · intro h b hb
+            rcases h b hb with ⟨a, ha, hab⟩
+            have hd := rawDepth_mem_list ha
+            exact ⟨a, ha, (ValEqAux_irrel n m a b (by omega) (by omega)).mpr hab⟩
+      | _ => exact Iff.rfl
+    | seq _ | fn _ =>
+      cases y with
+      | seq _ | fn _ => exact hfp rfl rfl
+      | _ => exact Iff.rfl
 
 def ValEq {K A : Type} [HasNatAtom A] (x y : RawVal K A) : Prop :=
   ValEqAux (rawDepth x + 1) x y
@@ -418,7 +425,6 @@ theorem ValEqAux_refl {K A : Type} [HasNatAtom A] :
   | n + 1, .atom _, _ => rfl
   | n + 1, .key _, _ => rfl
   | n + 1, .seq xs, h => by
-    simp only [ValEqAux, fnPairsEq]
     refine ⟨fun a ha => ⟨a, ha,
               ValEqAux_refl n a.1 (by have := (rawDepth_mem_rawFnPairs (x := .seq xs) rfl ha).1; omega),
               ValEqAux_refl n a.2 (by have := (rawDepth_mem_rawFnPairs (x := .seq xs) rfl ha).2; omega)⟩,
@@ -453,19 +459,21 @@ theorem ValEqAux_symm {K A : Type} [HasNatAtom A] :
     ∀ (n : Nat) (x y : RawVal K A), ValEqAux n x y → ValEqAux n y x
   | 0, _, _, h => False.elim h
   | n + 1, x, y, h => by
-    cases x <;> cases y
-    all_goals try exact False.elim h
-    case err.err => trivial
-    case atom.atom => exact h.symm
-    case key.key => exact h.symm
-    case set.set xs ys =>
-      rcases h with ⟨h1, h2⟩
-      exact ⟨fun b hb => let ⟨a, ha, hab⟩ := h2 b hb; ⟨a, ha, ValEqAux_symm n a b hab⟩,
-             fun a ha => let ⟨b, hb, hab⟩ := h1 a ha; ⟨b, hb, ValEqAux_symm n a b hab⟩⟩
-    case seq.seq => exact fnPairsEq_symm (ValEqAux_symm n) h
-    case seq.fn => exact fnPairsEq_symm (ValEqAux_symm n) h
-    case fn.seq => exact fnPairsEq_symm (ValEqAux_symm n) h
-    case fn.fn => exact fnPairsEq_symm (ValEqAux_symm n) h
+    cases x with
+    | err => cases y with | err => trivial | _ => exact False.elim h
+    | atom _ => cases y with | atom _ => exact h.symm | _ => exact False.elim h
+    | key _ => cases y with | key _ => exact h.symm | _ => exact False.elim h
+    | set xs =>
+      cases y with
+      | set ys =>
+        rcases h with ⟨h1, h2⟩
+        exact ⟨fun b hb => let ⟨a, ha, hab⟩ := h2 b hb; ⟨a, ha, ValEqAux_symm n a b hab⟩,
+               fun a ha => let ⟨b, hb, hab⟩ := h1 a ha; ⟨b, hb, ValEqAux_symm n a b hab⟩⟩
+      | _ => exact False.elim h
+    | seq _ | fn _ =>
+      cases y with
+      | seq _ | fn _ => exact fnPairsEq_symm (ValEqAux_symm n) h
+      | _ => exact False.elim h
 
 theorem ValEq.symm {K A : Type} [HasNatAtom A] {x y : RawVal K A} (h : ValEq x y) : ValEq y x := by
   let n := max (rawDepth x) (rawDepth y) + 1
@@ -488,25 +496,37 @@ theorem ValEqAux_trans {K A : Type} [HasNatAtom A] :
     ∀ (n : Nat) (x y z : RawVal K A), ValEqAux n x y → ValEqAux n y z → ValEqAux n x z
   | 0, _, _, _, h, _ => False.elim h
   | n + 1, x, y, z, hxy, hyz => by
-    cases x <;> cases y <;> cases z
-    all_goals try exact False.elim hxy
-    all_goals try exact False.elim hyz
-    case err.err.err => trivial
-    case atom.atom.atom => exact hxy.trans hyz
-    case key.key.key => exact hxy.trans hyz
-    case set.set.set xs ys zs =>
-      rcases hxy with ⟨h1, h2⟩
-      rcases hyz with ⟨h3, h4⟩
-      exact ⟨fun a ha => let ⟨b, hb, h1e⟩ := h1 a ha; let ⟨c, hc, h2e⟩ := h3 b hb; ⟨c, hc, ValEqAux_trans n a b c h1e h2e⟩,
-             fun c hc => let ⟨b, hb, h2e⟩ := h4 c hc; let ⟨a, ha, h1e⟩ := h2 b hb; ⟨a, ha, ValEqAux_trans n a b c h1e h2e⟩⟩
-    case seq.seq.seq => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case seq.seq.fn => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case seq.fn.seq => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case seq.fn.fn => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case fn.seq.seq => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case fn.seq.fn => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case fn.fn.seq => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
-    case fn.fn.fn => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
+    cases x with
+    | err =>
+      cases y with
+      | err => cases z with | err => trivial | _ => exact False.elim hyz
+      | _ => exact False.elim hxy
+    | atom _ =>
+      cases y with
+      | atom _ => cases z with | atom _ => exact hxy.trans hyz | _ => exact False.elim hyz
+      | _ => exact False.elim hxy
+    | key _ =>
+      cases y with
+      | key _ => cases z with | key _ => exact hxy.trans hyz | _ => exact False.elim hyz
+      | _ => exact False.elim hxy
+    | set xs =>
+      cases y with
+      | set ys =>
+        cases z with
+        | set zs =>
+          rcases hxy with ⟨h1, h2⟩
+          rcases hyz with ⟨h3, h4⟩
+          exact ⟨fun a ha => let ⟨b, hb, h1e⟩ := h1 a ha; let ⟨c, hc, h2e⟩ := h3 b hb; ⟨c, hc, ValEqAux_trans n a b c h1e h2e⟩,
+                 fun c hc => let ⟨b, hb, h2e⟩ := h4 c hc; let ⟨a, ha, h1e⟩ := h2 b hb; ⟨a, ha, ValEqAux_trans n a b c h1e h2e⟩⟩
+        | _ => exact False.elim hyz
+      | _ => exact False.elim hxy
+    | seq _ | fn _ =>
+      cases y with
+      | seq _ | fn _ =>
+        cases z with
+        | seq _ | fn _ => exact fnPairsEq_trans (ValEqAux_trans n) hxy hyz
+        | _ => exact False.elim hyz
+      | _ => exact False.elim hxy
 
 theorem ValEq.trans {K A : Type} [HasNatAtom A] {x y z : RawVal K A} (hxy : ValEq x y) (hyz : ValEq y z) : ValEq x z := by
   let n := max (max (rawDepth x) (rawDepth y)) (rawDepth z) + 1
@@ -546,42 +566,58 @@ theorem ValEqAux_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom
       ValEqAux n (renameRaw p x) (renameRaw p y) ↔ ValEqAux n x y
   | 0, _, _ => Iff.rfl
   | n + 1, x, y => by
-    cases x <;> cases y
-    all_goals try exact Iff.rfl
-    case key.key => exact p.injective
-    case set.set xs ys =>
-      simp only [renameRaw, renameRawList_eq_map, ValEqAux]
-      apply and_congr
-      · constructor
-        · intro h a ha
-          rcases h (renameRaw p a) (List.mem_map_of_mem ha) with ⟨b', hb', hab⟩
-          rcases List.mem_map.mp hb' with ⟨b, hb, rfl⟩
-          exact ⟨b, hb, (ValEqAux_rename p n a b).mp hab⟩
-        · intro h a' ha'
-          rcases List.mem_map.mp ha' with ⟨a, ha, rfl⟩
-          rcases h a ha with ⟨b, hb, hab⟩
-          exact ⟨renameRaw p b, List.mem_map_of_mem hb, (ValEqAux_rename p n a b).mpr hab⟩
-      · constructor
-        · intro h b hb
-          rcases h (renameRaw p b) (List.mem_map_of_mem hb) with ⟨a', ha', hab⟩
-          rcases List.mem_map.mp ha' with ⟨a, ha, rfl⟩
-          exact ⟨a, ha, (ValEqAux_rename p n a b).mp hab⟩
-        · intro h b' hb'
-          rcases List.mem_map.mp hb' with ⟨b, hb, rfl⟩
-          rcases h b hb with ⟨a, ha, hab⟩
-          exact ⟨renameRaw p a, List.mem_map_of_mem ha, (ValEqAux_rename p n a b).mpr hab⟩
-    case seq.seq xs ys =>
-      simp only [renameRaw, ValEqAux, seqPairs, seqPairsAux_rename]
-      exact fnPairsEq_rename p (ValEqAux_rename p n)
-    case seq.fn xs qs =>
-      simp only [renameRaw, ValEqAux, seqPairs, seqPairsAux_rename]
-      exact fnPairsEq_rename p (ValEqAux_rename p n)
-    case fn.seq ps ys =>
-      simp only [renameRaw, ValEqAux, seqPairs, seqPairsAux_rename]
-      exact fnPairsEq_rename p (ValEqAux_rename p n)
-    case fn.fn ps qs =>
-      simp only [renameRaw, ValEqAux]
-      exact fnPairsEq_rename p (ValEqAux_rename p n)
+    cases x with
+    | err => cases y <;> exact Iff.rfl
+    | atom _ => cases y <;> exact Iff.rfl
+    | key _ =>
+      cases y with
+      | key _ => exact p.injective
+      | _ => exact Iff.rfl
+    | set xs =>
+      cases y with
+      | set ys =>
+        change ((∀ a ∈ renameRawList p xs, ∃ b ∈ renameRawList p ys, ValEqAux n a b) ∧
+                (∀ b ∈ renameRawList p ys, ∃ a ∈ renameRawList p xs, ValEqAux n a b)) ↔ _
+        rw [renameRawList_eq_map, renameRawList_eq_map]
+        apply and_congr
+        · constructor
+          · intro h a ha
+            rcases h (renameRaw p a) (List.mem_map_of_mem ha) with ⟨b', hb', hab⟩
+            rcases List.mem_map.mp hb' with ⟨b, hb, rfl⟩
+            exact ⟨b, hb, (ValEqAux_rename p n a b).mp hab⟩
+          · intro h a' ha'
+            rcases List.mem_map.mp ha' with ⟨a, ha, rfl⟩
+            rcases h a ha with ⟨b, hb, hab⟩
+            exact ⟨renameRaw p b, List.mem_map_of_mem hb, (ValEqAux_rename p n a b).mpr hab⟩
+        · constructor
+          · intro h b hb
+            rcases h (renameRaw p b) (List.mem_map_of_mem hb) with ⟨a', ha', hab⟩
+            rcases List.mem_map.mp ha' with ⟨a, ha, rfl⟩
+            exact ⟨a, ha, (ValEqAux_rename p n a b).mp hab⟩
+          · intro h b' hb'
+            rcases List.mem_map.mp hb' with ⟨b, hb, rfl⟩
+            rcases h b hb with ⟨a, ha, hab⟩
+            exact ⟨renameRaw p a, List.mem_map_of_mem ha, (ValEqAux_rename p n a b).mpr hab⟩
+      | _ => exact Iff.rfl
+    | seq xs =>
+      cases y with
+      | seq ys =>
+        change fnPairsEq (ValEqAux n) (seqPairs (renameRawList p xs)) (seqPairs (renameRawList p ys)) ↔ _
+        rw [seqPairs, seqPairs, seqPairsAux_rename, seqPairsAux_rename]
+        exact fnPairsEq_rename p (ValEqAux_rename p n)
+      | fn qs =>
+        change fnPairsEq (ValEqAux n) (seqPairs (renameRawList p xs)) (renameRawPairs p qs) ↔ _
+        rw [seqPairs, seqPairsAux_rename]
+        exact fnPairsEq_rename p (ValEqAux_rename p n)
+      | _ => exact Iff.rfl
+    | fn ps =>
+      cases y with
+      | seq ys =>
+        change fnPairsEq (ValEqAux n) (renameRawPairs p ps) (seqPairs (renameRawList p ys)) ↔ _
+        rw [seqPairs, seqPairsAux_rename]
+        exact fnPairsEq_rename p (ValEqAux_rename p n)
+      | fn qs => exact fnPairsEq_rename p (ValEqAux_rename p n)
+      | _ => exact Iff.rfl
 
 theorem ValEq.rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (x y : RawVal (Key sizes) A) :
@@ -593,10 +629,15 @@ theorem ValEq.rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
 theorem ValEq.rawFnPairs_some {K A : Type} [HasNatAtom A] {x y : RawVal K A}
     (h : ValEq x y) :
     (rawFnPairs x).isSome = (rawFnPairs y).isSome := by
-  unfold ValEq at h
-  cases x <;> cases y <;> simp only [rawDepth, ValEqAux, rawFnPairs] at h ⊢
-  all_goals try exact False.elim h
-  all_goals rfl
+  cases x with
+  | seq _ | fn _ =>
+    cases y with
+    | seq _ | fn _ => rfl
+    | _ => exact False.elim h
+  | _ =>
+    cases y with
+    | seq _ | fn _ => exact False.elim h
+    | _ => rfl
 
 theorem ValEq.fnPairs_iff {K A : Type} [HasNatAtom A] {x y : RawVal K A}
     {ps qs : List (RawVal K A × RawVal K A)}
@@ -630,33 +671,86 @@ theorem ValEq.fnPairs_iff {K A : Type} [HasNatAtom A] {x y : RawVal K A}
 theorem ValEq.set_iff {K A : Type} [HasNatAtom A] {xs ys : List (RawVal K A)} :
     ValEq (.set xs) (.set ys) ↔
       (∀ x ∈ xs, ∃ y ∈ ys, ValEq x y) ∧ (∀ y ∈ ys, ∃ x ∈ xs, ValEq x y) := by
-  unfold ValEq
-  simp only [rawDepth, ValEqAux]
+  change ((∀ x ∈ xs, ∃ y ∈ ys, ValEqAux (rawDepth (.set xs)) x y) ∧
+          (∀ y ∈ ys, ∃ x ∈ xs, ValEqAux (rawDepth (.set xs)) x y)) ↔ _
+  have hdep : ∀ a ∈ xs, rawDepth a < rawDepth (.set xs) := fun a ha => by
+    have := rawDepth_mem_list ha
+    simp only [rawDepth]
+    omega
   apply and_congr
   · constructor
     · intro h a ha
-      have hd := rawDepth_mem_list ha
       rcases h a ha with ⟨b, hb, hab⟩
-      exact ⟨b, hb, (ValEq_iff_aux (by omega)).mpr hab⟩
+      exact ⟨b, hb, (ValEq_iff_aux (hdep a ha)).mpr hab⟩
     · intro h a ha
-      have hd := rawDepth_mem_list ha
       rcases h a ha with ⟨b, hb, hab⟩
-      exact ⟨b, hb, (ValEq_iff_aux (by omega)).mp hab⟩
+      exact ⟨b, hb, (ValEq_iff_aux (hdep a ha)).mp hab⟩
   · constructor
     · intro h b hb
       rcases h b hb with ⟨a, ha, hab⟩
-      have hd := rawDepth_mem_list ha
-      exact ⟨a, ha, (ValEq_iff_aux (by omega)).mpr hab⟩
+      exact ⟨a, ha, (ValEq_iff_aux (hdep a ha)).mpr hab⟩
     · intro h b hb
       rcases h b hb with ⟨a, ha, hab⟩
-      have hd := rawDepth_mem_list ha
-      exact ⟨a, ha, (ValEq_iff_aux (by omega)).mp hab⟩
+      exact ⟨a, ha, (ValEq_iff_aux (hdep a ha)).mp hab⟩
 
 theorem ValEq.fn_iff {K A : Type} [HasNatAtom A] {ps qs : List (RawVal K A × RawVal K A)} :
     ValEq (.fn ps) (.fn qs) ↔
       (∀ kv ∈ ps, ∃ q ∈ qs, ValEq kv.1 q.1 ∧ ValEq kv.2 q.2) ∧
       (∀ q ∈ qs, ∃ kv ∈ ps, ValEq kv.1 q.1 ∧ ValEq kv.2 q.2) :=
   ValEq.fnPairs_iff (x := .fn ps) (y := .fn qs) rfl rfl
+
+private theorem lift_set_sound {K A : Type} [HasNatAtom A] {β : Sort _}
+    {g : RawVal K A → β} {fallback : β}
+    (hset : ∀ xs ys, ValEq (.set xs) (.set ys) → g (.set xs) = g (.set ys))
+    (herr : g .err = fallback := by rfl)
+    (hatom : ∀ a, g (.atom a) = fallback := by intro _; rfl)
+    (hkey : ∀ k, g (.key k) = fallback := by intro _; rfl)
+    (hseq : ∀ xs, g (.seq xs) = fallback := by intro _; rfl)
+    (hfn : ∀ ps, g (.fn ps) = fallback := by intro _; rfl)
+    (s1 s2 : RawVal K A) (h : ValEq s1 s2) : g s1 = g s2 := by
+  cases s1 with
+  | set xs =>
+    cases s2 with
+    | set ys => exact hset xs ys h
+    | _ => exact False.elim h
+  | _ =>
+    cases s2 with
+    | set _ => exact False.elim h
+    | _ => simp only [herr, hatom, hkey, hseq, hfn]
+
+private theorem lift₂_set_sound {K A : Type} [HasNatAtom A] {β : Sort _}
+    {g : RawVal K A → RawVal K A → β} {fallback : β}
+    (hset : ∀ xs1 xs2 ys1 ys2, ValEq (.set xs1) (.set xs2) → ValEq (.set ys1) (.set ys2) →
+      g (.set xs1) (.set ys1) = g (.set xs2) (.set ys2))
+    (h1err : ∀ r, g .err r = fallback := by intro _; rfl)
+    (h1atom : ∀ a r, g (.atom a) r = fallback := by intro _ _; rfl)
+    (h1key : ∀ k r, g (.key k) r = fallback := by intro _ _; rfl)
+    (h1seq : ∀ xs r, g (.seq xs) r = fallback := by intro _ _; rfl)
+    (h1fn : ∀ ps r, g (.fn ps) r = fallback := by intro _ _; rfl)
+    (h2err : ∀ xs, g (.set xs) .err = fallback := by intro _; rfl)
+    (h2atom : ∀ xs a, g (.set xs) (.atom a) = fallback := by intro _ _; rfl)
+    (h2key : ∀ xs k, g (.set xs) (.key k) = fallback := by intro _ _; rfl)
+    (h2seq : ∀ xs ys, g (.set xs) (.seq ys) = fallback := by intro _ _; rfl)
+    (h2fn : ∀ xs ps, g (.set xs) (.fn ps) = fallback := by intro _ _; rfl)
+    (s1 r1 s2 r2 : RawVal K A) (hs : ValEq s1 s2) (hr : ValEq r1 r2) : g s1 r1 = g s2 r2 := by
+  cases s1 with
+  | set xs1 =>
+    cases s2 with
+    | set xs2 =>
+      cases r1 with
+      | set ys1 =>
+        cases r2 with
+        | set ys2 => exact hset xs1 xs2 ys1 ys2 hs hr
+        | _ => exact False.elim hr
+      | _ =>
+        cases r2 with
+        | set _ => exact False.elim hr
+        | _ => simp only [h2err, h2atom, h2key, h2seq, h2fn]
+    | _ => exact False.elim hs
+  | _ =>
+    cases s2 with
+    | set _ => exact False.elim hs
+    | _ => simp only [h1err, h1atom, h1key, h1seq, h1fn]
 
 def valSetoid (K A : Type) [HasNatAtom A] : Setoid (RawVal K A) where
   r := ValEq
@@ -727,11 +821,11 @@ private theorem valEq_out_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [H
 private theorem nodup_length_eq {α : Type} [DecidableEq α] :
     ∀ {l1 l2 : List α}, l1.Nodup → l2.Nodup → (∀ x, x ∈ l1 ↔ x ∈ l2) → l1.length = l2.length
   | [], [], _, _, _ => rfl
-  | [], b :: _, _, _, heq => absurd ((heq b).mpr (by simp)) (by simp)
+  | [], b :: _, _, _, heq => absurd ((heq b).mpr List.mem_cons_self) List.not_mem_nil
   | a :: t, l2, h1, h2, heq => by
     have ha_not_t : a ∉ t := (List.nodup_cons.mp h1).1
     have ht_nd : t.Nodup := (List.nodup_cons.mp h1).2
-    have ha_l2 : a ∈ l2 := (heq a).mp (by simp)
+    have ha_l2 : a ∈ l2 := (heq a).mp List.mem_cons_self
     have hlen : (l2.erase a).length + 1 = l2.length := by
       rw [List.length_erase_of_mem ha_l2]
       exact Nat.sub_add_cancel (List.length_pos_of_mem ha_l2)
@@ -768,7 +862,7 @@ def dedupList {α : Type} [DecidableEq α] : List α → List α
 theorem mem_dedupList {α : Type} [DecidableEq α] {l : List α} {x : α} :
     x ∈ dedupList l ↔ x ∈ l := by
   induction l with
-  | nil => simp [dedupList]
+  | nil => exact Iff.rfl
   | cons a t ih =>
     simp only [dedupList]
     split
@@ -824,20 +918,20 @@ theorem Val.rename_seq {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom 
   · intro kv hkv
     rcases List.mem_map.mp hkv with ⟨r, hr, rfl⟩
     rcases (mem_seqPairsAux HasNatAtom.natAtom 1 (xs.map valOut) r).mp hr with ⟨j, hj, rfl⟩
-    have hj' : j < xs.length := by simpa using hj
+    have hj' : j < xs.length := by simpa only [List.length_map] using hj
     refine ⟨(.atom (HasNatAtom.natAtom (1 + j)), valOut (renameVal p xs[j])), ?_, ValEq.refl _, ?_⟩
     · rw [mem_seqPairsAux]
-      refine ⟨j, by simpa using hj', ?_⟩
+      refine ⟨j, by simpa only [List.length_map] using hj', ?_⟩
       simp only [List.getElem_map]
     · simp only [List.getElem_map]
       exact valEq_out_rename p xs[j]
   · intro q hq
     rcases (mem_seqPairsAux HasNatAtom.natAtom 1 ((xs.map (renameVal p)).map valOut) q).mp hq with ⟨j, hj, rfl⟩
-    have hj' : j < xs.length := by simpa using hj
+    have hj' : j < xs.length := by simpa only [List.length_map] using hj
     refine ⟨(renameRaw p (.atom (HasNatAtom.natAtom (1 + j))), renameRaw p (valOut xs[j])), ?_, ValEq.refl _, ?_⟩
     · refine List.mem_map.mpr ⟨(.atom (HasNatAtom.natAtom (1 + j)), valOut xs[j]), ?_, rfl⟩
       rw [mem_seqPairsAux]
-      refine ⟨j, by simpa using hj', ?_⟩
+      refine ⟨j, by simpa only [List.length_map] using hj', ?_⟩
       simp only [List.getElem_map]
     · simp only [List.getElem_map]
       exact valEq_out_rename p xs[j]
@@ -894,17 +988,17 @@ private theorem mem_valSeqPairsAux {d : Nat} {sizes : Fin d → Nat} {A : Type} 
     ∀ (base : Nat) (xs : List (Val sizes A)) (kv : Val sizes A × Val sizes A),
       kv ∈ valSeqPairsAux base xs ↔
         ∃ (j : Nat) (hj : j < xs.length), kv = (Val.atom (HasNatAtom.natAtom (base + j)), xs[j])
-  | _, [], _ => by simp [valSeqPairsAux]
+  | _, [], _ => Iff.intro (fun h => nomatch h) (fun ⟨_, hj, _⟩ => nomatch hj)
   | base, x :: xs, kv => by
     simp only [valSeqPairsAux, List.mem_cons, mem_valSeqPairsAux (base + 1) xs]
     constructor
     · rintro (rfl | ⟨j, hj, rfl⟩)
-      · exact ⟨0, Nat.zero_lt_succ _, by simp⟩
+      · exact ⟨0, Nat.zero_lt_succ _, rfl⟩
       · refine ⟨j + 1, Nat.succ_lt_succ hj, ?_⟩
         simp only [List.getElem_cons_succ, Nat.add_assoc, Nat.add_comm 1 j]
     · rintro ⟨j, hj, rfl⟩
       cases j with
-      | zero => left; simp
+      | zero => left; rfl
       | succ j' =>
         right
         refine ⟨j', Nat.lt_of_succ_lt_succ hj, ?_⟩
@@ -920,7 +1014,7 @@ theorem Val.seq_eq_fn {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A
   constructor
   · intro kv hkv
     rcases (mem_seqPairsAux HasNatAtom.natAtom 1 (xs.map valOut) kv).mp hkv with ⟨j, hj, rfl⟩
-    have hj' : j < xs.length := by simpa using hj
+    have hj' : j < xs.length := by simpa only [List.length_map] using hj
     refine ⟨(valOut (Val.atom (HasNatAtom.natAtom (1 + j))), valOut xs[j]), ?_, ?_, ?_⟩
     · refine List.mem_map.mpr ⟨(Val.atom (HasNatAtom.natAtom (1 + j)), xs[j]), ?_, rfl⟩
       exact (mem_valSeqPairsAux 1 xs _).mpr ⟨j, hj', rfl⟩
@@ -931,7 +1025,7 @@ theorem Val.seq_eq_fn {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A
     rcases (mem_valSeqPairsAux 1 xs kv).mp hkv with ⟨j, hj, rfl⟩
     refine ⟨(.atom (HasNatAtom.natAtom (1 + j)), valOut xs[j]), ?_, ?_, ValEq.refl _⟩
     · rw [mem_seqPairsAux]
-      exact ⟨j, by simpa using hj, by simp only [List.getElem_map]⟩
+      exact ⟨j, by simpa only [List.length_map] using hj, by simp only [List.getElem_map]⟩
     · exact @Quotient.exact _ (valSetoid (Key sizes) A) _ _ (valOut_eq (Val.atom (HasNatAtom.natAtom (1 + j)))).symm
 
 theorem Val.seq_singleton_eq_fn {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
@@ -953,13 +1047,13 @@ theorem Val.seq_inj {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     · have hmem : (.atom (HasNatAtom.natAtom (1 + (xs.length - 1))), valOut xs[xs.length - 1]) ∈
           seqPairs (xs.map valOut) := by
         rw [seqPairs, mem_seqPairsAux]
-        exact ⟨xs.length - 1, by simp; omega, by simp⟩
+        exact ⟨xs.length - 1, by rw [List.length_map]; omega, by simp only [List.getElem_map]⟩
       rcases h1 _ hmem with ⟨q, hq, hk, _⟩
       rcases (mem_seqPairsAux HasNatAtom.natAtom 1 (ys.map valOut) q).mp hq with ⟨j, hj, rfl⟩
       have hna : HasNatAtom.natAtom (1 + (xs.length - 1)) = HasNatAtom.natAtom (1 + j) :=
         Val.atom_inj (sizes := sizes) (Quotient.sound hk)
       have hij : 1 + (xs.length - 1) = 1 + j := HasNatAtom.natAtom_inj _ _ hna
-      have hj' : j < ys.length := by simpa using hj
+      have hj' : j < ys.length := by simpa only [List.length_map] using hj
       omega
   have hle2 : ys.length ≤ xs.length := by
     by_cases hy : ys.length = 0
@@ -967,19 +1061,19 @@ theorem Val.seq_inj {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     · have hmem : (.atom (HasNatAtom.natAtom (1 + (ys.length - 1))), valOut ys[ys.length - 1]) ∈
           seqPairs (ys.map valOut) := by
         rw [seqPairs, mem_seqPairsAux]
-        exact ⟨ys.length - 1, by simp; omega, by simp⟩
+        exact ⟨ys.length - 1, by rw [List.length_map]; omega, by simp only [List.getElem_map]⟩
       rcases h2 _ hmem with ⟨kv, hkv, hk, _⟩
       rcases (mem_seqPairsAux HasNatAtom.natAtom 1 (xs.map valOut) kv).mp hkv with ⟨i, hi, rfl⟩
       have hna : HasNatAtom.natAtom (1 + i) = HasNatAtom.natAtom (1 + (ys.length - 1)) :=
         Val.atom_inj (sizes := sizes) (Quotient.sound hk)
       have hij : 1 + i = 1 + (ys.length - 1) := HasNatAtom.natAtom_inj _ _ hna
-      have hi' : i < xs.length := by simpa using hi
+      have hi' : i < xs.length := by simpa only [List.length_map] using hi
       omega
   apply List.ext_getElem (by omega)
   intro i h1i h2i
   have hmem : (.atom (HasNatAtom.natAtom (1 + i)), valOut xs[i]) ∈ seqPairs (xs.map valOut) := by
     rw [seqPairs, mem_seqPairsAux]
-    exact ⟨i, by simpa using h1i, by simp⟩
+    exact ⟨i, by simpa only [List.length_map] using h1i, by simp only [List.getElem_map]⟩
   rcases h1 _ hmem with ⟨q, hq, hk, hv⟩
   rcases (mem_seqPairsAux HasNatAtom.natAtom 1 (ys.map valOut) q).mp hq with ⟨j, hj, rfl⟩
   have hna : HasNatAtom.natAtom (1 + i) = HasNatAtom.natAtom (1 + j) :=
@@ -1063,10 +1157,15 @@ theorem Val.fn_eq_iff {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A
 def Val.asAtom {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val sizes A → Option A :=
   Quotient.lift (fun x => match x with | .atom a => some a | _ => none) (by
     intro x y h
-    cases x <;> cases y
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case atom.atom => exact congrArg some h)
+    cases x with
+    | atom _ =>
+      cases y with
+      | atom _ => exact congrArg some h
+      | _ => exact False.elim h
+    | _ =>
+      cases y with
+      | atom _ => exact False.elim h
+      | _ => rfl)
 
 theorem Val.asAtom_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes) (v : Val sizes A) :
     Val.asAtom (renameVal p v) = Val.asAtom v := by
@@ -1074,11 +1173,8 @@ theorem Val.asAtom_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAt
   | _ x => cases x <;> rfl
 
 def Val.isSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val sizes A → Prop :=
-  Quotient.lift (fun x => match x with | .set _ => True | _ => False) (by
-    intro x y h
-    cases x <;> cases y
-    all_goals try exact False.elim h
-    all_goals rfl)
+  Quotient.lift (fun x => match x with | .set _ => True | _ => False)
+    (lift_set_sound (fallback := False) (fun _ _ _ => rfl))
 
 theorem Val.isSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes) (v : Val sizes A) :
     Val.isSet (renameVal p v) ↔ Val.isSet v := by
@@ -1153,12 +1249,9 @@ theorem Val.seqElems_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNat
     simp only [h, h', ↓reduceDIte, Option.map_none]
 
 def Val.mem {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (x : Val sizes A) : Val sizes A → Prop :=
-  Quotient.lift (fun s => match s with | .set xs => ∃ y ∈ xs, mkVal y = x | _ => False) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+  Quotient.lift (fun s => match s with | .set xs => ∃ y ∈ xs, mkVal y = x | _ => False)
+    (lift_set_sound (fallback := False) (by
+      intro xs ys h
       apply propext
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       constructor
@@ -1167,7 +1260,7 @@ def Val.mem {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (x : Val
         exact ⟨b, hb, (Quotient.sound hab).symm⟩
       · rintro ⟨b, hb, rfl⟩
         rcases h2 b hb with ⟨a, ha, hab⟩
-        exact ⟨a, ha, Quotient.sound hab⟩)
+        exact ⟨a, ha, Quotient.sound hab⟩))
 
 theorem Val.mem_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (x s : Val sizes A) :
@@ -1192,8 +1285,8 @@ def Val.mapsTo {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f k 
     have hs := ValEq.rawFnPairs_some h
     cases hf1 : rawFnPairs f1 <;> cases hf2 : rawFnPairs f2
     · rfl
-    · simp [hf1, hf2] at hs
-    · simp [hf1, hf2] at hs
+    · rw [hf1, hf2] at hs; cases hs
+    · rw [hf1, hf2] at hs; cases hs
     · case some.some ps qs =>
       apply propext
       rcases (ValEq.fnPairs_iff hf1 hf2).mp h with ⟨h1, h2⟩
@@ -1314,8 +1407,8 @@ def Val.domain {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] :
     have hs := ValEq.rawFnPairs_some h
     cases hf1 : rawFnPairs f1 <;> cases hf2 : rawFnPairs f2
     · rfl
-    · simp [hf1, hf2] at hs
-    · simp [hf1, hf2] at hs
+    · rw [hf1, hf2] at hs; cases hs
+    · rw [hf1, hf2] at hs; cases hs
     · case some.some ps qs =>
       rw [Val.set_eq_iff]
       rcases (ValEq.fnPairs_iff hf1 hf2).mp h with ⟨h1, h2⟩
@@ -1354,8 +1447,8 @@ def Val.update {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     have hs := ValEq.rawFnPairs_some h
     cases hf1 : rawFnPairs f1 <;> cases hf2 : rawFnPairs f2
     · rfl
-    · simp [hf1, hf2] at hs
-    · simp [hf1, hf2] at hs
+    · rw [hf1, hf2] at hs; cases hs
+    · rw [hf1, hf2] at hs; cases hs
     · case some.some ps qs =>
       rw [Val.fn_eq_iff]
       rcases (ValEq.fnPairs_iff hf1 hf2).mp h with ⟨h1, h2⟩
@@ -1432,12 +1525,12 @@ def Val.merge {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f g :
     have hgs := ValEq.rawFnPairs_some hg
     cases hf1 : rawFnPairs f1 <;> cases hf2 : rawFnPairs f2
     · rfl
-    · simp [hf1, hf2] at hfs
-    · simp [hf1, hf2] at hfs
+    · rw [hf1, hf2] at hfs; cases hfs
+    · rw [hf1, hf2] at hfs; cases hfs
     · cases hg1 : rawFnPairs g1 <;> cases hg2 : rawFnPairs g2
       · rfl
-      · simp [hg1, hg2] at hgs
-      · simp [hg1, hg2] at hgs
+      · rw [hg1, hg2] at hgs; cases hgs
+      · rw [hg1, hg2] at hgs; cases hgs
       · case some.some.some.some ps1 ps2 qs1 qs2 =>
         rcases (ValEq.fnPairs_iff hf1 hf2).mp hf with ⟨hf1', hf2'⟩
         rcases (ValEq.fnPairs_iff hg1 hg2).mp hg with ⟨hg1', hg2'⟩
@@ -1522,12 +1615,9 @@ def Val.card {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val s
   classical
   exact Quotient.lift (fun s => match s with
     | .set xs => some (dedupList (xs.map mkVal)).length
-    | _ => none) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => none)
+    (lift_set_sound (fallback := none) (by
+      intro xs ys h
       dsimp only
       congr 1
       apply nodup_length_eq (nodup_dedupList _) (nodup_dedupList _)
@@ -1540,7 +1630,7 @@ def Val.card {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val s
         exact ⟨b, hb, (Quotient.sound hab).symm⟩
       · rintro ⟨b, hb, rfl⟩
         rcases h2 b hb with ⟨a, ha, hab⟩
-        exact ⟨a, ha, Quotient.sound hab⟩)
+        exact ⟨a, ha, Quotient.sound hab⟩))
 
 theorem Val.card_seq_fn_singleton {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     (v : Val sizes A) :
@@ -1575,13 +1665,9 @@ theorem Val.card_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom
 def Val.cup {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b : Val sizes A) : Val sizes A :=
   Quotient.liftOn₂ a b (fun ar br => match ar, br with
     | .set xs, .set ys => Val.set (xs.map mkVal ++ ys.map mkVal)
-    | _, _ => Val.err) (by
-    intro a1 b1 a2 b2 ha hb
-    cases a1 <;> cases a2 <;> cases b1 <;> cases b2
-    all_goals try exact False.elim ha
-    all_goals try exact False.elim hb
-    all_goals try rfl
-    case set.set.set.set xs1 xs2 ys1 ys2 =>
+    | _, _ => Val.err)
+    (lift₂_set_sound (fallback := Val.err) (by
+      intro xs1 xs2 ys1 ys2 ha hb
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp ha with ⟨ha1, ha2⟩
       rcases ValEq.set_iff.mp hb with ⟨hb1, hb2⟩
@@ -1593,7 +1679,7 @@ def Val.cup {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b : V
         · right; rcases hb1 y hy with ⟨y', hy', he⟩; exact ⟨y', hy', (Quotient.sound he).symm⟩
       · rintro (⟨x, hx, rfl⟩ | ⟨y, hy, rfl⟩)
         · left; rcases ha2 x hx with ⟨x', hx', he⟩; exact ⟨x', hx', Quotient.sound he⟩
-        · right; rcases hb2 y hy with ⟨y', hy', he⟩; exact ⟨y', hy', Quotient.sound he⟩)
+        · right; rcases hb2 y hy with ⟨y', hy', he⟩; exact ⟨y', hy', Quotient.sound he⟩))
 
 theorem Val.cup_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes) (a b : Val sizes A) :
     Val.cup (renameVal p a) (renameVal p b) = renameVal p (Val.cup a b) := by
@@ -1601,25 +1687,25 @@ theorem Val.cup_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom 
   | _ ar =>
     induction b using Quotient.ind with
     | _ br =>
-      cases ar <;> cases br
-      all_goals try rfl
-      case set.set xs ys =>
-        change Val.set ((renameRawList p xs).map mkVal ++ (renameRawList p ys).map mkVal) =
-          renameVal p (Val.set (xs.map mkVal ++ ys.map mkVal))
-        rw [Val.rename_set, renameRawList_eq_map, renameRawList_eq_map, List.map_append, List.map_map, List.map_map, List.map_map, List.map_map]
-        rfl
+      cases ar with
+      | set xs =>
+        cases br with
+        | set ys =>
+          change Val.set ((renameRawList p xs).map mkVal ++ (renameRawList p ys).map mkVal) =
+            renameVal p (Val.set (xs.map mkVal ++ ys.map mkVal))
+          rw [Val.rename_set, renameRawList_eq_map, renameRawList_eq_map, List.map_append, List.map_map, List.map_map, List.map_map, List.map_map]
+          rfl
+        | _ => rfl
+      | _ => rfl
 
 def Val.setFilter {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s : Val sizes A)
     (pred : Val sizes A → Prop) : Val sizes A := by
   classical
   exact Quotient.liftOn s (fun sr => match sr with
     | .set xs => Val.set ((xs.map mkVal).filter (fun v => decide (pred v)))
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       intro v
@@ -1630,7 +1716,7 @@ def Val.setFilter {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s
         exact ⟨⟨b, hb, (Quotient.sound hab).symm⟩, hp⟩
       · rintro ⟨⟨b, hb, rfl⟩, hp⟩
         rcases h2 b hb with ⟨a, ha, hab⟩
-        exact ⟨⟨a, ha, Quotient.sound hab⟩, hp⟩)
+        exact ⟨⟨a, ha, Quotient.sound hab⟩, hp⟩))
 
 theorem Val.setFilter_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (s : Val sizes A) (pred pred' : Val sizes A → Prop)
@@ -1683,12 +1769,9 @@ def Val.setMap {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s : 
     (f : Val sizes A → Val sizes A) : Val sizes A :=
   Quotient.liftOn s (fun sr => match sr with
     | .set xs => Val.set ((xs.map mkVal).map f)
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       intro v
@@ -1699,7 +1782,7 @@ def Val.setMap {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s : 
         exact ⟨mkVal b, ⟨b, hb, rfl⟩, congrArg f (Quotient.sound hab).symm⟩
       · rintro ⟨w, ⟨b, hb, rfl⟩, rfl⟩
         rcases h2 b hb with ⟨a, ha, hab⟩
-        exact ⟨mkVal a, ⟨a, ha, rfl⟩, congrArg f (Quotient.sound hab)⟩)
+        exact ⟨mkVal a, ⟨a, ha, rfl⟩, congrArg f (Quotient.sound hab)⟩))
 
 theorem Val.setMap_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (s : Val sizes A) (f f' : Val sizes A → Val sizes A)
@@ -1722,12 +1805,9 @@ def Val.fnConstruct {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] 
     (f : Val sizes A → Val sizes A) : Val sizes A :=
   Quotient.liftOn s (fun sr => match sr with
     | .set xs => Val.fn ((xs.map mkVal).map (fun v => (v, f v)))
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       rw [Val.fn_eq_iff]
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       intro kv
@@ -1740,7 +1820,7 @@ def Val.fnConstruct {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] 
       · rintro ⟨w, ⟨b, hb, rfl⟩, rfl⟩
         rcases h2 b hb with ⟨a, ha, hab⟩
         have e : mkVal a = mkVal b := Quotient.sound hab
-        exact ⟨mkVal a, ⟨a, ha, rfl⟩, by rw [e]⟩)
+        exact ⟨mkVal a, ⟨a, ha, rfl⟩, by rw [e]⟩))
 
 theorem Val.fnConstruct_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (s : Val sizes A) (f f' : Val sizes A → Val sizes A)
@@ -1762,12 +1842,9 @@ theorem Val.fnConstruct_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [Has
 def Val.union {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val sizes A → Val sizes A :=
   Quotient.lift (fun sr => match sr with
     | .set xs => Val.set (xs.flatMap (fun x => match x with | .set ys => ys.map mkVal | _ => []))
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       intro v
@@ -1775,22 +1852,26 @@ def Val.union {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val 
       constructor
       · rintro ⟨x, hx, hv⟩
         rcases h1 x hx with ⟨y, hy, hxy⟩
-        cases x <;> cases y
-        all_goals try exact False.elim hxy
-        all_goals try cases hv
-        case set.set ax ay =>
-          rcases List.mem_map.mp hv with ⟨a, ha, rfl⟩
-          rcases (ValEq.set_iff.mp hxy).1 a ha with ⟨b, hb, hab⟩
-          exact ⟨.set ay, hy, List.mem_map.mpr ⟨b, hb, (Quotient.sound hab).symm⟩⟩
+        cases x with
+        | set ax =>
+          cases y with
+          | set ay =>
+            rcases List.mem_map.mp hv with ⟨a, ha, rfl⟩
+            rcases (ValEq.set_iff.mp hxy).1 a ha with ⟨b, hb, hab⟩
+            exact ⟨.set ay, hy, List.mem_map.mpr ⟨b, hb, (Quotient.sound hab).symm⟩⟩
+          | _ => exact False.elim hxy
+        | _ => cases hv
       · rintro ⟨y, hy, hv⟩
         rcases h2 y hy with ⟨x, hx, hxy⟩
-        cases x <;> cases y
-        all_goals try exact False.elim hxy
-        all_goals try cases hv
-        case set.set ax ay =>
-          rcases List.mem_map.mp hv with ⟨b, hb, rfl⟩
-          rcases (ValEq.set_iff.mp hxy).2 b hb with ⟨a, ha, hab⟩
-          exact ⟨.set ax, hx, List.mem_map.mpr ⟨a, ha, Quotient.sound hab⟩⟩)
+        cases y with
+        | set ay =>
+          cases x with
+          | set ax =>
+            rcases List.mem_map.mp hv with ⟨b, hb, rfl⟩
+            rcases (ValEq.set_iff.mp hxy).2 b hb with ⟨a, ha, hab⟩
+            exact ⟨.set ax, hx, List.mem_map.mpr ⟨a, ha, Quotient.sound hab⟩⟩
+          | _ => exact False.elim hxy
+        | _ => cases hv))
 
 theorem Val.union_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes) (s : Val sizes A) :
     Val.union (renameVal p s) = renameVal p (Val.union s) := by
@@ -1844,7 +1925,7 @@ theorem mem_sublists {α : Type} {l sub : List α} :
 theorem filter_mem_sublists {α : Type} (l : List α) (pred : α → Bool) :
     l.filter pred ∈ sublists l := by
   induction l with
-  | nil => simp [sublists]
+  | nil => exact List.mem_cons_self
   | cons a t ih =>
     simp only [List.filter_cons, sublists, List.mem_append, List.mem_map]
     cases pred a
@@ -1863,12 +1944,9 @@ def Val.powerset {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : V
   classical
   exact Quotient.lift (fun sr => match sr with
     | .set xs => Val.set ((sublists (xs.map mkVal)).map Val.set)
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp h with ⟨h1, h2⟩
       have hmem : ∀ v, v ∈ xs.map mkVal ↔ v ∈ ys.map mkVal := by
@@ -1891,7 +1969,7 @@ def Val.powerset {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : V
         rw [Val.set_eq_iff]
         intro w
         simp only [List.mem_filter, decide_eq_true_eq]
-        exact ⟨fun hw => hw.2, fun hw => ⟨(hmem w).mpr (mem_sublists hsub w hw), hw⟩⟩)
+        exact ⟨fun hw => hw.2, fun hw => ⟨(hmem w).mpr (mem_sublists hsub w hw), hw⟩⟩))
 
 theorem Val.powerset_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes) (s : Val sizes A) :
     Val.powerset (renameVal p s) = renameVal p (Val.powerset s) := by
@@ -1927,13 +2005,9 @@ def cartCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s r : 
     | .set xs, .set rxs =>
       Val.set ((xs.map mkVal).flatMap (fun x =>
         (rxs.map mkVal).flatMap (fun rv => match Val.seqElems rv with | some ys => [Val.seq (x :: ys)] | none => [])))
-    | _, _ => Val.err) (by
-    intro s1 r1 s2 r2 hs hr
-    cases s1 <;> cases s2 <;> cases r1 <;> cases r2
-    all_goals try exact False.elim hs
-    all_goals try exact False.elim hr
-    all_goals try rfl
-    case set.set.set.set xs1 xs2 rxs1 rxs2 =>
+    | _, _ => Val.err)
+    (lift₂_set_sound (fallback := Val.err) (by
+      intro xs1 xs2 rxs1 rxs2 hs hr
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp hs with ⟨hs1, hs2⟩
       rcases ValEq.set_iff.mp hr with ⟨hr1, hr2⟩
@@ -1953,7 +2027,7 @@ def cartCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s r : 
         have hae : mkVal a = mkVal b := Quotient.sound (s := valSetoid (Key sizes) A) hab
         have hre : mkVal ra = mkVal rb := Quotient.sound (s := valSetoid (Key sizes) A) hrr'
         rw [← hae, ← hre] at hv
-        exact ⟨mkVal a, ⟨a, ha, rfl⟩, mkVal ra, ⟨ra, hra, rfl⟩, hv⟩)
+        exact ⟨mkVal a, ⟨a, ha, rfl⟩, mkVal ra, ⟨ra, hra, rfl⟩, hv⟩))
 
 theorem cartCons_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (s r : Val sizes A) :
@@ -1962,39 +2036,42 @@ theorem cartCons_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom
   | _ sr =>
     induction r using Quotient.ind with
     | _ rr =>
-      cases sr <;> cases rr
-      all_goals try rfl
-      case set.set xs rxs =>
-        change Val.set (((renameRawList p xs).map mkVal).flatMap (fun x =>
-            ((renameRawList p rxs).map mkVal).flatMap (fun rv => match Val.seqElems rv with | some ys => [Val.seq (x :: ys)] | none => []))) =
-          renameVal p (Val.set ((xs.map mkVal).flatMap (fun x =>
-            (rxs.map mkVal).flatMap (fun rv => match Val.seqElems rv with | some ys => [Val.seq (x :: ys)] | none => []))))
-        rw [Val.rename_set, Val.set_eq_iff, renameRawList_eq_map, renameRawList_eq_map]
-        intro v
-        simp only [List.mem_flatMap, List.mem_map]
-        constructor
-        · rintro ⟨x, ⟨a', ⟨a, ha, rfl⟩, rfl⟩, rv', ⟨ra', ⟨ra, hra, rfl⟩, rfl⟩, hv⟩
-          have hse : Val.seqElems (mkVal (renameRaw p ra)) = (Val.seqElems (mkVal ra)).map (List.map (renameVal p)) :=
-            Val.seqElems_rename p (mkVal ra)
-          rw [hse] at hv
-          cases hrv : Val.seqElems (mkVal ra) with
-          | none => simp [hrv] at hv
-          | some ys =>
-            simp only [hrv, Option.map_some, List.mem_singleton] at hv
-            subst hv
-            refine ⟨Val.seq (mkVal a :: ys),
-              ⟨mkVal a, ⟨a, ha, rfl⟩, mkVal ra, ⟨ra, hra, rfl⟩, by simp [hrv]⟩, ?_⟩
-            rw [Val.rename_seq, List.map_cons]
-            rfl
-        · rintro ⟨w, ⟨x, ⟨a, ha, rfl⟩, rv, ⟨ra, hra, rfl⟩, hw⟩, rfl⟩
-          cases hrv : Val.seqElems (mkVal ra) with
-          | none => simp [hrv] at hw
-          | some ys =>
-            simp only [hrv, List.mem_singleton] at hw
-            subst hw
-            refine ⟨renameVal p (mkVal a), ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩,
-              renameVal p (mkVal ra), ⟨renameRaw p ra, ⟨ra, hra, rfl⟩, rfl⟩, ?_⟩
-            rw [Val.seqElems_rename, hrv, Option.map_some, List.mem_singleton, Val.rename_seq, List.map_cons]
+      cases sr with
+      | set xs =>
+        cases rr with
+        | set rxs =>
+          change Val.set (((renameRawList p xs).map mkVal).flatMap (fun x =>
+              ((renameRawList p rxs).map mkVal).flatMap (fun rv => match Val.seqElems rv with | some ys => [Val.seq (x :: ys)] | none => []))) =
+            renameVal p (Val.set ((xs.map mkVal).flatMap (fun x =>
+              (rxs.map mkVal).flatMap (fun rv => match Val.seqElems rv with | some ys => [Val.seq (x :: ys)] | none => []))))
+          rw [Val.rename_set, Val.set_eq_iff, renameRawList_eq_map, renameRawList_eq_map]
+          intro v
+          simp only [List.mem_flatMap, List.mem_map]
+          constructor
+          · rintro ⟨x, ⟨a', ⟨a, ha, rfl⟩, rfl⟩, rv', ⟨ra', ⟨ra, hra, rfl⟩, rfl⟩, hv⟩
+            have hse : Val.seqElems (mkVal (renameRaw p ra)) = (Val.seqElems (mkVal ra)).map (List.map (renameVal p)) :=
+              Val.seqElems_rename p (mkVal ra)
+            rw [hse] at hv
+            cases hrv : Val.seqElems (mkVal ra) with
+            | none => rw [hrv] at hv; cases hv
+            | some ys =>
+              simp only [hrv, Option.map_some, List.mem_singleton] at hv
+              subst hv
+              refine ⟨Val.seq (mkVal a :: ys),
+                ⟨mkVal a, ⟨a, ha, rfl⟩, mkVal ra, ⟨ra, hra, rfl⟩, by rw [hrv]; exact List.mem_cons_self⟩, ?_⟩
+              rw [Val.rename_seq, List.map_cons]
+              rfl
+          · rintro ⟨w, ⟨x, ⟨a, ha, rfl⟩, rv, ⟨ra, hra, rfl⟩, hw⟩, rfl⟩
+            cases hrv : Val.seqElems (mkVal ra) with
+            | none => rw [hrv] at hw; cases hw
+            | some ys =>
+              simp only [hrv, List.mem_singleton] at hw
+              subst hw
+              refine ⟨renameVal p (mkVal a), ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩,
+                renameVal p (mkVal ra), ⟨renameRaw p ra, ⟨ra, hra, rfl⟩, rfl⟩, ?_⟩
+              rw [Val.seqElems_rename, hrv, Option.map_some, List.mem_singleton, Val.rename_seq, List.map_cons]
+        | _ => rfl
+      | _ => rfl
 
 def cartSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : List (Val sizes A) → Val sizes A
   | [] => Val.set [Val.seq []]
@@ -2028,7 +2105,7 @@ theorem mem_allMaps {α β : Type} {ds : List α} {rs : List β} {m : List (α �
     constructor
     · rintro ⟨r, hr, m', hm', rfl⟩
       rcases ih.mp hm' with ⟨h1, h2⟩
-      refine ⟨by simp [h1], fun kv hkv => ?_⟩
+      refine ⟨by simp only [List.map_cons, h1], fun kv hkv => ?_⟩
       rcases List.mem_cons.mp hkv with rfl | hkv'
       · exact hr
       · exact h2 kv hkv'
@@ -2123,13 +2200,9 @@ def Val.fnSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (dom r
   classical
   exact Quotient.liftOn₂ dom ran (fun dr rr => match dr, rr with
     | .set ds, .set rs => Val.set ((allMaps (dedupList (ds.map mkVal)) (rs.map mkVal)).map Val.fn)
-    | _, _ => Val.err) (by
-    intro d1 r1 d2 r2 hd hr
-    cases d1 <;> cases d2 <;> cases r1 <;> cases r2
-    all_goals try exact False.elim hd
-    all_goals try exact False.elim hr
-    all_goals try rfl
-    case set.set.set.set ds1 ds2 rs1 rs2 =>
+    | _, _ => Val.err)
+    (lift₂_set_sound (fallback := Val.err) (by
+      intro ds1 ds2 rs1 rs2 hd hr
       rcases ValEq.set_iff.mp hd with ⟨hd1, hd2⟩
       rcases ValEq.set_iff.mp hr with ⟨hr1, hr2⟩
       have hdeq : ∀ x, x ∈ dedupList (ds1.map mkVal) ↔ x ∈ dedupList (ds2.map mkVal) := by
@@ -2159,7 +2232,7 @@ def Val.fnSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (dom r
           rcases mem_allMaps.mp hm with ⟨h1, h2⟩
           exact mem_allMaps.mpr ⟨h1, fun kv hkv => (hreq _).mpr (h2 kv hkv)⟩
         rcases fn_of_nodup_graph (nodup_dedupList _) (fun x => (hdeq x).symm) hm1 with ⟨m', hm', hfe⟩
-        exact ⟨m', hm', hfe.symm⟩)
+        exact ⟨m', hm', hfe.symm⟩))
 
 theorem Val.fnSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (dom ran : Val sizes A) :
@@ -2169,41 +2242,44 @@ theorem Val.fnSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAto
   | _ dr =>
     induction ran using Quotient.ind with
     | _ rr =>
-      cases dr <;> cases rr
-      all_goals try rfl
-      case set.set ds rs =>
-        change Val.set ((allMaps (dedupList ((renameRawList p ds).map mkVal)) ((renameRawList p rs).map mkVal)).map Val.fn) =
-          renameVal p (Val.set ((allMaps (dedupList (ds.map mkVal)) (rs.map mkVal)).map Val.fn))
-        have hrmap : (renameRawList p rs).map mkVal = (rs.map mkVal).map (renameVal p) := by
-          rw [renameRawList_eq_map, List.map_map, List.map_map]; rfl
-        have hdeq : ∀ x, x ∈ dedupList ((renameRawList p ds).map mkVal) ↔
-            x ∈ (dedupList (ds.map mkVal)).map (renameVal p) := by
-          intro x
-          simp only [mem_dedupList, renameRawList_eq_map, List.mem_map]
+      cases dr with
+      | set ds =>
+        cases rr with
+        | set rs =>
+          change Val.set ((allMaps (dedupList ((renameRawList p ds).map mkVal)) ((renameRawList p rs).map mkVal)).map Val.fn) =
+            renameVal p (Val.set ((allMaps (dedupList (ds.map mkVal)) (rs.map mkVal)).map Val.fn))
+          have hrmap : (renameRawList p rs).map mkVal = (rs.map mkVal).map (renameVal p) := by
+            rw [renameRawList_eq_map, List.map_map, List.map_map]; rfl
+          have hdeq : ∀ x, x ∈ dedupList ((renameRawList p ds).map mkVal) ↔
+              x ∈ (dedupList (ds.map mkVal)).map (renameVal p) := by
+            intro x
+            simp only [mem_dedupList, renameRawList_eq_map, List.mem_map]
+            constructor
+            · rintro ⟨a', ⟨a, ha, rfl⟩, rfl⟩
+              exact ⟨mkVal a, ⟨a, ha, rfl⟩, rfl⟩
+            · rintro ⟨w, ⟨a, ha, rfl⟩, rfl⟩
+              exact ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩
+          rw [hrmap, Val.rename_set, Val.set_eq_iff]
+          intro v
+          simp only [List.mem_map]
           constructor
-          · rintro ⟨a', ⟨a, ha, rfl⟩, rfl⟩
-            exact ⟨mkVal a, ⟨a, ha, rfl⟩, rfl⟩
-          · rintro ⟨w, ⟨a, ha, rfl⟩, rfl⟩
-            exact ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩
-        rw [hrmap, Val.rename_set, Val.set_eq_iff]
-        intro v
-        simp only [List.mem_map]
-        constructor
-        · rintro ⟨m, hm, rfl⟩
-          rcases fn_of_nodup_graph (nodup_dedupList _) hdeq hm with ⟨m', hm', hfe⟩
-          rw [allMaps_map] at hm'
-          rcases List.mem_map.mp hm' with ⟨m0, hm0, rfl⟩
-          refine ⟨Val.fn m0, ⟨m0, hm0, rfl⟩, ?_⟩
-          rw [Val.rename_fn, hfe]
-        · rintro ⟨w, ⟨m0, hm0, rfl⟩, rfl⟩
-          have hm' : m0.map (fun kv => (renameVal p kv.1, renameVal p kv.2)) ∈
-              allMaps ((dedupList (ds.map mkVal)).map (renameVal p)) ((rs.map mkVal).map (renameVal p)) := by
-            rw [allMaps_map]
-            exact List.mem_map_of_mem hm0
-          have hnd2 := nodup_map_inj (fun _ _ h => (renameVal_injective p).mp h) (nodup_dedupList (ds.map mkVal))
-          rcases fn_of_nodup_graph hnd2 (fun x => (hdeq x).symm) hm' with ⟨m, hm, hfe⟩
-          refine ⟨m, hm, ?_⟩
-          rw [Val.rename_fn, hfe]
+          · rintro ⟨m, hm, rfl⟩
+            rcases fn_of_nodup_graph (nodup_dedupList _) hdeq hm with ⟨m', hm', hfe⟩
+            rw [allMaps_map] at hm'
+            rcases List.mem_map.mp hm' with ⟨m0, hm0, rfl⟩
+            refine ⟨Val.fn m0, ⟨m0, hm0, rfl⟩, ?_⟩
+            rw [Val.rename_fn, hfe]
+          · rintro ⟨w, ⟨m0, hm0, rfl⟩, rfl⟩
+            have hm' : m0.map (fun kv => (renameVal p kv.1, renameVal p kv.2)) ∈
+                allMaps ((dedupList (ds.map mkVal)).map (renameVal p)) ((rs.map mkVal).map (renameVal p)) := by
+              rw [allMaps_map]
+              exact List.mem_map_of_mem hm0
+            have hnd2 := nodup_map_inj (fun _ _ h => (renameVal_injective p).mp h) (nodup_dedupList (ds.map mkVal))
+            rcases fn_of_nodup_graph hnd2 (fun x => (hdeq x).symm) hm' with ⟨m, hm, hfe⟩
+            refine ⟨m, hm, ?_⟩
+            rw [Val.rename_fn, hfe]
+        | _ => rfl
+      | _ => rfl
 
 def recCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f : A) (s r : Val sizes A) : Val sizes A :=
   Quotient.liftOn₂ s r (fun sr rr => match sr, rr with
@@ -2212,13 +2288,9 @@ def recCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f : A) 
         rxs.flatMap (fun rv => match rawFnPairs rv with
           | some ps => [Val.fn ((Val.atom f, v) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2)))]
           | none => [])))
-    | _, _ => Val.err) (by
-    intro s1 r1 s2 r2 hs hr
-    cases s1 <;> cases s2 <;> cases r1 <;> cases r2
-    all_goals try exact False.elim hs
-    all_goals try exact False.elim hr
-    all_goals try rfl
-    case set.set.set.set xs1 xs2 rxs1 rxs2 =>
+    | _, _ => Val.err)
+    (lift₂_set_sound (fallback := Val.err) (by
+      intro xs1 xs2 rxs1 rxs2 hs hr
       rw [Val.set_eq_iff]
       rcases ValEq.set_iff.mp hs with ⟨hs1, hs2⟩
       rcases ValEq.set_iff.mp hr with ⟨hr1, hr2⟩
@@ -2230,9 +2302,9 @@ def recCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f : A) 
         rcases hr1 rv hrm with ⟨rv', hrv', hrr'⟩
         have hfs := ValEq.rawFnPairs_some hrr'
         cases hp1 : rawFnPairs rv <;> cases hp2 : rawFnPairs rv'
-        · simp [hp1] at hw
-        · simp [hp1, hp2] at hfs
-        · simp [hp1, hp2] at hfs
+        · rw [hp1] at hw; cases hw
+        · rw [hp1, hp2] at hfs; cases hfs
+        · rw [hp1, hp2] at hfs; cases hfs
         · case some.some ps1 ps2 =>
           simp only [hp1, List.mem_singleton] at hw
           subst hw
@@ -2260,9 +2332,9 @@ def recCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f : A) 
         rcases hr2 rv' hrv' with ⟨rv, hrm, hrr'⟩
         have hfs := ValEq.rawFnPairs_some hrr'
         cases hp1 : rawFnPairs rv <;> cases hp2 : rawFnPairs rv'
-        · simp [hp2] at hw
-        · simp [hp1, hp2] at hfs
-        · simp [hp1, hp2] at hfs
+        · rw [hp2] at hw; cases hw
+        · rw [hp1, hp2] at hfs; cases hfs
+        · rw [hp1, hp2] at hfs; cases hfs
         · case some.some ps1 ps2 =>
           simp only [hp2, List.mem_singleton] at hw
           subst hw
@@ -2284,7 +2356,7 @@ def recCons {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (f : A) 
               · right
                 rcases hf1 x hx with ⟨y, hy, h1e, h2e⟩
                 exact ⟨y, hy, Prod.ext (Quotient.sound h1e).symm (Quotient.sound h2e).symm⟩
-          exact ⟨mkVal a, ⟨a, ha, rfl⟩, rv, hrm, by simp only [hp1, List.mem_singleton, hfe]⟩)
+          exact ⟨mkVal a, ⟨a, ha, rfl⟩, rv, hrm, by simp only [hp1, List.mem_singleton, hfe]⟩))
 
 theorem recCons_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (f : A) (s r : Val sizes A) :
@@ -2293,43 +2365,46 @@ theorem recCons_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom 
   | _ sr =>
     induction r using Quotient.ind with
     | _ rr =>
-      cases sr <;> cases rr
-      all_goals try rfl
-      case set.set xs rxs =>
-        change Val.set (((renameRawList p xs).map mkVal).flatMap (fun v =>
-            (renameRawList p rxs).flatMap (fun rv => match rawFnPairs rv with
-              | some ps => [Val.fn ((Val.atom f, v) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2)))]
-              | none => []))) =
-          renameVal p (Val.set ((xs.map mkVal).flatMap (fun v =>
-            rxs.flatMap (fun rv => match rawFnPairs rv with
-              | some ps => [Val.fn ((Val.atom f, v) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2)))]
-              | none => []))))
-        rw [Val.rename_set, Val.set_eq_iff, renameRawList_eq_map, renameRawList_eq_map]
-        intro w
-        simp only [List.mem_flatMap, List.mem_map]
-        constructor
-        · rintro ⟨v, ⟨a', ⟨a, ha, rfl⟩, rfl⟩, rv', ⟨rv, hrv, rfl⟩, hw⟩
-          rw [rawFnPairs_rename] at hw
-          cases hp : rawFnPairs rv with
-          | none => simp [hp] at hw
-          | some ps =>
-            simp only [hp, Option.map_some, renameRawPairs_eq_map, List.mem_singleton] at hw
-            subst hw
-            refine ⟨Val.fn ((Val.atom f, mkVal a) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2))),
-              ⟨mkVal a, ⟨a, ha, rfl⟩, rv, hrv, by simp [hp]⟩, ?_⟩
-            rw [Val.rename_fn, List.map_cons, List.map_map, List.map_map]
-            rfl
-        · rintro ⟨w0, ⟨v, ⟨a, ha, rfl⟩, rv, hrv, hw⟩, rfl⟩
-          cases hp : rawFnPairs rv with
-          | none => simp [hp] at hw
-          | some ps =>
-            simp only [hp, List.mem_singleton] at hw
-            subst hw
-            refine ⟨renameVal p (mkVal a), ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩,
-              renameRaw p rv, ⟨rv, hrv, rfl⟩, ?_⟩
-            rw [rawFnPairs_rename, hp, Option.map_some, renameRawPairs_eq_map, List.mem_singleton]
-            rw [Val.rename_fn, List.map_cons, List.map_map, List.map_map]
-            rfl
+      cases sr with
+      | set xs =>
+        cases rr with
+        | set rxs =>
+          change Val.set (((renameRawList p xs).map mkVal).flatMap (fun v =>
+              (renameRawList p rxs).flatMap (fun rv => match rawFnPairs rv with
+                | some ps => [Val.fn ((Val.atom f, v) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2)))]
+                | none => []))) =
+            renameVal p (Val.set ((xs.map mkVal).flatMap (fun v =>
+              rxs.flatMap (fun rv => match rawFnPairs rv with
+                | some ps => [Val.fn ((Val.atom f, v) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2)))]
+                | none => []))))
+          rw [Val.rename_set, Val.set_eq_iff, renameRawList_eq_map, renameRawList_eq_map]
+          intro w
+          simp only [List.mem_flatMap, List.mem_map]
+          constructor
+          · rintro ⟨v, ⟨a', ⟨a, ha, rfl⟩, rfl⟩, rv', ⟨rv, hrv, rfl⟩, hw⟩
+            rw [rawFnPairs_rename] at hw
+            cases hp : rawFnPairs rv with
+            | none => rw [hp] at hw; cases hw
+            | some ps =>
+              simp only [hp, Option.map_some, renameRawPairs_eq_map, List.mem_singleton] at hw
+              subst hw
+              refine ⟨Val.fn ((Val.atom f, mkVal a) :: ps.map (fun kv => (mkVal kv.1, mkVal kv.2))),
+                ⟨mkVal a, ⟨a, ha, rfl⟩, rv, hrv, by rw [hp]; exact List.mem_cons_self⟩, ?_⟩
+              rw [Val.rename_fn, List.map_cons, List.map_map, List.map_map]
+              rfl
+          · rintro ⟨w0, ⟨v, ⟨a, ha, rfl⟩, rv, hrv, hw⟩, rfl⟩
+            cases hp : rawFnPairs rv with
+            | none => rw [hp] at hw; cases hw
+            | some ps =>
+              simp only [hp, List.mem_singleton] at hw
+              subst hw
+              refine ⟨renameVal p (mkVal a), ⟨renameRaw p a, ⟨a, ha, rfl⟩, rfl⟩,
+                renameRaw p rv, ⟨rv, hrv, rfl⟩, ?_⟩
+              rw [rawFnPairs_rename, hp, Option.map_some, renameRawPairs_eq_map, List.mem_singleton]
+              rw [Val.rename_fn, List.map_cons, List.map_map, List.map_map]
+              rfl
+        | _ => rfl
+      | _ => rfl
 
 def Val.recSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] :
     List (A × Val sizes A) → Val sizes A
@@ -2362,7 +2437,7 @@ theorem Val.groupSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNat
   constructor
   · rintro ⟨w, ⟨g, hg⟩, rfl⟩
     cases hm : mask g
-    · simp [hm] at hg
+    · simp only [hm, Bool.false_eq_true, ↓reduceIte, List.not_mem_nil] at hg
     · simp only [hm, ↓reduceIte, List.mem_map, List.mem_finRange, true_and] at hg
       rcases hg with ⟨i, rfl⟩
       refine ⟨g, ?_⟩
@@ -2370,7 +2445,7 @@ theorem Val.groupSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNat
       exact ⟨(p g).toFun i, rfl⟩
   · rintro ⟨g, hg⟩
     cases hm : mask g
-    · simp [hm] at hg
+    · simp only [hm, Bool.false_eq_true, ↓reduceIte, List.not_mem_nil] at hg
     · simp only [hm, ↓reduceIte, List.mem_map, List.mem_finRange, true_and] at hg
       rcases hg with ⟨i, rfl⟩
       refine ⟨Val.key ⟨g, (p g).invFun i⟩, ⟨g, ?_⟩, ?_⟩
@@ -2544,14 +2619,17 @@ theorem Val.cup_comm {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
   | _ ar =>
     induction b using Quotient.ind with
     | _ br =>
-      cases ar <;> cases br
-      all_goals try rfl
-      case set.set xs ys =>
-        change Val.set (xs.map mkVal ++ ys.map mkVal) = Val.set (ys.map mkVal ++ xs.map mkVal)
-        rw [Val.set_eq_iff]
-        intro v
-        simp only [List.mem_append]
-        exact Or.comm
+      cases ar with
+      | set xs =>
+        cases br with
+        | set ys =>
+          change Val.set (xs.map mkVal ++ ys.map mkVal) = Val.set (ys.map mkVal ++ xs.map mkVal)
+          rw [Val.set_eq_iff]
+          intro v
+          simp only [List.mem_append]
+          exact Or.comm
+        | _ => rfl
+      | _ => cases br <;> rfl
 
 theorem Val.cup_assoc {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (a b c : Val sizes A) :
     Val.cup (Val.cup a b) c = Val.cup a (Val.cup b c) := by
@@ -2561,18 +2639,24 @@ theorem Val.cup_assoc {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A
     | _ br =>
       induction c using Quotient.ind with
       | _ cr =>
-        cases ar <;> cases br <;> cases cr
-        all_goals try rfl
-        case set.set.set xs ys zs =>
-          change Val.cup (Val.set (xs.map mkVal ++ ys.map mkVal)) (mkVal (.set zs)) =
-            Val.cup (mkVal (.set xs)) (Val.set (ys.map mkVal ++ zs.map mkVal))
-          unfold Val.set
-          change Val.set ((((xs.map mkVal ++ ys.map mkVal).map valOut).map mkVal) ++ zs.map mkVal) =
-            Val.set (xs.map mkVal ++ (((ys.map mkVal ++ zs.map mkVal).map valOut).map mkVal))
-          rw [Val.set_eq_iff]
-          intro v
-          simp only [List.mem_append, List.map_map, Function.comp_def, valOut_eq, List.map_id']
-          exact or_assoc
+        cases ar with
+        | set xs =>
+          cases br with
+          | set ys =>
+            cases cr with
+            | set zs =>
+              change Val.cup (Val.set (xs.map mkVal ++ ys.map mkVal)) (mkVal (.set zs)) =
+                Val.cup (mkVal (.set xs)) (Val.set (ys.map mkVal ++ zs.map mkVal))
+              unfold Val.set
+              change Val.set ((((xs.map mkVal ++ ys.map mkVal).map valOut).map mkVal) ++ zs.map mkVal) =
+                Val.set (xs.map mkVal ++ (((ys.map mkVal ++ zs.map mkVal).map valOut).map mkVal))
+              rw [Val.set_eq_iff]
+              intro v
+              simp only [List.mem_append, List.map_map, Function.comp_def, valOut_eq, List.map_id']
+              exact or_assoc
+            | _ => rfl
+          | _ => rfl
+        | _ => exact Eq.symm (Quotient.ind (motive := fun v => Val.cup _ v = Val.err) (fun _ => rfl) (Val.cup (mkVal br) (mkVal cr)))
 
 private theorem Val.cap_mk_set {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     (xs ys : List (RawVal (Key sizes) A)) :
@@ -2978,7 +3062,15 @@ private theorem foldScalarAC_perm {d : Nat} {sizes : Fin d → Nat} {A α : Type
       (match (match acc, decode y with | some a, some b => some (combine a b) | _, _ => none), decode x with
        | some a, some b => some (combine a b) | _, _ => none) := by
     intro x _ y _ acc
-    cases acc <;> cases decode x <;> cases decode y <;> simp [hcomm]
+    cases acc with
+    | none => rfl
+    | some a =>
+      cases decode x with
+      | none => cases decode y <;> rfl
+      | some bx =>
+        cases decode y with
+        | none => rfl
+        | some by' => exact congrArg some (hcomm a bx by')
   rw [hp.foldl_eq' hswap (decode base)]
 
 private theorem foldScalarAC_rename {d : Nat} {sizes : Fin d → Nat} {A α : Type} [HasNatAtom A]
@@ -3046,13 +3138,9 @@ def Val.foldSetAC {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
   classical
   exact Quotient.liftOn s (fun sr => match sr with
     | .set xs => foldSetACList ops op base ((dedupList (xs.map mkVal)).map f)
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
-      dsimp only
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       have hperm : (dedupList (xs.map mkVal)).Perm (dedupList (ys.map mkVal)) :=
         (List.perm_ext_iff_of_nodup (nodup_dedupList _) (nodup_dedupList _)).mpr (fun v => by
           simp only [mem_dedupList, List.mem_map]
@@ -3064,7 +3152,7 @@ def Val.foldSetAC {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
           · rintro ⟨b, hb, rfl⟩
             rcases h2 b hb with ⟨a, ha, hab⟩
             exact ⟨a, ha, Quotient.sound hab⟩)
-      exact foldSetACList_perm ops op base (hperm.map f))
+      exact foldSetACList_perm ops op base (hperm.map f)))
 
 theorem Val.foldSetAC_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (s base : Val sizes A)
@@ -3368,13 +3456,9 @@ private def foldBagDom {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom 
           match (Val.fnLookup b k).bind (valInt ops) with
           | some n => List.replicate n.toNat k
           | none => []))
-    | _ => Val.err) (by
-    intro s1 s2 h
-    cases s1 <;> cases s2
-    all_goals try exact False.elim h
-    all_goals try rfl
-    case set.set xs ys =>
-      dsimp only
+    | _ => Val.err)
+    (lift_set_sound (fallback := Val.err) (by
+      intro xs ys h
       have hperm : (dedupList (xs.map mkVal)).Perm (dedupList (ys.map mkVal)) :=
         (List.perm_ext_iff_of_nodup (nodup_dedupList _) (nodup_dedupList _)).mpr (fun v => by
           simp only [mem_dedupList, List.mem_map]
@@ -3386,7 +3470,7 @@ private def foldBagDom {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom 
           · rintro ⟨c, hc, rfl⟩
             rcases h2 c hc with ⟨a, ha, hac⟩
             exact ⟨a, ha, Quotient.sound hac⟩)
-      exact foldSetACList_perm ops op base (perm_flatMap _ hperm))
+      exact foldSetACList_perm ops op base (perm_flatMap _ hperm)))
 
 private theorem foldBagDom_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
     (p : GroupPerm sizes) (ops : AtomOps A) (op : ACOp) (b base dVal : Val sizes A) :
@@ -3750,6 +3834,10 @@ def evalRecSetPreds {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A
       evalRecSetPreds ops s t env rest v
 end
 
+private theorem congrArg₂ {α β γ : Sort _} (f : α → β → γ) {a₁ a₂ : α} {b₁ b₂ : β}
+    (ha : a₁ = a₂) (hb : b₁ = b₂) : f a₁ b₁ = f a₂ b₂ :=
+  ha ▸ hb ▸ rfl
+
 mutual
 theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
@@ -3762,22 +3850,35 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
   | .primeVar _ => rfl
   | .localVar _ => rfl
   | .groupSet mask => (Val.groupSet_rename p mask).symm
-  | .seqLit elems => by
-    simp only [evalExpr, evalExprList_equivariant p ops s t env elems, Val.rename_seq]
-  | .setEnum elems => by
-    simp only [evalExpr, evalExprList_equivariant p ops s t env elems, Val.rename_set]
-  | .recLit fields => by
-    simp only [evalExpr, evalRecPairs_equivariant p ops s t env fields, Val.rename_fn]
-  | .colonGt k v => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env k, evalExpr_equivariant p ops s t env v, Val.rename_fn, List.map_singleton]
-  | .atAt f g => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env f, evalExpr_equivariant p ops s t env g, Val.merge_rename]
-  | .fnApp f arg => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env f, evalExpr_equivariant p ops s t env arg, Val.apply_rename]
-  | .domain f => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env f, Val.domain_rename]
+  | .seqLit elems =>
+    (congrArg Val.seq (evalExprList_equivariant p ops s t env elems)).trans (Val.rename_seq p _).symm
+  | .setEnum elems =>
+    (congrArg Val.set (evalExprList_equivariant p ops s t env elems)).trans (Val.rename_set p _).symm
+  | .recLit fields =>
+    (congrArg Val.fn (evalRecPairs_equivariant p ops s t env fields)).trans (Val.rename_fn p _).symm
+  | .colonGt k v =>
+    (congrArg₂ (fun a b => Val.fn [(a, b)])
+      (evalExpr_equivariant p ops s t env k) (evalExpr_equivariant p ops s t env v)).trans
+      (Val.rename_fn p [(evalExpr ops s t env k, evalExpr ops s t env v)]).symm
+  | .atAt f g =>
+    (congrArg₂ Val.merge (evalExpr_equivariant p ops s t env f) (evalExpr_equivariant p ops s t env g)).trans
+      (Val.merge_rename p _ _)
+  | .fnApp f arg =>
+    (congrArg₂ Val.apply (evalExpr_equivariant p ops s t env f) (evalExpr_equivariant p ops s t env arg)).trans
+      (Val.apply_rename p _ _)
+  | .domain f =>
+    (congrArg Val.domain (evalExpr_equivariant p ops s t env f)).trans (Val.domain_rename p _)
   | .except base key rhs => by
-    dsimp only [evalExpr]
+    change @ite _ (Val.isFn (evalExpr _ _ _ _ base)) (Classical.propDecidable _)
+        (match Val.fnLookup (evalExpr _ _ _ _ base) (evalExpr _ _ _ _ key) with
+         | some old => Val.update (evalExpr _ _ _ _ base) (evalExpr _ _ _ _ key)
+             (evalExpr _ _ _ (push _ old) rhs)
+         | none => evalExpr _ _ _ _ base) Val.err =
+      renameVal p (@ite _ (Val.isFn (evalExpr ops s t env base)) (Classical.propDecidable _)
+        (match Val.fnLookup (evalExpr ops s t env base) (evalExpr ops s t env key) with
+         | some old => Val.update (evalExpr ops s t env base) (evalExpr ops s t env key)
+             (evalExpr ops s t (push env old) rhs)
+         | none => evalExpr ops s t env base) Val.err)
     rw [evalExpr_equivariant p ops s t env base, evalExpr_equivariant p ops s t env key]
     rw [propext (Val.isFn_rename p _), Val.fnLookup_rename]
     split
@@ -3787,106 +3888,137 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
         simp only [Option.map_some]
         rw [← renameEnv_push, evalExpr_equivariant p ops s t (push env old) rhs, Val.update_rename]
     · rfl
-  | .fnConstruct dom body => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env dom]
-    exact Val.fnConstruct_rename p _ _ _ (fun v => by
-      rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) body)
-  | .setFilter dom pred => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env dom]
-    exact Val.setFilter_rename p _ _ _ (fun v => by
-      rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) pred)
-  | .setMap dom body => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env dom]
-    exact Val.setMap_rename p _ _ _ (fun v => by
-      rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) body)
-  | .cup a b => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env a, evalExpr_equivariant p ops s t env b, Val.cup_rename]
-  | .cap a b => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env a, evalExpr_equivariant p ops s t env b, Val.cap_rename]
-  | .setMinus a b => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env a, evalExpr_equivariant p ops s t env b, Val.setMinus_rename]
-  | .union x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.union_rename]
-  | .powerset x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.powerset_rename]
-  | .cartesian sets => by
-    simp only [evalExpr, evalExprList_equivariant p ops s t env sets, cartSet_rename]
-  | .fnSet dom ran => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env dom, evalExpr_equivariant p ops s t env ran, Val.fnSet_rename]
-  | .recSet fields => by
-    simp only [evalExpr, evalRecSetPairs_equivariant p ops s t env fields, Val.recSet_rename]
+  | .fnConstruct dom body =>
+    (congrArg (Val.fnConstruct · _) (evalExpr_equivariant p ops s t env dom)).trans
+      (Val.fnConstruct_rename p _ _ _ (fun v => by
+        rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) body))
+  | .setFilter dom pred =>
+    (congrArg (Val.setFilter · _) (evalExpr_equivariant p ops s t env dom)).trans
+      (Val.setFilter_rename p _ _ _ (fun v => by
+        rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) pred))
+  | .setMap dom body =>
+    (congrArg (Val.setMap · _) (evalExpr_equivariant p ops s t env dom)).trans
+      (Val.setMap_rename p _ _ _ (fun v => by
+        rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) body))
+  | .cup a b =>
+    (congrArg₂ Val.cup (evalExpr_equivariant p ops s t env a) (evalExpr_equivariant p ops s t env b)).trans
+      (Val.cup_rename p _ _)
+  | .cap a b =>
+    (congrArg₂ Val.cap (evalExpr_equivariant p ops s t env a) (evalExpr_equivariant p ops s t env b)).trans
+      (Val.cap_rename p _ _)
+  | .setMinus a b =>
+    (congrArg₂ Val.setMinus (evalExpr_equivariant p ops s t env a) (evalExpr_equivariant p ops s t env b)).trans
+      (Val.setMinus_rename p _ _)
+  | .union x =>
+    (congrArg Val.union (evalExpr_equivariant p ops s t env x)).trans (Val.union_rename p _)
+  | .powerset x =>
+    (congrArg Val.powerset (evalExpr_equivariant p ops s t env x)).trans (Val.powerset_rename p _)
+  | .cartesian sets =>
+    (congrArg cartSet (evalExprList_equivariant p ops s t env sets)).trans (cartSet_rename p _)
+  | .fnSet dom ran =>
+    (congrArg₂ Val.fnSet (evalExpr_equivariant p ops s t env dom) (evalExpr_equivariant p ops s t env ran)).trans
+      (Val.fnSet_rename p _ _)
+  | .recSet fields =>
+    (congrArg Val.recSet (evalRecSetPairs_equivariant p ops s t env fields)).trans (Val.recSet_rename p _)
   | .card x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.card_rename]
+    change (match Val.card (evalExpr _ _ _ _ x) with
+        | some n => Val.atom (HasNatAtom.natAtom n) | none => Val.err) =
+      renameVal p (match Val.card (evalExpr ops s t env x) with
+        | some n => Val.atom (HasNatAtom.natAtom n) | none => Val.err)
+    rw [evalExpr_equivariant p ops s t env x, Val.card_rename]
     cases Val.card (evalExpr ops s t env x) <;> rfl
-  | .len x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.len_rename]
-  | .head x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.head_rename]
-  | .tail x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.tail_rename]
-  | .append x elem => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, evalExpr_equivariant p ops s t env elem, Val.append_rename]
-  | .concat a b => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env a, evalExpr_equivariant p ops s t env b, Val.concat_rename]
+  | .len x =>
+    (congrArg Val.len (evalExpr_equivariant p ops s t env x)).trans (Val.len_rename p _)
+  | .head x =>
+    (congrArg Val.head (evalExpr_equivariant p ops s t env x)).trans (Val.head_rename p _)
+  | .tail x =>
+    (congrArg Val.tail (evalExpr_equivariant p ops s t env x)).trans (Val.tail_rename p _)
+  | .append x elem =>
+    (congrArg₂ Val.append (evalExpr_equivariant p ops s t env x) (evalExpr_equivariant p ops s t env elem)).trans
+      (Val.append_rename p _ _)
+  | .concat a b =>
+    (congrArg₂ Val.concat (evalExpr_equivariant p ops s t env a) (evalExpr_equivariant p ops s t env b)).trans
+      (Val.concat_rename p _ _)
   | .subseq x lo hi => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, evalExpr_equivariant p ops s t env lo,
+    change Val.subseq ops.intOf (evalExpr _ _ _ _ x) (evalExpr _ _ _ _ lo) (evalExpr _ _ _ _ hi) =
+      renameVal p (Val.subseq ops.intOf (evalExpr ops s t env x) (evalExpr ops s t env lo) (evalExpr ops s t env hi))
+    rw [evalExpr_equivariant p ops s t env x, evalExpr_equivariant p ops s t env lo,
       evalExpr_equivariant p ops s t env hi, Val.subseq_rename]
-  | .selectSeq x pred => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x]
-    exact Val.selectSeq_rename p _ _ _ (fun v => by
-      rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) pred)
-  | .foldSeq right onDomain seq base step => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env seq, evalExpr_equivariant p ops s t env base]
-    exact Val.foldSeq_rename p right onDomain _ _ _ _ (fun x acc => by
-      rw [← renameEnv_push, ← renameEnv_push]
-      exact evalExpr_equivariant p ops s t (push (push env acc) x) step)
-  | .foldSetAC op dom base elem => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env dom, evalExpr_equivariant p ops s t env base]
-    exact Val.foldSetAC_rename p ops op _ _ _ _ (fun v => by
-      rw [← renameEnv_push]
-      exact evalExpr_equivariant p ops s t (push env v) elem)
-  | .copiesIn elem bag => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env elem, evalExpr_equivariant p ops s t env bag, Val.copiesIn_rename]
-  | .bagCup b1 b2 => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.bagCup_rename]
-  | .bagDiff b1 b2 => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.bagDiff_rename]
-  | .bagUnion x => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env x, Val.bagUnion_rename]
-  | .bagCard b => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env b, Val.bagCard_rename]
-  | .bagOfAll bag f => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env bag]
-    exact Val.bagOfAll_rename p ops _ _ (fun v => by
-      rw [← renameEnv_push]
-      exact evalExpr_equivariant p ops s t (push env v) f) _
-  | .foldBag op bag base => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env bag, evalExpr_equivariant p ops s t env base, Val.foldBag_rename]
+  | .selectSeq x pred =>
+    (congrArg (Val.selectSeq · _) (evalExpr_equivariant p ops s t env x)).trans
+      (Val.selectSeq_rename p _ _ _ (fun v => by
+        rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) pred))
+  | .foldSeq right onDomain seq base step =>
+    (congrArg₂ (Val.foldSeq right onDomain · · _) (evalExpr_equivariant p ops s t env seq)
+      (evalExpr_equivariant p ops s t env base)).trans
+      (Val.foldSeq_rename p right onDomain _ _ _ _ (fun x acc => by
+        rw [← renameEnv_push, ← renameEnv_push]
+        exact evalExpr_equivariant p ops s t (push (push env acc) x) step))
+  | .foldSetAC op dom base elem =>
+    (congrArg₂ (Val.foldSetAC ops op · · _) (evalExpr_equivariant p ops s t env dom)
+      (evalExpr_equivariant p ops s t env base)).trans
+      (Val.foldSetAC_rename p ops op _ _ _ _ (fun v => by
+        rw [← renameEnv_push]
+        exact evalExpr_equivariant p ops s t (push env v) elem))
+  | .copiesIn elem bag =>
+    (congrArg₂ (Val.copiesIn ops) (evalExpr_equivariant p ops s t env elem)
+      (evalExpr_equivariant p ops s t env bag)).trans (Val.copiesIn_rename p ops _ _)
+  | .bagCup b1 b2 =>
+    (congrArg₂ (Val.bagCup ops) (evalExpr_equivariant p ops s t env b1)
+      (evalExpr_equivariant p ops s t env b2)).trans (Val.bagCup_rename p ops _ _)
+  | .bagDiff b1 b2 =>
+    (congrArg₂ (Val.bagDiff ops) (evalExpr_equivariant p ops s t env b1)
+      (evalExpr_equivariant p ops s t env b2)).trans (Val.bagDiff_rename p ops _ _)
+  | .bagUnion x =>
+    (congrArg (Val.bagUnion ops) (evalExpr_equivariant p ops s t env x)).trans (Val.bagUnion_rename p ops _)
+  | .bagCard b =>
+    (congrArg (Val.bagCard ops) (evalExpr_equivariant p ops s t env b)).trans (Val.bagCard_rename p ops _)
+  | .bagOfAll bag f =>
+    (congrArg (Val.bagOfAll ops _) (evalExpr_equivariant p ops s t env bag)).trans
+      (Val.bagOfAll_rename p ops _ _ (fun v => by
+        rw [← renameEnv_push]
+        exact evalExpr_equivariant p ops s t (push env v) f) _)
+  | .foldBag op bag base =>
+    (congrArg₂ (Val.foldBag ops op) (evalExpr_equivariant p ops s t env bag)
+      (evalExpr_equivariant p ops s t env base)).trans (Val.foldBag_rename p ops op _ _)
   | .ite cond yes no => by
-    simp only [evalExpr]
+    change @ite _ (evalForm _ _ _ _ cond) (Classical.propDecidable _) _ _ =
+      renameVal p (@ite _ (evalForm ops s t env cond) (Classical.propDecidable _)
+        (evalExpr ops s t env yes) (evalExpr ops s t env no))
     rw [propext (evalForm_equivariant p ops s t env cond)]
     split
     · exact evalExpr_equivariant p ops s t env yes
     · exact evalExpr_equivariant p ops s t env no
-  | .letBind val body => by
-    simp only [evalExpr, evalExpr_equivariant p ops s t env val, ← renameEnv_push]
-    exact evalExpr_equivariant p ops s t (push env (evalExpr ops s t env val)) body
-  | .ofForm f => by
-    simp only [evalExpr]
-    rw [propext (evalForm_equivariant p ops s t env f)]
-    rfl
+  | .letBind val body =>
+    (congrArg (fun e => evalExpr ops (renameState p s) (renameState p t) e body)
+      ((congrArg (push _) (evalExpr_equivariant p ops s t env val)).trans (renameEnv_push p env _).symm)).trans
+      (evalExpr_equivariant p ops s t (push env (evalExpr ops s t env val)) body)
+  | .ofForm f =>
+    congrArg (fun q => Val.atom (ops.boolAtom (@decide q (Classical.propDecidable _))))
+      (propext (evalForm_equivariant p ops s t env f))
   | .atomOp id args => by
-    simp only [evalExpr, evalExprList_equivariant p ops s t env args, collectAtoms_rename]
+    change (match collectAtoms (evalExprList _ _ _ _ args) with
+        | some as => Val.atom (ops.atomOp id as) | none => Val.err) =
+      renameVal p (match collectAtoms (evalExprList ops s t env args) with
+        | some as => Val.atom (ops.atomOp id as) | none => Val.err)
+    rw [evalExprList_equivariant p ops s t env args, collectAtoms_rename]
     cases collectAtoms (evalExprList ops s t env args) <;> rfl
   | .atomSetOp id args => by
-    simp only [evalExpr, evalExprList_equivariant p ops s t env args, collectAtoms_rename]
+    change (match collectAtoms (evalExprList _ _ _ _ args) with
+        | some as => Val.set ((ops.atomSetOp id as).map Val.atom) | none => Val.err) =
+      renameVal p (match collectAtoms (evalExprList ops s t env args) with
+        | some as => Val.set ((ops.atomSetOp id as).map Val.atom) | none => Val.err)
+    rw [evalExprList_equivariant p ops s t env args, collectAtoms_rename]
     cases collectAtoms (evalExprList ops s t env args) with
     | none => rfl
     | some as =>
       rw [Val.rename_set, List.map_map]
       rfl
   | .atomSetAgg id x => by
-    dsimp only [evalExpr]
+    change @ite _ (Val.allAtoms (evalExpr _ _ _ _ x)) (Classical.propDecidable _)
+        (Val.atom (ops.atomSetAgg id (fun a => Val.mem (Val.atom a) (evalExpr _ _ _ _ x)))) Val.err =
+      renameVal p (@ite _ (Val.allAtoms (evalExpr ops s t env x)) (Classical.propDecidable _)
+        (Val.atom (ops.atomSetAgg id (fun a => Val.mem (Val.atom a) (evalExpr ops s t env x)))) Val.err)
     rw [evalExpr_equivariant p ops s t env x]
     rw [propext (Val.allAtoms_rename p _)]
     split
@@ -3898,7 +4030,13 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       rfl
     · rfl
   | .atomChoose dom pred => by
-    dsimp only [evalExpr]
+    change @ite _ (Val.allAtoms (evalExpr _ _ _ _ dom)) (Classical.propDecidable _)
+        (Val.atom (ops.chooseAtom (fun a =>
+          Val.mem (Val.atom a) (evalExpr _ _ _ _ dom) ∧
+          evalForm _ _ _ (push _ (Val.atom a)) pred))) Val.err =
+      renameVal p (@ite _ (Val.allAtoms (evalExpr ops s t env dom)) (Classical.propDecidable _)
+        (Val.atom (ops.chooseAtom (fun a =>
+          Val.mem (Val.atom a) (evalExpr ops s t env dom) ∧ evalForm ops s t (push env (Val.atom a)) pred))) Val.err)
     rw [evalExpr_equivariant p ops s t env dom]
     rw [propext (Val.allAtoms_rename p _)]
     split
@@ -3921,9 +4059,8 @@ theorem evalExprList_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} 
       evalExprList ops (renameState p s) (renameState p t) (renameEnv p env) es =
         (evalExprList ops s t env es).map (renameVal p)
   | [] => rfl
-  | e :: es => by
-    simp only [evalExprList, List.map_cons, evalExpr_equivariant p ops s t env e,
-      evalExprList_equivariant p ops s t env es]
+  | e :: es =>
+    congrArg₂ List.cons (evalExpr_equivariant p ops s t env e) (evalExprList_equivariant p ops s t env es)
 
 theorem evalRecPairs_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
@@ -3931,9 +4068,9 @@ theorem evalRecPairs_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} 
       evalRecPairs ops (renameState p s) (renameState p t) (renameEnv p env) fs =
         (evalRecPairs ops s t env fs).map (fun kv => (renameVal p kv.1, renameVal p kv.2))
   | [] => rfl
-  | (f, e) :: rest => by
-    simp only [evalRecPairs, List.map_cons, evalExpr_equivariant p ops s t env e,
-      evalRecPairs_equivariant p ops s t env rest, Val.rename_atom]
+  | (_, e) :: rest =>
+    congrArg₂ List.cons (Prod.ext rfl (evalExpr_equivariant p ops s t env e))
+      (evalRecPairs_equivariant p ops s t env rest)
 
 theorem evalRecSetPairs_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
@@ -3941,9 +4078,9 @@ theorem evalRecSetPairs_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Typ
       evalRecSetPairs ops (renameState p s) (renameState p t) (renameEnv p env) fs =
         (evalRecSetPairs ops s t env fs).map (fun kv => (kv.1, renameVal p kv.2))
   | [] => rfl
-  | (f, e) :: rest => by
-    simp only [evalRecSetPairs, List.map_cons, evalExpr_equivariant p ops s t env e,
-      evalRecSetPairs_equivariant p ops s t env rest]
+  | (_, e) :: rest =>
+    congrArg₂ List.cons (Prod.ext rfl (evalExpr_equivariant p ops s t env e))
+      (evalRecSetPairs_equivariant p ops s t env rest)
 
 theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
@@ -3951,15 +4088,20 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       evalForm ops (renameState p s) (renameState p t) (renameEnv p env) f ↔
         evalForm ops s t env f
   | .truth _ => Iff.rfl
-  | .ofExpr e => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env e, Val.asAtom_rename]
-  | .eq a b => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env a, evalExpr_equivariant p ops s t env b, renameVal_injective]
-  | .mem elem set => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env elem]
-    exact evalSetPred_equivariant p ops s t env set (evalExpr ops s t env elem)
+  | .ofExpr e =>
+    (congrArg (fun o => match o with | some a => ops.isTrue a | none => False)
+      ((congrArg Val.asAtom (evalExpr_equivariant p ops s t env e)).trans (Val.asAtom_rename p _))).to_iff
+  | .eq a b =>
+    (congrArg₂ Eq (evalExpr_equivariant p ops s t env a) (evalExpr_equivariant p ops s t env b)).to_iff.trans
+      (renameVal_injective p)
+  | .mem elem set =>
+    (congrArg (evalSetPred ops (renameState p s) (renameState p t) (renameEnv p env) set)
+      (evalExpr_equivariant p ops s t env elem)).to_iff.trans
+      (evalSetPred_equivariant p ops s t env set (evalExpr ops s t env elem))
   | .subsetEq sub sup => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env sub, Val.isSet_rename]
+    change (Val.isSet (evalExpr _ _ _ _ sub) ∧
+        ∀ v, Val.mem v (evalExpr _ _ _ _ sub) → evalSetPred _ _ _ _ sup v) ↔ _
+    rw [evalExpr_equivariant p ops s t env sub, Val.isSet_rename]
     constructor
     · rintro ⟨hs, hsub⟩
       refine ⟨hs, fun v hv => ?_⟩
@@ -3972,14 +4114,16 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
         exact this hv
       have hsp := (evalSetPred_equivariant p ops s t env sup (renameVal p.inverse v)).mpr (hsub _ hv')
       rwa [renameVal_right] at hsp
-  | .isFiniteSet e => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env e, Val.isFinite_rename]
-  | .isABag b => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env b, Val.isABag_rename]
-  | .bagIn elem bag => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env elem, evalExpr_equivariant p ops s t env bag, Val.bagIn_rename]
-  | .sqSubseteq b1 b2 => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env b1, evalExpr_equivariant p ops s t env b2, Val.sqSubseteq_rename]
+  | .isFiniteSet e =>
+    (congrArg Val.isFinite (evalExpr_equivariant p ops s t env e)).to_iff.trans (Val.isFinite_rename p _)
+  | .isABag b =>
+    (congrArg (Val.isABag ops) (evalExpr_equivariant p ops s t env b)).to_iff.trans (Val.isABag_rename p ops _)
+  | .bagIn elem bag =>
+    (congrArg₂ (Val.bagIn ops) (evalExpr_equivariant p ops s t env elem)
+      (evalExpr_equivariant p ops s t env bag)).to_iff.trans (Val.bagIn_rename p ops _ _)
+  | .sqSubseteq b1 b2 =>
+    (congrArg₂ (Val.sqSubseteq ops) (evalExpr_equivariant p ops s t env b1)
+      (evalExpr_equivariant p ops s t env b2)).to_iff.trans (Val.sqSubseteq_rename p ops _ _)
   | .conj a b => and_congr (evalForm_equivariant p ops s t env a) (evalForm_equivariant p ops s t env b)
   | .disj a b => or_congr (evalForm_equivariant p ops s t env a) (evalForm_equivariant p ops s t env b)
   | .neg a => not_congr (evalForm_equivariant p ops s t env a)
@@ -3988,11 +4132,11 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
   | .ite cond yes no =>
     or_congr (and_congr (evalForm_equivariant p ops s t env cond) (evalForm_equivariant p ops s t env yes))
       (and_congr (not_congr (evalForm_equivariant p ops s t env cond)) (evalForm_equivariant p ops s t env no))
-  | .letBind val body => by
-    simp only [evalForm, evalExpr_equivariant p ops s t env val, ← renameEnv_push]
-    exact evalForm_equivariant p ops s t (push env (evalExpr ops s t env val)) body
+  | .letBind val body =>
+    (congrArg (fun e => evalForm ops (renameState p s) (renameState p t) e body)
+      ((congrArg (push _) (evalExpr_equivariant p ops s t env val)).trans (renameEnv_push p env _).symm)).to_iff.trans
+      (evalForm_equivariant p ops s t (push env (evalExpr ops s t env val)) body)
   | .all dom body => by
-    simp only [evalForm]
     constructor
     · intro h v hv
       have hv' := (evalSetPred_equivariant p ops s t env dom v).mpr hv
@@ -4008,7 +4152,6 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       rw [renameEnv_push, renameVal_right] at hb
       exact hb
   | .some dom body => by
-    simp only [evalForm]
     constructor
     · rintro ⟨v, hv, hb⟩
       have hv' : evalSetPred ops s t env dom (renameVal p.inverse v) := by
@@ -4021,24 +4164,26 @@ theorem evalForm_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       refine ⟨renameVal p v, (evalSetPred_equivariant p ops s t env dom v).mpr hv, ?_⟩
       have hb' := (evalForm_equivariant p ops s t (push env v) body).mpr hb
       rwa [renameEnv_push] at hb'
-  | .atomRel id args => by
-    simp only [evalForm, evalExprList_equivariant p ops s t env args, collectAtoms_rename]
+  | .atomRel id args =>
+    (congrArg (fun o => match o with | some as => ops.atomRel id as | none => False)
+      ((congrArg collectAtoms (evalExprList_equivariant p ops s t env args)).trans (collectAtoms_rename p _))).to_iff
 
 theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
     ∀ (sp : SetPred d V) (v : Val sizes A),
       evalSetPred ops (renameState p s) (renameState p t) (renameEnv p env) sp (renameVal p v) ↔
         evalSetPred ops s t env sp v
-  | .expr e, v => by
-    simp only [evalSetPred, evalExpr_equivariant p ops s t env e, Val.mem_rename]
-  | .atomPred id, v => by
-    simp only [evalSetPred, Val.asAtom_rename]
+  | .expr e, v =>
+    (congrArg (Val.mem (renameVal p v)) (evalExpr_equivariant p ops s t env e)).to_iff.trans (Val.mem_rename p v _)
+  | .atomPred id, v =>
+    (congrArg (fun o => match o with | some a => ops.atomPred id a | none => False)
+      (Val.asAtom_rename p v)).to_iff
   | .group mask, v => by
-    simp only [evalSetPred]
     have h := Val.mem_rename p v (Val.groupSet (A := A) mask)
     rwa [Val.groupSet_rename] at h
   | .enum elems, v => by
-    simp only [evalSetPred, evalExprList_equivariant p ops s t env elems, List.mem_map]
+    change renameVal p v ∈ evalExprList _ _ _ _ elems ↔ _
+    rw [evalExprList_equivariant p ops s t env elems, List.mem_map]
     constructor
     · rintro ⟨w, hw, heq⟩
       exact ((renameVal_injective p).mp heq) ▸ hw
@@ -4051,7 +4196,8 @@ theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [
   | .diff a b, v =>
     and_congr (evalSetPred_equivariant p ops s t env a v) (not_congr (evalSetPred_equivariant p ops s t env b v))
   | .subset sp, v => by
-    simp only [evalSetPred, Val.isSet_rename]
+    change (Val.isSet (renameVal p v) ∧ ∀ x, Val.mem x (renameVal p v) → evalSetPred _ _ _ _ sp x) ↔ _
+    rw [Val.isSet_rename]
     constructor
     · rintro ⟨hs, hsub⟩
       refine ⟨hs, fun x hx => ?_⟩
@@ -4065,7 +4211,10 @@ theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [
       have hsp := (evalSetPred_equivariant p ops s t env sp (renameVal p.inverse x)).mpr (hsub _ hx')
       rwa [renameVal_right] at hsp
   | .seq sp, v => by
-    simp only [evalSetPred, Val.seqElems_rename]
+    change (match Val.seqElems (renameVal p v) with
+        | some xs => ∀ x ∈ xs, evalSetPred _ _ _ _ sp x | none => False) ↔
+      (match Val.seqElems v with | some xs => ∀ x ∈ xs, evalSetPred ops s t env sp x | none => False)
+    rw [Val.seqElems_rename]
     cases Val.seqElems v with
     | none => exact Iff.rfl
     | some xs =>
@@ -4077,15 +4226,17 @@ theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [
         rcases List.mem_map.mp hx with ⟨x0, hx0, rfl⟩
         exact (evalSetPred_equivariant p ops s t env sp x0).mpr (h x0 hx0)
   | .times ps, v => by
-    simp only [evalSetPred, Val.seqElems_rename]
+    change (match Val.seqElems (renameVal p v) with
+        | some xs => evalSetPredList _ _ _ _ ps xs | none => False) ↔
+      (match Val.seqElems v with | some xs => evalSetPredList ops s t env ps xs | none => False)
+    rw [Val.seqElems_rename]
     cases Val.seqElems v with
     | none => exact Iff.rfl
     | some xs =>
       simp only [Option.map_some]
       exact evalSetPredList_equivariant p ops s t env ps xs
   | .fnSet dom ran, v => by
-    simp only [evalSetPred, Val.isSingleValuedFn_rename]
-    apply and_congr Iff.rfl
+    apply and_congr (Val.isSingleValuedFn_rename p v)
     apply and_congr
     · constructor
       · intro h k
@@ -4126,8 +4277,7 @@ theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [
         have hr := (evalSetPred_equivariant p ops s t env ran (renameVal p.inverse w)).mpr (h _ _ hkw')
         rwa [renameVal_right] at hr
   | .recSet fields, v => by
-    simp only [evalSetPred, Val.isSingleValuedFn_rename]
-    apply and_congr Iff.rfl
+    apply and_congr (Val.isSingleValuedFn_rename p v)
     apply and_congr
     · constructor
       · intro h k w hkw
@@ -4143,11 +4293,11 @@ theorem evalSetPred_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [
         have := congrArg (renameVal p) heq
         rwa [renameVal_right] at this
     · exact evalRecSetPreds_equivariant p ops s t env fields v
-  | .filter dom pred, v => by
-    simp only [evalSetPred]
-    apply and_congr (evalSetPred_equivariant p ops s t env dom v)
-    rw [← renameEnv_push]
-    exact evalForm_equivariant p ops s t (push env v) pred
+  | .filter dom pred, v =>
+    and_congr (evalSetPred_equivariant p ops s t env dom v)
+      ((congrArg (fun e => evalForm ops (renameState p s) (renameState p t) e pred)
+        (renameEnv_push p env v).symm).to_iff.trans
+        (evalForm_equivariant p ops s t (push env v) pred))
 
 theorem evalSetPredList_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :
@@ -4157,9 +4307,8 @@ theorem evalSetPredList_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Typ
   | [], [] => Iff.rfl
   | [], _ :: _ => Iff.rfl
   | _ :: _, [] => Iff.rfl
-  | sp :: ps, x :: xs => by
-    simp only [List.map_cons, evalSetPredList]
-    exact and_congr (evalSetPred_equivariant p ops s t env sp x)
+  | sp :: ps, x :: xs =>
+    and_congr (evalSetPred_equivariant p ops s t env sp x)
       (evalSetPredList_equivariant p ops s t env ps xs)
 
 theorem evalRecSetPreds_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
@@ -4169,7 +4318,6 @@ theorem evalRecSetPreds_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Typ
         evalRecSetPreds ops s t env fs v
   | [], _ => Iff.rfl
   | (f, sp) :: rest, v => by
-    simp only [evalRecSetPreds]
     apply and_congr
     · constructor
       · rintro ⟨w, hw⟩
