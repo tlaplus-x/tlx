@@ -5166,6 +5166,158 @@
    ]
   },
   {
+   "id": "ext/zookeeper/FastLeaderElection_small",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "Apache ZooKeeper FastLeaderElection, two servers, bounded election rounds and channels",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/zookeeper/FastLeaderElection_medium",
+   "size": "medium",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "Apache ZooKeeper FastLeaderElection, three servers and two election rounds",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/pingcap/Percolator_Test1",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 900,
+   "note": "TiKV Percolator, three keys and three symmetric clients; complete search without deadlock checking",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/pingcap/Percolator_Test2",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 120,
+   "note": "TiKV Percolator, two keys and two clients without symmetry; complete search without deadlock checking",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/pingcap/RaftMerge_Test1",
+   "size": "small",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "interp",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1200,
+   "note": "TiKV Raft region merge, two stores, complete search without deadlock checking",
+   "expect": {
+    "result": "success",
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
+   "id": "ext/pingcap/DistributedTransaction_Test1",
+   "size": "medium",
+   "runs": [
+    {
+     "mode": "compile",
+     "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 1
+    }
+   ],
+   "timeout_s": 1800,
+   "note": "TiDB distributed transaction, two keys and three clients (optimistic and pessimistic)",
+   "expect": {
+    "source": "unpinned"
+   },
+   "category": [
+    "external"
+   ]
+  },
+  {
    "id": "bench/ReprRaft",
    "size": "small",
    "runs": [

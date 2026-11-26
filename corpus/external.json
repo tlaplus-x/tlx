@@ -196,6 +196,27 @@
       "license": "Apache-2.0",
       "attribution": "Copyright Elasticsearch B.V. (elastic/elasticsearch-formal-models)",
       "redistributable": true
+    },
+    "zookeeper": {
+      "repo": "apache/zookeeper",
+      "commit": "2b86687b0b11b8e38e6dbbd3a031b894d4ff5d84",
+      "root": "zookeeper-specifications",
+      "fetch": "files",
+      "include": [
+        "system-spec",
+        "protocol-spec"
+      ],
+      "license": "Apache-2.0",
+      "attribution": "Copyright the Apache Software Foundation (apache/zookeeper, zookeeper-specifications)",
+      "redistributable": true
+    },
+    "pingcap": {
+      "repo": "pingcap/tla-plus",
+      "commit": "5649f86df14c73b0ab8773dda3802bc1937ace8d",
+      "sha256": "0fa9ba627245b8de3484216d1f4b42f414c4e76aee12662d52a33c0c341f0b6a",
+      "license": "Apache-2.0",
+      "attribution": "Copyright PingCAP (pingcap/tla-plus); Raft/Raft.tla is Copyright 2014 Diego Ongaro under CC-BY-4.0",
+      "redistributable": true
     }
   },
   "suites": {
@@ -1346,6 +1367,58 @@
       "runtime": "00:00:01",
       "scratch": true,
       "oracle_workers": 1
+    },
+    {
+      "name": "FastLeaderElection_small",
+      "repo": "zookeeper",
+      "tla": "system-spec/zk-3.7/MC_tlx_FastLeaderElection.tla",
+      "cfg": "system-spec/zk-3.7/MC_tlx_FastLeaderElection_small.cfg",
+      "tier": "small",
+      "runtime": "00:00:04",
+      "result": "success"
+    },
+    {
+      "name": "FastLeaderElection_medium",
+      "repo": "zookeeper",
+      "tla": "system-spec/zk-3.7/MC_tlx_FastLeaderElection.tla",
+      "cfg": "system-spec/zk-3.7/MC_tlx_FastLeaderElection_medium.cfg",
+      "tier": "medium",
+      "runtime": "unknown"
+    },
+    {
+      "name": "Percolator_Test1",
+      "repo": "pingcap",
+      "tla": "Percolator/Test1.tla",
+      "cfg": "Percolator/Test1_tlx.cfg",
+      "tier": "small",
+      "runtime": "00:01:12",
+      "result": "success"
+    },
+    {
+      "name": "Percolator_Test2",
+      "repo": "pingcap",
+      "tla": "Percolator/Test2.tla",
+      "cfg": "Percolator/Test2_tlx.cfg",
+      "tier": "small",
+      "runtime": "00:00:05",
+      "result": "success"
+    },
+    {
+      "name": "RaftMerge_Test1",
+      "repo": "pingcap",
+      "tla": "RaftMerge/RaftMerge.tla",
+      "cfg": "RaftMerge/Test1_tlx.cfg",
+      "tier": "small",
+      "runtime": "00:02:33",
+      "result": "success"
+    },
+    {
+      "name": "DistributedTransaction_Test1",
+      "repo": "pingcap",
+      "tla": "DistributedTransaction/Test1.tla",
+      "cfg": "DistributedTransaction/Test1_tlx.cfg",
+      "tier": "medium",
+      "runtime": "unknown"
     }
   ]
 }
