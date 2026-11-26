@@ -217,10 +217,12 @@ barrier is one such moment but a level can take minutes, so there are mid-level 
   tests); at high-water, in a safepoint, a table of twice the size (or what the budget allows) is allocated
   and all workers re-insert the old table in parallel across page-aligned units (sized by `-fpbits` shards
   and capped at 2 MiB) from low to high slots, releasing completed old-table pages immediately via
-  `madvise` (`MADV_DONTNEED` / `MADV_FREE_REUSABLE`). Because placement is monotone, new-table pages fault
-  in only as old-table units are discarded, bounding peak resident memory during growth to the larger table
-  plus one active unit per worker instead of the sum of both tables. When only one worker is active (narrow
-  level) the same number of temporary threads does it for tables of at least 2^20 slots.
+  `madvise` (`MADV_DONTNEED` / `MADV_FREE_REUSABLE`). A mapped table starts on a 2 MiB boundary, so the
+  default 2 MiB rehash units line up with 2 MiB transparent huge pages and each `madvise` covers whole huge
+  pages instead of partially covering one. Because placement is monotone, new-table pages fault in only as
+  old-table units are discarded, bounding peak resident memory during growth to the larger table plus one
+  active unit per worker instead of the sum of both tables. When only one worker is active (narrow level)
+  the same number of temporary threads does it for tables of at least 2^20 slots.
 - **Entry count** is not a shared counter (a single contended cache line more than doubled the insert cost
   at 8 threads): 64 stripes (by worker number) each flush into the shared count at 64 entries; near the
   marks the shared count is used directly, so high-water and hard limit decisions are exact.

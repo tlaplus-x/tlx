@@ -1264,15 +1264,35 @@ fn chunked_grow_bounds_peak_bytes_and_rss() {
             peak_res = peak_res.max(old.resident_bytes() + new.resident_bytes());
         }
         // `old` is still mapped here, yet virtually all of its physical pages
-        // have been reclaimed!
-        assert!(old.resident_bytes() < (64 << 10), "old table still holds {} B resident", old.resident_bytes());
+        // have been reclaimed. Report old, destination, and saved peak
+        // residency so a CI-only regression is diagnosable from the log alone.
+        let old_res = old.resident_bytes();
+        let new_res = new.resident_bytes();
+        assert!(old_res < (64 << 10), "old table still holds {old_res} B resident (new {new_res} B, peak {peak_res} B)");
         assert!(
             peak_res <= new_bytes + (4 << 20),
-            "peak physical residency {} MiB exceeded new_bytes {} MiB + 4 MiB (old+new={} MiB)",
+            "peak physical residency {} MiB exceeded new_bytes {} MiB + 4 MiB (old+new={} MiB; old={old_res} B, new={new_res} B)",
             peak_res >> 20,
             new_bytes >> 20,
             (old_bytes + new_bytes) >> 20
         );
+    }
+}
+
+/// A mapped table starts on the `REHASH_CHUNK_BYTES` grid, so a 2 MiB chunked
+/// `madvise` discard covers whole huge pages instead of partially covering one
+/// (which some kernels leave resident). Covers both storage tiers, table sizes
+/// that are and are not page multiples, and several OS-chosen base addresses.
+#[cfg_attr(miri, ignore)]
+#[test]
+fn mapped_tables_are_chunk_aligned() {
+    let g = Arc::new(Gauge::new());
+    for slots in [1usize << 20, (1 << 20) + 1, (4 << 20) + 1, (8 << 20) + 4_096] {
+        for _ in 0..8 {
+            let t = super::table::Table::new(slots, 0, g.clone(), usize::MAX);
+            assert!(t.is_mapped(), "{slots}-slot table should be mapped");
+            assert_eq!(t.buffer_addr() % super::table::REHASH_CHUNK_BYTES, 0, "{slots}-slot table base is not chunk-aligned");
+        }
     }
 }
 
