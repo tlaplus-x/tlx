@@ -1,0 +1,621 @@
+//! Explicit subgroup permutation plans.
+//!
+//! A [`PermPlan`] is compiled once per (shape, permutation): atoms map through
+//! a table, bitsets map their bit ranks, sorted-array sets permute their
+//! elements and re-sort, functions over atom domains move their slots, maps
+//! move their presence bits and slots, `Dyn` handles are permuted as values
+//! and re-interned.
+
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use tlx_value::Value;
+
+use crate::dynval;
+use crate::layout::{bitset_universe, rank, unrank, words, BitPos, FieldGroup, FieldLayout, FieldLoc, MapDims, SlotLayout};
+use crate::Shape;
+
+/// Numbers of the `PermPlan::Dyn` plans (from 1: 0 marks an empty memo
+/// entry).
+static NEXT_DYN_PLAN: AtomicU64 = AtomicU64::new(1);
+
+/// Log2 of the entries of `DYN_MEMO`.
+const DYN_MEMO_BITS: u32 = 12;
+
+thread_local! {
+    /// Images of `Dyn` / `Ref` handles, direct-mapped: (plan number, gc generation, handle, image).
+    /// `Dyn` uses generation 0; `Ref` keys on `store.gc_gen()` so entries whose
+    /// output handle was swept are never returned after a GC cycle.
+    static DYN_MEMO: RefCell<Vec<(u64, u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A permutation of atoms (identity on everything but model values).
+pub type AtomPerm = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
+/// How to permute one encoded value of a given shape. Applying a plan
+/// writes exactly the value's words.
+#[derive(Clone)]
+pub enum PermPlan {
+    /// Unaffected by the permutation: copy `n` words.
+    Copy(usize),
+    /// An atom: map its index.
+    Atom(Arc<[u64]>),
+    /// Fixed word positions: copies and atom maps (see `FlatOp`).
+    Flat(Box<[FlatOp]>),
+    /// A bitset: bit `r` moves to bit `map[r]`.
+    Bitset { map: Box<[u32]>, words: usize },
+    /// A sorted array of `elem_words`-word elements: permute each element
+    /// and re-sort.
+    Sorted { elem: Box<PermPlan>, elem_words: usize, words: usize },
+    /// Fixed slots (records, tuples, functions): slot `i` of the input,
+    /// permuted with `plans[i]`, goes to word offset `dst[i]`. The slots
+    /// cover all words.
+    Slots { src: Box<[usize]>, dst: Box<[usize]>, plans: Box<[PermPlan]> },
+    /// A sequence: length word, then elements.
+    Seq { elem: Box<PermPlan>, elem_words: usize, words: usize },
+    /// A sequence of packed sub-word atoms: length word, then `bits`-wide elements.
+    SeqBits { bits: u8, map: Arc<[u64]>, words: usize },
+    /// A union: arm index word, then the arm's payload (padded).
+    Union { arms: Box<[PermPlan]>, words: usize },
+    /// A map: presence bitset (`bitset_words`) over the key universe, then
+    /// one `range_words` slot per key, plus an optional trailing witness word.
+    /// Key rank `r` moves to `keys[r]`.
+    Map { keys: Box<[u32]>, bitset_words: usize, range: Box<PermPlan>, range_words: usize, words: usize, dynamic_witness: bool },
+    /// A map with sub-word packed values (`bits`-wide, mapped through `map` if atoms),
+    /// plus an optional trailing witness word.
+    MapBits { keys: Box<[u32]>, bitset_words: usize, bits: u8, map: Option<Arc<[u64]>>, words: usize, dynamic_witness: bool },
+    /// A `Dyn` handle: permute the interned value and re-intern it (memoized
+    /// per thread by handle; the number identifies the plan, see
+    /// `DYN_MEMO`).
+    Dyn(AtomPerm, u64),
+    /// A value store handle: permute the stored value and store it (memoized
+    /// like `Dyn`; handles of a store are never reused either).
+    Ref(AtomPerm, crate::store::StoreRef, u64),
+}
+
+/// One step of a flat plan.
+#[derive(Clone, Debug)]
+pub enum FlatOp {
+    /// Zero `len` words starting at `dst`.
+    Zero { dst: u32, len: u32 },
+    /// Copy `len` words from `src` to `dst`.
+    Copy { src: u32, dst: u32, len: u32 },
+    /// `dst = map[src]` (one word).
+    Atom { src: u32, dst: u32, map: Arc<[u64]> },
+    /// Copy sub-word bitfield `src` into zeroed `dst`.
+    BitCopy { src: BitPos, dst: BitPos },
+    /// Map sub-word atom bitfield `src` through `map` into zeroed `dst`.
+    BitAtom { src: BitPos, dst: BitPos, map: Arc<[u64]> },
+}
+
+impl std::fmt::Debug for PermPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermPlan::Copy(n) => write!(f, "Copy({n})"),
+            PermPlan::Atom(m) => write!(f, "Atom({m:?})"),
+            PermPlan::Flat(ops) => write!(f, "Flat({ops:?})"),
+            PermPlan::Bitset { map, .. } => write!(f, "Bitset({map:?})"),
+            PermPlan::Sorted { elem, .. } => write!(f, "Sorted({elem:?})"),
+            PermPlan::Slots { src, dst, plans } => write!(f, "Slots({src:?} -> {dst:?}, {plans:?})"),
+            PermPlan::Seq { elem, .. } => write!(f, "Seq({elem:?})"),
+            PermPlan::SeqBits { bits, map, .. } => write!(f, "SeqBits({bits}, {map:?})"),
+            PermPlan::Union { arms, .. } => write!(f, "Union({arms:?})"),
+            PermPlan::Map { keys, range, .. } => write!(f, "Map({keys:?}, {range:?})"),
+            PermPlan::MapBits { keys, bits, map, .. } => write!(f, "MapBits({keys:?}, {bits}, {map:?})"),
+            PermPlan::Dyn(..) => write!(f, "Dyn"),
+            PermPlan::Ref(..) => write!(f, "Ref"),
+        }
+    }
+}
+
+impl PermPlan {
+    /// Plan for permuting values of `shape` with `perm` (on atoms). `None`
+    /// if the shape cannot be permuted in place (an atom universe or a
+    /// function domain not closed under the permutation).
+    pub fn compile(shape: &Shape, perm: &AtomPerm) -> Option<PermPlan> {
+        let n = words(shape);
+        let permute_value = |v: &Value| tlx_value::ops::permute(v, &|m| Some(perm(&Value::ModelValue(m)))).ok();
+        Some(match shape {
+            Shape::Never | Shape::Bool | Shape::Int { .. } => PermPlan::Copy(n),
+            Shape::Atom(u) => {
+                let map: Vec<u64> = u.iter().map(|a| u.binary_search(&perm(a)).ok().map(|i| i as u64)).collect::<Option<_>>()?;
+                if is_identity(map.iter().map(|m| *m as usize)) {
+                    PermPlan::Copy(n)
+                } else {
+                    PermPlan::Atom(map.into())
+                }
+            }
+            Shape::Set { elem, .. } if bitset_universe(elem).is_some() => {
+                let map = rank_map(elem, &permute_value)?;
+                if is_identity(map.iter().map(|m| *m as usize)) {
+                    PermPlan::Copy(n)
+                } else {
+                    PermPlan::Bitset { map: map.into(), words: n }
+                }
+            }
+            Shape::Set { elem, .. } => match PermPlan::compile(elem, perm)? {
+                PermPlan::Copy(_) => PermPlan::Copy(n),
+                p => PermPlan::Sorted { elem: Box::new(p), elem_words: words(elem), words: n },
+            },
+            Shape::Seq { elem, .. } => match PermPlan::compile(elem, perm)? {
+                PermPlan::Copy(_) => PermPlan::Copy(n),
+                p => match SlotLayout::of(elem) {
+                    SlotLayout::Words(ew) => PermPlan::Seq { elem: Box::new(p), elem_words: ew, words: n },
+                    SlotLayout::Bits(bits) => {
+                        let PermPlan::Atom(map) = p else { unreachable!("packed non-copy scalar must be Atom") };
+                        PermPlan::SeqBits { bits, map, words: n }
+                    }
+                },
+            },
+            Shape::Record(fs) => {
+                let parts: Vec<&Shape> = fs.iter().map(|(_, f)| f).collect();
+                product_slots(&parts, perm, n)?
+            }
+            Shape::Tuple(es) => {
+                let parts: Vec<&Shape> = es.iter().collect();
+                product_slots(&parts, perm, n)?
+            }
+            Shape::Fcn { dom, range, witness, key_variants } => {
+                // Slot of key k moves to the slot of perm(k).
+                let extra = witness.extra_words() + key_variants.len();
+                let mut moved = Vec::with_capacity(dom.len());
+                if key_variants.is_empty() {
+                    for k in dom.iter() {
+                        let pk = permute_value(k)?;
+                        moved.push(dom.iter().position(|d| d.exact_eq(&pk))?);
+                    }
+                } else {
+                    // Key-variant indices are fixed per position; only permute in
+                    // place when every key (and every variant) is fixed by `perm`.
+                    for (i, k) in dom.iter().enumerate() {
+                        if !permute_value(k)?.exact_eq(k) {
+                            return None;
+                        }
+                        moved.push(i);
+                    }
+                    for (_, vs) in key_variants.iter() {
+                        for k in vs.iter() {
+                            if !permute_value(k)?.exact_eq(k) {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                fcn_slots(range, dom.len(), &moved, extra, perm, n)?
+            }
+            Shape::Map { key, range, witness } => {
+                let keys = rank_map(key, &permute_value)?;
+                let d = MapDims::new(keys.len(), SlotLayout::of(range));
+                let range_plan = PermPlan::compile(range, perm)?;
+                let dynamic_witness = *witness == crate::FcnWitness::Dynamic;
+                if is_identity(keys.iter().map(|k| *k as usize)) && matches!(range_plan, PermPlan::Copy(_)) {
+                    PermPlan::Copy(n)
+                } else {
+                    match d.slot {
+                        SlotLayout::Words(rw) => PermPlan::Map {
+                            keys: keys.into(),
+                            bitset_words: d.bitset_words,
+                            range: Box::new(range_plan),
+                            range_words: rw,
+                            words: n,
+                            dynamic_witness,
+                        },
+                        SlotLayout::Bits(bits) => {
+                            let map = match range_plan {
+                                PermPlan::Copy(_) => None,
+                                PermPlan::Atom(m) => Some(m),
+                                _ => unreachable!("packed scalar plan must be Copy or Atom"),
+                            };
+                            PermPlan::MapBits { keys: keys.into(), bitset_words: d.bitset_words, bits, map, words: n, dynamic_witness }
+                        }
+                    }
+                }
+            }
+            Shape::Union(arms) => {
+                let plans: Vec<PermPlan> = arms.iter().map(|a| PermPlan::compile(a, perm)).collect::<Option<_>>()?;
+                if plans.iter().all(|p| matches!(p, PermPlan::Copy(_))) {
+                    PermPlan::Copy(n)
+                } else {
+                    PermPlan::Union { arms: plans.into(), words: n }
+                }
+            }
+            Shape::Dyn => PermPlan::Dyn(perm.clone(), NEXT_DYN_PLAN.fetch_add(1, Ordering::Relaxed)),
+            Shape::Ref(store) => PermPlan::Ref(perm.clone(), store.clone(), NEXT_DYN_PLAN.fetch_add(1, Ordering::Relaxed)),
+        })
+    }
+
+    /// Whether the plan leaves every value unchanged.
+    pub fn is_identity(&self) -> bool {
+        matches!(self, PermPlan::Copy(_))
+    }
+
+    /// Write the permutation of `src` (an encoding of the plan's shape)
+    /// into `dst` (same length).
+    pub fn apply(&self, src: &[u64], dst: &mut [u64]) {
+        // SAFETY: the false instantiation validates any handle it decodes.
+        unsafe { self.apply_impl::<false>(src, dst) }
+    }
+
+    /// Apply a permutation to trusted encoded words.
+    ///
+    /// # Safety
+    /// `src` must have this plan's encoding; active Dyn handles must satisfy
+    /// `dynval::lookup_unchecked`'s publication contract.
+    pub unsafe fn apply_unchecked(&self, src: &[u64], dst: &mut [u64]) {
+        // SAFETY: the caller guarantees valid and published source handles.
+        unsafe { self.apply_impl::<true>(src, dst) }
+    }
+
+    unsafe fn apply_impl<const TRUSTED: bool>(&self, src: &[u64], dst: &mut [u64]) {
+        // SAFETY: trusted recursive slots inherit the valid-encoding contract;
+        // the safe instantiation checks every handle before constructing a value.
+        unsafe {
+            match self {
+                PermPlan::Copy(1) => dst[0] = src[0],
+                PermPlan::Copy(n) => dst[..*n].copy_from_slice(&src[..*n]),
+                PermPlan::Atom(map) => dst[0] = map[src[0] as usize],
+                PermPlan::Flat(ops) => apply_flat(ops, src, dst),
+                PermPlan::Bitset { map, words } => {
+                    dst[..*words].fill(0);
+                    for (i, &w) in src[..*words].iter().enumerate() {
+                        let mut b = w;
+                        while b != 0 {
+                            let r = i * 64 + b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            let t = map[r] as usize;
+                            dst[t / 64] |= 1 << (t % 64);
+                        }
+                    }
+                }
+                PermPlan::Sorted { elem, elem_words, words } => {
+                    let (n, ew) = (src[0] as usize, *elem_words);
+                    dst[0] = src[0];
+                    for i in 0..n {
+                        let o = 1 + i * ew;
+                        elem.apply_impl::<TRUSTED>(&src[o..o + ew], &mut dst[o..o + ew]);
+                    }
+                    dst[1 + n * ew..*words].fill(0);
+                    sort_elems(&mut dst[1..1 + n * ew], ew);
+                }
+                PermPlan::Seq { elem, elem_words, words } => {
+                    let (n, ew) = (src[0] as usize, *elem_words);
+                    dst[0] = src[0];
+                    for i in 0..n {
+                        let o = 1 + i * ew;
+                        elem.apply_impl::<TRUSTED>(&src[o..o + ew], &mut dst[o..o + ew]);
+                    }
+                    dst[1 + n * ew..*words].fill(0);
+                }
+                PermPlan::SeqBits { bits, map, words } => {
+                    let n = src[0] as usize;
+                    dst[0] = src[0];
+                    dst[1..*words].fill(0);
+                    for i in 0..n {
+                        let raw = SlotLayout::extract(*bits, &src[1..], i);
+                        SlotLayout::set_zeroed(*bits, &mut dst[1..], i, map[raw as usize]);
+                    }
+                }
+                PermPlan::Slots { src: so, dst: d, plans } => {
+                    for ((s, t), p) in so.iter().zip(d.iter()).zip(plans.iter()) {
+                        p.apply_impl::<TRUSTED>(&src[*s..], &mut dst[*t..]);
+                    }
+                }
+                PermPlan::Union { arms, words } => {
+                    dst[..*words].fill(0);
+                    dst[0] = src[0];
+                    arms[src[0] as usize].apply_impl::<TRUSTED>(&src[1..*words], &mut dst[1..*words]);
+                }
+                PermPlan::Map { keys, bitset_words, range, range_words, words, dynamic_witness } => {
+                    let (bw, rw) = (*bitset_words, *range_words);
+                    dst[..*words].fill(0);
+                    for (i, &w) in src[..bw].iter().enumerate() {
+                        let mut b = w;
+                        while b != 0 {
+                            let r = i * 64 + b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            let t = keys[r] as usize;
+                            dst[t / 64] |= 1 << (t % 64);
+                            range.apply_impl::<TRUSTED>(&src[bw + r * rw..bw + (r + 1) * rw], &mut dst[bw + t * rw..bw + (t + 1) * rw]);
+                        }
+                    }
+                    if *dynamic_witness {
+                        dst[*words - 1] = src[*words - 1];
+                    }
+                }
+                PermPlan::MapBits { keys, bitset_words, bits, map, words, dynamic_witness } => {
+                    let bw = *bitset_words;
+                    dst[..*words].fill(0);
+                    for (i, &w) in src[..bw].iter().enumerate() {
+                        let mut b = w;
+                        while b != 0 {
+                            let r = i * 64 + b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            let t = keys[r] as usize;
+                            dst[t / 64] |= 1 << (t % 64);
+                            let raw = SlotLayout::extract(*bits, &src[bw..], r);
+                            let mapped = map.as_ref().map_or(raw, |m| m[raw as usize]);
+                            SlotLayout::set_zeroed(*bits, &mut dst[bw..], t, mapped);
+                        }
+                    }
+                    if *dynamic_witness {
+                        dst[*words - 1] = src[*words - 1];
+                    }
+                }
+                PermPlan::Dyn(perm, id) | PermPlan::Ref(perm, _, id) => {
+                    // Handles are never reused for other values, and the states
+                    // of a search share most of their values: the image of a
+                    // handle under this plan is looked up first (keyed by
+                    // `gc_gen` for `Ref` so swept nodes are never returned).
+                    let store = match self {
+                        PermPlan::Ref(_, store, _) => Some(store),
+                        _ => None,
+                    };
+                    let gen = store.map_or(0, |s| s.gc_gen());
+                    let slot =
+                        (src[0] ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0xff51_afd7_ed55_8ccd) >> (64 - DYN_MEMO_BITS);
+                    let hit = DYN_MEMO.with(|m| {
+                        let m = m.borrow();
+                        m.get(slot as usize).filter(|e| e.0 == *id && e.1 == gen && e.2 == src[0]).map(|e| e.3)
+                    });
+                    if let Some(h) = hit {
+                        dst[0] = h;
+                        return;
+                    }
+                    let v = match store {
+                        Some(s) if TRUSTED => s.thaw(src[0]),
+                        Some(s) => s.try_thaw(src[0]).expect("valid value store handle"),
+                        None if TRUSTED => dynval::lookup_unchecked(src[0]),
+                        None => dynval::lookup(src[0]),
+                    };
+                    // Permuting a normalized value cannot fail in practice; keep
+                    // the value if it does.
+                    let image = |m| {
+                        let x = Value::ModelValue(m);
+                        let y = perm(&x);
+                        (y != x).then_some(y)
+                    };
+                    let mut cacheable = true;
+                    dst[0] = match tlx_value::ops::permute_shared(&v, &image) {
+                        // (A full store keeps the handle and records STORE_FULL_HIT;
+                        // do not memoize it so a retry after GC computes the image.)
+                        Ok(Some(p)) => match store {
+                            Some(s) => match s.freeze(&p) {
+                                Ok(h) => h,
+                                Err(_) => {
+                                    cacheable = false;
+                                    src[0]
+                                }
+                            },
+                            None => dynval::intern_exact(&p),
+                        },
+                        _ => src[0],
+                    };
+                    if cacheable {
+                        DYN_MEMO.with(|m| {
+                            let mut m = m.borrow_mut();
+                            if m.is_empty() {
+                                m.resize(1 << DYN_MEMO_BITS, (0, 0, 0, 0));
+                            }
+                            m[slot as usize] = (*id, gen, src[0], dst[0]);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_flat(ops: &[FlatOp], src: &[u64], dst: &mut [u64]) {
+    for op in ops {
+        match op {
+            FlatOp::Zero { dst: d, len } => {
+                let (d, l) = (*d as usize, *len as usize);
+                dst[d..d + l].fill(0);
+            }
+            FlatOp::Copy { src: s, dst: d, len } => {
+                let (s, d, l) = (*s as usize, *d as usize, *len as usize);
+                if l <= 4 {
+                    // Short runs (typically single slots): no memmove call.
+                    #[allow(clippy::manual_memcpy)] // short runs: a plain loop, no memmove call
+                    for k in 0..l {
+                        dst[d + k] = src[s + k];
+                    }
+                } else {
+                    dst[d..d + l].copy_from_slice(&src[s..s + l]);
+                }
+            }
+            FlatOp::Atom { src: s, dst: d, map } => dst[*d as usize] = map[src[*s as usize] as usize],
+            FlatOp::BitCopy { src: s, dst: d } => d.set_zeroed(dst, s.extract(src)),
+            FlatOp::BitAtom { src: s, dst: d, map } => d.set_zeroed(dst, map[s.extract(src) as usize]),
+        }
+    }
+}
+
+fn is_identity(map: impl Iterator<Item = usize>) -> bool {
+    map.enumerate().all(|(i, m)| i == m)
+}
+
+/// The permutation of ranks in the (finite, bitset-sized) universe of
+/// `elem` induced by `permute_value`; `None` if the universe is not closed
+/// under it.
+fn rank_map(elem: &Shape, permute_value: &dyn Fn(&Value) -> Option<Value>) -> Option<Vec<u32>> {
+    let card = bitset_universe(elem)?;
+    let mut map = Vec::with_capacity(card as usize);
+    for r in 0..card {
+        let p = permute_value(&unrank(elem, r))?;
+        map.push(rank(elem, &p).ok()? as u32);
+    }
+    Some(map)
+}
+
+/// Plan for a `Record` or `Tuple` (`parts` in field/position order).
+fn product_slots(parts: &[&Shape], perm: &AtomPerm, n: usize) -> Option<PermPlan> {
+    let fl = FieldLayout::of_shapes(parts.iter().copied());
+    let plans: Vec<PermPlan> = parts.iter().map(|p| PermPlan::compile(p, perm)).collect::<Option<_>>()?;
+    if plans.iter().all(PermPlan::is_identity) {
+        return Some(PermPlan::Copy(n));
+    }
+    // Group into disjoint word-aligned units using `FieldLayout::word_groups`
+    // so zero-storage children between packed scalars keep them in one word.
+    let mut unit_offs: Vec<usize> = Vec::new();
+    let mut unit_plans: Vec<PermPlan> = Vec::new();
+    for group in fl.word_groups() {
+        match group {
+            FieldGroup::Word { index, offset, .. } => {
+                unit_offs.push(*offset);
+                unit_plans.push(plans[*index].clone());
+            }
+            FieldGroup::Packed { word, fields } => {
+                unit_offs.push(*word);
+                if fields.iter().all(|&(i, _)| plans[i].is_identity()) {
+                    unit_plans.push(PermPlan::Copy(1));
+                } else {
+                    let mut bops = vec![FlatOp::Zero { dst: 0, len: 1 }];
+                    for &(i, pos) in fields.iter() {
+                        let rel = BitPos::new(0, pos.shift, pos.bits);
+                        match &plans[i] {
+                            PermPlan::Copy(_) => bops.push(FlatOp::BitCopy { src: rel, dst: rel }),
+                            PermPlan::Atom(map) => bops.push(FlatOp::BitAtom { src: rel, dst: rel, map: map.clone() }),
+                            _ => unreachable!("packed scalar plan must be Copy or Atom"),
+                        }
+                    }
+                    unit_plans.push(PermPlan::Flat(bops.into()));
+                }
+            }
+        }
+    }
+    let mut ops = Vec::new();
+    if unit_plans.iter().zip(&unit_offs).all(|(p, &o)| flatten(p, o, o, &mut ops)) {
+        return Some(PermPlan::Flat(merge_flat_ops(ops).into()));
+    }
+    let src: Box<[usize]> = unit_offs.clone().into();
+    let dst: Box<[usize]> = unit_offs.into();
+    Some(PermPlan::Slots { src, dst, plans: unit_plans.into() })
+}
+
+/// Plan for a `Fcn` over `len` domain elements where slot `i` moves to `moved[i]`,
+/// followed by `extra` invariant trailing witness / key-variant words.
+fn fcn_slots(range: &Shape, len: usize, moved: &[usize], extra: usize, perm: &AtomPerm, n: usize) -> Option<PermPlan> {
+    let rp = PermPlan::compile(range, perm)?;
+    let identity_moves = is_identity(moved.iter().copied());
+    if identity_moves && rp.is_identity() {
+        return Some(PermPlan::Copy(n));
+    }
+    let slot = SlotLayout::of(range);
+    let payload_words = slot.array_words(len);
+    match slot {
+        SlotLayout::Words(rw) => {
+            if rw == 0 {
+                return Some(PermPlan::Copy(n));
+            }
+            let mut offs: Vec<usize> = (0..len).map(|i| i * rw).collect();
+            let mut dst: Vec<usize> = (0..len).map(|i| moved[i] * rw).collect();
+            let mut ops = Vec::new();
+            if offs.iter().zip(&dst).all(|(&s, &d)| flatten(&rp, s, d, &mut ops))
+                && (extra == 0 || flatten(&PermPlan::Copy(extra), payload_words, payload_words, &mut ops))
+            {
+                return Some(PermPlan::Flat(merge_flat_ops(ops).into()));
+            }
+            let mut plans: Vec<PermPlan> = vec![rp; len];
+            if extra > 0 {
+                offs.push(payload_words);
+                dst.push(payload_words);
+                plans.push(PermPlan::Copy(extra));
+            }
+            Some(PermPlan::Slots { src: offs.into(), dst: dst.into(), plans: plans.into() })
+        }
+        SlotLayout::Bits(bits) => {
+            let mut ops = vec![FlatOp::Zero { dst: 0, len: payload_words as u32 }];
+            for (i, &target) in moved.iter().enumerate() {
+                let FieldLoc::Bits(s) = SlotLayout::Bits(bits).loc(0, i) else { unreachable!() };
+                let FieldLoc::Bits(d) = SlotLayout::Bits(bits).loc(0, target) else { unreachable!() };
+                match &rp {
+                    PermPlan::Copy(_) => ops.push(FlatOp::BitCopy { src: s, dst: d }),
+                    PermPlan::Atom(map) => ops.push(FlatOp::BitAtom { src: s, dst: d, map: map.clone() }),
+                    _ => unreachable!("packed scalar plan must be Copy or Atom"),
+                }
+            }
+            if extra > 0 {
+                ops.push(FlatOp::Copy { src: payload_words as u32, dst: payload_words as u32, len: extra as u32 });
+            }
+            Some(PermPlan::Flat(merge_flat_ops(ops).into()))
+        }
+    }
+}
+
+/// Append the flat ops of plan `p` applied from word `s` to word `d`; false
+/// if `p` is not at fixed word positions.
+fn flatten(p: &PermPlan, s: usize, d: usize, ops: &mut Vec<FlatOp>) -> bool {
+    let (Ok(s32), Ok(d32)) = (u32::try_from(s), u32::try_from(d)) else {
+        return false;
+    };
+    match p {
+        PermPlan::Copy(0) => {}
+        PermPlan::Copy(n) => {
+            let Ok(len) = u32::try_from(*n) else {
+                return false;
+            };
+            ops.push(FlatOp::Copy { src: s32, dst: d32, len });
+        }
+        PermPlan::Atom(map) => ops.push(FlatOp::Atom { src: s32, dst: d32, map: map.clone() }),
+        PermPlan::Flat(inner) => {
+            for op in inner.iter() {
+                let shifted = match op {
+                    FlatOp::Zero { dst, len } => dst.checked_add(d32).map(|dst| FlatOp::Zero { dst, len: *len }),
+                    FlatOp::Copy { src, dst, len } => {
+                        src.checked_add(s32).zip(dst.checked_add(d32)).map(|(src, dst)| FlatOp::Copy { src, dst, len: *len })
+                    }
+                    FlatOp::Atom { src, dst, map } => {
+                        src.checked_add(s32).zip(dst.checked_add(d32)).map(|(src, dst)| FlatOp::Atom { src, dst, map: map.clone() })
+                    }
+                    FlatOp::BitCopy { src, dst } => Some(FlatOp::BitCopy { src: src.offset_words(s), dst: dst.offset_words(d) }),
+                    FlatOp::BitAtom { src, dst, map } => {
+                        Some(FlatOp::BitAtom { src: src.offset_words(s), dst: dst.offset_words(d), map: map.clone() })
+                    }
+                };
+                let Some(shifted) = shifted else { return false };
+                ops.push(shifted);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Hoist `Zero` ops before bit writes when contiguous or adjacent, and merge
+/// adjacent `Copy` / `Zero` runs.
+fn merge_flat_ops(ops: Vec<FlatOp>) -> Vec<FlatOp> {
+    let mut out: Vec<FlatOp> = Vec::with_capacity(ops.len());
+    for op in ops {
+        match (out.last_mut(), &op) {
+            (Some(FlatOp::Copy { src: s0, dst: d0, len: l0 }), FlatOp::Copy { src, dst, len })
+                if *s0 + *l0 == *src && *d0 + *l0 == *dst =>
+            {
+                *l0 += len;
+                continue;
+            }
+            (Some(FlatOp::Zero { dst: d0, len: l0 }), FlatOp::Zero { dst, len }) if *d0 + *l0 == *dst => {
+                *l0 += len;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(op);
+    }
+    out
+}
+
+/// Sort `n`-word elements lexicographically (insertion sort: sets are small).
+pub(super) fn sort_elems(w: &mut [u64], n: usize) {
+    let len = w.len() / n;
+    for i in 1..len {
+        let mut j = i;
+        while j > 0 && w[(j - 1) * n..j * n] > w[j * n..(j + 1) * n] {
+            for k in 0..n {
+                w.swap((j - 1) * n + k, j * n + k);
+            }
+            j -= 1;
+        }
+    }
+}
