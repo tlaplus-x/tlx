@@ -217,8 +217,9 @@ This is the single source for known limitations ([design.md](design.md) and
 - **Sets whose size overflows TLC's int**: `Cardinality` (TLC's `Value.size`) refuses `SUBSET S`
   with `|S| >= 31` and a `[S -> T]`, `\X` or record set whose product of component sizes does not
   fit an int ([tlc-semantics.md](tlc-semantics.md) section 4). Enumeration itself needs no size:
-  tlx streams a single bound's domain and `x' \in S`, and TLC streams `x' \in S`, `{x \in S : P}`
-  and printing (the default order) for every set type. A *bound* asks for the normalized order,
+  tlx streams a single bound's domain, `x' \in S` and `x' \subseteq S` (and `x \subseteq S` in
+  `Init`, outside `-generate`), and TLC streams `x' \in S`, `x' \subseteq S`, `{x \in S : P}`
+  and printing for every set type (`x' \subseteq S` in normalized order). A *bound* asks for the normalized order,
   which TLC implements by materializing everything but `SUBSET S`, an enumerated set and
   `kSubset(k, S)`; materializing stops at `-maxSetSize` (default 10^6, implemented in every tier:
   [configuration.md](configuration.md) and [features.md](features.md) section 1). So a `SUBSET S`
@@ -237,10 +238,10 @@ This is the single source for known limitations ([design.md](design.md) and
   eager cup copies the interval), without TLC's memory cost for `1..2147483646`. For homogeneous
   explicit sets, `\cup`, `\cap` and `\` enforce `-maxSetSize` on canonical distinct elements rather
   than imitating TLC's mutable in-place `SetEnumValue.normalize()` aliasing (D-35).
-- **Sets kept as a whole**: `CHOOSE x \in S`, `x' \subseteq S` and a bound of several variables
+- **Sets kept as a whole**: `CHOOSE x \in S` and a bound of several variables
   (`\E x, y \in S`) refuse such a set in tlx, where TLC streams a `SUBSET S` or enumerated domain
-  and answers: `CHOOSE s \in SUBSET (1..31) : s = {}` is `{}` in TLC, and `x' \subseteq S`
-  enumerates the subsets; for the other set types TLC materializes as above.
+  and answers: `CHOOSE s \in SUBSET (1..31) : s = {}` is `{}` in TLC; for the other set types TLC
+  materializes as above.
 - **Command line** (outside the contract, section 2): TLC's `-continue`, `-difftrace`,
   `-fp`, `-lncheck`, `-terse` and others are not implemented and give a usage error
   (exit code 2); `-cleanup` and `-noGenerateSpecTE` are accepted without effect; no `*_TTrace_*`

@@ -294,3 +294,30 @@ Mono == [][\A i \in 1..2 : x' + i > x]_<<x, y>>"#,
     );
     assert_eq!(lib.src, plain.src, "the same code with mixed mode on");
 }
+
+#[test]
+fn subseteq_loop_routes_to_streaming_region_not_elems() {
+    let src = module(
+        "MixedCGenSubsetEq",
+        r#"EXTENDS Naturals
+VARIABLE x
+Init == x = {}
+Next == IF x = {} THEN x' = {1} ELSE x' = x
+Inv == ENABLED (x' \subseteq (1..18) /\ x' = {})"#,
+    );
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let (_, _, lib) = generate(&src, cfg, true, 0);
+    assert!(
+        !lib.src.contains("h->elems(cx, "),
+        "x' \\subseteq S must route to the streaming executor, not materialize via h->elems:\n{}",
+        lib.src
+    );
+    assert!(
+        lib.plan.native.invariants[0]
+            && lib.plan.native.mixed_invariants[0]
+            && lib.plan.regions.regions().iter().any(|r| matches!(&*r.expr.kind, tlx_compile::ir::ExprKind::Enabled(_))),
+        "ENABLED(x' \\subseteq S) should run as a streaming host region: {:?}, regions={}",
+        lib.plan.native,
+        lib.plan.regions.len()
+    );
+}

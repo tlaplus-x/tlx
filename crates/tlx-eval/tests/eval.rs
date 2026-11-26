@@ -103,8 +103,8 @@ fn constant_expressions() {
 /// too (`SubsetValue` implements the normalized enumeration by streaming), so
 /// that case agrees. A `[S -> T]` domain is materialized by both: its size
 /// overflows TLC's int, and TLC's growing `ValueVec` reports its
-/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE`, a
-/// bound of several variables and `x' \subseteq S` still need the whole set.
+/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE` and a
+/// bound of several variables still need the whole set.
 #[test]
 fn quantifiers_stream_subsets_whose_size_overflows() {
     let body = "\
@@ -123,6 +123,22 @@ Pair == \\E x, y \\in SUBSET (1..31) : x = y";
     for (i, what) in [(2, "Cardinality"), (3, "CHOOSE"), (4, "a bound of two variables")] {
         assert!(out[i].starts_with("ERROR:") && out[i].contains("Overflow when computing the number of elements in"), "{what}: {}", out[i]);
     }
+}
+
+#[test]
+fn init_subseteq_streams_overflowing_powerset_in_normalized_order() {
+    let (_dir, path) = write_spec("M", "EXTENDS Naturals\nVARIABLE x\nInit == x \\subseteq (1..31)\nNext == x' = x\n");
+    let mut prog = Program::load(&path, &[]).unwrap_or_else(|e| panic!("{e:?}"));
+    let Some(RootSymbol::Def(init_def)) = prog.lookup_root("Init") else { panic!("Init not defined") };
+    let ip = Interp::new(prog, Default::default()).unwrap_or_else(|e| panic!("{e}"));
+    let tlx_sema::hir::DefKind::Op(init_body) = &ip.prog.defs[init_def.idx()].kind else { panic!("Init is an operator") };
+    let mut seen = Vec::new();
+    let mut emit = |s1: &[Option<tlx_value::Value>]| {
+        seen.push(s1[0].as_ref().unwrap().to_string());
+        Ok(seen.len() < 5)
+    };
+    ip.init_states(init_body, &mut emit).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(seen, ["{}", "{1}", "{2}", "{3}", "{4}"]);
 }
 
 #[test]

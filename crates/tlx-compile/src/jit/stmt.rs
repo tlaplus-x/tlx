@@ -88,21 +88,26 @@ impl Gen<'_, '_, '_> {
                 self.with_temp(*temp, v, |g| g.stmt(body))?;
             }
             Stmt::ForEach { bind, set, iter, body } => {
-                // A guarded body does nothing where its guard is false.
-                let pred = match &**body {
-                    Stmt::Guard { cond, .. } => Some((cond, false)),
-                    _ => None,
-                };
-                let spec = self.spec_stmt(body, *bind);
                 let sorted = match iter {
                     IterMode::Enumerate => Some(false),
-                    IterMode::Normalized => Some(true),
+                    // `x' \subseteq S` streams `SUBSET S` in normalized order;
+                    // `HostFn::Elems` materializes every element upfront, so
+                    // route this loop to the streaming closure executor (as a
+                    // host region inside `ENABLED`, or via action/init
+                    // fallback).
+                    IterMode::Normalized => return no("streaming normalized enumeration"),
                     // A quantifier's bound domain: in mixed mode `HostFn::Elems`
                     // calls `ops::enumerate`, which enforces `-maxSetSize` and
                     // falls back to the interpreter on overflow or streaming
                     // domains (`SUBSET S`).
                     IterMode::Bound => Some(false),
                 };
+                // A guarded body does nothing where its guard is false.
+                let pred = match &**body {
+                    Stmt::Guard { cond, .. } => Some((cond, false)),
+                    _ => None,
+                };
+                let spec = self.spec_stmt(body, *bind);
                 self.foreach(*bind, set, sorted, pred, spec, &mut |g| g.stmt(body))?;
             }
             Stmt::Assign { var, value, body } => {
