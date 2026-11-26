@@ -69,6 +69,7 @@ pub fn history_projection_with_spec(
             view: Expr::new(ExprKind::Tuple(values), span),
             fields: vec![format!("{}.history", program.vars[i].name)],
             certificate,
+            mathematical_counter_arithmetic: false,
         });
     }
     None

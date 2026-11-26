@@ -136,6 +136,7 @@ pub fn unobserved_projection_with_spec(
         fields: omitted.iter().map(|v| program.vars[v.idx()].name.to_string()).collect(),
         certificate: Some(certificate),
         ordered: None,
+        mathematical_counter_arithmetic: false,
     })
 }
 

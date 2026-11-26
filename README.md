@@ -230,6 +230,10 @@ that application:
      and combines supported age and history reductions (15 states; 113 states with two slots and
      age-filtered sets; 135 states in [DependentHistory.tla](proofs/age/DependentHistory.tla)
      with dynamic filter domains and dependent transfers).
+   - *Threshold counters:* [saturates scalar or fixed-domain](proofs/counter/README.md) monotone and
+     resettable natural counters at `min(c, K)` in the `VIEW` when every read is a threshold
+     comparison, keeping concrete un-capped counter values in traces (and forgetting a monotone
+     counter no accepted predicate reads, `K = 0`).
 3. **[Counter export](proofs/counter/README.md) (`tlx optimize`).** Emits closed Lean proofs
    for each actual cleanup and threshold-saturation pass plus their composition. The generated
    finite model can be checked separately; export does not itself check safety.

@@ -88,6 +88,7 @@ pub fn sequence_length_projection_with_spec(
         view: Expr::new(ExprKind::Tuple(values), init.span),
         certificate,
         fields: projected.iter().map(|v| format!("{}.contents", program.vars[v.idx()].name)).collect(),
+        mathematical_counter_arithmetic: false,
     })
 }
 

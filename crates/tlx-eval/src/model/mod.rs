@@ -155,6 +155,9 @@ pub struct InterpModel {
     ordered_projection: Option<Arc<tlx_sema::optimize::OrderedPlan>>,
     /// Optional Lean certificate emitted with the accepted projection.
     projection_certificate: Option<Arc<str>>,
+    /// True when the active threshold-counter projection relies on mathematical
+    /// natural-number semantics rather than proved-in-range machine arithmetic.
+    mathematical_counter_arithmetic: bool,
     /// ALIAS: error-trace states are displayed as this record.
     alias: Option<Expr>,
     /// POSTCONDITIONs (name, definition), checked after model checking.
@@ -512,6 +515,7 @@ impl InterpModel {
             state_projection: false,
             ordered_projection: None,
             projection_certificate: None,
+            mathematical_counter_arithmetic: false,
             alias,
             postconditions,
             possible,

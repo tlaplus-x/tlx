@@ -415,6 +415,12 @@ impl Analysis<'_> {
             .enumerate()
             .map(|(i, v)| if i == self.var.idx() { projected.clone() } else { Expr::new(ExprKind::Var(VarId(i as u32)), v.span) })
             .collect();
-        Some(FieldProjection { ordered: None, view: Expr::new(ExprKind::Tuple(values), span), fields, certificate: None })
+        Some(FieldProjection {
+            ordered: None,
+            view: Expr::new(ExprKind::Tuple(values), span),
+            fields,
+            certificate: None,
+            mathematical_counter_arithmetic: false,
+        })
     }
 }

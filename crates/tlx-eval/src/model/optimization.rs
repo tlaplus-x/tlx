@@ -246,6 +246,9 @@ impl InterpModel {
         }))
         .chain(std::iter::once_with(|| {
             ("ordered-allocation-projection", opt::ordered_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
+        }))
+        .chain(std::iter::once_with(|| {
+            ("threshold-counter-projection", opt::threshold_counter_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }));
         for (rule, candidate) in candidates {
             let Some(projection) = candidate else { continue };
@@ -256,12 +259,19 @@ impl InterpModel {
             // additionally require that the quotient actually merges admitted
             // states: one that merges nothing cannot reduce the search. Rules
             // that already supported action checks keep their selection.
-            let newly_enabled = matches!(rule, "phase-field-projection" | "ordered-allocation-projection");
-            if newly_enabled && spec.has_action_checks() && !self.projection_merges(&projection) {
+            let newly_enabled = matches!(rule, "phase-field-projection" | "ordered-allocation-projection" | "threshold-counter-projection");
+            // A saturation whose caps no reachable counter value exceeds merges
+            // nothing, so its `VIEW` is pure overhead. The static bound on Init,
+            // `Next` and `CONSTRAINT` cannot see guards that bound a counter only
+            // in some control phases, so this rule additionally requires a
+            // bounded merge witness instead of trusting the static estimate.
+            let needs_merge_witness = (newly_enabled && spec.has_action_checks()) || rule == "threshold-counter-projection";
+            if needs_merge_witness && !self.projection_merges(&projection) {
                 continue;
             }
             let Some(certificate) = projection.certificate else { continue };
             self.projection_certificate = Some(certificate.into());
+            self.mathematical_counter_arithmetic = projection.mathematical_counter_arithmetic;
             self.ordered_projection = projection.ordered.map(Into::into);
             self.view = Some(projection.view);
             self.state_projection = true;
@@ -330,6 +340,10 @@ impl InterpModel {
     /// The accepted pass's generated proof; generation never invokes Lean.
     pub fn projection_certificate(&self) -> Option<&str> {
         self.projection_certificate.as_deref()
+    }
+
+    pub fn mathematical_counter_arithmetic(&self) -> bool {
+        self.mathematical_counter_arithmetic
     }
 
     pub fn ordered_projection(&self) -> Option<&tlx_sema::optimize::OrderedPlan> {

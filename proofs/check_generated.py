@@ -30,6 +30,7 @@ SUPPORTED_NAMESPACES = (
     "GeneratedLive",
     "GeneratedErasedSymmetry",
     "GeneratedErasedEquivSymmetry",
+    "GeneratedThresholdCounter",
 )
 # Representative tracked specifications covering every supported generated
 # certificate namespace when check_generated.py is invoked without explicit files.
@@ -58,6 +59,7 @@ DEFAULT_CASES = (
     ("GeneratedLive", "check", "proofs/ordered/LiveVersions.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedErasedSymmetry", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize"), (0,)),
     ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/ErasedMultiKey.tla", None, ("-interp", "-optimize"), (0,)),
+    ("GeneratedThresholdCounter", "check", "proofs/counter/ThresholdProtocol.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
 )
 THEOREMS = {
     "certificate", "optimization_correct", "specification_correct",
@@ -329,6 +331,10 @@ def verify(lean, path, negative, lean_pool=None):
                 ("| .erase, _ => none\n\ntheorem update_commutes", "| .erase, a => a\n\ntheorem update_commutes", "failed to erase a timestamp"),
                 ("h k = some n ∧ d ≤ n", "h k = some n ∧ d < n", "changed deadline strictness"),
             ] if namespace in {"GeneratedAge", "GeneratedAgeHistory"} else [
+                ("| .le, t => t + 1", "| .le, t => t", "off-by-one cap on <= comparison"),
+                ("| .add d => min (a i + d) (cap i)", "| .add d => min (a i) (cap i)", "dropped increment in reduced transfer"),
+                ("(m.guard a.1 b.1 w).eval a.2", "(m.guard a.1 b.1 w).eval (fun _ => 0)", "discarded threshold guard feedback"),
+            ] if namespace == "GeneratedThresholdCounter" else [
                 ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
                 ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
             ])

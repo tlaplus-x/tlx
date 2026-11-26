@@ -19,8 +19,8 @@ There are two consumers:
   typed transition IR, runs cached inductive cleanup and threshold-counter saturation passes,
   validates every step independently, and emits a standalone `Optimized.tla` / `Optimized.cfg` pair
   with a composed Lean certificate. Export does not model-check or transfer verdicts or traces back
-  to the source specification; saturation remains export-only because counter-specific trace lifting
-  is not integrated into ordinary checking.
+  to the source specification; for in-place checking with concrete trace reconstruction and
+  arbitrary retained TLA+ state, `tlx check -optimize` provides `threshold-counter-projection`.
 
 Opt-in checking permits proved reductions over mathematical integers to eliminate eventual 32-bit
 machine overflow on proved clock or allocation frontiers, as specified in
@@ -51,6 +51,7 @@ negative mutation checks are explicit.
 | Immutable live versions | `LiveCertificate.lean`: singleton-seeded append-only version table with explicit live-root payload feedback, ranked-table key equivalence, and constrained action checks over retained core state | Enabled (`-optimize`) |
 | Sequence length | `LengthCertificate.lean`: multiple sequences, tuple/copy/append/conditional transfers, and current-length feedback | Enabled (`-optimize`) |
 | Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records or fixed-domain maps, masked reads, kernel-checked (`decide`) liveness tables, and constrained action checks over both endpoints' retained phases and observed values | Enabled (`-optimize`) |
+| Threshold counters | `ThresholdCounterCertificate.lean`: one or more monotone/resettable scalar natural counters or fixed-domain per-actor counter maps `[Actor -> Nat]` saturated in `VIEW` at `min(n_i, cap_i)` alongside arbitrary retained TLA+ state, with constrained state checks and counter-independent action checks | Enabled (`-optimize`) |
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–7 model values each, product order `<= 5040`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
@@ -63,11 +64,12 @@ automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTI
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
 `ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `OrderedCertificate`,
-`NestedCertificate`, and `LiveCertificate` when every action check factors through the retained
-representative. `Field` certifies checks whose unprimed and primed field reads are recorded, and
-records each such field as globally observed so its value survives at both endpoints. `Ordered`,
-`Nested`, and `Live` certify checks that read only retained core state, refusing any read of a
-projected allocation magnitude, rank pattern, or live-version table. `Length`, `History`, `Age`, and
+`NestedCertificate`, `LiveCertificate`, and `ThresholdCounterCertificate` when every action check
+factors through the retained representative. `Field` certifies checks whose unprimed and primed field
+reads are recorded, and records each such field as globally observed so its value survives at both
+endpoints. `Ordered`, `Nested`, `Live`, and `ThresholdCounter` certify checks that read only
+retained core state, refusing any read of a projected allocation magnitude, rank pattern,
+live-version table, or projected counter. `Length`, `History`, `Age`, and
 `AgeHistory` still fail closed when action constraints or action properties are present.
 Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
 builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
@@ -76,25 +78,28 @@ projection.
 
 When `-optimize` runs, `InterpModel::project_state` tries projection families in priority order —
 unobserved variables, relative ages (including combined age/history), standalone finite history,
-phase-dependent fields, sequence lengths, and ordered allocation — and installs the first candidate
-that produces a connected certificate; an uncertified candidate never preempts a certified later
-rule. Selection is certificate-based; it does not compare state counts between a reduced and an
-unreduced search. For the newly enabled action-check cases, however, a certified projection is
-additionally declined when a **bounded merge probe** finds no pair of distinct admitted states with
-the same projected key: a quotient that never identifies two reachable states cannot reduce the
-search, so a configuration whose `CONSTRAINT` or `ACTION_CONSTRAINT` prunes exactly the transitions
-the quotient would merge stays unreduced instead of claiming a reduction. Initial states and
-successors share one admission path: both budgets are charged while enumerating (at most 4,096
+phase-dependent fields, sequence lengths, ordered allocation, and threshold counters — and installs
+the first candidate that produces a connected certificate; an uncertified candidate never preempts a
+certified later rule. Selection is certificate-based; it does not compare state counts between a
+reduced and an unreduced search. For the newly enabled action-check cases, and for every
+threshold-counter saturation, a certified projection is additionally declined when a **bounded merge
+probe** finds no pair of distinct admitted states with the same projected key: a quotient that never
+identifies two reachable states cannot reduce the search, so a configuration whose `CONSTRAINT` or
+`ACTION_CONSTRAINT` prunes exactly the transitions the quotient would merge stays unreduced instead
+of claiming a reduction. A threshold saturation also has a static profitability gate, but that gate
+reads `Init`, `Next` branches, and `CONSTRAINT` only; it cannot see a control phase whose guard
+keeps a counter below its cap, so the probe is what finally prevents a no-op `VIEW`. Initial states
+and successors share one admission path: both budgets are charged while enumerating (at most 4,096
 admitted states and 65,536 enumerated states), each admitted state's projected key is compared as
 soon as it is generated (only unseen concrete states are queued), and the probe stops at the first
-witnessed merge. It is one deterministic BFS from `Init` under the same
-constraint/action-constraint admission as the search, it evaluates the candidate projection without
-installing it, and it suppresses `-stats` collection and restores the generated-state counter, so it
-changes no report. The bound is conservative in one direction: a merge beyond it is not observed and
-the projection declines. An evaluation error before a witness also declines the candidate, leaving
-the ordinary search to report the error. Configurations without action checks keep the plain
-certificate-based selection, and a projection whose merges do occur within the bound is installed
-exactly as before.
+witnessed merge. It is one deterministic BFS from `Init` under the same constraint/action-constraint
+admission as the search, it evaluates the candidate projection without installing it, and it
+suppresses `-stats` collection and restores the generated-state counter, so it changes no report.
+The bound is conservative in one direction: a merge beyond it is not observed and the projection
+declines. An evaluation error before a witness also declines the candidate, leaving the ordinary
+search to report the error. Apart from the threshold saturation, which always needs a witness, a
+configuration without action checks keeps the plain certificate-based selection, and a projection
+whose merges do occur within the bound is installed exactly as before.
 
 ### Certificate goal and soundness boundary
 
@@ -159,9 +164,11 @@ end-to-end soundness relies on five cross-cutting boundaries (alongside each rul
    (`phase/domain.rs`, `phase/sym_totality/`).
 3. **Mathematical `Nat`/`Int` vs. 32-bit machine overflow (`-optimize` and `tlx optimize`):** clock,
    frontier, and counter reductions (`AgeCertificate`, `OrderedCertificate`, `NestedCertificate`,
-   `LiveCertificate`, `PipelineCertificate`) prove correspondence over mathematical integers; an
-   unbounded counter that would eventually hit 32-bit overflow in an unreduced run may collapse to a
-   finite quotient under `-optimize` (disabled in `-tlc`).
+   `LiveCertificate`, `ThresholdCounterCertificate`, `PipelineCertificate`) prove correspondence
+   over mathematical integers; an unbounded counter that would eventually hit 32-bit overflow in an
+   unreduced run may collapse to a finite quotient under `-optimize` (disabled in `-tlc`). When
+   every projected threshold counter is statically proved bounded within `i32::MAX`,
+   `threshold-counter-projection` reports checked machine arithmetic instead.
 4. **Runtime projection and orbit canonicalization:** Lean proves soundness of the formal `project`
    map (including `Quotient (orbits ...)` and rank keys), while Rust executes `VIEW` evaluation,
    structural rank-key construction (`crates/tlx-eval/src/model/ordered.rs`), and minimum-key
@@ -727,6 +734,69 @@ infers result shapes for anonymous structural `VIEW` expressions from the curren
 rebuilds them on layout widening, and falls back to interpreted key evaluation for unknown shapes).
 Measure the complete check: fewer explored states can still cost more wall time when projection or
 orbit canonicalization overhead dominates.
+
+## Threshold-counter projection
+
+`threshold-counter-projection` (`crates/tlx-sema/src/optimize/phase/threshold/`) saturates one or
+more monotone/resettable natural-number counters in place via an internal `VIEW` while leaving
+arbitrary retained TLA+ state `C`, concrete transitions, deadlock checks, and un-capped concrete
+counterexample traces intact. See [proofs/counter/README.md](../proofs/counter/README.md).
+
+### Scope
+
+- **Projected counters:** scalar variables with inferred non-negative integer domain (`>= 0`) and
+  fixed-domain per-actor counter maps `[Actor -> Nat]` (`1 <= |Actor| <= 64`, mutually comparable
+  keys, total projected slots `<= 256`), alongside arbitrary retained state variables `C`.
+- **Initializations and transfers:** every `Init` branch binds each projected counter once to a
+  non-negative constant natural (or counter-free `IF` over constants, or fixed-domain map
+  constructor over constants). Every `Next` branch binds each projected counter once via `keep`
+  (`c` / `UNCHANGED`), `reset(r)` (`0 <= r <= i32::MAX`), `add(d)` (`c + d` or `d + c`,
+  `0 <= d <= i32::MAX`), fixed-domain map constructors / single-index `EXCEPT` updates whose index
+  is counter-free and proved in `DOMAIN c`, or conditional `IF` trees over threshold-safe
+  conditions.
+- **Allowed reads:** threshold comparisons against constant integer literals (`<`, `<=`, `=`, `/=`,
+  `>`, `>=`) in guards, `IF` conditions (including retained equations `x' = IF c < T THEN a ELSE b`),
+  invariants, init properties, and state constraints, plus domain memberships (`Nat`, `Int`,
+  `lo..hi`, finite integer sets, `[D -> R]`), `DOMAIN m` for map counters, and finite quantifiers
+  over exact sets. Pure counter-free recursive helpers (such as `sumList` over retained tuples) and
+  `INSTANCE` variable substitutions are permitted in retained expressions.
+- **Cap selection and profitability:** for each counter, `cap` is the maximum required threshold
+  (`T` for `< T` and `>= T`; `T + 1` for `<= T`, `> T`, `= T`, `/= T`; `0` if only tested by
+  `\in Nat`), capped at `i32::MAX - 1`. Each projected counter must have at least one `add(d)` with
+  `d > 0` and must not be statically proved `<= cap` across `Init`, `Next`, and `CONSTRAINT`;
+  every accepted saturation additionally requires a merge witness from the bounded merge probe.
+  A counter that no accepted predicate reads keeps `cap = 0`, which forgets it entirely, so an
+  unread monotone step counter is reduced to a constant `VIEW` component.
+  Action constraints and `[][A]_sub` action properties are permitted when counter-free (gated by
+  the bounded merge probe).
+
+### Lowered Rule & Lean Certificate
+
+- **`ThresholdCounterCertificate.lean` (`GeneratedThresholdCounter`):** models concrete state as
+  `C × (Fin SlotCount → Nat)` and projects via `saturate cap n := fun i => min (n i) (cap i)`.
+  `Cmp.eval_commutes` proves every comparison commutes with `min · (cap i)` when
+  `Cmp.reqCap op t ≤ cap i`; `Test.eval_commutes` lifts this to Boolean combinations; and
+  `Transfer.eval_commutes` proves `keep`, `reset`, `add`, and `ite` commute with `saturate`.
+  `Model.certificate` discharges `Certificate`, `optimization_correct`, `specification_correct`,
+  `counterexample_lifts`, and `deadlock_preserved` (plus `ConstrainedCertificate` obligations when
+  constraints, init properties, or action checks are present).
+- **Runtime `VIEW`:** installs `0` (when `cap == 0`) or `IF c >= cap THEN cap ELSE c` for scalars,
+  and `[k \in DOMAIN m |-> 0]` or `[k \in DOMAIN m |-> IF m[k] >= cap THEN cap ELSE m[k]]` for
+  fixed-domain maps.
+
+### Refusals & Trusted Computing Base (TCB)
+
+- **Refusals:** decrements (`c - 1`), negative seeds/resets/deltas, cross-counter comparisons
+  (`c1 < c2`) or copies (`c1' = c2`), raw counter escapes into retained state, primed counter reads
+  outside the single binding, duplicate or membership bindings, out-of-domain map indices, caps
+  exceeding `i32::MAX - 1`, counters appearing in action constraints or action properties,
+  already-bounded (`<= cap`) non-profitable counters, and saturations whose bounded merge probe
+  finds no merged admitted state.
+- **TCB:** shares the five cross-cutting boundaries above (Rust HIR lowering/normalization,
+  totality of retained semantic leaves and pure recursive helpers, `VIEW` evaluation, and offline
+  Lean verification). When any projected counter is not statically proved `<= i32::MAX`, the rule
+  records mathematical natural-number counter semantics (eventual 32-bit overflow need not be
+  preserved; bypassed by `-tlc`).
 
 ## Finite counter export
 
