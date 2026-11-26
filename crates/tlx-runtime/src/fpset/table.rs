@@ -58,7 +58,8 @@ const RAW_GROUP: usize = 4;
 /// Maximum byte granularity of one parallel rehash work unit with physical
 /// reclamation (`2 MiB`: aligns to 2 MiB transparent huge pages, 4/16/64 KiB
 /// base pages, and 64-byte cache lines while avoiding THP splits and excess
-/// `madvise` TLB shootdowns).
+/// `madvise` TLB shootdowns). Mapped table buffers also start on this
+/// boundary so a chunk discard covers whole huge pages; see `MappedBuf`.
 pub(super) const REHASH_CHUNK_BYTES: usize = 2 << 20;
 
 /// Header encoding in `Compact` (`AtomicU16`):
@@ -148,6 +149,12 @@ type PauseHook = Box<dyn Fn() + Send + Sync>;
 
 /// Raw zeroed memory backing a slot array, either anonymous `mmap` (for
 /// `>= MAP_BYTES`) or `alloc_zeroed`.
+///
+/// A mapped buffer starts on a `REHASH_CHUNK_BYTES` boundary. The chunked
+/// rehash discards `REHASH_CHUNK_BYTES` ranges, and only a chunk-aligned base
+/// makes every such range cover whole transparent huge pages; a range that
+/// partially covers one relies on the kernel splitting it, and kernels (or
+/// memory pressure) that decline the split leave those pages resident.
 struct MappedBuf {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -166,27 +173,46 @@ impl MappedBuf {
         let layout = Layout::from_size_align(size, align).expect("fingerprint set too large");
         #[cfg(unix)]
         if layout.size() >= MAP_BYTES {
-            // SAFETY: requests a fresh private anonymous mapping of `layout.size()`
-            // bytes at an OS-chosen page-aligned address (`>= 4096 >= align`),
-            // touching no existing mapping.
-            let p = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    layout.size(),
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            if p != libc::MAP_FAILED {
-                #[cfg(target_os = "linux")]
-                // SAFETY: `p` and `layout.size()` name the anonymous mapping
-                // just created above.
-                unsafe {
-                    libc::madvise(p, layout.size(), libc::MADV_HUGEPAGE);
+            let page = page_size();
+            // `mmap` only promises page alignment, so over-map (one chunk of
+            // slack) and trim the unused head and tail to keep a
+            // `REHASH_CHUNK_BYTES`-aligned, page-granular range.
+            let len = layout.size().next_multiple_of(page);
+            if let Some(map_len) = len.checked_add(REHASH_CHUNK_BYTES) {
+                // SAFETY: requests a fresh private anonymous mapping of
+                // `map_len` bytes at an OS-chosen page-aligned address
+                // (`>= 4096 >= align`), touching no existing mapping.
+                let p = unsafe {
+                    libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+                };
+                if p != libc::MAP_FAILED {
+                    let base = p as usize;
+                    let start = base.next_multiple_of(REHASH_CHUNK_BYTES);
+                    let head = start - base;
+                    let tail = map_len - head - len;
+                    debug_assert_eq!((head % page, tail % page), (0, 0));
+                    // SAFETY: `head` and `tail` are page multiples inside the
+                    // mapping just created, and each `munmap` names a
+                    // page-aligned range of it; the retained range is exactly
+                    // `start..start + len`. `Drop` later unmaps that range (the
+                    // kernel rounds its length up to the page multiple `len`).
+                    unsafe {
+                        if head > 0 {
+                            libc::munmap(p, head);
+                        }
+                        if tail > 0 {
+                            libc::munmap((start + len) as *mut libc::c_void, tail);
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    // SAFETY: `start` and `len` name the retained anonymous
+                    // mapping just created above.
+                    unsafe {
+                        libc::madvise(start as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+                    }
+                    let ptr = NonNull::new(start as *mut u8).expect("mapped non-null");
+                    return MappedBuf { ptr, layout, mapped: true };
                 }
-                return MappedBuf { ptr: NonNull::new(p.cast()).expect("mapped non-null"), layout, mapped: true };
             }
         }
         // SAFETY: `layout` has non-zero size (`size > 0`) and valid power-of-two alignment.
@@ -1205,6 +1231,12 @@ impl Table {
 
     pub(super) fn is_mapped(&self) -> bool {
         self.buf().mapped
+    }
+
+    /// Base address of the slot array (chunk-alignment and residency checks).
+    #[cfg(test)]
+    pub(super) fn buffer_addr(&self) -> usize {
+        self.buf().ptr.as_ptr() as usize
     }
 
     /// Smallest slot quantum aligned to both cache-line blocks and OS pages.
