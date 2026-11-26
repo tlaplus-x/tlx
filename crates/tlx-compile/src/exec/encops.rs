@@ -152,15 +152,28 @@ pub fn next_combination(idx: &mut [u32], n: u32) -> bool {
 /// Call `f` on the index sets of the subsets of `0..n`, by size, then in
 /// lexicographic order (the order of `SUBSET`).
 pub fn for_each_combination(n: u32, mut f: impl FnMut(&[u32])) {
+    let _ = try_for_each_combination(n, |idx| {
+        f(idx);
+        Ok::<_, std::convert::Infallible>(true)
+    });
+}
+
+/// Fallible, early-stopping version of [`for_each_combination`]: yields each
+/// combination on demand and stops as soon as `f` returns `Ok(false)` (then
+/// returning `Ok(false)`) or `Err(e)`.
+pub fn try_for_each_combination<E>(n: u32, mut f: impl FnMut(&[u32]) -> Result<bool, E>) -> Result<bool, E> {
     for k in 0..=n {
         let mut idx: Vec<u32> = (0..k).collect();
         loop {
-            f(&idx);
+            if !f(&idx)? {
+                return Ok(false);
+            }
             if !next_combination(&mut idx, n) {
                 break;
             }
         }
     }
+    Ok(true)
 }
 
 #[cfg(test)]

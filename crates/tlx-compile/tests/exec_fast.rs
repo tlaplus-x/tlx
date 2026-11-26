@@ -72,3 +72,33 @@ fn executor_shortcuts() {
     let (exec, _) = rep.totals();
     assert!(exec.agree > 1000 && exec.wrong == 0, "{}", rep.render());
 }
+
+const DYNAMIC_BITSET_CHOOSE: &str = r#"
+EXTENDS Naturals
+VARIABLE x
+Init == x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}
+Next == IF 24 \in x THEN x' = x \ {24} ELSE x' = x
+Inv ==
+    /\ (CHOOSE s \in SUBSET x : TRUE) = {}
+    /\ (CHOOSE s \in SUBSET x : 2 \in s) = {2}
+"#;
+
+/// `CHOOSE` over `SUBSET x` where `x` is a 24-element bitset state variable
+/// (`ExprKind::Subsets`): both the closure executor (`Src::Subsets`) and
+/// native code must stream combinations on demand without allocating `2^24`
+/// subsets upfront or bailing out to the interpreter.
+#[test]
+fn choose_over_dynamic_bitset_subsets_streams() {
+    let h =
+        Harness::new(&module("FastSubsetsChoose", DYNAMIC_BITSET_CHOOSE), "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n");
+    let kinds = h.node_kinds();
+    assert!(kinds.contains("Subsets") && kinds.contains("Choose"), "{kinds:?}");
+    let rep: DiffReport = h.run_reachable(10);
+    rep.assert_ok("dynamic bitset CHOOSE");
+    let (exec, native) = rep.totals();
+    assert!(
+        exec.agree >= 2 && exec.bailout == 0 && exec.wrong == 0 && native.agree >= 2 && native.bailout == 0 && native.wrong == 0,
+        "{}",
+        rep.render()
+    );
+}

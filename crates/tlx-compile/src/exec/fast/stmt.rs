@@ -8,7 +8,7 @@ use tlx_value::{ops, Value};
 
 use super::expr::{Compiler, LocF, Place, Slot, C, SET_TOO_LARGE};
 use super::{copy_words, move_words, Code, Fx, IntF, Loc, StmtF, ValF, R};
-use crate::exec::encops::{for_each_combination, sorted_add};
+use crate::exec::encops::{sorted_add, try_for_each_combination};
 use crate::inplace::{self, Plan};
 use crate::ir::*;
 use crate::types::Typing;
@@ -31,11 +31,8 @@ pub(crate) enum ValIter {
     Enumerate,
     /// Normalized order, streaming via `ops::for_each_enumerated` when
     /// `ops::streams_normalized` holds (`SUBSET S` / `kSubset(k, S)`), used by
-    /// `IterMode::Normalized` (`x' \subseteq S`).
+    /// `IterMode::Normalized` (`x' \subseteq S`) and `CHOOSE`.
     Normalized,
-    /// `ops::enumerate_normalized` materialized upfront (`CHOOSE`, keeping
-    /// parity with the interpreter until `CHOOSE` streams).
-    NormalizedEager,
 }
 
 /// Largest bitset universe whose element encodings are tabulated.
@@ -220,25 +217,20 @@ impl Src {
                 let Slot::W(off, _) = bind else { return bind_mismatch() };
                 let l = set.at(fx)?;
                 let ranks: Vec<usize> = super::super::words::bit_ranks(fx.get(l, *n)).collect();
+                // Keep the 24-element cap aligned with C/JIT so >24-element
+                // bases fall back to the interpreter (preserving interpreter
+                // parity for multi-variable bounds until they stream too).
                 if ranks.len() > 24 {
                     return Err(EvalError::new("too many subsets for compiled iteration"));
                 }
-                let mut subsets: Vec<u64> = Vec::with_capacity((1 << ranks.len()) * n);
-                for_each_combination(ranks.len() as u32, |idx| {
-                    let at = subsets.len();
-                    subsets.resize(at + n, 0);
+                try_for_each_combination(ranks.len() as u32, |idx| {
+                    fx.fr.w[off..off + n].fill(0);
                     for &i in idx {
                         let r = ranks[i as usize];
-                        subsets[at + r / 64] |= 1 << (r % 64);
+                        fx.fr.w[off + r / 64] |= 1 << (r % 64);
                     }
-                });
-                for s in subsets.chunks(*n) {
-                    fx.fr.w[off..off + n].copy_from_slice(s);
-                    if !f(fx)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                    f(fx)
+                })
             }
             Src::Bits { set, n, stage, elem } => {
                 let Slot::W(off, bn) = bind else { return bind_mismatch() };
@@ -378,7 +370,7 @@ impl Src {
                     ValIter::Normalized if ops::streams_normalized(&v) => {
                         ops::for_each_enumerated(&v, &mut visit)?;
                     }
-                    ValIter::Normalized | ValIter::NormalizedEager => {
+                    ValIter::Normalized => {
                         for x in ops::enumerate_normalized(&v)? {
                             if !visit(x)? {
                                 break;
@@ -448,7 +440,7 @@ impl Compiler<'_> {
 
     /// `src_how` for quantifiers (`sorted` = false) and CHOOSE (true).
     pub(crate) fn src(&mut self, set: &Expr, sorted: bool) -> C<Src> {
-        self.src_how(set, if sorted { ValIter::NormalizedEager } else { ValIter::Enumerate })
+        self.src_how(set, if sorted { ValIter::Normalized } else { ValIter::Enumerate })
     }
 
     pub(crate) fn stmt(&mut self, s: &Stmt) -> C<StmtF> {

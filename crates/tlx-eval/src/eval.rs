@@ -377,15 +377,8 @@ impl Interp {
                     return Err(EvalError::new("TLC attempted to evaluate an unbounded CHOOSE."));
                 };
                 let s = self.eval(set, env, cx)?;
-                for x in ops::enumerate_normalized(&s)? {
-                    let env2 = self.bind_bound_vars(vars, x.clone(), env)?;
-                    if self.eval_bool(body, &env2, cx)? {
-                        return Ok(x);
-                    }
-                }
-                return Err(EvalError::new(
-                    "Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P.",
-                ));
+                let always_true = matches!(&*body.kind, ExprKind::Bool(true)) && matches!(vars, BoundVars::Many(ls) if ls.len() == 1);
+                self.choose_in(vars, &s, env, always_true, &mut |env2| self.eval_bool(body, env2, cx))?
             }
             ExprKind::If { cond, then, els } => {
                 if self.eval_bool(cond, env, cx)? {
@@ -444,6 +437,71 @@ impl Interp {
             ExprKind::AngleAction { action, sub } => Value::Bool(self.eval_bool(action, env, cx)? && !self.unchanged(sub, env, cx)?),
             ExprKind::Fairness { .. } => return Err(EvalError::new("fairness formulas cannot be evaluated as values")),
         })
+    }
+
+    /// `CHOOSE vars \in s : pred` in TLC's normalized order: streams when
+    /// `ops::streams_normalized(s)` holds (`SUBSET S` / `kSubset(k, S)`), and
+    /// materializes via `ops::enumerate_normalized(s)` (or borrows an already
+    /// enumerated `Value::Set`) for all other sets.
+    pub(crate) fn choose_in(
+        self: &Arc<Self>,
+        vars: &BoundVars,
+        s: &Value,
+        env: &Env,
+        always_true: bool,
+        pred: &mut dyn FnMut(&Env) -> EResult<bool>,
+    ) -> EResult<Value> {
+        if ops::streams_normalized(s) {
+            let mut found = None;
+            let mut err = None;
+            ops::for_each_enumerated(s, &mut |x| {
+                // (`CHOOSE x \in S : TRUE`: binding one variable cannot fail;
+                // runs only after `for_each_enumerated` validates `s` and
+                // yields an element.)
+                if always_true {
+                    found = Some(x);
+                    return Ok(false);
+                }
+                let r = self.bind_bound_vars(vars, x.clone(), env).and_then(|env2| pred(&env2));
+                match r {
+                    Ok(true) => {
+                        found = Some(x);
+                        Ok(false)
+                    }
+                    Ok(false) => Ok(true),
+                    Err(e) => {
+                        err = Some(e);
+                        Ok(false)
+                    }
+                }
+            })?;
+            if let Some(e) = err {
+                return Err(e);
+            }
+            if let Some(x) = found {
+                return Ok(x);
+            }
+        } else {
+            // (An enumerated set is normalized: its elements in order.)
+            let owned;
+            let elems: &[Value] = match s {
+                Value::Set(es) => es,
+                _ => {
+                    owned = ops::enumerate_normalized(s)?;
+                    &owned
+                }
+            };
+            for x in elems {
+                if always_true {
+                    return Ok(x.clone());
+                }
+                let env2 = self.bind_bound_vars(vars, x.clone(), env)?;
+                if pred(&env2)? {
+                    return Ok(x.clone());
+                }
+            }
+        }
+        Err(EvalError::new("Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P."))
     }
 
     /// The fields of a record constructor or record set, evaluated in order.

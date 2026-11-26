@@ -140,6 +140,140 @@ Inv == ENABLED (x' \subseteq Nat)
 ====
 "#;
 
+/// `CHOOSE` over overflowing `SUBSET (1..31)` and over-`-maxSetSize`
+/// `kSubset(10, 1..30)` (30,045,015 subsets) streams in TLC's normalized order
+/// for both constant hoisted and state-dependent predicates. Two distinct
+/// states ensure `TLX_PRERUN=1` enters compiled execution.
+const CHOOSE_STREAM_SPEC: &str = r#"---- MODULE CardStreamChoose ----
+EXTENDS Naturals, FiniteSets, FiniteSetsExt
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv ==
+    /\ (CHOOSE s \in SUBSET (1..31) : s = {}) = {}
+    /\ (CHOOSE s \in SUBSET (1..31) : TRUE) = {}
+    /\ (CHOOSE s \in SUBSET (1..31) : x \in s) = {x}
+    /\ (CHOOSE s \in kSubset(10, 1..30) : x \in s) = (1..10)
+    /\ (CHOOSE s \in kSubset(10, 1..30) : (x + 10) \in s) = ((1..9) \cup {x + 10})
+====
+"#;
+
+/// Empty `kSubset(2, {1})` in `CHOOSE` must report the standard no-witness
+/// error across every tier.
+const CHOOSE_EMPTY_KSUBSET_SPEC: &str = r#"---- MODULE CardStreamChooseEmptyKSub ----
+EXTENDS Naturals, FiniteSetsExt
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == (CHOOSE s \in kSubset(2, {x}) : TRUE) = {}
+====
+"#;
+
+/// Non-enumerable base in `CHOOSE s \in SUBSET Nat : TRUE` must validate the
+/// base even on the `TRUE` fast path across every tier.
+const CHOOSE_SUBSET_NAT_SPEC: &str = r#"---- MODULE CardStreamChooseSubsetNat ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == (CHOOSE s \in SUBSET Nat : TRUE) = {x}
+====
+"#;
+
+/// Tuple binder over `SUBSET (1..31)` with `TRUE` body must still fail tuple
+/// destructuring rather than taking the single-variable `TRUE` fast path.
+const CHOOSE_TUPLE_BINDER_SPEC: &str = r#"---- MODULE CardStreamChooseTuple ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == (CHOOSE <<a, b>> \in SUBSET (1..31) : TRUE) = <<x, x>>
+====
+"#;
+
+/// Non-`streams_normalized` lazy set (`[1..5 -> 1..121]`) in `CHOOSE` keeps
+/// TLC's `-maxSetSize` materialization error across every tier.
+const CHOOSE_FUNCTION_SET_SPEC: &str = r#"---- MODULE CardStreamChooseFcn ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == (CHOOSE f \in [1..5 -> 1..121] : f[1] = x)[1] = x
+====
+"#;
+
+/// Dynamic bitset state variable (`|x| = 24`) in `CHOOSE s \in SUBSET x : ...`:
+/// lowering emits `ExprKind::Subsets(x)`, so the closure executor's
+/// `Src::Subsets` must stream without allocating `2^24` subsets upfront.
+const CHOOSE_DYNAMIC_BITSET_SPEC: &str = r#"---- MODULE CardStreamChooseDynBitset ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}
+
+Next == IF 24 \in x THEN x' = x \ {24} ELSE x' = x
+
+Inv ==
+    /\ (CHOOSE s \in SUBSET x : TRUE) = {}
+    /\ (CHOOSE s \in SUBSET x : 2 \in s) = {2}
+====
+"#;
+
+/// Dynamic bitset state variable (`|x| = 32 -> 31`) in both `CHOOSE` (streams
+/// via interpreter fallback beyond 24 elements) and multi-variable `\E a, b`
+/// (must preserve interpreter overflow parity across compiled tiers and
+/// `TLX_PARANOID=1` until multi-variable bounds stream).
+const CHOOSE_DYNAMIC_BITSET_31_SPEC: &str = r#"---- MODULE CardStreamChooseDynBitset31 ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+
+Next == IF 32 \in x THEN x' = x \ {32} ELSE x' = x
+
+Inv ==
+    32 \in x \/ (
+        /\ (CHOOSE s \in SUBSET x : TRUE) = {}
+        /\ (CHOOSE s \in SUBSET x : 2 \in s) = {2}
+    )
+====
+"#;
+
+const MULTI_VAR_DYNAMIC_BITSET_31_SPEC: &str = r#"---- MODULE CardStreamMultiDynBitset31 ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+
+Next == IF 32 \in x THEN x' = x \ {32} ELSE x' = x
+
+Inv == 32 \in x \/ (\E a, b \in SUBSET x : a = b)
+====
+"#;
+
 /// Whether to run the default tier (else the `-tlc -interp` parity tier of
 /// `tlx!`). The timeout turns a materializing enumeration into a failure
 /// instead of a hang.
@@ -283,5 +417,106 @@ fn non_enumerable_subseteq_errors() {
         let (code, out) = run(&dir, "CardStreamSubsetEqNonEnum.tla", true, &["-compile"], env);
         assert_eq!(code, 75, "{env:?}:\n{out}");
         assert!(out.contains("non-enumerable"), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn choose_streams_normalized_subset_and_ksubset() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_choose", CHOOSE_STREAM_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamChoose.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert!(!plain.contains("Overflow"), "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamChoose.tla", default_tier, args, &[]);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamChoose.tla", true, &["-compile"], env);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn choose_streams_dynamic_bitset_subsets() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_choose_dyn_bitset", CHOOSE_DYNAMIC_BITSET_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamChooseDynBitset.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamChooseDynBitset.tla", default_tier, args, &[]);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamChooseDynBitset.tla", true, &["-compile"], env);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_choose_dyn_bitset_31", CHOOSE_DYNAMIC_BITSET_31_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamChooseDynBitset31.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamChooseDynBitset31.tla", default_tier, args, &[]);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamChooseDynBitset31.tla", true, &["-compile"], env);
+        assert_eq!((code, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn multi_var_dynamic_bitset_preserves_interpreter_parity() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_multi_dyn_bitset_31", MULTI_VAR_DYNAMIC_BITSET_31_SPEC, CFG);
+    let (code, interp) = run(&dir, "CardStreamMultiDynBitset31.tla", false, &[], &[]);
+    assert!(code != 0, "expected overflow error:\n{interp}");
+    assert!(interp.contains("Overflow when computing the number of elements in"), "{interp}");
+    for (default_tier, args) in [(true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (c, out) = run(&dir, "CardStreamMultiDynBitset31.tla", default_tier, args, &[]);
+        assert_eq!(c, code, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("Overflow when computing the number of elements in"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (c, out) = run(&dir, "CardStreamMultiDynBitset31.tla", true, &["-compile"], env);
+        assert_eq!(c, code, "{env:?}:\n{out}");
+        assert!(out.contains("Overflow when computing the number of elements in"), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn choose_stream_errors_match_across_tiers() {
+    let cases = [
+        ("card_stream_choose_empty_ksub", "CardStreamChooseEmptyKSub.tla", CHOOSE_EMPTY_KSUBSET_SPEC, "no element of S satisfied P"),
+        ("card_stream_choose_subset_nat", "CardStreamChooseSubsetNat.tla", CHOOSE_SUBSET_NAT_SPEC, "non-enumerable"),
+        ("card_stream_choose_tuple", "CardStreamChooseTuple.tla", CHOOSE_TUPLE_BINDER_SPEC, "non-tuple"),
+        (
+            "card_stream_choose_fcn",
+            "CardStreamChooseFcn.tla",
+            CHOOSE_FUNCTION_SET_SPEC,
+            "Attempted to construct a set with too many elements (>1000000)",
+        ),
+    ];
+    for (tag, file, spec, needle) in cases {
+        let dir = tlx_testkit::TempDir::with_spec(tag, spec, CFG);
+        for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+            let (code, out) = run(&dir, file, default_tier, args, &[]);
+            assert_eq!(code, 75, "{file} default_tier={default_tier} {args:?}:\n{out}");
+            assert!(out.contains(needle), "{file} default_tier={default_tier} {args:?}:\n{out}");
+        }
+        for env in PARANOID_MODES {
+            let (code, out) = run(&dir, file, true, &["-compile"], env);
+            assert_eq!(code, 75, "{file} {env:?}:\n{out}");
+            assert!(out.contains(needle), "{file} {env:?}:\n{out}");
+        }
     }
 }

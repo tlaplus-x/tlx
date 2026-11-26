@@ -321,3 +321,38 @@ Inv == ENABLED (x' \subseteq (1..18) /\ x' = {})"#,
         lib.plan.regions.len()
     );
 }
+
+#[test]
+fn choose_over_subset_routes_to_streaming_region_not_elems() {
+    let src = module(
+        "MixedCGenChooseSubset",
+        r#"EXTENDS Naturals
+VARIABLE x
+Init == x = 1
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+Inv == (CHOOSE s \in SUBSET (1..31) : x \in s) = {x}"#,
+    );
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let (_, _, lib) = generate(&src, cfg, true, 0);
+    assert!(
+        !lib.src.contains("h->elems(cx, "),
+        "CHOOSE over SUBSET S must route to the streaming executor, not materialize via h->elems:\n{}",
+        lib.src
+    );
+    fn has_choose(e: &tlx_compile::ir::Expr) -> bool {
+        if matches!(&*e.kind, tlx_compile::ir::ExprKind::Choose { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.for_each_child(&mut |c| found |= has_choose(c));
+        found
+    }
+    assert!(
+        lib.plan.native.invariants[0]
+            && lib.plan.native.mixed_invariants[0]
+            && lib.plan.regions.regions().iter().any(|r| has_choose(&r.expr)),
+        "CHOOSE over SUBSET S should run as a streaming host region: {:?}, regions={}",
+        lib.plan.native,
+        lib.plan.regions.len()
+    );
+}

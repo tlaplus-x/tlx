@@ -642,24 +642,8 @@ impl Interp {
             Node::Choose(ch) => {
                 let (vars, set, body) = &**ch;
                 let s = self.exec(set, env, cx)?;
-                // (An enumerated set is normalized: its elements in order.)
-                let elems = match &s {
-                    Value::Set(es) => es.clone(),
-                    _ => ops::enumerate_normalized(&s)?.into(),
-                };
-                for x in elems.iter() {
-                    // (`CHOOSE x \in S : TRUE`: binding one variable cannot fail.)
-                    if matches!(body.node, Node::Lit(Value::Bool(true))) && matches!(vars, BoundVars::Many(ls) if ls.len() == 1) {
-                        return Ok(x.clone());
-                    }
-                    let env2 = self.bind_bound_vars(vars, x.clone(), env)?;
-                    if self.exec_bool(body, &env2, cx)? {
-                        return Ok(x.clone());
-                    }
-                }
-                return Err(crate::error::EvalError::new(
-                    "Attempted to compute the value of an expression of form\nCHOOSE x \\in S: P, but no element of S satisfied P.",
-                ));
+                let always_true = matches!(body.node, Node::Lit(Value::Bool(true))) && matches!(vars, BoundVars::Many(ls) if ls.len() == 1);
+                self.choose_in(vars, &s, env, always_true, &mut |env2| self.exec_bool(body, env2, cx))?
             }
             Node::FnSet(dr) => {
                 let d = self.exec_cow(&dr[0], env, cx)?;

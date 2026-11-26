@@ -113,4 +113,27 @@ fn combinations() {
     assert_eq!(seen, 1);
     let mut last = [1, 2, 3];
     assert!(!next_combination(&mut last, 4) && last == [1, 2, 3]);
+
+    // Streaming early-stop on 2^31 combinations without allocating them all.
+    let mut head = Vec::new();
+    let completed = try_for_each_combination::<()>(31, |idx| {
+        head.push(idx.to_vec());
+        Ok(head.len() < 3)
+    })
+    .unwrap();
+    assert!(!completed);
+    assert_eq!(head, [vec![], vec![0], vec![1]]);
+
+    // Error propagation stops immediately.
+    let mut steps = 0;
+    let err = try_for_each_combination(31, |_| {
+        steps += 1;
+        if steps == 2 {
+            Err("boom")
+        } else {
+            Ok(true)
+        }
+    });
+    assert_eq!(err, Err("boom"));
+    assert_eq!(steps, 2);
 }
