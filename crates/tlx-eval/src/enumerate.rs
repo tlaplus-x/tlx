@@ -427,7 +427,7 @@ impl<'a> Enumerator<'a> {
             ExprKind::Or(es) if self.random => self.disjunction_random(es, env, k),
             ExprKind::Or(es) => self.disjunction(es, env, k),
             ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => self.exists(bounds, body, env, k),
-            ExprKind::Quant { kind: QuantKind::Forall, bounds, body } => self.forall(bounds, body, env, k),
+            ExprKind::Quant { kind: QuantKind::Forall, bounds, body } => self.forall(e, bounds, body, env, k),
             ExprKind::If { cond, then, els } => self.conditional(cond, then, els, env, k),
             ExprKind::Case { .. } if self.random => Err(EvalError::of_kind(
                 tlx_runtime::ErrorKind::Unsupported,
@@ -516,24 +516,16 @@ impl Interp {
                 }
             }
             ExprKind::Let { body, .. } => self.split(body, env, name, def, out),
-            ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
-                let mut envs = Vec::new();
-                let r = self.for_each_binding(bounds, env, &Ctx::NONE, &mut |env2| {
-                    envs.push(env2.clone());
-                    Ok(true)
-                });
-                match r {
-                    // (TLC keeps an existential over an empty set as an
-                    // action, which has no successors.)
-                    Ok(_) if envs.is_empty() => leaf(out, name, def),
-                    Ok(_) => {
-                        for env2 in envs {
-                            self.split(body, &env2, name.clone(), def, out);
-                        }
+            ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => match self.collect_split_bindings(bounds, env) {
+                // (TLC keeps an existential over an empty or non-materializable
+                // set as a single unsplit action.)
+                Some(envs) if !envs.is_empty() => {
+                    for env2 in envs {
+                        self.split(body, &env2, name.clone(), def, out);
                     }
-                    Err(_) => leaf(out, name, def),
                 }
-            }
+                _ => leaf(out, name, def),
+            },
             ExprKind::Apply { op: OpRef::Def(d), args } => match self.expand_for_split(*d, args, env) {
                 Some((def_name, body, env2)) => {
                     let d2 = self.redirect_def(*d);

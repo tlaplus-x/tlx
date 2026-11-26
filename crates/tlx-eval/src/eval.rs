@@ -53,6 +53,7 @@ pub(crate) fn elems(set: &Value) -> EResult<Arc<[Value]>> {
 
 /// The elements of a finite set in its enumeration order, without
 /// materializing intervals or copying enumerated sets.
+#[derive(Clone)]
 pub(crate) enum Elems {
     Shared(Arc<[Value]>, usize),
     Interval(i64, i64),
@@ -65,16 +66,26 @@ impl Elems {
             _ => Elems::Shared(elems(set)?, 0),
         })
     }
-}
 
-impl Elems {
-    /// All the elements (shares an enumerated set's storage).
-    pub(crate) fn into_shared(self) -> EResult<Arc<[Value]>> {
-        Ok(match self {
-            Elems::Shared(es, 0) => es,
-            Elems::Shared(es, i) => es[i..].into(),
-            Elems::Interval(lo, end) => elems(&Value::Interval(lo, end - 1))?,
-        })
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Elems::Shared(es, start) => es.len().saturating_sub(*start),
+            Elems::Interval(lo, end) => (*end - *lo).max(0) as usize,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Value {
+        match self {
+            Elems::Shared(es, start) => es[*start + i].clone(),
+            Elems::Interval(lo, _) => Value::Int(*lo + i as i64),
+        }
     }
 }
 
@@ -89,24 +100,12 @@ impl Elems {
 /// (`tlx-value/tests/ops.rs::streaming_order_is_the_normalized_order`), and it
 /// can stop early: a body that finds its witness before the end never needs
 /// the whole `SUBSET S`.
+#[derive(Clone)]
 pub(crate) enum BoundElems {
     Elems(Elems),
     /// A `SUBSET S`/`kSubset(k, S)` and the set itself. The set is enumerated
     /// element by element instead of being held in memory.
     Stream(Value),
-}
-
-impl BoundElems {
-    /// All the elements. A bound of several variables (the odometer of
-    /// `for_each_binding`) needs every element at once, so a streamed domain
-    /// is materialized here — which keeps the materializing path's `size()`
-    /// overflow for a `SUBSET S` of 31 or more elements.
-    pub(crate) fn into_shared(self) -> EResult<Arc<[Value]>> {
-        match self {
-            BoundElems::Elems(e) => e.into_shared(),
-            BoundElems::Stream(v) => Elems::of(&v)?.into_shared(),
-        }
-    }
 }
 
 impl Iterator for Elems {
@@ -645,9 +644,23 @@ impl Interp {
             }
         }
         // Flatten `x, y \in S` into one (var, domain) slot per variable.
-        let mut slots: Vec<(&BoundVars, Option<LocalId>, Arc<[Value]>)> = Vec::new();
+        // Validate every domain in left-to-right source order and track
+        // emptiness before iterating the product, matching TLC's Tool.contexts.
+        let mut slots: Vec<(&BoundVars, Option<LocalId>, BoundElems)> = Vec::new();
+        let mut any_empty = false;
+        let mut has_stream = false;
         for b in bounds {
-            let elems = self.bound_elems(&b.set, env, cx)?.into_shared()?;
+            let elems = self.bound_elems(&b.set, env, cx)?;
+            match &elems {
+                BoundElems::Elems(e) => any_empty |= e.is_empty(),
+                BoundElems::Stream(v) => {
+                    has_stream = true;
+                    // Probing the first element performs full Subset/KSubset
+                    // base validation and detects empty kSubset(k, S) in
+                    // O(|base|).
+                    any_empty |= ops::for_each_enumerated(v, &mut |_| Ok(false))?;
+                }
+            }
             match &b.vars {
                 BoundVars::Many(ls) => {
                     for l in ls {
@@ -657,14 +670,18 @@ impl Interp {
                 BoundVars::Tuple(_) => slots.push((&b.vars, None, elems)),
             }
         }
-        if slots.iter().any(|s| s.2.is_empty()) {
+        if any_empty {
             return Ok(true);
+        }
+        if has_stream {
+            return self.for_each_stream_slot(&slots, env, f);
         }
         let mut idx = vec![0usize; slots.len()];
         loop {
             let mut env2 = env.clone();
             for (k, (vars, l, elems)) in slots.iter().enumerate() {
-                let x = elems[idx[k]].clone();
+                let BoundElems::Elems(e) = elems else { unreachable!() };
+                let x = e.get(idx[k]);
                 env2 = match l {
                     Some(l) => env2.bind_val(*l, x),
                     None => self.bind_bound_vars(vars, x, &env2)?,
@@ -679,12 +696,96 @@ impl Interp {
                 if k == slots.len() {
                     return Ok(true);
                 }
+                let BoundElems::Elems(e) = &slots[k].2 else { unreachable!() };
                 idx[k] += 1;
-                if idx[k] < slots[k].2.len() {
+                if idx[k] < e.len() {
                     break;
                 }
                 idx[k] = 0;
                 k += 1;
+            }
+        }
+    }
+
+    /// Collect all bindings of `bounds` in a constant context (`Ctx::NONE`) for
+    /// action splitting and liveness leaf matching. When any bound is
+    /// `BoundElems::Stream` (`SUBSET S` / `kSubset(k, S)`), refuses to expand
+    /// if any streamed cardinality overflows or the product exceeds
+    /// `-maxSetSize` (`tlx_value::limits::growth_limit()`), returning `None`
+    /// so the caller preserves the unsplit action without OOMing.
+    pub(crate) fn collect_split_bindings(self: &Arc<Self>, bounds: &[Bound], env: &Env) -> Option<Vec<Env>> {
+        let limit = usize::try_from(tlx_value::limits::growth_limit()).unwrap_or(usize::MAX);
+        let mut has_stream = false;
+        let mut total: usize = 1;
+        for b in bounds {
+            let card = match self.bound_elems(&b.set, env, &Ctx::NONE).ok()? {
+                BoundElems::Elems(e) => e.len(),
+                BoundElems::Stream(v) => {
+                    has_stream = true;
+                    usize::try_from(ops::cardinality(&v).ok()?).ok()?
+                }
+            };
+            let slots = match &b.vars {
+                BoundVars::Many(ls) => ls.len(),
+                BoundVars::Tuple(_) => 1,
+            };
+            for _ in 0..slots {
+                total = total.checked_mul(card)?;
+            }
+        }
+        if has_stream && total > limit {
+            return None;
+        }
+        let mut envs = Vec::with_capacity(total);
+        self.for_each_binding(bounds, env, &Ctx::NONE, &mut |env2| {
+            envs.push(env2.clone());
+            Ok(true)
+        })
+        .ok()?;
+        Some(envs)
+    }
+
+    /// Recursive product traversal when at least one slot is `BoundElems::Stream`.
+    /// Descends from the last slot (outermost) down to slot 0 (innermost) so
+    /// the first variable varies fastest, matching TLC's `ContextEnumerator`.
+    fn for_each_stream_slot(
+        self: &Arc<Self>,
+        slots: &[(&BoundVars, Option<LocalId>, BoundElems)],
+        env: &Env,
+        f: &mut dyn FnMut(&Env) -> EResult<bool>,
+    ) -> EResult<bool> {
+        let Some(((vars, local, elems), rest)) = slots.split_last() else {
+            return f(env);
+        };
+        let mut step = |x: Value| -> EResult<bool> {
+            let env2 = match local {
+                Some(l) => env.bind_val(*l, x),
+                None => self.bind_bound_vars(vars, x, env)?,
+            };
+            self.for_each_stream_slot(rest, &env2, f)
+        };
+        match elems {
+            BoundElems::Elems(e) => {
+                for i in 0..e.len() {
+                    if !step(e.get(i))? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            BoundElems::Stream(v) => {
+                let mut err = None;
+                let done = ops::for_each_enumerated(v, &mut |x| match step(x) {
+                    Ok(go_on) => Ok(go_on),
+                    Err(e) => {
+                        err = Some(e);
+                        Ok(false)
+                    }
+                })?;
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(done),
+                }
             }
         }
     }

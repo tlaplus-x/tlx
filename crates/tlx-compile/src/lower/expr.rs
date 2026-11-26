@@ -443,29 +443,30 @@ impl Lowerer<'_> {
     fn quant_loops(&mut self, kind: QuantKind, bounds: &[hir::Bound], body: &hir::Expr, env: &LEnv, st: &St) -> Option<Expr> {
         // (temp, set, tuple binder check) per slot, in binding order.
         let mut slots = Vec::new();
-        let mut upfront = Vec::new();
         let mut env2 = env.clone();
+        let sets: Vec<(Expr, Ty)> = bounds
+            .iter()
+            .map(|b| {
+                let set = self.extensional_set_expr(&b.set, env, st);
+                self.typed_iter_in(set, true)
+            })
+            .collect();
         let multi = bounds.len() > 1;
-        for (idx, b) in bounds.iter().enumerate() {
-            let set = self.extensional_set_expr(&b.set, env, st);
-            let (set, ety) = self.typed_iter_in(set, true);
-            // When multiple bounds are nested with the first variable varying
-            // fastest (last bound outermost), an empty outer bound would skip
-            // evaluating/validating earlier bounds unless they are hoisted and
-            // statically known to be valid enumerable sets. Fall back to the
-            // interpreter when any earlier bound is not statically a valid set
-            // (or when a constant bound is known invalid).
-            let set = if multi && idx + 1 < bounds.len() {
-                if !self.bound_is_valid_set(&set) {
-                    return None;
-                }
-                self.hoist_valid_bound(set, &mut upfront)
-            } else {
-                if matches!(&*set.kind, ExprKind::Const(_)) && !self.bound_is_valid_set(&set) {
-                    return None;
-                }
-                set
-            };
+        // When multiple bounds include a streamed (`SUBSET`/`kSubset`),
+        // powerset, or dynamically boxed domain, probe earlier domains upfront
+        // so a dynamically empty earlier bound skips outer streamed loops while
+        // preserving left-to-right domain evaluation and validation order.
+        let check_empty = multi && sets.iter().any(|(s, _)| self.bound_may_stream(s));
+        let mut guards = super::stmt::BoundGuards::new(multi, check_empty);
+        for (idx, (b, (set, ety))) in bounds.iter().zip(sets).enumerate() {
+            let is_last = idx + 1 == bounds.len();
+            // Fall back to the interpreter when an earlier bound is not
+            // statically a valid enumerable set or when a constant final bound
+            // is invalid.
+            if !self.bound_is_valid_set(&set) && ((multi && !is_last) || matches!(&*set.kind, ExprKind::Const(_))) {
+                return None;
+            }
+            let set = self.hoist_bound_set(set, ety, is_last, &mut guards);
             match &b.vars {
                 BoundVars::Many(ls) => {
                     for l in ls {
@@ -493,7 +494,17 @@ impl Lowerer<'_> {
             };
             Expr::new(Ty::Bool, k)
         });
-        Some(let_in(upfront.into_iter().rev(), looped))
+        let guarded = if guards.earlier_guards.is_empty() {
+            looped
+        } else {
+            let empty_val = bool_lit(kind == QuantKind::Forall);
+            let empty_branch = match guards.last_probe {
+                Some((temp, value)) => Expr::new(Ty::Bool, ExprKind::Let { temp, value, body: empty_val }),
+                None => empty_val,
+            };
+            Expr::new(Ty::Bool, ExprKind::If(and(guards.earlier_guards), looped, empty_branch))
+        };
+        Some(let_in(guards.upfront.into_iter().rev(), guarded))
     }
 
     /// `\A x \in C : \A y \in S(x) : P` (or `\E`) over a small constant `C`

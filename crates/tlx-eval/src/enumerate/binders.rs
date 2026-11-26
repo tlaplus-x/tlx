@@ -80,8 +80,15 @@ impl<'a> Enumerator<'a> {
         Ok(go_on)
     }
 
-    /// `\A x \in S : P`: expanded into a conjunction over the bindings.
-    pub(super) fn forall(&mut self, bounds: &[Bound], body: &Expr, env: &Env, k: &Cont) -> EResult<bool> {
+    /// `\A x \in S : P`: expanded into a conjunction over the bindings, or
+    /// evaluated directly as a predicate when `body` can neither assign an
+    /// unassigned variable nor branch (matching `Lowerer::go_forall` so
+    /// streamed `SUBSET`/`kSubset` bounds short-circuit without materializing
+    /// all bindings into a `Vec`).
+    pub(super) fn forall(&mut self, e: &Expr, bounds: &[Bound], body: &Expr, env: &Env, k: &Cont) -> EResult<bool> {
+        if self.is_pure_test(body, env, 0) {
+            return self.test(e, env, k);
+        }
         let ip: &'a Arc<Interp> = self.ip;
         // Expanded into a conjunction over the elements.
         let mut envs = Vec::new();
@@ -91,6 +98,141 @@ impl<'a> Enumerator<'a> {
         })?;
         let k2 = Cont::push(Seg::Forall(body, &envs), k);
         self.cont(&k2)
+    }
+
+    /// Whether enumerating `e` in `env` can neither assign an unassigned
+    /// variable nor branch into multiple paths (so `self.go(e, env, k)` is
+    /// equivalent to `self.test(e, env, k)`).
+    fn is_pure_test(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match &*e.kind {
+            ExprKind::And(es) => es.iter().all(|c| self.is_pure_test(c, env, depth)),
+            ExprKind::Or(_) | ExprKind::Quant { kind: QuantKind::Exists, .. } => false,
+            ExprKind::Quant { kind: QuantKind::Forall, body, .. } => self.is_pure_test(body, env, depth),
+            ExprKind::If { then, els, .. } => self.is_pure_test(then, env, depth) && self.is_pure_test(els, env, depth),
+            ExprKind::Case { .. } if self.random => false,
+            ExprKind::Case { arms, other } => {
+                arms.iter().all(|(_, v)| self.is_pure_test(v, env, depth))
+                    && other.as_ref().is_none_or(|o| self.is_pure_test(o, env, depth))
+            }
+            ExprKind::Let { body, .. } => self.is_pure_test(body, env, depth),
+            ExprKind::Builtin { op: B::Implies, args } => self.is_pure_test(&args[1], env, depth),
+            ExprKind::Builtin { op: B::Eq | B::In | B::SubsetEq, args } => !self.lhs_may_assign(&args[0], env, depth),
+            ExprKind::Builtin { op: B::Unchanged | B::Compose, .. } | ExprKind::BoxAction { .. } | ExprKind::AngleAction { .. }
+                if !self.init() =>
+            {
+                false
+            }
+            ExprKind::FnApp { func, .. } => !self.may_be_lambda(func, env, depth),
+            ExprKind::Apply { op: OpRef::Const(_) | OpRef::Param(_), .. } => false,
+            ExprKind::Apply { op: OpRef::Builtin(b), .. } => {
+                !matches!(b, B::Eq | B::In | B::SubsetEq | B::Implies | B::Unchanged | B::Compose)
+            }
+            ExprKind::Apply { op: OpRef::Def(d), args } => {
+                let d = self.ip.redirect_def(*d);
+                let def = &self.ip.prog.defs[d.idx()];
+                let expand = self.ip.def_defer_errors[d.idx()] || self.ip.def_by_name[d.idx()];
+                match &def.kind {
+                    DefKind::Op(body)
+                        if expand && def.builtin.is_none() && !self.ip.def_value.contains_key(&d) && !self.ip.def_const[d.idx()] =>
+                    {
+                        if args.iter().any(|a| !self.arg_is_value_only(a, env, depth + 1)) {
+                            return false;
+                        }
+                        self.is_pure_test(body, &self.ip.def_env(d, env), depth + 1)
+                    }
+                    _ => true,
+                }
+            }
+            ExprKind::Local(l) => match env.lookup(*l) {
+                Some(b) => match b.by_name(&self.ip.prog) {
+                    Some((a, aenv)) => self.is_pure_test(a, aenv, depth + 1),
+                    None => true,
+                },
+                None => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// Whether a call-by-name argument `a` can neither assign/branch in
+    /// statement position, act as an assignment target on the LHS of
+    /// `=`/`\in`/`\subseteq`, nor expand as a syntactic lambda in `fn_app`.
+    fn arg_is_value_only(&self, a: &Expr, env: &Env, depth: usize) -> bool {
+        !self.lhs_may_assign(a, env, depth) && !self.may_be_lambda(a, env, depth) && self.is_pure_test(a, env, depth)
+    }
+
+    /// Conservative check matching `Enumerator::lambda_of`: whether `f` could
+    /// expand as a lazily represented function in `Enumerator::fn_app`.
+    fn may_be_lambda(&self, f: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        match &*f.kind {
+            ExprKind::FnConstruct { .. } => true,
+            ExprKind::Local(l) => match env.lookup(*l) {
+                Some(b) => b.by_name(&self.ip.prog).is_some_and(|(a, aenv)| self.may_be_lambda(a, aenv, depth + 1)),
+                None => false,
+            },
+            ExprKind::Apply { op: OpRef::Def(_), args } if args.is_empty() => self.lambda_of(f, env).is_some(),
+            ExprKind::Apply { op: OpRef::Const(_) | OpRef::Param(_), args } if args.is_empty() => true,
+            _ => false,
+        }
+    }
+
+    /// Conservative check matching `Enumerator::target` / `unassigned_target`.
+    fn lhs_may_assign(&self, lhs: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        if self.init() {
+            return self.may_be_var(lhs, env, depth);
+        }
+        match &*lhs.kind {
+            ExprKind::Builtin { op: B::Prime, args } => self.may_be_var(&args[0], env, depth),
+            ExprKind::Local(l) => match env.lookup(*l) {
+                Some(b) => b.by_name(&self.ip.prog).is_some_and(|(a, aenv)| self.lhs_may_assign(a, aenv, depth + 1)),
+                None => false,
+            },
+            ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => match self.ip.plain_op_body(*d) {
+                Some((_, body)) => self.lhs_may_assign(body, env, depth + 1),
+                None => false,
+            },
+            ExprKind::Apply { op: OpRef::Const(_) | OpRef::Param(_), args } if args.is_empty() => true,
+            ExprKind::Let { body, .. } => self.lhs_may_assign(body, env, depth),
+            _ => false,
+        }
+    }
+
+    /// Conservative check matching `Enumerator::var_of` for unassigned vars.
+    fn may_be_var(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+        if depth > 8 {
+            return true;
+        }
+        match &*e.kind {
+            ExprKind::Var(v) => self.s1[v.idx()].is_none(),
+            ExprKind::InstVar { slot, .. } => {
+                let v = self.ip.inst_var(*slot);
+                v.idx() < self.s1.len() && self.s1[v.idx()].is_none()
+            }
+            ExprKind::Local(l) => match env.lookup(*l) {
+                Some(b) => b.by_name(&self.ip.prog).is_some_and(|(a, aenv)| self.may_be_var(a, aenv, depth + 1)),
+                // Inside a stepped-into operator body (`depth > 0`), an unbound
+                // formal parameter might receive a state variable (e.g.
+                // `Assign(v) == v' = 1`). At `depth == 0`, an unbound local is
+                // a quantifier value variable, never a state variable.
+                None => depth > 0,
+            },
+            ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => match self.ip.plain_op_body(*d) {
+                Some((_, body)) => self.may_be_var(body, env, depth + 1),
+                None => false,
+            },
+            ExprKind::Apply { op: OpRef::Const(_) | OpRef::Param(_), args } if args.is_empty() => true,
+            ExprKind::Let { body, .. } => self.may_be_var(body, env, depth),
+            _ => false,
+        }
     }
 
     /// `IF c THEN t ELSE e`: enumerate the branch `c` picks.

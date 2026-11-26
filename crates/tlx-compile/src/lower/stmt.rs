@@ -16,6 +16,22 @@ use tlx_value::Value;
 
 use super::*;
 
+/// Shared upfront-hoisting and empty-product guard state for multi-bound
+/// quantifier lowering (`Lowerer::quant_loops` and `Lowerer::bind_bounds`).
+pub(super) struct BoundGuards {
+    multi: bool,
+    check_empty: bool,
+    pub(super) upfront: Vec<(Temp, Expr)>,
+    pub(super) earlier_guards: Vec<Expr>,
+    pub(super) last_probe: Option<(Temp, Expr)>,
+}
+
+impl BoundGuards {
+    pub(super) fn new(multi: bool, check_empty: bool) -> Self {
+        Self { multi, check_empty, upfront: Vec::new(), earlier_guards: Vec::new(), last_probe: None }
+    }
+}
+
 impl Lowerer<'_> {
     /// Continue with the pending conjuncts `k`.
     pub(super) fn cont(&mut self, k: &Cont, st: &St) -> LResult<Stmt> {
@@ -648,6 +664,14 @@ impl Lowerer<'_> {
         };
         let mut empty = false;
         for s in &sets {
+            if tlx_value::ops::bound_kind(s) == tlx_value::ops::BoundKind::Stream {
+                match tlx_value::ops::for_each_enumerated(s, &mut |_| Ok(false)) {
+                    Ok(true) => empty = true,
+                    Ok(false) => {}
+                    Err(_) => return false,
+                }
+                continue;
+            }
             if !s.is_set() || tlx_value::ops::materialization_error(s).is_some() {
                 return false;
             }
@@ -674,6 +698,16 @@ impl Lowerer<'_> {
             | ExprKind::OrderedSet { .. }
             | ExprKind::RefElems(_) => true,
             _ => matches!(self.shape_of(set.ty), Some(Shape::Set { .. })),
+        }
+    }
+
+    /// Whether `set` is a streamed (`SUBSET` / `kSubset`), powerset, or
+    /// dynamically boxed bound whose iteration can be exponentially large.
+    pub(super) fn bound_may_stream(&self, set: &Expr) -> bool {
+        match &*set.kind {
+            ExprKind::Const(v) => tlx_value::ops::bound_kind(v) == tlx_value::ops::BoundKind::Stream,
+            ExprKind::Subsets(_) => true,
+            _ => !self.bound_is_valid_set(set),
         }
     }
 
@@ -714,34 +748,65 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Hoist `set` (with element type `ety`) into `guards.upfront` when needed
+    /// for multi-bound left-to-right domain evaluation/validation, recording
+    /// earlier non-emptiness guards and an optional empty-branch probe for an
+    /// unvalidated final domain when `guards.check_empty` is active.
+    pub(super) fn hoist_bound_set(&mut self, set: Expr, ety: Ty, is_last: bool, guards: &mut BoundGuards) -> Expr {
+        let need_upfront = guards.check_empty || (guards.multi && !is_last);
+        if !need_upfront {
+            return set;
+        }
+        let valid = self.bound_is_valid_set(&set);
+        let s = if valid {
+            self.hoist_valid_bound(set, &mut guards.upfront)
+        } else {
+            let (s, bnd) = self.share(set);
+            guards.upfront.extend(bnd);
+            s
+        };
+        if !is_last && (guards.check_empty || !valid) {
+            let dummy = self.iter_temp(ety, &s);
+            let chk = self.temp(Ty::Bool);
+            let probe = Expr::new(Ty::Bool, ExprKind::Exists { bind: dummy, set: s.clone(), body: bool_lit(true) });
+            guards.upfront.push((chk, probe));
+            if guards.check_empty {
+                guards.earlier_guards.push(temp_ref(Ty::Bool, chk));
+            }
+        } else if is_last && guards.check_empty && !valid {
+            let dummy = self.iter_temp(ety, &s);
+            let chk = self.temp(Ty::Bool);
+            let probe = Expr::new(Ty::Bool, ExprKind::Exists { bind: dummy, set: s.clone(), body: bool_lit(true) });
+            guards.last_probe = Some((chk, probe));
+        }
+        s
+    }
+
     fn bind_bounds(&mut self, bounds: &[hir::Bound], env: &LEnv, st: &St) -> LResult<(LEnv, Box<dyn FnOnce(Stmt) -> Stmt>)> {
         // (temp, set, tuple binder check) per enumerated slot, in binding order.
         let mut slots: Vec<(Temp, Expr, Option<Expr>)> = Vec::new();
-        let mut upfront: Vec<(Temp, Expr)> = Vec::new();
         let mut env2 = env.clone();
-        let sets: Vec<Expr> = bounds.iter().map(|b| self.action_iter_set_expr(&b.set, env, st)).collect();
+        let sets: Vec<(Expr, Expr, Ty)> = bounds
+            .iter()
+            .map(|b| {
+                let raw = self.action_iter_set_expr(&b.set, env, st);
+                let (typed, ety) = self.typed_iter(raw.clone());
+                (raw, typed, ety)
+            })
+            .collect();
         let multi = bounds.len() > 1;
-        for (idx, (b, set)) in bounds.iter().zip(sets).enumerate() {
-            let need_upfront = multi && idx + 1 < bounds.len();
-            let mut hoist = |this: &mut Self, set: Expr| -> Expr {
-                if !need_upfront {
-                    return set;
-                }
-                if this.bound_is_valid_set(&set) {
-                    return this.hoist_valid_bound(set, &mut upfront);
-                }
-                let (s, bnd) = this.share(set);
-                upfront.extend(bnd);
-                let dummy = this.temp(Ty::Val);
-                let chk = this.temp(Ty::Bool);
-                let probe = Expr::new(Ty::Bool, ExprKind::Exists { bind: dummy, set: s.clone(), body: bool_lit(true) });
-                upfront.push((chk, probe));
-                s
-            };
+        // When multiple bounds include a streamed (`SUBSET`/`kSubset`),
+        // powerset, or dynamically boxed domain, probe earlier domains upfront
+        // so any dynamically empty earlier bound skips outer streamed
+        // iterations (while still validating an unvalidated final bound on the
+        // empty branch).
+        let check_empty = multi && sets.iter().any(|(_, s, _)| self.bound_may_stream(s));
+        let mut guards = BoundGuards::new(multi, check_empty);
+        for (idx, (b, (raw, tset, ety))) in bounds.iter().zip(sets).enumerate() {
+            let is_last = idx + 1 == bounds.len();
             match &b.vars {
                 BoundVars::Many(ls) => {
-                    let (set, ety) = self.typed_iter(set);
-                    let set = hoist(self, set);
+                    let set = self.hoist_bound_set(tset, ety, is_last, &mut guards);
                     for l in ls {
                         let t = self.iter_temp(ety, &set);
                         env2 = env2.bind(*l, LBind::Ir(temp_ref(ety, t)));
@@ -749,10 +814,9 @@ impl Lowerer<'_> {
                     }
                 }
                 BoundVars::Tuple(ls) => {
-                    let (tset, ety) = self.typed_iter(set.clone());
                     let t = self.temp(ety);
                     if let Some((e3, check)) = self.bind_elem(&b.vars, &temp_ref(ety, t), &env2) {
-                        let tset = hoist(self, tset);
+                        let tset = self.hoist_bound_set(tset, ety, is_last, &mut guards);
                         env2 = e3;
                         slots.push((t, tset, check));
                         continue;
@@ -760,7 +824,7 @@ impl Lowerer<'_> {
                     // Boxed elements: components by application (the
                     // interpreter checks that the element is a tuple of
                     // the binder's length).
-                    let set = hoist(self, to_val(set));
+                    let set = self.hoist_bound_set(to_val(raw), Ty::Val, is_last, &mut guards);
                     let t = self.temp(Ty::Val);
                     for (i, l) in ls.iter().enumerate() {
                         env2 = env2.bind(*l, LBind::Ir(tuple_component(temp_ref(Ty::Val, t), i)));
@@ -782,7 +846,16 @@ impl Lowerer<'_> {
                 iter: IterMode::Bound,
                 body: Box::new(binders::checked_stmt(check, s)),
             });
-            upfront.into_iter().rev().fold(looped, |body, (temp, value)| Stmt::Let { temp, value, body: Box::new(body) })
+            let guarded = if guards.earlier_guards.is_empty() {
+                looped
+            } else {
+                let empty_branch = match guards.last_probe {
+                    Some((temp, value)) => Stmt::Let { temp, value, body: Box::new(Stmt::Stop) },
+                    None => Stmt::Stop,
+                };
+                if_stmt(and(guards.earlier_guards), looped, empty_branch)
+            };
+            guards.upfront.into_iter().rev().fold(guarded, |body, (temp, value)| Stmt::Let { temp, value, body: Box::new(body) })
         };
         Ok((env2, Box::new(wrap)))
     }

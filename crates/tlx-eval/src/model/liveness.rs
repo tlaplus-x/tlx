@@ -868,17 +868,10 @@ fn leaves(ip: &Arc<Interp>, e: &Expr, env: &Env, out: &mut Vec<(Expr, Env)>) {
         ExprKind::Or(es) => es.iter().for_each(|c| leaves(ip, c, env, out)),
         ExprKind::And(es) if es.len() == 1 => leaves(ip, &es[0], env, out),
         ExprKind::Let { body, .. } => leaves(ip, body, env, out),
-        ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
-            let mut envs = Vec::new();
-            let r = ip.for_each_binding(bounds, env, &Ctx::NONE, &mut |env2| {
-                envs.push(env2.clone());
-                Ok(true)
-            });
-            match r {
-                Ok(_) => envs.iter().for_each(|env2| leaves(ip, body, env2, out)),
-                Err(_) => out.push((e.clone(), env.clone())),
-            }
-        }
+        ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => match ip.collect_split_bindings(bounds, env) {
+            Some(envs) => envs.iter().for_each(|env2| leaves(ip, body, env2, out)),
+            None => out.push((e.clone(), env.clone())),
+        },
         ExprKind::Apply { op: OpRef::Def(d), args } => match ip.expand_for_split(*d, args, env) {
             Some((_, body, env2)) => leaves(ip, body, &env2, out),
             None => out.push((e.clone(), env.clone())),

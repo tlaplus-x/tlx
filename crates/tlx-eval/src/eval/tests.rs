@@ -176,3 +176,79 @@ fn def_cache_from_source_defers_the_lookup_and_shares_it() {
     assert!(second.knows(d, false));
     assert_eq!(lookups.get(), 2);
 }
+
+#[test]
+fn for_each_binding_streams_first_variable_fastest() {
+    let dir = tlx_testkit::TempDir::new("stream_order");
+    let path = dir.write(
+        "StreamOrder.tla",
+        "---- MODULE StreamOrder ----\n\
+         EXTENDS Naturals\n\
+         Big == \\E x, y \\in SUBSET (1..31) : TRUE\n\
+         Mixed == \\E x \\in SUBSET (1..2), y \\in {10, 20} : TRUE\n\
+         ====\n",
+    );
+    let mut prog = tlx_sema::Program::load(&path, &[]).unwrap();
+    let quant_bounds = |prog: &mut tlx_sema::Program, name: &str| -> (Vec<Bound>, LocalId, LocalId) {
+        let Some(RootSymbol::Def(def)) = prog.lookup_root(name) else { panic!("{name}") };
+        let DefKind::Op(body) = &prog.defs[def.idx()].kind else { panic!("body") };
+        let ExprKind::Quant { bounds, .. } = &*body.kind else { panic!("quant") };
+        let mut locals = Vec::new();
+        for b in bounds {
+            if let BoundVars::Many(ls) = &b.vars {
+                locals.extend_from_slice(ls);
+            }
+        }
+        (bounds.clone(), locals[0], locals[1])
+    };
+    let (big_bounds, bx, by) = quant_bounds(&mut prog, "Big");
+    let (mix_bounds, mx, my) = quant_bounds(&mut prog, "Mixed");
+    let ip = Interp::new(prog, Default::default()).unwrap();
+
+    // First 5 bindings of `x, y \in SUBSET (1..31)`: `x` varies fastest.
+    let mut seen = Vec::new();
+    let completed = ip
+        .for_each_binding(&big_bounds, &Env::default(), &Ctx::NONE, &mut |env| {
+            let x = ip.read_local(bx, env, &Ctx::NONE)?.to_string();
+            let y = ip.read_local(by, env, &Ctx::NONE)?.to_string();
+            seen.push((x, y));
+            Ok(seen.len() < 5)
+        })
+        .unwrap();
+    assert!(!completed, "visitor stopped after 5 bindings");
+    assert_eq!(
+        seen,
+        vec![
+            ("{}".into(), "{}".into()),
+            ("{1}".into(), "{}".into()),
+            ("{2}".into(), "{}".into()),
+            ("{3}".into(), "{}".into()),
+            ("{4}".into(), "{}".into()),
+        ]
+    );
+
+    // Exhaustive mixed `x \in SUBSET (1..2), y \in {10, 20}`: first variable fastest.
+    let mut mixed = Vec::new();
+    let completed = ip
+        .for_each_binding(&mix_bounds, &Env::default(), &Ctx::NONE, &mut |env| {
+            let x = ip.read_local(mx, env, &Ctx::NONE)?.to_string();
+            let y = ip.read_local(my, env, &Ctx::NONE)?.to_string();
+            mixed.push((x, y));
+            Ok(true)
+        })
+        .unwrap();
+    assert!(completed);
+    assert_eq!(
+        mixed,
+        vec![
+            ("{}".into(), "10".into()),
+            ("{1}".into(), "10".into()),
+            ("{2}".into(), "10".into()),
+            ("{1, 2}".into(), "10".into()),
+            ("{}".into(), "20".into()),
+            ("{1}".into(), "20".into()),
+            ("{2}".into(), "20".into()),
+            ("{1, 2}".into(), "20".into()),
+        ]
+    );
+}

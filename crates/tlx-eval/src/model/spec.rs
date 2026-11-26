@@ -136,15 +136,19 @@ fn classify(
             _ if is_state_level(ip, e, &mut Vec::new()) && !is_temporal(ip, e) => out.push(PropPart::Init(name, wrap(e, quants))),
             _ => out.push(PropPart::Liveness(wrap(e, quants))),
         },
-        ExprKind::Quant { bounds, body, .. } if constant_forall(ip, e).is_some() => {
-            if constant_forall(ip, e) == Some(0) {
-                return Err(EvalError::new(TAUTOLOGY));
+        ExprKind::Quant { bounds, body, .. } => match constant_forall(ip, e) {
+            Some(true) => return Err(EvalError::new(TAUTOLOGY)),
+            Some(false) => {
+                quants.push((bounds.clone(), e.span));
+                let r = classify(ip, body, loc(body), subs, quants, names, out);
+                quants.pop();
+                r?;
             }
-            quants.push((bounds.clone(), e.span));
-            let r = classify(ip, body, loc(body), subs, quants, names, out);
-            quants.pop();
-            r?;
-        }
+            None if is_state_level(ip, e, &mut Vec::new()) && !is_temporal(ip, e) => {
+                out.push(PropPart::Init(name, wrap(e, quants)));
+            }
+            None => out.push(PropPart::Liveness(wrap(e, quants))),
+        },
         _ if !matches!(&*e.kind, ExprKind::Builtin { op: B::Always, .. })
             && is_state_level(ip, e, &mut Vec::new())
             && !is_temporal(ip, e) =>
@@ -196,23 +200,53 @@ pub(super) fn tlc_has_value(ip: &Interp, d: DefId) -> bool {
         && ip.plain_op_body(d).is_some_and(|(_, body)| is_state_level(ip, body, &mut Vec::new()) && !is_temporal(ip, body))
 }
 
-/// For `\A x \in S, ... : P` over constant sets: the number of their
-/// elements (TLC unrolls such a quantifier in a PROPERTY,
-/// `SpecProcessor.processConfigProps` with `OPCODE_bf`); None for anything
-/// else, or when the sets cannot be enumerated.
-fn constant_forall(ip: &Arc<Interp>, e: &Expr) -> Option<usize> {
+/// For `\A x \in S, ... : P` over constant sets: whether the product of their
+/// domains is empty (`Some(true)` = empty tautology, `Some(false)` = non-empty
+/// valid constant bounds; TLC unrolls such a quantifier in a PROPERTY,
+/// `SpecProcessor.processConfigProps` with `OPCODE_bf`); `None` for anything
+/// else, or when any domain or tuple binder fails validation. Validates each
+/// domain (and each tuple-bound domain's elements) individually without
+/// walking the Cartesian product or materializing `SUBSET S` / `kSubset(k, S)`.
+fn constant_forall(ip: &Arc<Interp>, e: &Expr) -> Option<bool> {
+    use crate::eval::BoundElems;
+
     let ExprKind::Quant { kind: QuantKind::Forall, bounds, .. } = &*e.kind else { return None };
     let env = Env::default();
     if !bounds.iter().all(|b| ip.is_constant_in(&b.set, &env)) {
         return None;
     }
-    let mut n = 0;
-    ip.for_each_binding(bounds, &env, &Ctx::NONE, &mut |_| {
-        n += 1;
-        Ok(true)
-    })
-    .ok()?;
-    Some(n)
+    let mut empty = false;
+    let mut tuple_bounds = Vec::new();
+    for b in bounds {
+        match ip.bound_elems(&b.set, &env, &Ctx::NONE).ok()? {
+            BoundElems::Elems(elems) => {
+                if elems.is_empty() {
+                    empty = true;
+                } else if matches!(b.vars, BoundVars::Tuple(_)) {
+                    tuple_bounds.push((&b.vars, elems));
+                }
+            }
+            BoundElems::Stream(v) => {
+                if tlx_value::ops::for_each_enumerated(&v, &mut |_| Ok(false)).ok()? {
+                    empty = true;
+                } else if matches!(b.vars, BoundVars::Tuple(_)) {
+                    // Every element of `SUBSET S` / `kSubset(k, S)` is a set
+                    // (never a tuple), so a non-empty streamed domain cannot
+                    // satisfy a tuple binder.
+                    return None;
+                }
+            }
+        }
+    }
+    if empty {
+        return Some(true);
+    }
+    for (vars, elems) in tuple_bounds {
+        for i in 0..elems.len() {
+            ip.bind_bound_vars(vars, elems.get(i), &env).ok()?;
+        }
+    }
+    Some(false)
 }
 
 /// Whether `e` contains no primes, actions or temporal operators (`seen`:
