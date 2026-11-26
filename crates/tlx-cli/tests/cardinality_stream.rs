@@ -240,10 +240,10 @@ Inv ==
 ====
 "#;
 
-/// Dynamic bitset state variable (`|x| = 32 -> 31`) in both `CHOOSE` (streams
-/// via interpreter fallback beyond 24 elements) and multi-variable `\E a, b`
-/// (must preserve interpreter overflow parity across compiled tiers and
-/// `TLX_PARANOID=1` until multi-variable bounds stream).
+/// Dynamic bitset state variable (`|x| = 32 -> 31`) in both `CHOOSE` and
+/// multi-variable `\E a, b \in SUBSET x`: bases beyond 24 elements fall back
+/// from `Src::Subsets` to the streaming interpreter and succeed across every
+/// tier and `TLX_PARANOID=1`.
 const CHOOSE_DYNAMIC_BITSET_31_SPEC: &str = r#"---- MODULE CardStreamChooseDynBitset31 ----
 EXTENDS Naturals
 
@@ -270,9 +270,202 @@ Init == x = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 
 
 Next == IF 32 \in x THEN x' = x \ {32} ELSE x' = x
 
-Inv == 32 \in x \/ (\E a, b \in SUBSET x : a = b)
+Inv == 32 \in x \/ (\E a, b \in SUBSET x : a = {1} /\ b = {})
 ====
 "#;
+
+/// Multi-variable, tuple-binder, empty-sibling, and action-level `ENABLED`
+/// streaming over `SUBSET (1..31)` and `kSubset(10, 1..30)`. Two distinct
+/// states ensure `TLX_PRERUN=1` enters compiled execution.
+const MULTI_VAR_STREAM_SPEC: &str = r#"---- MODULE CardStreamMultiVar ----
+EXTENDS Naturals, FiniteSets, FiniteSetsExt
+
+VARIABLE x
+
+Init == x = {}
+
+Next == IF x = {} THEN x' = {1} ELSE x' = x
+
+Inv ==
+    /\ (\E a, b \in SUBSET (1..31) : a = {1} /\ b = {})
+    /\ (\E a, b \in kSubset(10, 1..30) : a = (1..10) /\ b = (1..10))
+    /\ (\E s \in SUBSET (1..31), <<a, b>> \in {<<1, 2>>} : s = x /\ a = 1 /\ b = 2)
+    /\ ~(\E a \in SUBSET (1..31), b \in {} : TRUE)
+    /\ ~(\E a \in {}, b \in SUBSET (1..31) : TRUE)
+    /\ ~(\E a \in SUBSET (1..31), b \in kSubset(2, {1}) : TRUE)
+    /\ ~ENABLED (\A a, b \in SUBSET (1..31) : a = b)
+    /\ ENABLED (\E a, b \in SUBSET (1..31) : a = {1} /\ b = {} /\ x' = a)
+    /\ (x = {} => ~ENABLED (\E a \in x, b \in SUBSET (1..31) : x' = b))
+====
+"#;
+
+/// Tuple binder over `SUBSET (1..31)` in `\E` must fail tuple destructuring
+/// consistently across every tier.
+const MULTI_VAR_TUPLE_ERROR_SPEC: &str = r#"---- MODULE CardStreamMultiTupleErr ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == \E <<a, b>> \in SUBSET (1..31) : a = x
+====
+"#;
+
+/// Empty first bound followed by an invalid second bound (`SUBSET Nat`) must
+/// still report the non-enumerable bound error in source order across tiers.
+const MULTI_VAR_EMPTY_THEN_INVALID_SPEC: &str = r#"---- MODULE CardStreamMultiEmptyInvalid ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == \E a \in {}, b \in SUBSET Nat : x = 1
+====
+"#;
+
+/// Multi-variable set comprehension `{a \cup b : a, b \in SUBSET (1..20)}`
+/// streams bindings and stops at `-maxSetSize` via `limits::push`.
+const MULTI_VAR_SETMAP_LIMIT_SPEC: &str = r#"---- MODULE CardStreamMultiSetMapLimit ----
+EXTENDS Naturals
+
+VARIABLE x
+
+Init == x = 1
+
+Next == IF x = 1 THEN x' = 2 ELSE x' = x
+
+Inv == x \in {a \cup b : a, b \in SUBSET (1..20)}
+====
+"#;
+
+/// Action splitting must keep `\E a, b \in SUBSET (1..31) : ...` unsplit so
+/// initial-state invariant violations are reported without materializing
+/// `2^62` action instances at startup.
+const ACTION_SPLIT_STREAM_SPEC: &str = r#"---- MODULE CardStreamActionSplit ----
+EXTENDS Naturals
+
+VARIABLE n
+
+Init == n = 0
+
+Next == \E a, b \in SUBSET (1..31) : n' = n
+
+Inv == n = 1
+====
+"#;
+
+/// Dynamically empty inner domain paired with a large streamed outer domain
+/// (`kSubset(15, 1..30)`, `SUBSET (1..25)`) in compiled expression quantifiers
+/// must short-circuit without walking the outer combinations.
+const DYN_EMPTY_INNER_STREAM_SPEC: &str = r#"---- MODULE CardStreamDynEmptyInner ----
+EXTENDS Naturals, FiniteSetsExt
+
+VARIABLE n
+
+Init == n = 0
+
+Next == n' = IF n = 0 THEN 1 ELSE n
+
+Inv ==
+    n = 0 \/ (
+        /\ ~(\E a \in 1..(1 - n), b \in kSubset(15, 1..30) : a \in b)
+        /\ (\A a \in 1..(1 - n), b \in SUBSET (1..25) : a \in b)
+    )
+====
+"#;
+
+/// Dynamically empty inner domain followed by a dynamically invalid outer
+/// domain must still report the invalid outer domain in source order across
+/// every tier.
+const DYN_EMPTY_INNER_INVALID_OUTER_SPEC: &str = r#"---- MODULE CardStreamDynEmptyInvalidOuter ----
+EXTENDS Naturals
+
+VARIABLE n
+
+Init == n = 0
+
+Next == n' = IF n = 0 THEN 1 ELSE n
+
+Inv == n = 0 \/ ~(\E a \in 1..(1 - n), b \in (IF n = 1 THEN SUBSET Nat ELSE SUBSET (1..2)) : a \in b)
+====
+"#;
+
+/// Ordinary tuple/function lookup (`flags[...]`) inside an action universal
+/// over `SUBSET (1..31)` short-circuits via `self.test`, while an action-valued
+/// function definition (`Act[i]`) retains its action-enumeration semantics.
+const ACTION_FORALL_LOOKUP_SPEC: &str = r#"---- MODULE CardStreamForallLookup ----
+EXTENDS Naturals
+
+VARIABLES flags, x
+
+Act[i \in {1}] == x' = i
+
+Init == flags = <<FALSE, TRUE>> /\ x = 0
+
+Next == flags' = flags /\ \A i \in {1} : Act[i]
+
+Inv == ~ENABLED (\A a, b \in SUBSET (1..31) : flags[IF a = b THEN 1 ELSE 2])
+====
+"#;
+
+/// Quantified safety property (`PROPERTY P == \A a, b \in 1..4 : [](...)`)
+/// must stay classified as an invariant even when `-maxSetSize 10` is smaller
+/// than the 16-element binding product.
+const PROP_FORALL_SMALL_SPEC: &str = r#"---- MODULE CardStreamPropForallSmall ----
+EXTENDS Naturals
+
+VARIABLE n
+
+Init == n = 0
+
+Next == n' = n
+
+P == \A a, b \in 1..4 : [](n # a - b)
+====
+"#;
+
+/// Quantified safety property over `SUBSET (1..31)` must stay classified as an
+/// invariant (probing at most one binding at classification time) and report
+/// the initial-state violation immediately without expanding `2^62` temporal
+/// branches.
+const PROP_FORALL_STREAM_SPEC: &str = r#"---- MODULE CardStreamPropForallStream ----
+EXTENDS Naturals
+
+VARIABLE n
+
+Init == n = 0
+
+Next == n' = n
+
+P == \A a, b \in SUBSET (1..31) : [](n # 0 \/ a # b)
+====
+"#;
+
+/// A malformed tuple element in a quantified property whose body is a constant
+/// `TRUE` definition must still be rejected across every tier rather than
+/// folded away during property classification.
+const PROP_FORALL_MALFORMED_TUPLE_SPEC: &str = r#"---- MODULE CardStreamPropMalformedTuple ----
+EXTENDS Naturals
+
+VARIABLE n
+
+Init == n = 0
+
+Next == n' = n
+
+T == TRUE
+
+P == \A <<a, b>> \in {<<1, 2>>, <<1, 2, 3>>} : T
+====
+"#;
+
+const PROP_CFG: &str = "INIT Init\nNEXT Next\nPROPERTY P\nCHECK_DEADLOCK FALSE\n";
 
 /// Whether to run the default tier (else the `-tlc -interp` parity tier of
 /// `tlx!`). The timeout turns a materializing enumeration into a failure
@@ -476,20 +669,179 @@ fn choose_streams_dynamic_bitset_subsets() {
 }
 
 #[test]
-fn multi_var_dynamic_bitset_preserves_interpreter_parity() {
+fn multi_var_dynamic_bitset_streams_across_tiers() {
     let dir = tlx_testkit::TempDir::with_spec("card_stream_multi_dyn_bitset_31", MULTI_VAR_DYNAMIC_BITSET_31_SPEC, CFG);
-    let (code, interp) = run(&dir, "CardStreamMultiDynBitset31.tla", false, &[], &[]);
-    assert!(code != 0, "expected overflow error:\n{interp}");
-    assert!(interp.contains("Overflow when computing the number of elements in"), "{interp}");
-    for (default_tier, args) in [(true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+    let (code, plain) = run(&dir, "CardStreamMultiDynBitset31.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert!(!plain.contains("Overflow"), "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
         let (c, out) = run(&dir, "CardStreamMultiDynBitset31.tla", default_tier, args, &[]);
-        assert_eq!(c, code, "default_tier={default_tier} {args:?}:\n{out}");
-        assert!(out.contains("Overflow when computing the number of elements in"), "default_tier={default_tier} {args:?}:\n{out}");
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
     }
     for env in PARANOID_MODES {
         let (c, out) = run(&dir, "CardStreamMultiDynBitset31.tla", true, &["-compile"], env);
-        assert_eq!(c, code, "{env:?}:\n{out}");
-        assert!(out.contains("Overflow when computing the number of elements in"), "{env:?}:\n{out}");
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn multi_var_and_tuple_bounds_stream_across_tiers() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_multi_var", MULTI_VAR_STREAM_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamMultiVar.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert!(!plain.contains("Overflow"), "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (c, out) = run(&dir, "CardStreamMultiVar.tla", default_tier, args, &[]);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (c, out) = run(&dir, "CardStreamMultiVar.tla", true, &["-compile"], env);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn multi_var_stream_errors_match_across_tiers() {
+    let cases = [
+        ("card_stream_multi_tuple_err", "CardStreamMultiTupleErr.tla", MULTI_VAR_TUPLE_ERROR_SPEC, "non-tuple"),
+        ("card_stream_multi_empty_invalid", "CardStreamMultiEmptyInvalid.tla", MULTI_VAR_EMPTY_THEN_INVALID_SPEC, "non-enumerable"),
+        (
+            "card_stream_multi_setmap_limit",
+            "CardStreamMultiSetMapLimit.tla",
+            MULTI_VAR_SETMAP_LIMIT_SPEC,
+            "Attempted to construct a set with too many elements (>1000000)",
+        ),
+    ];
+    for (tag, file, spec, needle) in cases {
+        let dir = tlx_testkit::TempDir::with_spec(tag, spec, CFG);
+        for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+            let (code, out) = run(&dir, file, default_tier, args, &[]);
+            assert_eq!(code, 75, "{file} default_tier={default_tier} {args:?}:\n{out}");
+            assert!(out.contains(needle), "{file} default_tier={default_tier} {args:?}:\n{out}");
+        }
+        for env in PARANOID_MODES {
+            let (code, out) = run(&dir, file, true, &["-compile"], env);
+            assert_eq!(code, 75, "{file} {env:?}:\n{out}");
+            assert!(out.contains(needle), "{file} {env:?}:\n{out}");
+        }
+    }
+}
+
+#[test]
+fn action_split_keeps_huge_streamed_product_unsplit() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_action_split", ACTION_SPLIT_STREAM_SPEC, CFG);
+    for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamActionSplit.tla", default_tier, args, &[]);
+        assert_eq!(code, 12, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("Invariant Inv is violated"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamActionSplit.tla", true, &["-compile"], env);
+        assert_eq!(code, 12, "{env:?}:\n{out}");
+        assert!(out.contains("Invariant Inv is violated"), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn dynamic_empty_inner_bound_and_forall_lookup_stream_across_tiers() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_dyn_empty_inner", DYN_EMPTY_INNER_STREAM_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamDynEmptyInner.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (c, out) = run(&dir, "CardStreamDynEmptyInner.tla", default_tier, args, &[]);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (c, out) = run(&dir, "CardStreamDynEmptyInner.tla", true, &["-compile"], env);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_dyn_empty_invalid", DYN_EMPTY_INNER_INVALID_OUTER_SPEC, CFG);
+    for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamDynEmptyInvalidOuter.tla", default_tier, args, &[]);
+        assert_eq!(code, 76, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("non-enumerable"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamDynEmptyInvalidOuter.tla", true, &["-compile"], env);
+        assert_eq!(code, 76, "{env:?}:\n{out}");
+        assert!(out.contains("non-enumerable"), "{env:?}:\n{out}");
+    }
+
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_forall_lookup", ACTION_FORALL_LOOKUP_SPEC, CFG);
+    let (code, plain) = run(&dir, "CardStreamForallLookup.tla", true, &[], &[]);
+    assert_eq!(code, 0, "{plain}");
+    assert_eq!(
+        counts(&plain),
+        ["3 states generated, 2 distinct states found, 0 states left on queue.", "The depth of the complete state graph search is 2."]
+    );
+    for (default_tier, args) in [(false, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (c, out) = run(&dir, "CardStreamForallLookup.tla", default_tier, args, &[]);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (c, out) = run(&dir, "CardStreamForallLookup.tla", true, &["-compile"], env);
+        assert_eq!((c, counts(&out)), (0, counts(&plain)), "{env:?}:\n{out}");
+    }
+}
+
+#[test]
+fn quantified_safety_property_classifies_as_invariant_for_small_limit_and_stream() {
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_prop_small", PROP_FORALL_SMALL_SPEC, PROP_CFG);
+    for (default_tier, args) in [
+        (false, &["-maxSetSize", "10"][..]),
+        (true, &["-maxSetSize", "10"][..]),
+        (true, &["-interp", "-maxSetSize", "10"][..]),
+        (true, &["-compile", "-maxSetSize", "10"][..]),
+    ] {
+        let (code, out) = run(&dir, "CardStreamPropForallSmall.tla", default_tier, args, &[]);
+        assert_eq!(code, 12, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("Invariant") && out.contains("is violated"), "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(!out.contains("Temporal properties were violated"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamPropForallSmall.tla", true, &["-compile", "-maxSetSize", "10"], env);
+        assert_eq!(code, 12, "{env:?}:\n{out}");
+        assert!(out.contains("Invariant") && out.contains("is violated"), "{env:?}:\n{out}");
+        assert!(!out.contains("Temporal properties were violated"), "{env:?}:\n{out}");
+    }
+
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_prop_stream", PROP_FORALL_STREAM_SPEC, PROP_CFG);
+    for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamPropForallStream.tla", default_tier, args, &[]);
+        assert_eq!(code, 12, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("Invariant") && out.contains("is violated"), "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(!out.contains("Temporal properties were violated"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamPropForallStream.tla", true, &["-compile"], env);
+        assert_eq!(code, 12, "{env:?}:\n{out}");
+        assert!(out.contains("Invariant") && out.contains("is violated"), "{env:?}:\n{out}");
+        assert!(!out.contains("Temporal properties were violated"), "{env:?}:\n{out}");
+    }
+
+    let dir = tlx_testkit::TempDir::with_spec("card_stream_prop_malformed_tuple", PROP_FORALL_MALFORMED_TUPLE_SPEC, PROP_CFG);
+    for (default_tier, args) in [(false, &[][..]), (true, &[][..]), (true, &["-interp"][..]), (true, &["-compile"][..])] {
+        let (code, out) = run(&dir, "CardStreamPropMalformedTuple.tla", default_tier, args, &[]);
+        assert_eq!(code, 75, "default_tier={default_tier} {args:?}:\n{out}");
+        assert!(out.contains("tuple binder of length 2"), "default_tier={default_tier} {args:?}:\n{out}");
+    }
+    for env in PARANOID_MODES {
+        let (code, out) = run(&dir, "CardStreamPropMalformedTuple.tla", true, &["-compile"], env);
+        assert_eq!(code, 75, "{env:?}:\n{out}");
+        assert!(out.contains("tuple binder of length 2"), "{env:?}:\n{out}");
     }
 }
 

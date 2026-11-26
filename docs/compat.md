@@ -217,15 +217,17 @@ This is the single source for known limitations ([design.md](design.md) and
 - **Sets whose size overflows TLC's int**: `Cardinality` (TLC's `Value.size`) refuses `SUBSET S`
   with `|S| >= 31` and a `[S -> T]`, `\X` or record set whose product of component sizes does not
   fit an int ([tlc-semantics.md](tlc-semantics.md) section 4). Enumeration itself needs no size:
-  tlx streams a single bound's domain, `CHOOSE x \in S` (when `S` is `SUBSET T` or
-  `kSubset(k, T)`), `x' \in S` and `x' \subseteq S` (and `x \subseteq S` in `Init`, outside
-  `-generate`), and TLC streams `x' \in S`, `x' \subseteq S`, `{x \in S : P}` and printing for
-  every set type (`x' \subseteq S` in normalized order). A *bound* and `CHOOSE` ask for the
+  tlx streams quantifier and comprehension bounds (single, multi-variable and tuple binders) and
+  `CHOOSE x \in S` when the domain is `SUBSET T` or `kSubset(k, T)`, as well as `x' \in S` and
+  `x' \subseteq S` (and `x \subseteq S` in `Init`, outside `-generate`), and TLC streams `x' \in S`,
+  `x' \subseteq S`, `{x \in S : P}` and printing for every set type (`x' \subseteq S` in normalized
+  order). A *bound* and `CHOOSE` ask for the
   normalized order, which TLC implements by materializing everything but `SUBSET S`, an enumerated
   set and `kSubset(k, S)`; materializing stops at `-maxSetSize` (default 10^6, implemented in every
   tier:
   [configuration.md](configuration.md) and [features.md](features.md) section 1). So a `SUBSET S`
-  domain agrees — `\E s \in SUBSET (1..31) : s = {}` is TRUE in both — and so does a
+  domain agrees — `\E s \in SUBSET (1..31) : s = {}` and `\E x, y \in SUBSET (1..31) : x = y` are
+  TRUE in both — and so does a
   `[S -> T]`, `\X`, record or set-filter domain over the bound: both report "too many elements",
   also when the size overflows an int (TLC's growing `ValueVec` reaches the bound first). TLC's
   check has corners that tlx reproduces: a `ValueVec` starts with ten slots and the bound is
@@ -240,10 +242,6 @@ This is the single source for known limitations ([design.md](design.md) and
   eager cup copies the interval), without TLC's memory cost for `1..2147483646`. For homogeneous
   explicit sets, `\cup`, `\cap` and `\` enforce `-maxSetSize` on canonical distinct elements rather
   than imitating TLC's mutable in-place `SetEnumValue.normalize()` aliasing (D-35).
-- **Sets kept as a whole**: a bound of several variables (`\E x, y \in S`) refuses such a set in
-  tlx, where TLC streams a `SUBSET S`, `kSubset(k, S)` or enumerated domain and answers:
-  `\E x, y \in SUBSET (1..31) : x = y` is `TRUE` in TLC; for the other set types TLC materializes
-  as above.
 - **Command line** (outside the contract, section 2): TLC's `-continue`, `-difftrace`,
   `-fp`, `-lncheck`, `-terse` and others are not implemented and give a usage error
   (exit code 2); `-cleanup` and `-noGenerateSpecTE` are accepted without effect; no `*_TTrace_*`

@@ -218,8 +218,7 @@ impl Src {
                 let l = set.at(fx)?;
                 let ranks: Vec<usize> = super::super::words::bit_ranks(fx.get(l, *n)).collect();
                 // Keep the 24-element cap aligned with C/JIT so >24-element
-                // bases fall back to the interpreter (preserving interpreter
-                // parity for multi-variable bounds until they stream too).
+                // bases fall back to the streaming interpreter.
                 if ranks.len() > 24 {
                     return Err(EvalError::new("too many subsets for compiled iteration"));
                 }

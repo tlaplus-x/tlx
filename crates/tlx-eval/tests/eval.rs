@@ -103,9 +103,8 @@ fn constant_expressions() {
 /// too (`SubsetValue` implements the normalized enumeration by streaming), so
 /// that case agrees. A `[S -> T]` domain is materialized by both: its size
 /// overflows TLC's int, and TLC's growing `ValueVec` reports its
-/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE` streams
-/// `SUBSET S` in normalized order as well; a bound of several variables still
-/// needs the whole set.
+/// `-maxSetSize` bound first, so tlx reports that error too. `CHOOSE` and
+/// multi-variable bounds stream `SUBSET S` in normalized order as well.
 #[test]
 fn quantifiers_stream_subsets_whose_size_overflows() {
     let body = "\
@@ -121,9 +120,84 @@ Pair == \\E x, y \\in SUBSET (1..31) : x = y";
         "BigFcn: {}",
         out[1]
     );
+    assert!(
+        out[2].starts_with("ERROR:") && out[2].contains("Overflow when computing the number of elements in"),
+        "Cardinality: {}",
+        out[2]
+    );
     assert_eq!(out[3], "{}", "{out:?}");
-    for (i, what) in [(2, "Cardinality"), (4, "a bound of two variables")] {
-        assert!(out[i].starts_with("ERROR:") && out[i].contains("Overflow when computing the number of elements in"), "{what}: {}", out[i]);
+    assert_eq!(out[4], "TRUE", "{out:?}");
+}
+
+#[test]
+fn multi_var_and_tuple_bounds_stream_subset_and_ksubset() {
+    let body = "\
+EXTENDS Naturals, FiniteSets, FiniteSetsExt\n\
+FirstFast == \\E x, y \\in SUBSET (1..31) : x = {1} /\\ y = {}\n\
+ForallFalse == \\A x, y \\in SUBSET (1..31) : x = y\n\
+KSubPair == \\E x, y \\in kSubset(10, 1..30) : x = (1..10) /\\ y = (1..10)\n\
+KSubZeroNat == \\E x \\in kSubset(0, Nat), y \\in {1, 2} : x = {} /\\ y = 2\n\
+MixedTuple == \\E s \\in SUBSET (1..31), <<a, b>> \\in {<<1, 2>>} : s = {1} /\\ a = 1 /\\ b = 2\n\
+TupleOnSubset == \\E <<a, b>> \\in SUBSET (1..31) : TRUE\n\
+TupleOnEmptyKSub == \\E <<a, b>> \\in kSubset(2, {1}) : TRUE\n\
+EmptySecond == \\E x \\in SUBSET (1..31), y \\in {} : TRUE\n\
+EmptyFirst == \\E x \\in {}, y \\in SUBSET (1..31) : TRUE\n\
+EmptyKSubSecond == \\E x \\in SUBSET (1..31), y \\in kSubset(2, {1}) : TRUE\n\
+EmptyThenInvalid == \\E x \\in {}, y \\in SUBSET Nat : TRUE\n\
+SetMapLimit20 == {x \\cup y : x, y \\in SUBSET (1..20)}\n\
+SetMapLimit31 == {x \\cup y : x, y \\in SUBSET (1..31)}\n";
+    let (_dir, path) = write_spec("M", body);
+    let mut prog = Program::load(&path, &[]).unwrap_or_else(|e| panic!("{e:?}"));
+    let names = [
+        "FirstFast",
+        "ForallFalse",
+        "KSubPair",
+        "KSubZeroNat",
+        "MixedTuple",
+        "TupleOnSubset",
+        "TupleOnEmptyKSub",
+        "EmptySecond",
+        "EmptyFirst",
+        "EmptyKSubSecond",
+        "EmptyThenInvalid",
+        "SetMapLimit20",
+        "SetMapLimit31",
+    ];
+    let defs: Vec<_> = names
+        .iter()
+        .map(|n| match prog.lookup_root(n) {
+            Some(RootSymbol::Def(d)) => d,
+            other => panic!("{n}: {other:?}"),
+        })
+        .collect();
+    let ip = Interp::new(prog, Default::default()).unwrap();
+    let out: Vec<String> = defs
+        .iter()
+        .map(|d| {
+            let e = tlx_sema::hir::Expr::new(ExprKind::Apply { op: OpRef::Def(*d), args: vec![] }, Default::default());
+            match ip.eval(&e, &Env::default(), &Ctx::NONE) {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("ERROR: {e}"),
+            }
+        })
+        .collect();
+    assert_eq!(out[0], "TRUE", "FirstFast: {}", out[0]);
+    assert_eq!(out[1], "FALSE", "ForallFalse: {}", out[1]);
+    assert_eq!(out[2], "TRUE", "KSubPair: {}", out[2]);
+    assert_eq!(out[3], "TRUE", "KSubZeroNat: {}", out[3]);
+    assert_eq!(out[4], "TRUE", "MixedTuple: {}", out[4]);
+    assert!(out[5].starts_with("ERROR:") && out[5].contains("non-tuple"), "TupleOnSubset: {}", out[5]);
+    assert_eq!(out[6], "FALSE", "TupleOnEmptyKSub: {}", out[6]);
+    assert_eq!(out[7], "FALSE", "EmptySecond: {}", out[7]);
+    assert_eq!(out[8], "FALSE", "EmptyFirst: {}", out[8]);
+    assert_eq!(out[9], "FALSE", "EmptyKSubSecond: {}", out[9]);
+    assert!(out[10].starts_with("ERROR:") && out[10].contains("non-enumerable"), "EmptyThenInvalid: {}", out[10]);
+    for (i, what) in [(11, "SetMapLimit20"), (12, "SetMapLimit31")] {
+        assert!(
+            out[i].starts_with("ERROR:") && out[i].contains("Attempted to construct a set with too many elements (>1000000)"),
+            "{what}: {}",
+            out[i]
+        );
     }
 }
 
