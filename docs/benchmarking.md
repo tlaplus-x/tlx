@@ -300,7 +300,8 @@ timeout and the expected counts (`result`, and for a successful search `distinct
 `tlx-pinned` (no TLC run exists; the count was pinned from recorded runs) or `unpinned` (recorded,
 not enforced yet). The suite spans small models (start-up, front end, C build), medium and large
 corpus models, the industrial external specifications (Vanlightly Raft, FlexibleRaft, Neon,
-MongoDB, CCF, Zab, Cassandra Accord with liveness), the liveness stress configurations
+MongoDB, CCF, ZooKeeper Zab and FastLeaderElection, PingCAP Percolator, Raft region merge and
+distributed transaction, Cassandra Accord with liveness), the liveness stress configurations
 (`bench/ClockSettles`, `bench/RaftMongoT4`, `bench/ReplicatedLog4x3`) and the scaling
 configurations (`bench/MCLamportMutex_clock14`, and with `huge` `MultiPaxos_MC` and
 `bench/cf1s_folklore_N5`). A model whose SYMMETRY is not equivariant (`ext/neon`) runs at 1

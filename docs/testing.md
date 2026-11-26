@@ -500,21 +500,27 @@ back; copy them into `corpus/out/`. A linked worktree refreshes its private orac
 | `snapshot-isolation` | will62794/snapshot-isolation-spec `99ff1fd5ba64` | none: fetched only | William Schultz |
 | `mongo-repl-models` | will62794/mongo-repl-tla-models `48ef5d7e7d13` | none: fetched only | William Schultz |
 | `paxosstore` | Disalg-ICS-NJU/PaxosStore-TLA `0188955e7023`, `experiment/TPaxos` (our wrappers and cfg files from its `.ini` models) | none: fetched only | Disalg-ICS-NJU |
+| `zookeeper` | apache/zookeeper `2b86687b0b11`, `zookeeper-specifications` (our bounded `FastLeaderElection` wrapper and cfg files; the cfgs bind `NullPoint` to a bounded value because the upstream `CHOOSE` is unbounded) | Apache-2.0 | Copyright the Apache Software Foundation |
+| `pingcap` | pingcap/tla-plus `5649f86df14c` (our cfg files without deadlock checking for the Percolator, Raft region-merge and distributed-transaction models) | Apache-2.0 | Copyright PingCAP |
 
-Integrated models: query the live inventory across the 18 repositories above with
+Integrated models: query the live inventory across the 20 repositories above with
 `python3 scripts/corpus.py list --source external --tier small,medium,large,huge` (or pass a single
 `--tier` to inspect each tier). Industrial protocol models: MongoDB
 replication and sharding, CCF consensus and consistency, Neon safekeeper, Kafka KRaft and data
 replication, Viewstamped Replication, BookKeeper, Raft variants (Vanlightly, MongoDB's logless
-reconfiguration, etcd), ZooKeeper Zab, Cassandra Accord, Elasticsearch, Tencent PaxosStore,
-snapshot isolation. The huge tier (days of TLC, or no finite state space: `ext/pragmatic/
-storagecleaner`'s constraint does not bound its failure counter) has no oracle.
+reconfiguration, etcd), the official Apache ZooKeeper Fast Leader Election system specification,
+ZooKeeper Zab (`alpha-zk`), PingCAP TiKV Percolator and Raft region merge and TiDB's distributed
+transaction, Cassandra Accord, Elasticsearch, Tencent PaxosStore, snapshot isolation. The huge
+tier (days of TLC, or no finite state space: `ext/pragmatic/storagecleaner`'s constraint does not
+bound its failure counter) has no oracle.
 
 Models left out (the reason, for later): Vanlightly's `BookKeeperProtocolWithLimbo` (upstream
 does not parse: operators called with the wrong number of arguments); the KRaft and VSR
 configurations as published (10^8 states and more: our smaller cfg files instead); CommunityModules
-tests (`TLCExt!AssertError`); SwarmKit (nested modules); the NJU ZooKeeper and PingCAP
-specifications (cfg files to be written from `.ini`/Toolbox models).
+tests (`TLCExt!AssertError`); SwarmKit (nested modules); the ZooKeeper Zab protocol and system
+specifications beyond `FastLeaderElection` (`protocol-spec/Zab.tla` and
+`system-spec/zk-3.7/ZkV3_7_0.tla`: the smallest published parameter sets already traverse
+billions of states).
 
 ### 6.4 TLC's regression suite: `scripts/tlcsuite.py`
 
