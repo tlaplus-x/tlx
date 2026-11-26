@@ -1010,9 +1010,9 @@ Command-line options are not part of the compatibility contract, but tlx follows
 
 | TLC option | In tlx |
 |---|---|
-| `-config`, `-workers`, `-deadlock`, `-depth`, `-seed`, `-simulate`, `-generate`, `-dump`, `-dumpTrace`, `-coverage`, `-tool`, `-nowarning`, `-fpmem`, `-fpbits`, `-checkpoint`, `-recover`, `-metadir`, `-h` | implemented with TLC's meaning (restrictions: `-simulate` has no `file=`; `-dump` has no `constrained`; `-dumpTrace` has only `json` and `tla`; `-coverage` is action-level only) |
+| `-config`, `-workers`, `-deadlock`, `-depth`, `-seed`, `-simulate`, `-generate`, `-dump`, `-dumpTrace`, `-coverage`, `-tool`, `-nowarning`, `-fpmem`, `-fpbits`, `-maxSetSize`, `-checkpoint`, `-recover`, `-metadir`, `-h` | implemented with TLC's meaning (restrictions: `-simulate` has no `file=`; `-dump` has no `constrained`; `-dumpTrace` has only `json` and `tla`; `-coverage` is action-level only) |
 | `-cleanup`, `-noGenerateSpecTE` | accepted, no effect |
-| `-continue`, `-difftrace`, `-fp`, `-maxSetSize`, `-terse`, `-view`, `-userFile`, `-inv`, `-postCondition`, `-dfid`, `-lncheck`, `-debugger`, ... | not implemented; usage error, exit code 2 |
+| `-continue`, `-difftrace`, `-fp`, `-terse`, `-view`, `-userFile`, `-inv`, `-postCondition`, `-dfid`, `-lncheck`, `-debugger`, ... | not implemented; usage error, exit code 2 |
 | `-DTLA-Library` | `-I dir` or `TLX_PATH` |
 
 tlx-only options: `-I`, `-progress`, `-compile`, `-interp`, `-tlc`, `-optimize`, `-proofdir`,

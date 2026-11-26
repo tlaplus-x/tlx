@@ -66,7 +66,7 @@ impl CGen<'_> {
                 self.stmt(body, ind + 1, out)?;
                 writeln!(out, "{pad}}}").unwrap();
             }
-            Stmt::ForEach { bind, set, sorted, body } => {
+            Stmt::ForEach { bind, set, iter, body } => {
                 let h0 = self.handles;
                 let mut inner = String::new();
                 self.loop_body(*bind, body, |g| g.stmt(body, ind + 2, &mut inner))?;
@@ -75,7 +75,16 @@ impl CGen<'_> {
                     Stmt::Guard { cond, .. } => Some(cond),
                     _ => None,
                 };
-                let lp = self.foreach(*bind, set, &inner, ind, h0, Some(*sorted), pred)?;
+                let sorted = match iter {
+                    IterMode::Enumerate => Some(false),
+                    IterMode::Normalized => Some(true),
+                    // A quantifier's bound domain: in mixed mode `h->elems`
+                    // calls `ops::enumerate`, which enforces `-maxSetSize` and
+                    // falls back to the interpreter on overflow or streaming
+                    // domains (`SUBSET S`).
+                    IterMode::Bound => Some(false),
+                };
+                let lp = self.foreach(*bind, set, &inner, ind, h0, sorted, pred)?;
                 out.push_str(&lp);
             }
             Stmt::Assign { var, value, body } => {

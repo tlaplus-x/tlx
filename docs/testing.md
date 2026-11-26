@@ -576,7 +576,7 @@ The coverage summary reports `to_test`, `verified`, `missing`, `stale` and `skip
 `tests/tlcsuite_expected_failures.json` classifies the differences: an entry has the case name
 (a glob is allowed), a short `reason`, optionally the `result` kind tlx reported and `flaky`
 (a timeout under load). The reasons name out-of-contract options (`-continue`, `-dfid`,
-`-maxSetSize`, `-invlevel`, `-view`, `-dumpTrace` state files) and the known gaps (TLCGet
+`-invlevel`, `-view`, `-dumpTrace` state files) and the known gaps (TLCGet
 `"all"`/`"all:named"`, `\cdot` with context, a SPECIFICATION or PROPERTY wrapped in an operator
 or LET, lazily evaluated ASSUME bounds, `_POSSIBLE` cfg items, Java overrides). A listed case that
 now passes is reported as FIXED and fails the gate: remove the entry. After a fix lands,

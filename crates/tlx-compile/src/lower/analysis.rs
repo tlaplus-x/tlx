@@ -228,6 +228,11 @@ impl Lowerer<'_> {
         if consts.is_empty() && !self.uses_env_locals(e, env) {
             // The value cannot depend on the environment: evaluate it once.
             let v = if self.strings.expr_in(e, &env.base) { None } else { self.ip.eval(e, &env.base, &Ctx::NONE).ok() };
+            // A constant set over the `-maxSetSize` bound is not folded into
+            // the compiled model: TLC fails on a quantifier over such a set
+            // (but streams `x' \in S`), and only the interpreter decides the
+            // expression's own path.
+            let v = v.filter(|v| !tlx_value::ops::over_set_bound(v));
             self.const_cache.borrow_mut().insert(key, (e.kind.clone(), v.clone()));
             return v;
         }
@@ -238,7 +243,7 @@ impl Lowerer<'_> {
         if self.strings.expr_in(e, &base) {
             return None;
         }
-        self.ip.eval(e, &base, &Ctx::NONE).ok()
+        self.ip.eval(e, &base, &Ctx::NONE).ok().filter(|v| !tlx_value::ops::over_set_bound(v))
     }
 
     /// Whether definition `d` (transitively) uses a nondeterministic or

@@ -8,7 +8,7 @@ mod tests;
 use std::sync::Arc;
 
 use tlx_sema::hir::*;
-use tlx_value::{ops, LazyFcn, Sym, Value, ValueError};
+use tlx_value::{ops, LazyFcn, Sym, Value};
 
 use crate::apply::{apply_tail, field_tail, Cow};
 use crate::env::{Binding, Env, LetCell, LetFrame, OpVal, Thunk};
@@ -79,37 +79,32 @@ impl Elems {
 }
 
 /// The elements of a bound variable's domain (`bound_elems`): materialized, or
-/// — for a lazy set that cannot be materialized — a value enumerated on the
-/// fly by the caller (`ops::for_each_enumerated`).
+/// — for a `SUBSET S`/`kSubset(k, S)` — a value enumerated on the fly by the
+/// caller (`ops::for_each_enumerated`).
 ///
-/// TLC materializes such a domain too, except for `SUBSET S`: a bound asks for
-/// `elements(Ordering.NORMALIZED)`, which `EnumerableValue` implements by
-/// `toSetEnum()`, and only `SubsetValue`, `SetEnumValue` and `KSubsetValue`
-/// override it. So streaming a `SUBSET S` domain matches TLC, and streaming a
-/// `[S -> T]`, `\X`, record or interval domain keeps computing where TLC
-/// reports "too many elements" beyond its `-maxSetSize` bound (default 10^6),
-/// which tlx does not implement (`docs/compat.md` section 5). The streamed
+/// Which domains TLC streams and which it materializes (and so which are
+/// limited by `-maxSetSize`) is decided by `ops::bound_kind`, the same
+/// decision the compiled tier's boxed-domain iteration uses. The streamed
 /// order is the normalized order
-/// (`tlx-value/tests/ops.rs::streaming_order_is_the_normalized_order`).
+/// (`tlx-value/tests/ops.rs::streaming_order_is_the_normalized_order`), and it
+/// can stop early: a body that finds its witness before the end never needs
+/// the whole `SUBSET S`.
 pub(crate) enum BoundElems {
     Elems(Elems),
-    /// `ops::materialization_error` of the set, and the set itself: a `SUBSET`
-    /// of 31 or more elements, or a function, record or tuple set whose
-    /// product of component sizes overflows TLC's int. The set is enumerated
-    /// element by element instead of being held in memory: a body that stops
-    /// early never needs the whole set.
-    Stream(Value, ValueError),
+    /// A `SUBSET S`/`kSubset(k, S)` and the set itself. The set is enumerated
+    /// element by element instead of being held in memory.
+    Stream(Value),
 }
 
 impl BoundElems {
-    /// All the elements; a streamed domain keeps the materializing path's
-    /// `size()` overflow error. A bound of several variables (the odometer of
-    /// `for_each_binding`) needs every element at once, exactly as `enumerate`
-    /// does.
+    /// All the elements. A bound of several variables (the odometer of
+    /// `for_each_binding`) needs every element at once, so a streamed domain
+    /// is materialized here — which keeps the materializing path's `size()`
+    /// overflow for a `SUBSET S` of 31 or more elements.
     pub(crate) fn into_shared(self) -> EResult<Arc<[Value]>> {
         match self {
             BoundElems::Elems(e) => e.into_shared(),
-            BoundElems::Stream(_, e) => Err(e.into()),
+            BoundElems::Stream(v) => Elems::of(&v)?.into_shared(),
         }
     }
 }
@@ -416,13 +411,13 @@ impl Interp {
             }
             ExprKind::SetEnum(es) => {
                 let vs = es.iter().map(|x| self.eval(x, env, cx)).collect::<EResult<Vec<_>>>()?;
-                Value::set_enum(vs)?
+                Value::set_literal(vs)?
             }
             ExprKind::SetFilter { bound, pred } => self.set_filter(bound, pred, env, cx)?,
             ExprKind::SetMap { expr, bounds } => {
                 let mut out = Vec::new();
                 self.for_each_binding(bounds, env, cx, &mut |env2| {
-                    out.push(self.eval(expr, env2, cx)?);
+                    tlx_value::limits::push(&mut out, self.eval(expr, env2, cx)?)?;
                     Ok(true)
                 })?;
                 Value::set_enum(out)?
@@ -559,7 +554,7 @@ impl Interp {
                     // The domain cannot be materialized: stream it
                     // (`for_each_enumerated`, TLC's `Enumerable.elements()`)
                     // and stop as soon as `f` does.
-                    BoundElems::Stream(v, _) => {
+                    BoundElems::Stream(v) => {
                         let mut err = None;
                         let done = ops::for_each_enumerated(&v, &mut |x| match f(&env.bind_val(*l, x)) {
                             Ok(go_on) => Ok(go_on),
@@ -686,14 +681,19 @@ impl Interp {
         Ok(elems)
     }
 
-    /// `bound_elems` of an evaluated domain: a set that `enumerate` cannot
-    /// materialize (`ops::materialization_error`) is streamed by the caller
-    /// instead.
+    /// `bound_elems` of an evaluated domain, following `ops::bound_kind`:
+    /// TLC's normalized enumeration streams a `SUBSET S`/`kSubset(k, S)`,
+    /// shares an enumerated set or an interval, and materializes every other
+    /// lazy set — where the `-maxSetSize` bound applies, and an overflowing
+    /// size is that error rather than a reason to stream.
     fn bound_elems_of(&self, v: &Value, set: &Expr) -> EResult<BoundElems> {
-        if let Some(e) = ops::materialization_error(v) {
-            return Ok(BoundElems::Stream(v.clone(), e));
+        match ops::bound_kind(v) {
+            ops::BoundKind::Stream => Ok(BoundElems::Stream(v.clone())),
+            ops::BoundKind::Overflow => Err(self.bound_error(v, set, tlx_value::limits::too_many_elements().into())),
+            ops::BoundKind::Share | ops::BoundKind::Materialize => {
+                Elems::of(v).map(BoundElems::Elems).map_err(|e| self.bound_error(v, set, e))
+            }
         }
-        Elems::of(v).map(BoundElems::Elems).map_err(|e| self.bound_error(v, set, e))
     }
 
     /// The error of a quantifier bound `v` (the value of `set`) that cannot
@@ -740,7 +740,7 @@ impl Interp {
         for x in Elems::of(&set)? {
             let env2 = self.bind_bound_vars(&bound.vars, x.clone(), env)?;
             if self.eval_bool(pred, &env2, cx)? {
-                out.push(x);
+                tlx_value::limits::push(&mut out, x)?;
             }
         }
         Ok(Value::set_enum(out)?)

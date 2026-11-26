@@ -282,13 +282,17 @@ tlx: `tlx-eval/src/eval.rs` (`QuantUnbounded` and unbounded CHOOSE produce the s
   `x' \subseteq S`).
 
   tlx: `tlx-value/src/ops/enumerate.rs` (`for_each_enumerated` streams such a set in the default
-  order; `enumerate` refuses it and `materialization_error` reports the overflow) and
-  `tlx-eval/src/eval.rs::bound_elems` (a bound of one variable over a domain that cannot be
-  materialized is streamed; the streamed order is the normalized order, pinned by
-  `crates/tlx-value/tests/ops.rs::streaming_order_is_the_normalized_order`). A `CHOOSE`, a bound of
-  several variables and `x' \subseteq S` still materialize and keep the overflow; a bound over a
-  `[S -> T]`, `\X`, record or interval domain larger than TLC's `-maxSetSize` is an error in TLC and
-  keeps computing in tlx (see [compat.md](compat.md) section 5).
+  order; `enumerate` refuses it and `materialization_error` reports the overflow),
+  `ops::bound_kind` (the single decision both the interpreter's `bound_elems` and the compiled
+  tier's boxed-domain iteration follow: share an enumerated set or an interval, stream a
+  `SUBSET S`/`kSubset(k, S)`, materialize every other lazy set, and report the bound for a size
+  over the int) and `tlx-value/src/limits.rs`. Materializing enforces `-maxSetSize` exactly where
+  TLC's growing `ValueVec` does, including its ten initial slots (`V/ValueVec.java`: the check runs
+  only when the vector grows, so `max(10, N)` elements fit) and the eager cup that copies an
+  interval (`(1..n) \cup {}` reports the bound), while enforcing `-maxSetSize` on canonical
+  distinct elements of homogeneous explicit sets in `\cup`, `\cap` and `\` rather than imitating
+  TLC's mutable in-place normalization aliasing ([compat.md](compat.md) D-35). A `CHOOSE`, a bound of several variables and
+  `x' \subseteq S` still keep the overflow (see [compat.md](compat.md) section 5).
 
 tlx: `tlx_value::arith` (`add`, `sub`, `mul`, `pow`, `neg`, `modulo`, `div_floor`, `div_naturals`;
 values are `i64` with an i32 range check per operation; generated C uses `tlx_add` etc. from

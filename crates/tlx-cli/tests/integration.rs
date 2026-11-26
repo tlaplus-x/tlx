@@ -37,6 +37,7 @@ mod live_coverage;
 mod live_edges;
 mod live_mem;
 mod live_miss;
+mod max_set_size;
 mod maxmem;
 mod optimization_composition;
 mod optimization_lean;
@@ -95,6 +96,7 @@ fn all_test_files_registered() {
         "live_edges",
         "live_mem",
         "live_miss",
+        "max_set_size",
         "maxmem",
         "optimization",
         "optimization_composition",

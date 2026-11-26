@@ -136,6 +136,32 @@ impl Lowerer<'_> {
         let_in(bind, Expr::new(ty, ExprKind::If(fits, xs, fail)))
     }
 
+    /// Wrap a native set construction in TLC's `-maxSetSize` check. The
+    /// interpreter materializes the set, so a result over the bound is
+    /// "too many elements" there; an encoded set is never materialized, so
+    /// the check is emitted for the layout: only a capacity wider than the
+    /// bound can hold such a set, and a default run (bound 10^6) emits
+    /// nothing.
+    pub(super) fn within_set_bound(&mut self, x: Expr) -> Expr {
+        let Ty::Enc(sid) = x.ty else { return x };
+        let Some(Shape::Set { elem, max_card }) = self.shape_of(x.ty).cloned() else { return x };
+        let limit = tlx_value::limits::growth_limit();
+        if max_card as i64 <= limit {
+            return x;
+        }
+        // (Decided before `share`: returning a shared temporary without its
+        // `let` binding is an IR verifier error.)
+        let bitset = bitset_universe(&elem).is_some();
+        if !bitset && !self.typing.in_layout(sid) {
+            return x;
+        }
+        let (xs, bind) = self.share(x);
+        let card = if bitset { Expr::new(Ty::Int, ExprKind::BitCard(xs.clone())) } else { self.int_word(xs.clone(), 0, max_card as i64) };
+        let fits = Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, card, int_lit(limit)));
+        let fail = Expr::new(Ty::Enc(sid), ExprKind::Fail(tlx_value::limits::too_many_elements().into_message().into()));
+        let_in(bind, Expr::new(Ty::Enc(sid), ExprKind::If(fits, xs, fail)))
+    }
+
     /// The maximal number of elements of a bitset of the type `t`.
     pub(super) fn bitset_bound(&self, t: Ty) -> Option<u64> {
         match self.shape_of(t) {
@@ -433,8 +459,11 @@ impl Lowerer<'_> {
                 let universe = bitset_universe(&elem)?;
                 let subset = Shape::Set { elem, max_card: usize::try_from(universe).ok()? };
                 let count = subset.cardinality()?;
-                // Same inferred-universe budget as computed interval filters.
-                if count > 4096 {
+                // Same inferred-universe budget as computed interval filters;
+                // a lazy powerset filter whose universe exceeds `-maxSetSize`
+                // stays boxed so the surrounding expression decides whether to
+                // materialize or stream it.
+                if count > 4096 || count as i64 > tlx_value::limits::growth_limit() {
                     return None;
                 }
                 let sid = self.sid(&Shape::Set { elem: Box::new(subset.clone()), max_card: count as usize });
@@ -453,15 +482,19 @@ impl Lowerer<'_> {
             // A filter over a constant set: a bitset over its universe.
             let enc = self.const_bitset(v)?;
             let Ty::Enc(sid) = enc.ty else { return None };
-            let Some(Shape::Set { elem, .. }) = self.shape_of(enc.ty).cloned() else { return None };
+            let Some(Shape::Set { elem, max_card }) = self.shape_of(enc.ty).cloned() else { return None };
+            if !reducible && max_card as i64 > tlx_value::limits::growth_limit() {
+                return None;
+            }
             let mapped = self.set_filter_into(bound, pred, &elem, env, st, sid)?;
             if !reducible {
                 let ExprKind::MapSet { cond: Some(cond), .. } = &*mapped.kind else { return None };
                 if !self.total_filter_predicate(cond) {
                     return None;
                 }
+                return Some(mapped);
             }
-            return Some(mapped);
+            return Some(self.within_set_bound(mapped));
         }
         if let ExprKind::ValOp { op: B::DotDot, args } = &*set.kind {
             // A filter over a computed interval: a bitset over the integers
@@ -476,7 +509,7 @@ impl Lowerer<'_> {
             }
             let elem = Shape::Int { lo, hi };
             let sid = self.sid(&Shape::Set { elem: Box::new(elem.clone()), max_card: (hi - lo + 1) as usize });
-            return self.set_filter_into(bound, pred, &elem, env, st, sid);
+            return self.set_filter_into(bound, pred, &elem, env, st, sid).map(|m| self.within_set_bound(m));
         }
         let (set, lazy_domain) = match set.ty {
             Ty::Enc(_) => (set, false),
@@ -495,7 +528,11 @@ impl Lowerer<'_> {
         if lazy_domain && !self.total_filter_predicate(&p) {
             return None;
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::Filter { bind: t, set, pred: p }))
+        let f = Expr::new(Ty::Enc(sid), ExprKind::Filter { bind: t, set, pred: p });
+        // TLC's `{x \in S : P}` appends the kept elements, so the bound applies
+        // to the result's size (unlike a set former, which appends per
+        // iteration).
+        Some(self.within_set_bound(f))
     }
 
     /// `A \X B` of two encoded sets whose element universes multiply to a
@@ -540,6 +577,9 @@ impl Lowerer<'_> {
         let full = Expr::new(Ty::Enc(rsid), ExprKind::ConstWords(full.into()));
         let pred = Expr::new(Ty::Bool, ExprKind::And(vec![m0, m1]));
         let pairs = Expr::new(Ty::Enc(rsid), ExprKind::Filter { bind: t, set: full, pred });
+        // TLC's `SetOfTuplesValue.toSetEnum` appends one tuple per element of
+        // the product, so `-maxSetSize` applies to its size.
+        let pairs = self.within_set_bound(pairs);
         Some(let_in(bx, let_in(by, pairs)))
     }
 
@@ -613,13 +653,14 @@ impl Lowerer<'_> {
                 let elem = self.coerce_enc(elem, esid);
                 out = Expr::new(Ty::Enc(sid), ExprKind::SortedInsert { set: out, elem, elem_words: ew, max_card });
             }
-            return Some(out);
+            return Some(self.within_set_bound(out));
         }
         let lb = self.expr_into(b, env, st, sid);
         if lb.ty != Ty::Enc(sid) || matches!(&*lb.kind, ExprKind::Convert(_)) {
             return None;
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::SortedOp { op: SetOp::Union, a: la, b: lb, elem_words: ew, max_card }))
+        let union = Expr::new(Ty::Enc(sid), ExprKind::SortedOp { op: SetOp::Union, a: la, b: lb, elem_words: ew, max_card });
+        Some(self.within_set_bound(union))
     }
 
     /// Whether `e` syntactically evaluates to an eager `Value::Set` on every
@@ -1077,7 +1118,10 @@ impl Lowerer<'_> {
                     let elem = self.expr_into(x, env, st, esid);
                     out = Expr::new(ty, ExprKind::SortedInsert { set: out, elem, elem_words: ew, max_card });
                 }
-                return out;
+                // TLC's `SetEnumValue.cup` copies `s` into a fresh growing
+                // vector, so the bound applies to the union's size even when
+                // the right operand adds nothing or an existing element.
+                return self.within_set_bound(out);
             }
             return self.val_op(B::Cup, vec![a, lb]);
         }
@@ -1099,7 +1143,8 @@ impl Lowerer<'_> {
                 cb
             };
             let ty = a.ty;
-            return Expr::new(ty, ExprKind::SortedOp { op: SetOp::Union, a, b, elem_words: ew, max_card });
+            let r = Expr::new(ty, ExprKind::SortedOp { op: SetOp::Union, a, b, elem_words: ew, max_card });
+            return self.within_set_bound(r);
         }
         let b = if b_eager_ctor { self.bitset_operand(b, lb, a.ty, env, st) } else { lb };
         // Bitsets of different element shapes: one converted into the
@@ -1115,7 +1160,9 @@ impl Lowerer<'_> {
             Some((a, b, sid)) => {
                 let bound = self.bitset_bound(a.ty).zip(self.bitset_bound(b.ty)).map(|(x, y)| x + y);
                 let u = Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(SetOp::Union, a, b));
-                self.card_checked(u, bound)
+                // (Layout capacity first, then TLC's materialization bound.)
+                let u = self.card_checked(u, bound);
+                self.within_set_bound(u)
             }
             None => self.val_op(B::Cup, vec![a, b]),
         }
@@ -1172,7 +1219,8 @@ impl Lowerer<'_> {
             let b = if b.ty == a.ty { b } else { self.coerce_enc(b, sid) };
             let sop = if op == B::Cap { SetOp::Inter } else { SetOp::Diff };
             let ty = a.ty;
-            return Expr::new(ty, ExprKind::SortedOp { op: sop, a, b, elem_words: ew, max_card });
+            let r = Expr::new(ty, ExprKind::SortedOp { op: sop, a, b, elem_words: ew, max_card });
+            return self.within_set_bound(r);
         }
         let orig_a = a.clone();
         // A reducible constant left operand: encode it like the right operand
@@ -1201,7 +1249,8 @@ impl Lowerer<'_> {
         match self.same_bitsets(&a, &b, false, true).or_else(|| self.converted_bitsets(&a, &b, false)) {
             Some((a, b, sid)) => {
                 let sop = if op == B::Cap { SetOp::Inter } else { SetOp::Diff };
-                Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(sop, a, b))
+                let r = Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(sop, a, b));
+                self.within_set_bound(r)
             }
             None => self.val_op(op, vec![orig_a, b]),
         }
@@ -1257,6 +1306,12 @@ impl Lowerer<'_> {
         if !src.is_typed_source() {
             return None;
         }
+        // TLC constructs the family `{f(x) : x \in S}` eagerly, appending once
+        // per iteration before deduplication, so the bound applies to the
+        // domain's size even when the flattened union is small.
+        if self.iter_bound(&src).is_none_or(|n| n as i64 > tlx_value::limits::growth_limit()) {
+            return None;
+        }
         let t = self.temp(ety);
         let (env2, check) = self.bind_elem(&b.vars, &temp_ref(ety, t), &penv)?;
         let x = binders::checked(check, self.expr_with_mode(f, &env2, st, mode));
@@ -1271,7 +1326,8 @@ impl Lowerer<'_> {
         if !self.is_bitset(x.ty) {
             return None;
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::UnionFold { bind: t, set: src, body: x }))
+        // The union's distinct elements are what TLC appends to the result.
+        Some(self.within_set_bound(Expr::new(Ty::Enc(sid), ExprKind::UnionFold { bind: t, set: src, body: x })))
     }
 
     /// `UNION {f(x) : x \in S}` built directly in the destination bitset:
@@ -1290,6 +1346,9 @@ impl Lowerer<'_> {
         if !src.is_typed_source() {
             return None;
         }
+        if self.iter_bound(&src).is_none_or(|n| n as i64 > tlx_value::limits::growth_limit()) {
+            return None;
+        }
         let t = self.temp(ety);
         let (env2, check) = self.bind_elem(&b.vars, &temp_ref(ety, t), &penv)?;
         let x = binders::checked(check, self.expr_into(f, &env2, st, sid));
@@ -1304,7 +1363,7 @@ impl Lowerer<'_> {
         if x.ty != Ty::Enc(sid) {
             return None;
         }
-        Some(Expr::new(Ty::Enc(sid), ExprKind::UnionFold { bind: t, set: src, body: x }))
+        Some(self.within_set_bound(Expr::new(Ty::Enc(sid), ExprKind::UnionFold { bind: t, set: src, body: x })))
     }
 
     /// `UNION S` of an encoded set `S` of bitsets with a small element
@@ -1333,7 +1392,9 @@ impl Lowerer<'_> {
         let member = Expr::new(Ty::Bool, ExprKind::BitMember { set: temp_ref(ity, x), rank });
         let some = Expr::new(Ty::Bool, ExprKind::Exists { bind: x, set: src, body: member });
         let full = Expr::new(Ty::Enc(rsid), ExprKind::ConstWords(full.into()));
-        Some(let_in(bind, Expr::new(Ty::Enc(rsid), ExprKind::Filter { bind: u, set: full, pred: some })))
+        let r = Expr::new(Ty::Enc(rsid), ExprKind::Filter { bind: u, set: full, pred: some });
+        // TLC's eager `UNION` appends each distinct element.
+        Some(let_in(bind, self.within_set_bound(r)))
     }
 
     /// `UNION {f(x) : x \in S}` / `UNION {a, b, ...}` for a constant `S`
@@ -1351,7 +1412,9 @@ impl Lowerer<'_> {
                 }
                 let dom = self.const_domain(&b.set, &penv, st)?;
                 let elems = tlx_value::ops::enumerate(&dom).ok()?;
-                if elems.is_empty() || elems.len() > 64 {
+                // TLC builds the family first: one append per element, before
+                // the union deduplicates.
+                if elems.is_empty() || elems.len() > 64 || elems.len() as i64 > tlx_value::limits::growth_limit() {
                     return None;
                 }
                 for x in elems {
@@ -1391,7 +1454,8 @@ impl Lowerer<'_> {
                 Some(a) => Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(SetOp::Union, a, m)),
             });
         }
-        Some(self.card_checked(acc?, None))
+        let acc = self.card_checked(acc?, None);
+        Some(self.within_set_bound(acc))
     }
 
     /// `{e1, ..., en}` without a target encoding: the elements in a common
@@ -1469,6 +1533,13 @@ impl Lowerer<'_> {
             return None;
         }
         let bound = self.iter_bound(&src)?;
+        // TLC's `{e : x \in S}` appends once per iteration, before
+        // deduplication, so `-maxSetSize` applies to the domain's size: lower
+        // natively only when the iteration cannot exceed it (the shared
+        // interpreter counts the appends).
+        if bound as i64 > tlx_value::limits::growth_limit() {
+            return None;
+        }
         let t = self.temp(ety);
         let (env2, check) = self.bind_elem(&b.vars, &temp_ref(ety, t), env)?;
         let x = self.expr(f, &env2, st);
@@ -1518,6 +1589,31 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Conservative integer bounds of `x` from its shape and expression kind
+    /// without mutating the lowerer's shape table.
+    fn expr_int_bounds(&self, x: &Expr) -> Option<(i64, i64)> {
+        if let Some(Shape::Int { lo, hi }) = self.shape_of(x.ty) {
+            return Some((*lo, *hi));
+        }
+        match &*x.kind {
+            ExprKind::Const(Value::Int(i)) => Some((*i, *i)),
+            ExprKind::Convert(inner) => match self.shape_of(inner.ty) {
+                Some(Shape::Int { lo, hi }) => Some((*lo, *hi)),
+                _ => None,
+            },
+            ExprKind::SeqLen(s) => match self.shape_of(s.ty) {
+                Some(Shape::Seq { max_len, .. }) => Some((0, *max_len as i64)),
+                _ => None,
+            },
+            ExprKind::Let { body, .. } => self.expr_int_bounds(body),
+            ExprKind::If(_, a, b) => {
+                let (a, b) = (self.expr_int_bounds(a)?, self.expr_int_bounds(b)?);
+                Some((a.0.min(b.0), a.1.max(b.1)))
+            }
+            _ => None,
+        }
+    }
+
     /// `iter_bound` from the source's kind and shape alone.
     fn shape_bound(&self, src: &Expr) -> Option<usize> {
         match &*src.kind {
@@ -1529,8 +1625,18 @@ impl Lowerer<'_> {
                     Some(Shape::Seq { max_len, .. }) => Some(*max_len),
                     _ => None,
                 },
-                _ => None,
+                _ => {
+                    let (a, _) = self.expr_int_bounds(lo)?;
+                    let (_, b) = self.expr_int_bounds(hi)?;
+                    usize::try_from((b.saturating_sub(a).saturating_add(1)).max(0)).ok()
+                }
             },
+            ExprKind::ValOp { op: B::DotDot, args } if args.len() == 2 => {
+                let (a, _) = self.expr_int_bounds(&args[0])?;
+                let (_, b) = self.expr_int_bounds(&args[1])?;
+                usize::try_from((b.saturating_sub(a).saturating_add(1)).max(0)).ok()
+            }
+            ExprKind::Const(v) => tlx_value::ops::size_if_known(v).and_then(|n| usize::try_from(n).ok()),
             _ => match self.shape_of(src.ty) {
                 Some(Shape::Set { elem, max_card }) => Some(match bitset_universe(elem) {
                     // The bitsets of the layout's shapes respect their

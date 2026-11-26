@@ -19,7 +19,13 @@ pub fn cfg_value(v: &CfgValue) -> EResult<Value> {
         CfgValue::Str(s) => Value::Str(Sym::new(s)),
         CfgValue::Bool(b) => Value::Bool(*b),
         CfgValue::ModelValue(m) => Value::ModelValue(Sym::new(m)),
-        CfgValue::Set(es) => Value::set_from(es.iter().map(cfg_value).collect::<EResult<_>>()?)?,
+        CfgValue::Set(es) => {
+            // TLC builds configuration sets in a growing `ValueVec`, so
+            // `-maxSetSize` applies to the raw cfg entries before deduplication
+            // (unlike TLA+ source set literals, which preallocate their length).
+            tlx_value::limits::check_set_size(es.len())?;
+            Value::set_from(es.iter().map(cfg_value).collect::<EResult<_>>()?)?
+        }
         CfgValue::Tuple(es) => Value::tuple(es.iter().map(cfg_value).collect::<EResult<_>>()?),
     })
 }

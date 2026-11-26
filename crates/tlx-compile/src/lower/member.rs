@@ -285,6 +285,15 @@ impl Lowerer<'_> {
                 let t = self.temp(xl.ty);
                 let tx = temp_ref(xl.ty, t);
                 let base = self.expr(&bound.set, &senv, st);
+                // TLC constructs `{y \in S : P}` eagerly only when `S` is
+                // reducible (appending each kept element, so `-maxSetSize`
+                // applies). A lazy source like `SUBSET T` stays `SetPredValue`
+                // and never materializes for membership.
+                let lazy_base = matches!(&*base.kind, ExprKind::ValOp { op: B::Subset, .. } | ExprKind::Subsets { .. })
+                    || matches!(&*base.kind, ExprKind::Const(v) if !tlx_value::ops::is_reducible(v));
+                if !lazy_base && self.iter_bound(&base).is_none_or(|n| n as i64 > tlx_value::limits::growth_limit()) {
+                    return None;
+                }
                 let in_base = self.member_lowered(tx.clone(), None, base, &senv, st);
                 let (penv, check) = self.bind_elem(&bound.vars, &tx, &senv)?;
                 let p = binders::checked(check, self.bool_expr(pred, &penv, st));
@@ -303,7 +312,10 @@ impl Lowerer<'_> {
                 if !matches!(self.shape_of(s.ty), Some(Shape::Set { .. })) {
                     let (source, ety) = self.typed_iter(s);
                     let bound = self.iter_bound(&source)?;
-                    if !matches!(&*source.kind, ExprKind::IntRange(..)) || bound > i64::MAX as usize {
+                    // TLC's set former appends once per iteration before
+                    // deduplication: answer membership directly only when the
+                    // domain cannot exceed `-maxSetSize`.
+                    if !matches!(&*source.kind, ExprKind::IntRange(..)) || bound > tlx_value::limits::growth_limit() as usize {
                         return None;
                     }
                     let t = self.iter_temp(ety, &source);
@@ -321,6 +333,9 @@ impl Lowerer<'_> {
                     let count = Expr::new(Ty::Int, ExprKind::Fold { product: false, bind: t, set: source, body });
                     binds.reverse();
                     return Some(let_in(binds, Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Gt, count, int_lit(0)))));
+                }
+                if self.iter_bound(&s).is_none_or(|n| n as i64 > tlx_value::limits::growth_limit()) {
+                    return None;
                 }
                 let Some(Shape::Set { elem, .. }) = self.shape_of(s.ty).cloned() else { unreachable!() };
                 if is_composite_bitset_elem(&elem) {
@@ -385,6 +400,18 @@ impl Lowerer<'_> {
         let (tx, bind) = self.share(x);
         let la = self.expr(a, senv, st);
         let lb = self.expr(b, senv, st);
+        // TLC builds the union eagerly: it appends at most `|A| + |B|` elements,
+        // so a sum that may exceed `-maxSetSize` must be reported by the
+        // interpreter's checked union, not by testing the operands apart.
+        let limit = tlx_value::limits::growth_limit();
+        let within = match (self.iter_bound(&la), self.iter_bound(&lb)) {
+            (Some(na), Some(nb)) => na as i64 + nb as i64 <= limit,
+            _ => false,
+        };
+        if !within {
+            self.frame.restore(mark);
+            return None;
+        }
         let Some((ea, eb)) = self.set_elem_shape(&la).zip(self.set_elem_shape(&lb)) else {
             self.frame.restore(mark);
             return None;

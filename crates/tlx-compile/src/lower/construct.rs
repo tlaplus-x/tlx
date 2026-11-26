@@ -67,7 +67,10 @@ impl Lowerer<'_> {
                     let b = self.expr_into(&args[1], env, st, sid);
                     let bound = self.bitset_bound(a.ty).zip(self.bitset_bound(b.ty)).map(|(a, b)| a + b);
                     let union = Expr::new(Ty::Enc(sid), ExprKind::BitSetOp(SetOp::Union, a, b));
-                    Some(self.card_checked(union, bound))
+                    let union = self.card_checked(union, bound);
+                    // (TLC's cup copies into a fresh growing vector: the
+                    // materialization bound applies to the union's size.)
+                    Some(self.within_set_bound(union))
                 } else {
                     self.sorted_union_into(&args[0], &args[1], env, st, sid)
                 }
@@ -77,7 +80,7 @@ impl Lowerer<'_> {
                 if x.ty == Ty::Enc(sid) {
                     Some(x)
                 } else {
-                    self.set_filter_into(bound, pred, elem, env, st, sid)
+                    self.set_filter_into(bound, pred, elem, env, st, sid).map(|m| self.within_set_bound(m))
                 }
             }
             (H::Apply { op: OpRef::Def(d), args }, _) if args.is_empty() => self.def_into(e, *d, env, st, sid),
@@ -1344,6 +1347,12 @@ impl Lowerer<'_> {
             x
         };
         let bound = self.iter_bound(&src).map(|n| n as u64);
+        // A set former appends once per iteration (TLC's `OPCODE_soa`), before
+        // deduplication: only a domain that cannot exceed `-maxSetSize` is
+        // lowered, the interpreter counts the appends otherwise.
+        if bound.is_none_or(|n| n as i64 > tlx_value::limits::growth_limit()) {
+            return None;
+        }
         Some(self.card_checked(Expr::new(Ty::Enc(sid), ExprKind::MapSet { bind: t, set: src, elem: x, cond: None }), bound))
     }
 

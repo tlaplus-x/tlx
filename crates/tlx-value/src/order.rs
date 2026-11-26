@@ -435,7 +435,51 @@ fn cheap_size_cmp(a: &Value, b: &Value) -> Option<Ordering> {
         return None;
     }
     let (n, m) = (cheap_size(a)?, cheap_size(b)?);
+    // Ordering sets of functions, records or tuples converts the operands
+    // first: `compareTo` calls `convertAndCache` even for two sets of the same
+    // kind (their structural equality is `lazy_set_eq`, which never reaches
+    // this shortcut). That build appends through the whole set and converts
+    // the pieces it is built from — a function set's domain and range, a
+    // product's components, a powerset's base — so any of those over the
+    // bound must be left to the materializing path, which reports it. A
+    // powerset itself is preallocated and keeps the unequal-size shortcut
+    // when its base needs no conversion (an interval base, for instance).
+    let limit = crate::limits::growth_limit() as u64;
+    let converts = |v: &Value| conversion_cost(v).is_none_or(|cost| cost > limit);
+    if converts(a) || converts(b) {
+        return None;
+    }
     (n != m).then(|| n.cmp(&m))
+}
+
+/// The largest set TLC builds while converting `v` to an enumerated set:
+/// converting a set of functions materializes its domain and range, a product
+/// or record set its components (and itself), and a powerset its base — the
+/// powerset itself is preallocated. Already-built sets, intervals and
+/// enumerated sets need nothing. `None`: a piece is not decidable without
+/// enumerating it, so no shortcut may answer.
+fn conversion_cost(v: &Value) -> Option<u64> {
+    use crate::lazy::LazySet;
+    fn components<'a>(xs: impl Iterator<Item = &'a Value>) -> Option<u64> {
+        let mut cost = 0;
+        for x in xs {
+            cost = cost.max(conversion_cost(x)?);
+        }
+        Some(cost)
+    }
+    match v {
+        Value::Set(_) | Value::Interval(..) => Some(0),
+        Value::LazySet(l) => match &**l {
+            LazySet::Enum(_) => Some(0),
+            LazySet::FcnSet(d, r) => Some(cheap_size(v)?.max(conversion_cost(d)?).max(conversion_cost(r)?)),
+            LazySet::Product(sets) => Some(cheap_size(v)?.max(components(sets.iter())?)),
+            LazySet::RecordSet(fields) => Some(cheap_size(v)?.max(components(fields.iter().map(|(_, s)| s))?)),
+            LazySet::Subset(base) => conversion_cost(base),
+            LazySet::KSubset(_, base) => conversion_cost(base),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Size of a set computed from its operands' sizes (`None`: needs an

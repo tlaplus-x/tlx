@@ -34,8 +34,8 @@ use crate::value::Value;
 use crate::Result;
 
 pub use enumerate::{
-    enumerate, enumerate_normalized, for_each_element, for_each_enumerated, for_each_enumerated_seqs, materialization_error,
-    normalize_enumerated, SeqsVisitor,
+    bound_kind, enumerate, enumerate_normalized, for_each_element, for_each_enumerated, for_each_enumerated_seqs, materialization_error,
+    normalize_enumerated, over_set_bound, size_fact, size_if_known, streams_normalized, BoundKind, SeqsVisitor, SizeFact,
 };
 pub use fcns::{apply, apply_ref, apply_tuple_ref, domain, except, fcn_merge, field, field_ref, select, single_fcn};
 pub use ksubset::ksubset;

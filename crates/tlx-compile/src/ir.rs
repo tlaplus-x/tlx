@@ -551,6 +551,20 @@ pub enum Deferred {
     OpRef(hir::LocalId, hir::OpRef),
 }
 
+/// How a `ForEach` iterates its set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterMode {
+    /// TLC's default order, streamed: `x' \in S` and a set filter over a set
+    /// that is not enumerated.
+    Enumerate,
+    /// A quantifier's bound domain: TLC's `elements(Ordering.NORMALIZED)`, so
+    /// where TLC materializes it (`ops::bound_kind`) the `-maxSetSize` bound
+    /// applies; a `SUBSET S` bound still streams.
+    Bound,
+    /// The normalized order, streamed: `x' \subseteq S`.
+    Normalized,
+}
+
 /// Statement tree of an action / init enumeration (CPS form).
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -572,8 +586,9 @@ pub enum Stmt {
     /// Bind `temp` and continue.
     Let { temp: Temp, value: Expr, body: Box<Stmt> },
     /// For each element of `set` bind `bind`, run `body`. Elements come in
-    /// TLC enumeration order, or sorted (normalized) order if `sorted`.
-    ForEach { bind: Temp, set: Expr, sorted: bool, body: Box<Stmt> },
+    /// Iteration over `set`, in the order and with the materialization
+    /// `iter` decides.
+    ForEach { bind: Temp, set: Expr, iter: IterMode, body: Box<Stmt> },
     /// Assign next-state variable `var` (encoded into its layout; a value
     /// outside the layout is a layout miss) and continue.
     Assign { var: u32, value: Expr, body: Box<Stmt> },

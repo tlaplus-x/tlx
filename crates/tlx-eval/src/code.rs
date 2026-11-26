@@ -244,7 +244,7 @@ impl Interp {
             ExprKind::Let { defs, body } => Node::Let(defs.clone().into(), Box::new(self.compile_in(body, hoist))),
             ExprKind::SetEnum(es) => {
                 let cs = codes(es);
-                match literals(&cs).map(Value::set_enum) {
+                match literals(&cs).map(Value::set_literal) {
                     Some(Ok(v)) => self.shared(v),
                     _ => Node::SetEnum(cs),
                 }
@@ -592,7 +592,7 @@ impl Interp {
                 let (env2, _frame) = self.let_env(defs, env);
                 self.exec(body, &env2, cx)?
             }
-            Node::SetEnum(cs) => Value::set_enum(cs.iter().map(|x| self.exec(x, env, cx)).collect::<EResult<Vec<_>>>()?)?,
+            Node::SetEnum(cs) => Value::set_literal(cs.iter().map(|x| self.exec(x, env, cx)).collect::<EResult<Vec<_>>>()?)?,
             Node::Tuple(cs) if cs.len() <= SMALL => Value::Tuple(try_arc_slice(cs.len(), |i| self.exec(&cs[i], env, cx))?),
             Node::Tuple(cs) => Value::tuple(cs.iter().map(|x| self.exec(x, env, cx)).collect::<EResult<Vec<_>>>()?),
             Node::Record(fs) => Value::record(fs.iter().map(|(n, x)| Ok((*n, self.exec(x, env, cx)?))).collect::<EResult<Vec<_>>>()?),
@@ -608,7 +608,7 @@ impl Interp {
                 for x in Elems::of(&set)? {
                     let env2 = self.bind_bound_vars(&bound.vars, x.clone(), env)?;
                     if self.exec_bool(pred, &env2, cx)? {
-                        out.push(x);
+                        tlx_value::limits::push(&mut out, x)?;
                     }
                 }
                 Value::set_enum(out)?
@@ -616,7 +616,7 @@ impl Interp {
             Node::SetMap(bounds, expr) => {
                 let mut out = Vec::new();
                 self.for_each_binding(bounds, env, cx, &mut |env2| {
-                    out.push(self.exec(expr, env2, cx)?);
+                    tlx_value::limits::push(&mut out, self.exec(expr, env2, cx)?)?;
                     Ok(true)
                 })?;
                 Value::set_enum(out)?
@@ -733,7 +733,7 @@ impl Interp {
         if k != 0 && vals.iter().all(|v| kind(v) == k) {
             return Ok(vals.contains(&*xv));
         }
-        Ok(ops::member(&xv, &Value::set_enum(vals)?)?)
+        Ok(ops::member(&xv, &Value::set_literal(vals)?)?)
     }
 
     /// `Node::SetOne`: `ops::union` / `ops::difference` with the singleton
@@ -745,6 +745,17 @@ impl Interp {
         use tlx_value::order::cmp_tlc;
         let s = self.exec_cow(&sx[0], env, cx)?;
         let x = self.exec(&sx[1], env, cx)?;
+        // A set that already holds more elements than the bound allows can only
+        // be reproduced by the growing construction: TLC copies it into a fresh
+        // `ValueVec` for `\cup` and `\` too, so the bound applies even when the
+        // result is the same set. Let the shared operation decide; every other
+        // operand keeps the singleton fast path.
+        if let Value::Set(es) = &*s {
+            if es.len() as i64 > tlx_value::limits::growth_limit() {
+                let t = Value::set_from(vec![x])?;
+                return Ok(if op == B::SetMinus { ops::difference(&s, &t)? } else { ops::union(&s, &t)? });
+            }
+        }
         if let Value::Set(es) = &*s {
             if op == B::SetMinus {
                 // (`member(e, {x})`: `cmp_tlc(e, x)`.)
@@ -787,6 +798,7 @@ impl Interp {
                         Ordering::Greater => {}
                     }
                 }
+                tlx_value::limits::check_set_size(es.len() + 1)?;
                 let mut out = Vec::with_capacity(es.len() + 1);
                 out.extend_from_slice(&es[..at]);
                 out.push(x);
@@ -888,7 +900,7 @@ impl Interp {
                     // (`for_each_enumerated`; see `BoundElems` on how this
                     // relates to TLC's materializing bound) and stop at the
                     // first witness.
-                    BoundElems::Stream(v, _) => {
+                    BoundElems::Stream(v) => {
                         let mut found = !exists;
                         let mut err = None;
                         ops::for_each_enumerated(&v, &mut |x| {

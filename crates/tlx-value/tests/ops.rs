@@ -404,7 +404,14 @@ fn enumerating_a_set_whose_size_overflows() {
     ];
     for s in &cases {
         assert!(ops::cardinality(s).is_err_and(|e| e.kind == ValueErrorKind::Overflow), "n({s}) does not overflow");
-        assert!(ops::enumerate(s).is_err_and(|e| e.kind == ValueErrorKind::Overflow), "enumerate({s}) does not overflow");
+        if ops::streams_normalized(s) {
+            assert!(ops::enumerate(s).is_err_and(|e| e.kind == ValueErrorKind::Overflow), "enumerate({s}) does not overflow");
+        } else {
+            // Growing materializations (function/tuple/record sets) reach TLC's
+            // `-maxSetSize` bound before their size can overflow an int.
+            let e = ops::enumerate(s).unwrap_err();
+            assert!(e.to_string().contains("too many elements"), "enumerate({s}): {e}");
+        }
         assert!(matches!(ops::materialization_error(s), Some(e) if e.kind == ValueErrorKind::Overflow));
         assert!(ops::materialization_error(&ops::powerset(&ops::interval(1, 30)).unwrap()).is_none());
         // The streaming enumeration yields the same elements in the same order
@@ -425,14 +432,32 @@ fn enumerating_a_set_whose_size_overflows() {
         assert_eq!(streamed, direct);
         assert_eq!(streamed.len(), 3);
     }
-    // A tuple or record set materializes its constituents (TLC's
-    // SetOfTuplesValue/SetOfRcdsValue enumerator converts each of them with
-    // `toSetEnum`, which asks for `size()`): a constituent that cannot be
-    // materialized keeps the overflow here, as in TLC.
+    // A tuple or record set streams its constituents (TLC's
+    // SetOfTuplesValue/SetOfRcdsValue enumerators call each component's
+    // `elements()` and `nextElement()`): a consumer that stops after one
+    // element succeeds even when a constituent's size overflows, while
+    // materializing the product or record set still reports the error.
     let nested = ops::product(vec![ops::powerset(&ops::interval(1, 31)).unwrap(), five.clone()]).unwrap();
-    assert!(ops::for_each_enumerated(&nested, &mut |_| Ok(true)).is_err());
+    let mut streamed = Vec::new();
+    let done = ops::for_each_enumerated(&nested, &mut |e| {
+        streamed.push(e);
+        Ok(false)
+    })
+    .unwrap();
+    assert!(!done);
+    assert_eq!(streamed.len(), 1);
+    assert!(ops::enumerate(&nested).is_err());
+
     let rec = ops::record_set(vec![(Sym::new("ovf_a"), ops::powerset(&ops::interval(1, 31)).unwrap())]).unwrap();
-    assert!(ops::for_each_enumerated(&rec, &mut |_| Ok(true)).is_err());
+    let mut streamed = Vec::new();
+    let done = ops::for_each_enumerated(&rec, &mut |e| {
+        streamed.push(e);
+        Ok(false)
+    })
+    .unwrap();
+    assert!(!done);
+    assert_eq!(streamed.len(), 1);
+    assert!(ops::enumerate(&rec).is_err());
 }
 
 /// A bound variable's domain is streamed (`for_each_enumerated`) where it used

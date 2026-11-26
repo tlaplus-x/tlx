@@ -79,7 +79,7 @@ behavior behind them is in [usage.md](usage.md), [scale.md](scale.md) and [desig
 | `-gzip` | compress disk streams | unsupported | rejected |
 | `-fp N` | choose the N-th irreducible polynomial | unsupported | rejected; tlx's fingerprint does not use FP64 polynomials (the start-up line prints `fp 0`) |
 | `-fpbits num` | MultiFPSet shard bits | supported | 2^N shards by high bits ([scale.md](scale.md) section 4.1) |
-| `-maxSetSize num` | upper bound for enumerable sets (default 10^6) | unsupported | tlx has no such bound (where TLC reports "too many elements", tlx keeps computing or times out) |
+| `-maxSetSize num` | upper bound for enumerable sets (default 10^6) | supported | a materialized `[S -> T]`, `S \X T`, record set, set former, or set filter over an enumerable set (and a quantifier bound over one) reports TLC's "too many elements" error; `x' \in S`, `{x \in S : P}`, `SUBSET S` and `kSubset(k, S)` bounds, set literals, intervals, printing and `Cardinality` are not limited, and a grown set keeps TLC's initial ten slots, as in TLC (compat.md section 5) |
 | `-inv expr` | add an invariant expression on the command line | unsupported | |
 | `-invlevel n` | same as invariant `TLCGet("level") < n` | unsupported | |
 | `-postCondition mod!oper` | POSTCONDITION on the command line | unsupported | |

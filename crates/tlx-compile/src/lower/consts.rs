@@ -354,10 +354,17 @@ fn int_bounds(vals: &[Value]) -> Option<(i64, i64)> {
 /// error if it fails), else `None`. Collected as `v` is enumerated: a large
 /// set filter over a set that is not enumerated (`{c \in [a: S, b: T] : P}`)
 /// is not materialized just to be rejected.
+///
+/// A set over the `-maxSetSize` bound is never listed either: whether such a
+/// set may be materialized depends on the expression around it (TLC streams
+/// `x' \in S` but fails on a quantifier over the same set), so the
+/// expression stays in the interpreter, which decides it at run time.
 fn enumerate_listed(v: &Value) -> Option<tlx_value::Result<Vec<Value>>> {
+    let cap = i64::try_from(MAX_LISTED_ELEMS).unwrap_or(i64::MAX).min(tlx_value::limits::growth_limit());
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
     let mut out = Vec::new();
     let r = for_each_enumerated(v, &mut |x| {
-        if out.len() == MAX_LISTED_ELEMS {
+        if out.len() == cap {
             return Ok(false);
         }
         out.push(x);
