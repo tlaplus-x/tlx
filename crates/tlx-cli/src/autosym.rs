@@ -9,6 +9,7 @@ use tlx_base::format::{self, JsonNewline};
 use tlx_eval::model::autosym::{self, Analysis};
 use tlx_eval::model::symcheck::{self, Bounds};
 use tlx_eval::model::InterpModel;
+use tlx_sema::optimize::{AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
 
 use crate::args::Args;
 use crate::out::{self, code};
@@ -133,12 +134,30 @@ fn report(an: &Analysis) {
     }
 }
 
-/// The largest group applied: the search tries every element of the group
-/// on each state it finds.
-const MAX_ORDER: u128 = 720;
+/// The largest certified group applied, and the largest factor it may have:
+/// the certificate emitters' own bounds (`AUTOSYM_MAX_ORDER`,
+/// `AUTOSYM_MAX_KEYS`). A factorized disjoint product is canonicalized per
+/// state without enumerating `|G|` (`tlx-eval` partition refinement), so the
+/// bound is the certificate emission and candidate-search cost.
+const MAX_ORDER: u128 = AUTOSYM_MAX_ORDER;
+const MAX_KEYS: usize = AUTOSYM_MAX_KEYS;
+
+/// The maximum number of distinct model values in a product with order
+/// `<= MAX_ORDER`: twelve disjoint order-2 factors (`2^12 = 4,096`) reach 24
+/// keys, and no other combination of factorial orders up to 5,040 has more.
+const MAX_USED_KEYS: usize = 24;
 
 /// The time the bounded cross-check of an applied group may take.
 const CROSS_CHECK_TIME: Duration = Duration::from_millis(20);
+
+/// Bounds of the profitability probe of competing candidate factors: one
+/// bounded walk of admitted states (filtered by state and action constraints)
+/// to see which proven groups move states, without a second full cross-check
+/// cost.
+const EFFECT_PROBE_STATES: usize = 256;
+const EFFECT_PROBE_DEPTH: u32 = 6;
+const EFFECT_PROBE_EDGES: usize = 10_000;
+const EFFECT_PROBE_TIME: Duration = Duration::from_millis(10);
 
 fn eligible_proven(an: &Analysis) -> Vec<&autosym::SetResult> {
     an.proven().filter(|s| s.group_order() <= MAX_ORDER).collect()
@@ -178,19 +197,85 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
     if eligible.is_empty() {
         return Ok(None);
     }
-    let reused = if forced.is_empty() {
-        precertified.and_then(|pc| {
-            let sel =
-                pc.names.iter().map(|name| eligible.iter().copied().find(|s| s.candidate.name == *name)).collect::<Option<Vec<_>>>()?;
-            Some((sel, pc.certificate))
-        })
-    } else {
-        None
+    let mut precertified = precertified;
+    // A certified group whose permutations fix every admitted state the
+    // bounded probe reaches reduces nothing, yet its larger order can keep a
+    // smaller productive group out of the selected product. When competing
+    // proven factors did not all fit in the selected product, measure every
+    // competing factor against one shared bounded sample of admitted states
+    // (filtered by state and action constraints); if an inert selected factor
+    // displaces an unselected productive factor, leave the inert factor out
+    // and certify the next product. The movement probe is evidence, not a
+    // proof; not applying a proven symmetry stays sound.
+    let mut movement: Option<Vec<bool>> = None;
+    let mut excluded: Vec<String> = Vec::new();
+    let mut fallback: Option<(Vec<&autosym::SetResult>, String)> = None;
+    let mut pending_notes: Vec<String> = Vec::new();
+    let (selected, certificate) = loop {
+        let remaining: Vec<&autosym::SetResult> = eligible.iter().copied().filter(|s| !excluded.contains(&s.candidate.name)).collect();
+        let reused = if forced.is_empty() {
+            precertified.take().and_then(|pc| {
+                let sel = pc
+                    .names
+                    .iter()
+                    .map(|name| remaining.iter().copied().find(|s| s.candidate.name == *name))
+                    .collect::<Option<Vec<_>>>()?;
+                Some((sel, pc.certificate))
+            })
+        } else {
+            None
+        };
+        let Some((selected, certificate)) = reused.or_else(|| certify_groups(model, &remaining)) else {
+            if let Some(prev) = fallback.take() {
+                pending_notes.clear();
+                break prev;
+            }
+            note("not applied: no connected Lean certificate for automatic symmetry");
+            return Ok(None);
+        };
+        let unselected: Vec<&autosym::SetResult> =
+            remaining.iter().copied().filter(|s| s.full() && !selected.iter().any(|chosen| std::ptr::eq(*s, *chosen))).collect();
+        if !unselected.is_empty() {
+            let moved = match &movement {
+                Some(m) => m,
+                None => {
+                    let group_gens: Vec<Vec<_>> = eligible.iter().map(|s| s.generators()).collect();
+                    let bounds = Bounds {
+                        states: EFFECT_PROBE_STATES,
+                        depth: EFFECT_PROBE_DEPTH,
+                        edges: EFFECT_PROBE_EDGES,
+                        time: Some(EFFECT_PROBE_TIME),
+                        ..Bounds::default()
+                    };
+                    let t0 = Instant::now();
+                    let res = symcheck::probe_movement(model, &group_gens, &bounds);
+                    stats::phase("auto symmetry effect probe", t0.elapsed());
+                    let m = res.unwrap_or_else(|_| vec![true; eligible.len()]);
+                    movement.insert(m)
+                }
+            };
+            let is_moved = |s: &autosym::SetResult| eligible.iter().position(|e| std::ptr::eq(*e, s)).is_none_or(|idx| moved[idx]);
+            let inert: Vec<&autosym::SetResult> = selected.iter().copied().filter(|s| !is_moved(s)).collect();
+            let displaced = !inert.is_empty() && unselected.iter().any(|s| is_moved(s));
+            if displaced {
+                for s in &inert {
+                    pending_notes.push(format!(
+                        "{}: not applied (its permutations fix every admitted state the bounded probe reached, and it would displace a productive group)",
+                        s.candidate.name
+                    ));
+                    excluded.push(s.candidate.name.clone());
+                }
+                if fallback.is_none() {
+                    fallback = Some((selected, certificate));
+                }
+                continue;
+            }
+        }
+        break (selected, certificate);
     };
-    let Some((selected, certificate)) = reused.or_else(|| certify_groups(model, &eligible)) else {
-        note("not applied: no connected Lean certificate for automatic symmetry");
-        return Ok(None);
-    };
+    for line in pending_notes {
+        note(&line);
+    }
     let gens: Vec<_> = selected.iter().flat_map(|s| s.generators()).collect();
     let text = selected.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
     let bounds = Bounds { time: Some(CROSS_CHECK_TIME), ..Bounds::default() };
@@ -229,8 +314,8 @@ struct CandGroup<'a> {
     cand: &'a autosym::SetResult,
     ord: u16,
     keys: Vec<String>,
-    // Every full symmetric group of order `<= 720` (`6!`) has `2..=6` keys.
-    key_ids: [u32; 6],
+    // Every accepted full symmetric group has `2..=MAX_KEYS` keys.
+    key_ids: [u32; MAX_KEYS],
     key_len: u8,
 }
 
@@ -246,10 +331,11 @@ struct SearchNode {
     is_leaf: bool,
     cur_ord: u16,
     len: u8,
-    idxs: [usize; 9],
+    // One entry per selected factor (`AUTOSYM_MAX_GROUPS` factors at most).
+    idxs: [usize; AUTOSYM_MAX_GROUPS],
     start: usize,
-    // Every product of full symmetric groups with order `<= 720` has at most `9 * 2 = 18` keys.
-    used: [u32; 24],
+    // The union of the selected factors' keys (at most `MAX_USED_KEYS`).
+    used: [u32; MAX_USED_KEYS],
     used_len: u8,
 }
 
@@ -308,11 +394,12 @@ fn attainable_order(cur_ord: u16, start: usize, used: &[u32], full: &[CandGroup<
         let ord = full[i].ord as usize;
         let end = next_bucket[i];
         if (cur_ord as usize) * ord <= CAP {
+            // The most factors of this order a product `<= CAP` can hold.
             let bucket_cap = match ord {
-                720 | 120 => 1,
+                5040 | 720 | 120 => 1,
                 24 => 2,
-                6 => 3,
-                _ => 9,
+                6 => 4,
+                _ => 12,
             };
             let mut found = 0usize;
             for item in &full[i..end] {
@@ -353,7 +440,7 @@ fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
         next_bucket[i] = if i + 1 < full.len() && full[i + 1].ord == full[i].ord { next_bucket[i + 1] } else { i + 1 };
     }
 
-    // Best-first A* branch-and-bound ranked by admissible attainable product order (`<= 720`),
+    // Best-first A* branch-and-bound ranked by admissible attainable product order (`<= MAX_ORDER`),
     // using binary `(take, skip)` branching so heap size stays O(pops) rather than O(N^2).
     let floor_ord = min_ord.max(2);
     let root_upper = attainable_order(1, 0, &[], full, &next_bucket);
@@ -361,7 +448,16 @@ fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
         return (None, false);
     }
     let mut heap = std::collections::BinaryHeap::new();
-    heap.push(SearchNode { upper: root_upper, is_leaf: false, cur_ord: 1, len: 0, idxs: [0; 9], start: 0, used: [0; 24], used_len: 0 });
+    heap.push(SearchNode {
+        upper: root_upper,
+        is_leaf: false,
+        cur_ord: 1,
+        len: 0,
+        idxs: [0; AUTOSYM_MAX_GROUPS],
+        start: 0,
+        used: [0; MAX_USED_KEYS],
+        used_len: 0,
+    });
 
     let mut pops = 0usize;
     let mut cert_attempts = 0usize;
@@ -416,6 +512,7 @@ fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
         let mut next_used = node.used;
         let cand_ids = full[s].id_slice();
         let next_used_len = node.used_len as usize + cand_ids.len();
+        debug_assert!(next_used_len <= MAX_USED_KEYS, "a product of order <= {MAX_ORDER} has at most {MAX_USED_KEYS} keys");
         next_used[node.used_len as usize..next_used_len].copy_from_slice(cand_ids);
         let up_take = attainable_order(next_ord, s + 1, &next_used[..next_used_len], full, &next_bucket);
         if up_take >= floor_ord && (next_len >= min_len || up_take > next_ord) {
@@ -547,7 +644,7 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()
-                .filter(|ks| ks.len() <= 6)?;
+                .filter(|ks| ks.len() <= MAX_KEYS)?;
             Some((orig_idx, cand, ord, keys))
         })
         .collect();
@@ -568,7 +665,7 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
     let full: Vec<CandGroup<'a>> = raw
         .into_iter()
         .map(|(orig_idx, cand, ord, keys)| {
-            let mut key_ids = [0u32; 6];
+            let mut key_ids = [0u32; MAX_KEYS];
             for (slot, k) in key_ids.iter_mut().zip(&keys) {
                 *slot = key_map[k.as_str()];
             }
@@ -708,18 +805,20 @@ mod tests {
 
     #[test]
     fn fallback_never_discards_higher_order_singleton_for_smaller_product() {
-        // Case 1: Order-720 singleton `Big` + disjoint order-2 pair `P1 x P2` (order 4) behind
-        // budget exhaustion (`U1`, `U2` fail primary `max_attempts = 2`). Must return `Big` (720)
-        // immediately without probing `P1`, `P2`, or `[P1, P2]`.
+        // Case 1: Two order-5040 (`MAX_ORDER`) singletons `Big1`/`Big2` where the first
+        // exhausts a one-attempt primary budget, plus disjoint order-2 pair `P1 x P2`
+        // (order 4). The fallback must return the certifiable order-5040 singleton
+        // immediately, without probing `P1`, `P2`, or `[P1, P2]`.
         let u1 = mk_proven("U1", &["u1a", "u1b", "u1c", "u1d", "u1e", "u1f"]);
         let u2 = mk_proven("U2", &["u2a", "u2b", "u2c", "u2d", "u2e", "u2f"]);
-        let big = mk_proven("Big", &["b1", "b2", "b3", "b4", "b5", "b6"]);
+        let big1 = mk_proven("Big1", &["a1", "a2", "a3", "a4", "a5", "a6", "a7"]);
+        let big2 = mk_proven("Big2", &["b1", "b2", "b3", "b4", "b5", "b6", "b7"]);
         let p1 = mk_proven("P1", &["p1a", "p1b"]);
         let p2 = mk_proven("P2", &["p2a", "p2b"]);
-        let refs = [&u1, &u2, &big, &p1, &p2];
+        let refs = [&u1, &u2, &big1, &big2, &p1, &p2];
         let mut post_big_probed = false;
-        let (sel, cert) = certify_groups_by(&refs, 16_384, 2, |gs| match gs {
-            [g] if g[0] == "b1" => Some("cert-big-720".into()),
+        let (sel, cert) = certify_groups_by(&refs, 16_384, 1, |gs| match gs {
+            [g] if g[0] == "b1" => Some("cert-big2-5040".into()),
             [g] if g[0] == "p1a" || g[0] == "p2a" => {
                 post_big_probed = true;
                 Some("cert-p-2".into())
@@ -732,9 +831,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sel.len(), 1);
-        assert_eq!(sel[0].candidate.name, "Big");
-        assert_eq!(cert, "cert-big-720");
-        assert!(!post_big_probed, "order-720 singleton must return immediately without probing smaller singletons or products");
+        assert_eq!(sel[0].candidate.name, "Big2");
+        assert_eq!(cert, "cert-big2-5040");
+        assert!(!post_big_probed, "an order-5040 singleton must return immediately without probing smaller singletons or products");
 
         // Case 2: Order-120 singleton `Best` (which fails to combine with `P1`/`P2`) + `P1 x P2`
         // (order 4 < 120). Must keep `Best` (120), never overwriting it with `P1 x P2` (4).

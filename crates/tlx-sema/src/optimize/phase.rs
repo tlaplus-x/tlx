@@ -28,6 +28,19 @@ pub use sequence::{sequence_length_projection, sequence_length_projection_with_s
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
 pub use sym_totality::cfg_constants_supported;
 
+/// The largest automatic-symmetry product order (`7!`) the keyed, equivariant
+/// and choice certificate emitters accept, and the largest factor (number of
+/// model values) they accept. `tlx-cli` applies no larger group, and the
+/// runtime canonicalizes these disjoint products without enumerating `|G|`
+/// permutations, so the bound is the certificate/search cost, not the
+/// per-state canonicalization cost.
+pub const AUTOSYM_MAX_ORDER: u128 = 5040;
+pub const AUTOSYM_MAX_KEYS: usize = 7;
+
+/// The largest number of factors in an automatic-symmetry product: one bit per
+/// factor in the emitters' `GroupMask`.
+pub const AUTOSYM_MAX_GROUPS: usize = 16;
+
 /// All safety-level observations and admission constraints checked by `tlx-runtime`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CheckSpec<'a> {

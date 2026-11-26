@@ -1,7 +1,7 @@
 # Connected symmetry certificates
 
 The automatic symmetry pipeline supports disjoint products of full permutation
-groups (2–6 model values per group, total group order at most 720) through three
+groups (2–7 model values per group, total group order at most 5,040) through three
 connected Lean certificate emitters:
 
 1. **`KeyedCertificate.lean` (`phase/keyed/`):**
@@ -37,6 +37,14 @@ connected Lean certificate emitters:
   conditional values and nested key quantification. With `Keyed.cfg`, 64 concrete
   states become 20 permutation classes. With `KeyedLarge.cfg` (four processes,
   limit 30), 1,048,576 concrete states become 52,360 classes.
+- [KeyedSeven.tla](KeyedSeven.tla) ([KeyedSeven.cfg](KeyedSeven.cfg)):
+  the `S_7` case above the compiled plan cache's 720-element bound (7! = 5,040).
+  A fixed-domain map of records with record-field writes and a conditional
+  reset; 2,187 concrete states become 36 permutation classes.
+- [ProductLarge.tla](ProductLarge.tla) ([ProductLarge.cfg](ProductLarge.cfg)):
+  the product `Permutations(K) x Permutations(V) x Permutations(T)` with orders
+  `4! x 4! x 3! = 3,456` over three independent fixed-domain maps; 2,048
+  concrete states become 100 classes.
 - [ScalarSlot.tla](ScalarSlot.tla) ([ScalarSlot.cfg](ScalarSlot.cfg)):
   optional key slot `owner \in Proc \cup {"none"}` paired with a keyed map `pc`
   read and updated at `pc[owner]`. 108 concrete states become 28 classes.
@@ -63,6 +71,8 @@ From the repository root:
 ```sh
 cargo build --release
 ./target/release/tlx check proofs/symmetry/Keyed.tla -interp
+./target/release/tlx check proofs/symmetry/KeyedSeven.tla -interp
+./target/release/tlx check proofs/symmetry/ProductLarge.tla -interp
 ./target/release/tlx check proofs/symmetry/ScalarSlot.tla -compile
 ./target/release/tlx check proofs/symmetry/ProductSets.tla -compile
 ./target/release/tlx check proofs/symmetry/MultiKeyMsgs.tla -compile

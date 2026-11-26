@@ -203,10 +203,11 @@ Automatic state reductions require a compiler-generated Lean certificate connect
 that application:
 
 1. **[Automatic symmetry](proofs/symmetry/README.md) (default mode).** Applies disjoint
-   products of full permutation groups (up to order 720) when backed by a connected Lean
-   certificate across keyed state (`KeyedCertificate`: fixed/mixed maps, scalar or optional
-   key slots, sets of keys, single-key tagged record sets, and fixed records), recursive
-   equivariant finite values (`EquivSymCertificate`: key-valued and nested maps, multi-key
+   products of full permutation groups (two to seven model values each, total order at most
+   5,040) when backed by a connected Lean certificate across keyed state (`KeyedCertificate`:
+   fixed/mixed maps, scalar or optional key slots, sets of keys, single-key tagged record
+   sets, and fixed records), recursive equivariant finite values (`EquivSymCertificate`:
+   key-valued and nested maps, multi-key
    records, bounded sequences/tuples, set comprehensions, `KSubset`, `IsInjective`), or
    choice-irrelevant `CHOOSE` (`ChooseSymCertificate`: unique-witness `CHOOSE`, projected
    uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer

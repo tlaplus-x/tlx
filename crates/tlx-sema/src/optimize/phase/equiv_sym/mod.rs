@@ -2,7 +2,7 @@
 //!
 //! Covers arbitrary finite combinations of symmetric keys, key-free atoms,
 //! sequences/tuples, finite sets, finite functions, and records over disjoint
-//! products of full permutation groups (order <= 720). Used as a certified
+//! products of full permutation groups (order <= 5040). Used as a certified
 //! fallback when the narrower `keyed` certificate does not apply.
 
 mod lower;
@@ -251,14 +251,14 @@ fn extract_hidden_transfers(
 }
 
 pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, BTreeSet<Arc<str>>)> {
-    if raw.is_empty() || raw.len() > 16 {
+    if raw.is_empty() || raw.len() > super::AUTOSYM_MAX_GROUPS {
         return None;
     }
     let mut groups = Vec::with_capacity(raw.len());
     let mut all_keys = BTreeSet::new();
     let mut order: u128 = 1;
     for g in raw {
-        if !(2..=6).contains(&g.len()) {
+        if !(2..=super::AUTOSYM_MAX_KEYS).contains(&g.len()) {
             return None;
         }
         let keys: Vec<Arc<str>> = g.iter().map(|s| Arc::from(s.as_str())).collect();
@@ -268,7 +268,7 @@ pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option
         }
         let fact: u128 = (1..=g.len() as u128).product();
         order = order.checked_mul(fact)?;
-        if order > 720 {
+        if order > super::AUTOSYM_MAX_ORDER {
             return None;
         }
         all_keys.extend(key_set.iter().cloned());

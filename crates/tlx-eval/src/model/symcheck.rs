@@ -168,6 +168,18 @@ fn image(m: &InterpModel, s: &State, p: &symmetry::FastPerm) -> Result<State, Mo
     Ok(State::new(vals, s.level, fp))
 }
 
+/// Whether the state's image under `p` differs from it; false when every
+/// variable is fixed (a constant map over a symmetric key set, for example).
+fn moves_state(s: &State, p: &symmetry::FastPerm) -> Result<bool, ModelError> {
+    for v in s.vals.iter() {
+        let Some(image) = p.apply(v).map_err(|e| ModelError::new(e.to_string()))? else { continue };
+        if image != *v {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn label(p: &Perm) -> String {
     let mut pairs: Vec<_> = p.iter().map(|(k, v)| format!("{} -> {v}", Value::ModelValue(*k))).collect();
     pairs.sort();
@@ -378,4 +390,113 @@ pub fn check_perms(model: &InterpModel, perms: Vec<HashMap<Sym, Value>>, bounds:
         at += 1;
     }
     Ok(report)
+}
+
+/// Explore at most `bounds.states` admitted states (filtered by state and
+/// action constraints) and report, per generator group, whether any
+/// generator in that group moves an admitted state. Every group is checked
+/// against the exact same bounded sample of admitted states.
+///
+/// This is the profitability probe of automatic symmetry: a proven group
+/// that fixes every admitted state it reaches reduces nothing, and it must
+/// not displace a group that does reduce. The answer is evidence, not a
+/// proof; leaving a symmetry unapplied is always sound.
+pub fn probe_movement(model: &InterpModel, groups: &[Vec<HashMap<Sym, Value>>], bounds: &Bounds) -> Result<Vec<bool>, ModelError> {
+    if bounds.states == 0 || bounds.edges == 0 {
+        return Err(ModelError::new("symmetry limits must be positive"));
+    }
+    let started = std::time::Instant::now();
+    let m = model.with_fp_mode(FpMode::Plain);
+    let fast: Vec<Vec<_>> = groups.iter().map(|gs| gs.iter().map(symmetry::FastPerm::new).collect()).collect();
+    let mut moved = vec![false; fast.len()];
+    if moved.is_empty() {
+        return Ok(moved);
+    }
+    let mut nodes: Vec<State> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut init_err: Option<ModelError> = None;
+    m.init_states_while(&mut |s| {
+        if bounds.time.is_some_and(|t| started.elapsed() >= t) {
+            return false;
+        }
+        match m.constraint(&s) {
+            Ok(true) => {}
+            Ok(false) => return true,
+            Err(e) => {
+                init_err = Some(e);
+                return false;
+            }
+        }
+        if seen.insert(s.fp) {
+            nodes.push(s);
+            if nodes.len() >= bounds.states {
+                return false;
+            }
+        }
+        true
+    })?;
+    if let Some(e) = init_err {
+        return Err(e);
+    }
+    let mut at = 0;
+    while at < nodes.len() {
+        if at > 0 && bounds.time.is_some_and(|t| started.elapsed() >= t) {
+            break;
+        }
+        let s = nodes[at].clone();
+        for (i, gens) in fast.iter().enumerate() {
+            if moved[i] {
+                continue;
+            }
+            for f in gens {
+                if moves_state(&s, f)? {
+                    moved[i] = true;
+                    break;
+                }
+            }
+        }
+        if moved.iter().all(|&m| m) {
+            break;
+        }
+        if s.level <= bounds.depth && nodes.len() < bounds.states {
+            let mut edge_count = 0usize;
+            let mut succ_err: Option<ModelError> = None;
+            m.successors(&s, &mut |t, _| {
+                if edge_count >= bounds.edges || bounds.time.is_some_and(|lim| started.elapsed() >= lim) {
+                    return false;
+                }
+                edge_count += 1;
+                if seen.contains(&t.fp) {
+                    return true;
+                }
+                let admitted = match m.constraint(&t) {
+                    Ok(true) => match m.action_constraint(&s, &t) {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            succ_err = Some(e);
+                            return false;
+                        }
+                    },
+                    Ok(false) => false,
+                    Err(e) => {
+                        succ_err = Some(e);
+                        return false;
+                    }
+                };
+                if admitted {
+                    seen.insert(t.fp);
+                    nodes.push(t);
+                    if nodes.len() >= bounds.states {
+                        return false;
+                    }
+                }
+                true
+            })?;
+            if let Some(e) = succ_err {
+                return Err(e);
+            }
+        }
+        at += 1;
+    }
+    Ok(moved)
 }
