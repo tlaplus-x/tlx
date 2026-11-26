@@ -411,8 +411,12 @@ impl EncModel {
             // VIEW with SYMMETRY: TLC takes the VIEW of the orbit's least
             // state in TLC's value order (`base.var_order`), found directly on
             // encoded words with fallback to by-value selection when needed.
-            (Some(group), Some(view)) => Fingerprint::SymView { group, order: base.var_order(layout.vars.len()).to_vec(), view },
-            (Some(group), None) if !base.has_view() => Fingerprint::Symmetry { group, order: symmetry_order(&layout) },
+            // The permutations are visited in the interpreter's fallible
+            // order so both tiers stop at the same incomparable pair.
+            (Some(plans), Some(view)) => {
+                Fingerprint::SymView { group: plans.group, visit: plans.visit, order: base.var_order(layout.vars.len()).to_vec(), view }
+            }
+            (Some(plans), None) if !base.has_view() => Fingerprint::Symmetry { group: plans.group, order: symmetry_order(&layout) },
             (None, Some(view)) if !has_symmetry => Fingerprint::View(view),
             _ if base.has_view_or_symmetry() => Fingerprint::Values,
             _ => Fingerprint::Words,
