@@ -9,7 +9,7 @@ impl Emitter<'_, '_> {
         &self,
         seeds: Vec<Seed>,
         cases: Vec<Case>,
-        observed: Vec<bool>,
+        observed: Vec<Vec<bool>>,
         observations: Vec<String>,
         init_obs: Vec<String>,
         constraints: Vec<String>,
@@ -32,8 +32,8 @@ impl Emitter<'_, '_> {
             out,
             "def layout : String := {}",
             literal(&format!(
-                "var {:?}, control {:?}, keys {:?}, phases {:?}, data fields {:?}; missing = FALSE",
-                self.a.var, self.a.control, self.a.keys, self.phases, self.fields
+                "control {:?}, keys {:?}, phases {:?}, data slots {:?}",
+                self.a.control, self.a.keys, self.phases, self.fields
             ))
         )
         .unwrap();
@@ -49,7 +49,7 @@ impl Emitter<'_, '_> {
             .unwrap();
         }
         self.tables(&mut out, &cases, &observed);
-        out.push_str("-- C excludes the projected record/map; inputs contain only recorded field reads.\n-- Source lowering, domains, totality, leaf interpretation and runtime remain trusted.\nstructure Semantics (C V W : Type) where\n  missing : V\n  initial : Nat → C → W → Prop\n  seedValue : Nat → C → W → Key → V\n  actor : Nat → W → Key\n  test : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → Prop\n  value : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → V\n  observe : Nat → C → (Key → Phase) → (Key → Field → V) → Prop\n  actionTest : Nat → C → C → (Key → Phase) → (Key → Phase) → (Key → Field → V) → (Key → Field → V) → Prop\n");
+        out.push_str("-- C excludes the projected control/companion slots; inputs contain only recorded reads.\n-- Source lowering, domains, totality, leaf interpretation and runtime remain trusted.\nstructure Semantics (C V W : Type) where\n  missing : Field → V\n  initial : Nat → C → W → Prop\n  seedValue : Nat → C → W → Key → V\n  actor : Nat → W → Key\n  test : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → Prop\n  value : Nat → C → C → W → (Key → Phase) → (Key → Field → V) → V\n  observe : Nat → C → (Key → Phase) → (Key → Field → V) → Prop\n  actionTest : Nat → C → C → (Key → Phase) → (Key → Phase) → (Key → Field → V) → (Key → Field → V) → Prop\n");
         let params = "{C V W : Type} (sem : Semantics C V W)";
         writeln!(out, "variable {params}").unwrap();
         self.seeds(&mut out, params, &seeds);
@@ -89,7 +89,7 @@ impl Emitter<'_, '_> {
         super::super::super::OpenCert::new(out, include_str!("certificate.lean"), "GeneratedField", constrained, false, false)
     }
 
-    fn tables(&self, out: &mut String, cases: &[Case], observed: &[bool]) {
+    fn tables(&self, out: &mut String, cases: &[Case], observed: &[Vec<bool>]) {
         out.push_str("def live (p : Phase) (f : Field) : Bool :=\n  match p.val with\n");
         for (i, p) in self.phases.iter().enumerate() {
             writeln!(out, "  | {i} => match f.val with").unwrap();
@@ -122,9 +122,13 @@ impl Emitter<'_, '_> {
             }
             out.push_str("  | _ => false\n");
         }
-        out.push_str("def observed (f : Field) : Bool :=\n  match f.val with\n");
-        for (i, v) in observed.iter().enumerate() {
-            writeln!(out, "  | {i} => {v}").unwrap();
+        out.push_str("def observed (p : Phase) (f : Field) : Bool :=\n  match p.val with\n");
+        for (i, row) in observed.iter().enumerate() {
+            writeln!(out, "  | {i} => match f.val with").unwrap();
+            for (j, &v) in row.iter().enumerate() {
+                writeln!(out, "    | {j} => {v}").unwrap();
+            }
+            out.push_str("    | _ => false\n");
         }
         out.push_str("  | _ => false\n");
     }
@@ -147,9 +151,9 @@ impl Emitter<'_, '_> {
             for (j, v) in s.values.iter().enumerate() {
                 writeln!(out, "    | {j} => {v}").unwrap();
             }
-            out.push_str("    | _ => sem.missing\n");
+            out.push_str("    | _ => sem.missing f\n");
         }
-        out.push_str("  | _ => sem.missing\n");
+        out.push_str("  | _ => sem.missing f\n");
     }
 
     fn steps(&self, out: &mut String, params: &str, cases: &[Case]) {
@@ -177,8 +181,8 @@ impl Emitter<'_, '_> {
                     writeln!(out, "    | {j} => {v}").unwrap();
                 }
             }
-            out.push_str("    | _ => sem.missing\n");
+            out.push_str("    | _ => sem.missing f\n");
         }
-        out.push_str("  | _ => sem.missing\n");
+        out.push_str("  | _ => sem.missing f\n");
     }
 }

@@ -294,7 +294,8 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                 ("m.step s.1 t.1 w s.2", "m.step s.1 t.1 w (fun _ => 0)", "discarded length guard feedback"),
                 ("m.transfer s.1 d w s.2 k", "m.transfer s.1 d w (fun _ => 0) k", "discarded length transfer feedback"),
             ] if namespace == "GeneratedLength" else [
-                ("if m.live (p k) f then v k f else m.missing", "if m.live (p k) f then m.missing else v k f", "erased live fields"),
+                ("if m.live (p k) f then v k f else m.missing f", "if m.live (p k) f then m.missing f else v k f", "erased live fields"),
+                ("if m.observed (p k) f then v k f else m.missing f", "v k f", "dropped observation phase mask"),
                 ("s = m.project (m.seed c b w)", "s = m.seed c b w", "omitted initial projection"),
                 ("t = m.project (m.advance s t.1 b w)", "t = m.project s", "dropped reduced transfers"),
             ] if namespace == "GeneratedField" else [
@@ -412,6 +413,11 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     r"^  readsGlobal := readsGlobal$",
                     lambda _: "  readsGlobal := fun _ _ => true",
                     "read dead fields of another actor",
+                )
+                add_gen_decl_mutation(
+                    r"^  observed := observed$",
+                    lambda _: "  observed := fun _ _ => true",
+                    "observed dead field in a dead phase",
                 )
 
             after_pat = r"^def after := \(model sem\)\.reduced$"

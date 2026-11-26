@@ -797,46 +797,111 @@ pub fn phase_projection_with_spec(
         return None;
     }
     let mut expand = normalize::Normalizer::with_config(program, cfg);
-    let initial = branches(&expand.root(init)?)?;
-    let steps = branches(&expand.root(next)?)?;
+    let init_norm = expand.root(init)?;
+    let next_norm = expand.root(next)?;
+    let init_pos = branches_with_if_positioned(&init_norm).or_else(|| branches_positioned(&init_norm))?;
+    let step_pos = branches_with_if_positioned(&next_norm).or_else(|| branches_positioned(&next_norm))?;
+    let initial: Vec<Branch> = init_pos.iter().map(|(b, _)| b.clone()).collect();
+    let steps: Vec<Branch> = step_pos.iter().map(|(b, _)| b.clone()).collect();
     let norm = spec.try_map(|e| expand.root(e))?;
     let norm_spec = norm.as_spec();
     let domains = Domains::infer(program, cfg, &initial, &steps)?;
     let mut best: Option<(FieldProjection, Option<OpenCert>)> = None;
-    for (i, d) in domains.vars.iter().enumerate() {
-        let fields = match d {
-            Domain::Record(fs) => fs,
-            Domain::Function(keys, range) if !keys.is_empty() => {
-                let Domain::Record(fs) = &**range else { continue };
-                fs
+    let mut consider = |candidate: Option<(FieldProjection, Option<OpenCert>)>| {
+        if let Some((projection, cert)) = candidate {
+            // A Boolean flag can be a valid but unhelpful control field.
+            // Prefer certified candidates, then more forgotten fields;
+            // the proof is independent of this selection heuristic.
+            if best
+                .as_ref()
+                .is_none_or(|(old, old_cert)| (cert.is_some(), projection.fields.len()) > (old_cert.is_some(), old.fields.len()))
+            {
+                best = Some((projection, cert));
             }
-            _ => continue,
-        };
-        if fields.len() > 32 {
-            continue;
         }
-        for (control, values) in fields {
-            let Some(phases) = values.atoms() else { continue };
-            if phases.is_empty()
-                || phases.len() > 32
-                || !domain::compatible(phases)
-                || phases.iter().any(|p| domains.atom_expr(p, init.span).is_none())
-            {
-                continue;
-            }
-            if let Some((projection, cert)) =
-                liveness::derive(program, &domains, VarId(i as u32), control, phases, (&initial, &steps), norm_spec)
-            {
-                // A Boolean flag can be a valid but unhelpful control field.
-                // Prefer certified candidates, then more forgotten fields;
-                // the proof is independent of this selection heuristic.
-                if best
-                    .as_ref()
-                    .is_none_or(|(old, old_cert)| (cert.is_some(), projection.fields.len()) > (old_cert.is_some(), old.fields.len()))
-                {
-                    best = Some((projection, cert));
+    };
+    for (i, d) in domains.vars.iter().enumerate() {
+        let var = VarId(i as u32);
+        match d {
+            Domain::Record(fs) if fs.len() <= 32 => {
+                for (control, values) in fs {
+                    let Some(phases) = values.atoms() else { continue };
+                    if phases.is_empty()
+                        || phases.len() > 32
+                        || !domain::compatible(phases)
+                        || phases.iter().any(|p| domains.atom_expr(p, init.span).is_none())
+                    {
+                        continue;
+                    }
+                    consider(liveness::derive(
+                        program,
+                        &domains,
+                        liveness::Control::RecordField { var, field: control.clone() },
+                        phases,
+                        None,
+                        (&initial, &step_pos),
+                        norm_spec,
+                    ));
                 }
             }
+            Domain::Function(keys, range) if !keys.is_empty() && keys.len() <= 256 && domain::compatible(keys) => match &**range {
+                Domain::Record(fs) if fs.len() <= 32 => {
+                    for (control, values) in fs {
+                        let Some(phases) = values.atoms() else { continue };
+                        if phases.is_empty()
+                            || phases.len() > 32
+                            || !domain::compatible(phases)
+                            || phases.iter().any(|p| domains.atom_expr(p, init.span).is_none())
+                        {
+                            continue;
+                        }
+                        consider(liveness::derive(
+                            program,
+                            &domains,
+                            liveness::Control::RecordField { var, field: control.clone() },
+                            phases,
+                            Some(keys),
+                            (&initial, &step_pos),
+                            norm_spec,
+                        ));
+                    }
+                }
+                _ => {
+                    let Some(phases) = range.atoms() else { continue };
+                    if phases.len() < 2
+                        || phases.len() > 32
+                        || !domain::compatible(phases)
+                        || phases.iter().any(|p| domains.atom_expr(p, init.span).is_none())
+                    {
+                        continue;
+                    }
+                    consider(liveness::derive(
+                        program,
+                        &domains,
+                        liveness::Control::Var { var },
+                        phases,
+                        Some(keys),
+                        (&initial, &step_pos),
+                        norm_spec,
+                    ));
+                }
+            },
+            Domain::Atoms(phases)
+                if (2..=32).contains(&phases.len())
+                    && domain::compatible(phases)
+                    && phases.iter().all(|p| domains.atom_expr(p, init.span).is_some()) =>
+            {
+                consider(liveness::derive(
+                    program,
+                    &domains,
+                    liveness::Control::Var { var },
+                    phases,
+                    None,
+                    (&initial, &step_pos),
+                    norm_spec,
+                ));
+            }
+            _ => {}
         }
     }
     let (mut p, cert) = best?;
@@ -856,15 +921,23 @@ struct Branch {
 }
 
 fn branches(e: &Expr) -> Option<Vec<Branch>> {
-    split_branches(e, false)
+    Some(split_branches(e, false)?.into_iter().map(|(b, _)| b).collect())
 }
 
 pub(in crate::optimize::phase) fn branches_with_if(e: &Expr) -> Option<Vec<Branch>> {
+    Some(split_branches(e, true)?.into_iter().map(|(b, _)| b).collect())
+}
+
+fn branches_positioned(e: &Expr) -> Option<Vec<(Branch, Vec<usize>)>> {
+    split_branches(e, false)
+}
+
+fn branches_with_if_positioned(e: &Expr) -> Option<Vec<(Branch, Vec<usize>)>> {
     split_branches(e, true)
 }
 
-fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
-    fn split(e: &Expr, split_if: bool, remaining: &mut usize, depth: usize) -> Option<Vec<Branch>> {
+fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<(Branch, Vec<usize>)>> {
+    fn split(e: &Expr, split_if: bool, remaining: &mut usize, depth: usize) -> Option<Vec<(Branch, Vec<usize>)>> {
         if *remaining == 0 || depth >= 128 {
             return None;
         }
@@ -881,22 +954,25 @@ fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
                 Some(out)
             }
             ExprKind::And(es) => {
-                let mut out = vec![Branch { bounds: vec![], terms: vec![] }];
+                let mut out = vec![(Branch { bounds: vec![], terms: vec![] }, vec![])];
                 for e in es {
                     let alternatives = split(e, split_if, remaining, depth + 1)?;
                     if out.len().saturating_mul(alternatives.len()) > 512 {
                         return None;
                     }
                     let mut combined = Vec::new();
-                    for a in &out {
-                        for b in &alternatives {
+                    for (a, a_pos) in &out {
+                        let offset = a.terms.len();
+                        for (b, b_pos) in &alternatives {
                             if a.terms.len() + b.terms.len() > 512 || a.bounds.len() + b.bounds.len() > 128 {
                                 return None;
                             }
                             let mut branch = a.clone();
+                            let mut pos = a_pos.clone();
                             branch.bounds.extend(b.bounds.iter().cloned());
+                            pos.extend(b_pos.iter().map(|p| p + offset));
                             branch.terms.extend(b.terms.iter().cloned());
-                            combined.push(branch);
+                            combined.push((branch, pos));
                         }
                     }
                     out = combined;
@@ -905,13 +981,16 @@ fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
             }
             ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
                 let mut out = split(body, split_if, remaining, depth + 1)?;
-                for b in &mut out {
+                for (b, pos) in &mut out {
                     if bounds.len() + b.bounds.len() > 128 {
                         return None;
                     }
                     let mut combined = bounds.clone();
                     combined.append(&mut b.bounds);
                     b.bounds = combined;
+                    let mut combined_pos = vec![0; bounds.len()];
+                    combined_pos.append(pos);
+                    *pos = combined_pos;
                 }
                 Some(out)
             }
@@ -919,11 +998,17 @@ fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
                 let mut left = split(then, split_if, remaining, depth + 1)?;
                 let mut right = split(els, split_if, remaining, depth + 1)?;
                 let neg = Expr::new(ExprKind::Builtin { op: B::Not, args: vec![cond.clone()] }, cond.span);
-                for b in &mut left {
+                for (b, pos) in &mut left {
                     b.terms.insert(0, cond.clone());
+                    for p in pos {
+                        *p += 1;
+                    }
                 }
-                for b in &mut right {
+                for (b, pos) in &mut right {
                     b.terms.insert(0, neg.clone());
+                    for p in pos {
+                        *p += 1;
+                    }
                 }
                 left.extend(right);
                 if left.len() > 512 {
@@ -931,7 +1016,7 @@ fn split_branches(e: &Expr, split_if: bool) -> Option<Vec<Branch>> {
                 }
                 Some(left)
             }
-            _ => Some(vec![Branch { bounds: vec![], terms: vec![e.clone()] }]),
+            _ => Some(vec![(Branch { bounds: vec![], terms: vec![e.clone()] }, vec![])]),
         }
     }
     split(e, split_if, &mut 100_000, 0)

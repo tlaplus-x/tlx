@@ -20,42 +20,48 @@ checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 
 
+HISTORY_SOURCE = "\n".join([
+    "fun i => s.2 i ∧ q i e",
+    "m.step s.1 t.1 w s.2",
+    "m.transfer s.1 t.1 w s.2",
+    "namespace TlxOptimization.GeneratedHistory",
+    "def after := (model sem).reduced",
+    "end TlxOptimization.GeneratedHistory",
+]) + "\n"
+
+# A generated field certificate carries one extra scheduling path: the
+# dead-to-live probe that decides whether the write-table mutation
+# applies. It must queue behind the same --jobs bound as everything else.
+FIELD_SOURCE = "\n".join([
+    "def mask (p : K → P) (v : K → F → V) : K → F → V :=",
+    "  fun k f => if m.live (p k) f then v k f else m.missing f",
+    "def observations (p : K → P) (v : K → F → V) : K → F → V :=",
+    "  fun k f => if m.observed (p k) f then v k f else m.missing f",
+    "def seed (c : C) (b : B) (w : W) : State C K P F V :=",
+    "  s = m.project (m.seed c b w)",
+    "def advance (s : State C K P F V) (d : C) (b : B) (w : W) : State C K P F V :=",
+    "  t = m.project (m.advance s t.1 b w)",
+    "    fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
+    "namespace TlxOptimization.GeneratedField",
+    "def model : FieldRule.Model C Key Phase Field V BranchId W where",
+    "  readsActor := readsActor",
+    "  writes := writes",
+    "  readsGlobal := readsGlobal",
+    "  observed := observed",
+    "def after := (model sem).reduced",
+    "end TlxOptimization.GeneratedField",
+]) + "\n"
+
+
 class LeanConcurrency(unittest.TestCase):
     def test_jobs_caps_positive_checks_mutations_and_field_probe_together(self):
         # Only scheduling is under test; fake Lean accepts the original and
         # rejects each mutation with the same diagnostic contract as Lean.
-        source = "\n".join([
-            "fun i => s.2 i ∧ q i e",
-            "m.step s.1 t.1 w s.2",
-            "m.transfer s.1 t.1 w s.2",
-            "namespace TlxOptimization.GeneratedHistory",
-            "def after := (model sem).reduced",
-            "end TlxOptimization.GeneratedHistory",
-        ]) + "\n"
-        # A generated field certificate carries one extra scheduling path: the
-        # dead-to-live probe that decides whether the write-table mutation
-        # applies. It must queue behind the same --jobs bound as everything else.
-        field_source = "\n".join([
-            "def mask (p : K → P) (v : K → F → V) : K → F → V :=",
-            "  fun k f => if m.live (p k) f then v k f else m.missing",
-            "def seed (c : C) (b : B) (w : W) : State C K P F V :=",
-            "  s = m.project (m.seed c b w)",
-            "def advance (s : State C K P F V) (d : C) (b : B) (w : W) : State C K P F V :=",
-            "  t = m.project (m.advance s t.1 b w)",
-            "    fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
-            "namespace TlxOptimization.GeneratedField",
-            "def model : FieldRule.Model C Key Phase Field V BranchId W where",
-            "  readsActor := readsActor",
-            "  writes := writes",
-            "  readsGlobal := readsGlobal",
-            "def after := (model sem).reduced",
-            "end TlxOptimization.GeneratedField",
-        ]) + "\n"
         for jobs in (1, 2):
             with self.subTest(jobs=jobs), TemporaryDirectory() as tmp:
                 paths = [Path(tmp) / name for name in ("Field.lean", "Fast.lean")]
                 for path in paths:
-                    path.write_text(field_source if path.name == "Field.lean" else source)
+                    path.write_text(FIELD_SOURCE if path.name == "Field.lean" else HISTORY_SOURCE)
                 lock = threading.Lock()
                 active = peak = positives = negatives = probes = 0
 
@@ -100,38 +106,14 @@ class LeanConcurrency(unittest.TestCase):
                      patch.object(checker, "invoke", side_effect=invoke), \
                      contextlib.redirect_stdout(io.StringIO()):
                     checker.main()
-                self.assertEqual((positives, probes, negatives, active), (2, 1, 12, 0))
+                self.assertEqual((positives, probes, negatives, active), (2, 1, 14, 0))
                 self.assertLessEqual(peak, jobs)
 
     def test_sharding_partitions_all_positive_and_negative_checks(self):
-        source = "\n".join([
-            "fun i => s.2 i ∧ q i e",
-            "m.step s.1 t.1 w s.2",
-            "m.transfer s.1 t.1 w s.2",
-            "namespace TlxOptimization.GeneratedHistory",
-            "def after := (model sem).reduced",
-            "end TlxOptimization.GeneratedHistory",
-        ]) + "\n"
-        field_source = "\n".join([
-            "def mask (p : K → P) (v : K → F → V) : K → F → V :=",
-            "  fun k f => if m.live (p k) f then v k f else m.missing",
-            "def seed (c : C) (b : B) (w : W) : State C K P F V :=",
-            "  s = m.project (m.seed c b w)",
-            "def advance (s : State C K P F V) (d : C) (b : B) (w : W) : State C K P F V :=",
-            "  t = m.project (m.advance s t.1 b w)",
-            "    fun k f => if k = a ∧ m.writes b f = true then m.value b s.1 d w s.2.1 input f else s.2.2 k f",
-            "namespace TlxOptimization.GeneratedField",
-            "def model : FieldRule.Model C Key Phase Field V BranchId W where",
-            "  readsActor := readsActor",
-            "  writes := writes",
-            "  readsGlobal := readsGlobal",
-            "def after := (model sem).reduced",
-            "end TlxOptimization.GeneratedField",
-        ]) + "\n"
         with TemporaryDirectory() as tmp:
             paths = [Path(tmp) / name for name in ("Field.lean", "Fast.lean")]
             for path in paths:
-                path.write_text(field_source if path.name == "Field.lean" else source)
+                path.write_text(FIELD_SOURCE if path.name == "Field.lean" else HISTORY_SOURCE)
 
             seen_pos = []
             seen_neg = []
@@ -166,8 +148,8 @@ class LeanConcurrency(unittest.TestCase):
                     checker.main()
 
             self.assertEqual(sorted(seen_pos), ["Fast.lean", "Field.lean"])
-            self.assertEqual(len(seen_neg), 12)
-            self.assertEqual(len(set(seen_neg)), 12)
+            self.assertEqual(len(seen_neg), 14)
+            self.assertEqual(len(set(seen_neg)), 14)
 
     def test_parse_shard_rejects_invalid_specs(self):
         for bad in ("0/4", "5/4", "1/0", "abc", "1/2/3"):

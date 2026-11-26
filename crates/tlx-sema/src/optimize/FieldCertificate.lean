@@ -8,18 +8,18 @@ noncomputable section
 abbrev State (C K P F V : Type) := C × ((K → P) × (K → F → V))
 
 structure Model (C K P F V B W : Type) where
-  missing : V
+  missing : F → V
   live : P → F → Bool
   source : B → P
   target : B → P
   readsActor : B → F → Bool
   readsGlobal : B → F → Bool
   writes : B → F → Bool
-  observed : F → Bool
+  observed : P → F → Bool
   actorLive : ∀ b f, readsActor b f = true → live (source b) f = true
   globalLive : ∀ b p f, readsGlobal b f = true → live p f = true
   frameLive : ∀ b f, live (target b) f = true → writes b f = false → live (source b) f = true
-  observedLive : ∀ p f, observed f = true → live p f = true
+  observedLive : ∀ p f, observed p f = true → live p f = true
   actor : B → W → K
   initial : C → B → W → Prop
   seedPhase : C → B → W → K → P
@@ -40,14 +40,14 @@ namespace Model
 variable {C K P F V B W : Type} (m : Model C K P F V B W)
 
 def mask (p : K → P) (v : K → F → V) : K → F → V :=
-  fun k f => if m.live (p k) f then v k f else m.missing
+  fun k f => if m.live (p k) f then v k f else m.missing f
 
 def reads (b : B) (a : K) (v : K → F → V) : K → F → V := by
   classical
-  exact fun k f => if m.readsGlobal b f || (decide (k = a) && m.readsActor b f) then v k f else m.missing
+  exact fun k f => if m.readsGlobal b f || (decide (k = a) && m.readsActor b f) then v k f else m.missing f
 
-def observations (v : K → F → V) : K → F → V :=
-  fun k f => if m.observed f then v k f else m.missing
+def observations (p : K → P) (v : K → F → V) : K → F → V :=
+  fun k f => if m.observed (p k) f then v k f else m.missing f
 
 theorem reads_mask (b : B) (a : K) (p : K → P) (v : K → F → V)
     (phase : p a = m.source b) : m.reads b a (m.mask p v) = m.reads b a v := by
@@ -64,9 +64,9 @@ theorem reads_mask (b : B) (a : K) (p : K → P) (v : K → F → V)
     · simp [reads, hg', hk]
 
 theorem observations_mask (p : K → P) (v : K → F → V) :
-    m.observations (m.mask p v) = m.observations v := by
+    m.observations p (m.mask p v) = m.observations p v := by
   funext k f
-  by_cases h : m.observed f = true
+  by_cases h : m.observed (p k) f = true
   · simp [observations, mask, h, m.observedLive (p k) f h]
   · simp [observations, Bool.eq_false_iff.mpr h]
 
@@ -92,7 +92,7 @@ theorem advance_commutes (s : State C K P F V) (d : C) (b : B) (w : W)
   funext k f
   change (if m.live (if k = m.actor b w then m.target b else s.2.1 k) f then
     (if k = m.actor b w ∧ m.writes b f = true then m.value b s.1 d w s.2.1 (m.reads b (m.actor b w) s.2.2) f else s.2.2 k f)
-    else m.missing) = _
+    else m.missing f) = _
   simp only [project, advance, mask, m.reads_mask b (m.actor b w) s.2.1 s.2.2 phase]
   by_cases hk : k = m.actor b w
   · subst k
@@ -119,12 +119,12 @@ theorem enabled_project (s : State C K P F V) (d : C) (b : B) (w : W) :
 def concrete : System (State C K P F V) where
   initial s := ∃ c b w, m.initial c b w ∧ s = m.seed c b w
   next s t := ∃ b w, m.enabled s t.1 b w ∧ t = m.advance s t.1 b w
-  safe s := m.observe s.1 s.2.1 (m.observations s.2.2)
+  safe s := m.observe s.1 s.2.1 (m.observations s.2.1 s.2.2)
 
 def reduced : System (State C K P F V) where
   initial s := ∃ c b w, m.initial c b w ∧ s = m.project (m.seed c b w)
   next s t := ∃ b w, m.enabled s t.1 b w ∧ t = m.project (m.advance s t.1 b w)
-  safe s := m.observe s.1 s.2.1 (m.observations s.2.2)
+  safe s := m.observe s.1 s.2.1 (m.observations s.2.1 s.2.2)
 
 theorem certificate : Certificate m.concrete m.reduced m.project := by
   constructor
@@ -144,7 +144,7 @@ theorem certificate : Certificate m.concrete m.reduced m.project := by
       refine ⟨b, w, (m.enabled_project s t.1 b w).mp hg, ?_⟩
       exact (congrArg m.project ht).trans (m.advance_commutes s t.1 b w hg.1)
   · intro s
-    change _ ↔ m.observe s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2))
+    change _ ↔ m.observe s.1 s.2.1 (m.observations s.2.1 (m.mask s.2.1 s.2.2))
     rw [m.observations_mask]
     rfl
 
@@ -177,50 +177,50 @@ theorem deadlock_preserved (s : State C K P F V) :
 
 def constrainedConcrete : ConstrainedSystem (State C K P F V) where
   toSystem := m.concrete
-  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
-  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
+  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.1 s.2.2)
+  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.1 s.2.2)
   actionConstraint s t :=
-    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2)
   actionSafe s t :=
-    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2)
 
 def constrainedReduced : ConstrainedSystem (State C K P F V) where
   toSystem := m.reduced
-  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.2)
-  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.2)
+  initSafe s := m.initObserve s.1 s.2.1 (m.observations s.2.1 s.2.2)
+  constraint s := m.constraint s.1 s.2.1 (m.observations s.2.1 s.2.2)
   actionConstraint s t :=
-    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+    m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2)
   actionSafe s t :=
-    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2)
+    m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2)
 
 -- Projection keeps the retained core, the phase map and every observed value,
 -- so both action checks are unchanged on the projected pair.
 theorem actionConstraint_project (s t : State C K P F V) :
     m.constrainedConcrete.actionConstraint s t ↔
       m.constrainedReduced.actionConstraint (m.project s) (m.project t) := by
-  change m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2) ↔
+  change m.actionConstraint s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2) ↔
     m.actionConstraint s.1 t.1 s.2.1 t.2.1
-      (m.observations (m.mask s.2.1 s.2.2)) (m.observations (m.mask t.2.1 t.2.2))
+      (m.observations s.2.1 (m.mask s.2.1 s.2.2)) (m.observations t.2.1 (m.mask t.2.1 t.2.2))
   rw [m.observations_mask, m.observations_mask]
 
 theorem actionObserve_project (s t : State C K P F V) :
     m.constrainedConcrete.actionSafe s t ↔
       m.constrainedReduced.actionSafe (m.project s) (m.project t) := by
-  change m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.2) (m.observations t.2.2) ↔
+  change m.actionObserve s.1 t.1 s.2.1 t.2.1 (m.observations s.2.1 s.2.2) (m.observations t.2.1 t.2.2) ↔
     m.actionObserve s.1 t.1 s.2.1 t.2.1
-      (m.observations (m.mask s.2.1 s.2.2)) (m.observations (m.mask t.2.1 t.2.2))
+      (m.observations s.2.1 (m.mask s.2.1 s.2.2)) (m.observations t.2.1 (m.mask t.2.1 t.2.2))
   rw [m.observations_mask, m.observations_mask]
 
 theorem initObserve_project (s : State C K P F V) :
     m.constrainedConcrete.initSafe s ↔ m.constrainedReduced.initSafe (m.project s) := by
-  change m.initObserve s.1 s.2.1 (m.observations s.2.2) ↔
-    m.initObserve s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2))
+  change m.initObserve s.1 s.2.1 (m.observations s.2.1 s.2.2) ↔
+    m.initObserve s.1 s.2.1 (m.observations s.2.1 (m.mask s.2.1 s.2.2))
   rw [m.observations_mask]
 
 theorem constraint_project (s : State C K P F V) :
     m.constrainedConcrete.constraint s ↔ m.constrainedReduced.constraint (m.project s) := by
-  change m.constraint s.1 s.2.1 (m.observations s.2.2) ↔
-    m.constraint s.1 s.2.1 (m.observations (m.mask s.2.1 s.2.2))
+  change m.constraint s.1 s.2.1 (m.observations s.2.1 s.2.2) ↔
+    m.constraint s.1 s.2.1 (m.observations s.2.1 (m.mask s.2.1 s.2.2))
   rw [m.observations_mask]
 
 theorem constrained_certificate :

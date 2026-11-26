@@ -100,7 +100,7 @@ impl View {
         let def = named.and_then(|d| def_shapes.iter().position(|(x, _)| *x == d));
         let mut shape = match (named, def) {
             (Some(_), Some(i)) => def_shapes[i].1.clone(),
-            (None, _) => super::view_shape::infer(base.view_expr()?, layout)?,
+            (None, _) => super::view_shape::infer(base, base.view_expr()?, layout)?,
             _ => return None,
         };
         // Components of a tuple VIEW that are state variables: in their
