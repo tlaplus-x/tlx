@@ -208,6 +208,14 @@ class ReleasedTree(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(expected, result.stdout)
 
+    def test_dependency_check_passes_on_the_released_tree(self):
+        # The layering and feature-closure policy reads the Cargo manifests and
+        # the lockfile, which the released tree carries, and resolves offline,
+        # so a checkout of the published sources must still run it.
+        result = run('scripts/dependency_check.py', cwd=self.tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('; 0 problem(s)', result.stdout)
+
     def test_doccheck_passes_on_the_released_tree(self):
         result = run('scripts/doccheck.py', cwd=self.tree)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

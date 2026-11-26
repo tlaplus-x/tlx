@@ -84,6 +84,7 @@ jobs:
         run: |
           python3 scripts/check_imports.py
           python3 scripts/knobs_check.py
+          python3 scripts/dependency_check.py
           python3 scripts/doccheck.py --require-examples
           python3 scripts/bench.py suite-check
           python3 scripts/bench.py report --check
