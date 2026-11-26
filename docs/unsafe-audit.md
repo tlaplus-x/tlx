@@ -33,7 +33,7 @@ Locations name files and functions (line numbers drift).
 | # | Location | What | Invariant relied on | Status |
 |---|---|---|---|---|
 | 1 | `tlx-value/src/intern.rs`: `write_entry`, `entry`, `Sym::from_id` | append-only segmented table, read without a lock | an entry is initialized once under its shard lock before publishing a `Sym`; `unsafe Sym::from_id` requires an existing published symbol; safe `Sym::try_from_id` locks every shard before checking NEXT, so it waits for allocated but unwritten ids; segment pointers use Release/Acquire | Safety contracts; concurrent interning and checked-publication tests |
-| 2 | `tlx-layout/src/dynval.rs`: `lookup_unchecked`; `layout.rs`: `decode_unchecked`, `Layout::decode_state_unchecked`; `layout_tree/mod.rs`: `LayoutNode::decode_unchecked`, `transcode_unchecked`; `permute.rs`: `apply_unchecked` | trusted raw words become `Value`/`Sym` | active Dyn handles originate in this process's `intern`, or tables restored in symbol-then-Dyn order, and are published through synchronization; unchecked recursive decoding preserves this contract for active child slots | unsafe raw entry points with Safety contracts; safe lookup/decode/permute/transcode reject invalid handles before materializing a value; `raw_handles` tests and Miri |
+| 2 | `tlx-layout/src/dynval.rs`: `lookup_unchecked`; `layout.rs`: `decode_unchecked`, `Layout::decode_state_unchecked`; `layout_tree/mod.rs`: `LayoutNode::decode_unchecked`, `transcode_unchecked`; `permute/explicit.rs`, `permute/factor.rs`: `apply_unchecked` | trusted raw words become `Value`/`Sym` | active Dyn handles originate in this process's `intern`, or tables restored in symbol-then-Dyn order, and are published through synchronization; unchecked recursive decoding preserves this contract for active child slots | unsafe raw entry points with Safety contracts; safe lookup/decode/permute/transcode reject invalid handles before materializing a value; `raw_handles` tests and Miri |
 
 ### tlx-runtime
 
@@ -165,7 +165,7 @@ remain part of the [raw handle boundary](#raw-encoded-handle-boundary) review.
 | `tlx-compile/src/exec/mod.rs`: `DEF_MEMOS` thread-local | state-definition memos for encoded current and next states | keyed by `Interp::uid`, `Arc::ptr_eq` on `Arc<Layout>` (cloned into `DefMemo` so the layout address cannot be reused) and the state's exact words |
 | `tlx-compile/src/exec/memo.rs`: `MEMO` thread-local | pure `Interp` fallback and mixed-mode host-region memo keyed by IR node address and exact encoded inputs | scoped to `MemoScope::id` (monotonic `SCOPE_IDS`, owned by the model that owns the IR); `Memo::enter` clears `nodes` and `slots` whenever the scope id changes |
 | `Binding::Name(ExprId, Env)` (`tlx-sema` arena, `tlx-eval`) | name bindings referencing HIR | no `unsafe`: see section 2 |
-| other thread-locals (`tlx-value/src/fmt.rs` `EXPANDING`, `tlx-value/src/intern.rs` `Sym::new` `CACHE` verified against the append-only interner, `tlx-layout/src/store/mod.rs` `SYMBOLS`/`THAWED`/`ROOTS` keyed by `Sym` id or monotonic `Store::uid`, `tlx-layout/src/permute.rs` `DYN_MEMO` keyed by monotonic plan id, `enc/model/symmetry.rs` `ORBIT_BUF`, `enc/model/fingerprint.rs` `VIEW_BUF`, `live.rs` `ACTION`/`GENERATE`/`HAS_STATES`) | plain `Cell`/`RefCell` scratch buffers or monotonic-id caches | no reusable raw addresses |
+| other thread-locals (`tlx-value/src/fmt.rs` `EXPANDING`, `tlx-value/src/intern.rs` `Sym::new` `CACHE` verified against the append-only interner, `tlx-layout/src/store/mod.rs` `SYMBOLS`/`THAWED`/`ROOTS` keyed by `Sym` id or monotonic `Store::uid`, `tlx-layout/src/permute/explicit.rs` `DYN_MEMO` keyed by monotonic plan id, `enc/model/symmetry.rs` `ORBIT_BUF`, `enc/model/fingerprint.rs` `VIEW_BUF`, `live.rs` `ACTION`/`GENERATE`/`HAS_STATES`) | plain `Cell`/`RefCell` scratch buffers or monotonic-id caches | no reusable raw addresses |
 
 ### Checking the inventory
 
@@ -242,7 +242,9 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-layout/src/dynval.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-layout/src/layout.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-layout/src/layout_tree/mod.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
-| `crates/tlx-layout/src/permute.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
+| `crates/tlx-layout/src/permute/explicit.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
+| `crates/tlx-layout/src/permute/factor.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
+| `crates/tlx-layout/src/permute/tests.rs` | reviewed | Trusted active-handle provenance and checked alternatives (row 2). |
 | `crates/tlx-runtime/src/explore/checkpoint/recover.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/explore/checkpoint/write.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/explore/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
