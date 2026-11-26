@@ -6,8 +6,8 @@ use tlx_sema::{
     optimize::{
         age_projection_with_spec, cfg_constants_supported, choose_symmetry_certificate_with_spec, equiv_symmetry_certificate_with_spec,
         history_projection_with_spec, ordered_projection_with_spec, phase_projection_with_spec, sequence_length_projection_with_spec,
-        symmetry_certificate_with_spec, symmetry_projection_certificate_with_spec, unobserved_projection_with_spec, CheckSpec,
-        FieldProjection,
+        symmetry_certificate_with_spec, symmetry_projection_certificate_with_spec, threshold_counter_projection_with_spec,
+        unobserved_projection_with_spec, CheckSpec, FieldProjection,
     },
     Program,
 };
@@ -1233,6 +1233,265 @@ fn fixture_init_merge_certificate() -> String {
         .expect("initial-state merge certificate")
 }
 
+fn fixture_threshold_constrained() -> String {
+    let tla = r#"---- MODULE ThresholdConstrainedCert ----
+EXTENDS Naturals
+CONSTANT Limit, Actor
+DefaultLimit == 2
+VARIABLE phase, retries, fails
+Init == phase = "idle" /\ retries = 0 /\ fails = [a \in Actor |-> 0]
+Next == \/ /\ phase = "idle" /\ retries' = retries + 1
+           /\ phase' = IF retries >= Limit THEN "ready" ELSE "idle"
+           /\ UNCHANGED fails
+        \/ \E a \in Actor : /\ phase = "idle"
+           /\ fails' = [fails EXCEPT ![a] = @ + 1] /\ UNCHANGED <<phase, retries>>
+        \/ /\ phase = "ready" /\ phase' = "idle" /\ retries' = 0 /\ fails' = [a \in Actor |-> 0]
+Inv == phase \in {"idle", "ready"} /\ retries \in Nat /\ fails \in [Actor -> Nat] /\ ((phase = "ready") => retries >= 3)
+InitProp == phase = "idle" /\ retries = 0
+StateLimit == (phase = "idle") \/ (retries >= Limit /\ \A a \in Actor : fails[a] >= 0)
+ActLimit == phase' \in {"idle", "ready"}
+ActProp == [][phase' \in {"idle", "ready"}]_phase
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANTS\n  Limit <- DefaultLimit\n  Actor = {\"a1\", \"a2\"}\nINVARIANT Inv\n";
+    let (p, cfg) = load("ThresholdConstrainedCert", tla, cfg);
+    let (inv, init_p, c, ac, ap) = (
+        [def_expr(&p, "Inv")],
+        [def_expr(&p, "InitProp")],
+        [def_expr(&p, "StateLimit")],
+        [def_expr(&p, "ActLimit")],
+        [action_prop_expr(&p, "ActProp")],
+    );
+    let spec = CheckSpec { invariants: &inv, init_props: &init_p, constraints: &c, action_constraints: &ac, action_props: &ap };
+    threshold_counter_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), spec)
+        .expect("threshold counter projection with CONSTRAINT, ACTION_CONSTRAINT, PROPERTY, and CONSTANT <-")
+        .certificate
+        .expect("threshold counter constrained certificate")
+}
+
+#[test]
+fn threshold_counter_constrained_emits_constrained_certificate_and_const_subst() {
+    let cert = fixture_threshold_constrained();
+    assert_constrained_lean(&cert, "GeneratedThresholdCounter");
+    assert!(cert.contains("def constSubstDeclared (i : Fin ConstSubstCount) : String :="));
+    assert!(cert.contains("theorem const_subst_constrained_sound"));
+}
+
+fn fixture_threshold_tuple_and_seed() -> String {
+    let tla = r#"---- MODULE TupleAndSeedCert ----
+EXTENDS Naturals
+VARIABLE pair, flag, m
+Init == \E <<x, y>> \in {<<1, 2>>} :
+          /\ pair = <<x, y>>
+          /\ flag = FALSE
+          /\ m = [a \in {1, 2} |-> IF a = 1 THEN 0 ELSE 1]
+Next == \E <<x, y>> \in {<<1, 2>>} :
+          /\ pair' = <<y, x>>
+          /\ flag' = (x = 1 /\ y = 2)
+          /\ m' = [m EXCEPT ![1] = @ + 1]
+Inv == flag \in BOOLEAN /\ m \in [{1, 2} -> Nat] /\ (m[1] < 2 \/ m[1] >= 2)
+====
+"#;
+    let (p, cfg) = load("TupleAndSeedCert", tla, "INIT Init\nNEXT Next\nINVARIANT Inv\n");
+    let inv = [def_expr(&p, "Inv")];
+    threshold_counter_projection_with_spec(&p, &cfg, &def_expr(&p, "Init"), &def_expr(&p, "Next"), CheckSpec::invariants_only(&inv))
+        .expect("tuple bounds and per-key map init should certify")
+        .certificate
+        .expect("certificate")
+}
+
+#[test]
+fn threshold_counter_tuple_bounds_and_map_seed_keys_are_faithful() {
+    let cert = fixture_threshold_tuple_and_seed();
+    let atom_hirs: Vec<&str> = cert.lines().filter(|l| l.starts_with("def atom") && l.contains("HIR : String :=")).collect();
+
+    // Both Init and Next use `\E <<x, y>> \in {<<1, 2>>}`: each must emit ONE
+    // membership atom whose LHS is `Tuple([Local(...), Local(...)])`, never
+    // component-wise `Local(...) \in {<<1, 2>>}`.
+    let set_enum_in_atoms: Vec<&&str> = atom_hirs.iter().filter(|l| l.contains("op: In,") && l.contains("SetEnum(")).collect();
+    assert_eq!(
+        set_enum_in_atoms.len(),
+        2,
+        "Init and Next tuple bounds must emit exactly two membership atoms, got: {set_enum_in_atoms:#?}"
+    );
+    for atom in &set_enum_in_atoms {
+        assert!(atom.contains("Tuple("), "tuple bound membership must test the assembled tuple: {atom}");
+        // The first argument to `In` must be `Tuple`, not `Local`.
+        let args_start = atom.find("args: [").expect("In args");
+        let after_args = &atom[args_start..];
+        let tuple_pos = after_args.find("Tuple(").expect("Tuple in In args");
+        let local_pos = after_args.find("Local(").expect("Local in In args");
+        assert!(tuple_pos < local_pos, "In LHS must wrap locals in Tuple, not test bare Local: {atom}");
+    }
+    let init_section = cert.split("def initial ").nth(1).expect("initial def").split("def seed ").next().expect("before seed");
+    let guard_section = cert.split("def guard ").nth(1).expect("guard def").split("def transfer ").next().expect("before transfer");
+    let extract_atom_num =
+        |hir_line: &str| -> usize { hir_line.strip_prefix("def atom").unwrap().split("HIR").next().unwrap().parse().unwrap() };
+    let init_bound_id = extract_atom_num(set_enum_in_atoms[0]);
+    let next_bound_id = extract_atom_num(set_enum_in_atoms[1]);
+    assert!(init_section.contains(&format!("sem.test {init_bound_id} ")), "initial must reference its tuple bound atom: {init_section}");
+    assert!(guard_section.contains(&format!("sem.test {next_bound_id} ")), "guard must reference its tuple bound atom: {guard_section}");
+
+    // Map init `[a \in {1, 2} |-> IF a = 1 THEN 0 ELSE 1]` must bind each slot's
+    // key when lowering its seed condition so slot 0 and slot 1 carry distinct
+    // `Bound atoms` entries for `Num(1)` and `Num(2)`.
+    let seed_slots = cert
+        .split("def seed ")
+        .nth(1)
+        .expect("seed def")
+        .split("def guard ")
+        .next()
+        .expect("before guard")
+        .split("match k.val with")
+        .nth(1)
+        .expect("slot match");
+    let slot0_line = seed_slots.lines().find(|l| l.trim_start().starts_with("| 0 =>")).expect("slot 0 seed");
+    let slot1_line = seed_slots.lines().find(|l| l.trim_start().starts_with("| 1 =>")).expect("slot 1 seed");
+    let extract_test_id = |line: &str| -> usize {
+        let rest = line.split("sem.test ").nth(1).expect("sem.test in seed");
+        rest.split_whitespace().next().unwrap().parse().expect("atom id")
+    };
+    let id0 = extract_test_id(slot0_line);
+    let id1 = extract_test_id(slot1_line);
+    assert_ne!(id0, id1, "per-key seed conditions must lower to distinct atoms: {slot0_line} vs {slot1_line}");
+    let hir0 = atom_hirs[id0];
+    let hir1 = atom_hirs[id1];
+    assert!(hir0.contains("Bound atoms:") && hir0.contains("Num(1)"), "slot 0 seed must bind key 1: {hir0}");
+    assert!(hir1.contains("Bound atoms:") && hir1.contains("Num(2)"), "slot 1 seed must bind key 2: {hir1}");
+    assert_ne!(hir0, hir1, "slot 0 and slot 1 seed HIR must differ");
+}
+
+#[test]
+fn threshold_counter_refuses_non_closed_recursive_captures() {
+    let cases = [
+        (
+            "DirectCapture",
+            r#"---- MODULE DirectCapture ----
+EXTENDS Naturals
+VARIABLE c
+Inspect(x) == LET R[n \in 0..1] == IF n = 0 THEN x < 3 ELSE R[n - 1]
+              IN R[1]
+Init == c = 0
+Next == c' = c + 1
+Inv == Inspect(c)
+====
+"#,
+        ),
+        (
+            "TransitiveCapture",
+            r#"---- MODULE TransitiveCapture ----
+EXTENDS Naturals
+VARIABLE c
+Inspect(x) == LET Helper == x < 3
+                  R[n \in 0..1] == IF n = 0 THEN Helper ELSE R[n - 1]
+              IN R[1]
+Init == c = 0
+Next == c' = c + 1
+Inv == Inspect(c)
+====
+"#,
+        ),
+        (
+            "AtCapture",
+            r#"---- MODULE AtCapture ----
+EXTENDS Naturals
+VARIABLE m
+Init == m = [a \in {1} |-> 0]
+Next == m' = [m EXCEPT ![1] = LET R[n \in 0..1] == IF n = 0 THEN @ + 1 ELSE R[n - 1] IN R[1]]
+Inv == m \in [{1} -> Nat]
+====
+"#,
+        ),
+    ];
+    for (name, tla) in cases {
+        let (p, cfg) = load(name, tla, "INIT Init\nNEXT Next\nINVARIANT Inv\n");
+        let inv = [def_expr(&p, "Inv")];
+        assert!(
+            threshold_counter_projection_with_spec(
+                &p,
+                &cfg,
+                &def_expr(&p, "Init"),
+                &def_expr(&p, "Next"),
+                CheckSpec::invariants_only(&inv)
+            )
+            .is_none(),
+            "{name} must refuse projection when opaque recursive def has unresolved captures"
+        );
+    }
+}
+
+#[test]
+fn threshold_counter_eval_order_distinguishes_checked_vs_mathematical_arithmetic() {
+    let cases = [
+        (
+            "ScalarGuardAfter",
+            r#"---- MODULE ScalarGuardAfter ----
+EXTENDS Naturals
+VARIABLE c
+Init == c = 0
+Next == (c' = c + 1 /\ c < 100) \/ c' = 101 \/ c' = 2147483647
+Inv == c \in Nat
+====
+"#,
+            true,
+        ),
+        (
+            "ScalarGuardBefore",
+            r#"---- MODULE ScalarGuardBefore ----
+EXTENDS Naturals
+VARIABLE c
+Init == c = 0
+Next == (c < 100 /\ c' = c + 1) \/ c' = 101 \/ c' = 2147483647
+Inv == c \in Nat
+====
+"#,
+            false,
+        ),
+        (
+            "MapGuardAfter",
+            r#"---- MODULE MapGuardAfter ----
+EXTENDS Naturals
+VARIABLE m
+Init == m = [a \in {1} |-> 0]
+Next == \/ (m' = [m EXCEPT ![1] = @ + 1] /\ m[1] < 100)
+        \/ m' = [a \in {1} |-> 101]
+        \/ m' = [a \in {1} |-> 2147483647]
+Inv == m \in [{1} -> Nat]
+====
+"#,
+            true,
+        ),
+        (
+            "MapGuardBefore",
+            r#"---- MODULE MapGuardBefore ----
+EXTENDS Naturals
+VARIABLE m
+Init == m = [a \in {1} |-> 0]
+Next == \/ (m[1] < 100 /\ m' = [m EXCEPT ![1] = @ + 1])
+        \/ m' = [a \in {1} |-> 101]
+        \/ m' = [a \in {1} |-> 2147483647]
+Inv == m \in [{1} -> Nat]
+====
+"#,
+            false,
+        ),
+    ];
+
+    for (name, tla, expect_math) in cases {
+        let (p, cfg) = load(name, tla, "INIT Init\nNEXT Next\nINVARIANT Inv\n");
+        let inv = [def_expr(&p, "Inv")];
+        let proj = threshold_counter_projection_with_spec(
+            &p,
+            &cfg,
+            &def_expr(&p, "Init"),
+            &def_expr(&p, "Next"),
+            CheckSpec::invariants_only(&inv),
+        )
+        .unwrap_or_else(|| panic!("{name} should certify"));
+        assert_eq!(proj.mathematical_counter_arithmetic, expect_math, "{name}: expected mathematical_counter_arithmetic={expect_math}");
+    }
+}
+
 #[test]
 #[ignore = "requires lean on PATH; verifies all constrained certificate families sequentially with proofs/check_generated.py --negative"]
 fn verify_all_constrained_certificate_families_with_lean_negative() {
@@ -1262,6 +1521,8 @@ fn verify_all_constrained_certificate_families_with_lean_negative() {
         ("OrderedAction", fixture_ordered_action_constrained()),
         ("NestedAction", fixture_nested_action_constrained()),
         ("LiveAction", fixture_live_action_constrained()),
+        ("ThresholdAction", fixture_threshold_constrained()),
+        ("ThresholdTupleAndSeed", fixture_threshold_tuple_and_seed()),
         ("AgeHistory", fixture_age_history_constrained()),
         ("Nested", fixture_nested_constrained()),
         ("Live", fixture_live_constrained()),

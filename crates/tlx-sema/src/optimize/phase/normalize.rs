@@ -1,11 +1,15 @@
 //! Bounded, analysis-only expansion. Executable definitions remain untouched.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use tlx_front::cfg::Config;
 
 use super::ConstSubstTarget;
-use crate::{builtins::Effect, hir::*, visit, Program};
+use crate::{
+    builtins::{Builtin as B, Effect},
+    hir::*,
+    visit, Program,
+};
 
 pub(super) struct Normalizer<'a> {
     program: &'a Program,
@@ -17,6 +21,11 @@ pub(super) struct Normalizer<'a> {
     local: u32,
     at_stack: Vec<(Expr, bool)>,
     let_at: HashMap<DefId, Option<usize>>,
+    allow_opaque_recursive: bool,
+    expand_inst_var: bool,
+    in_enabled: bool,
+    recursive_cache: HashMap<DefId, bool>,
+    opaque_vars_cache: HashMap<DefId, Option<BTreeSet<VarId>>>,
 }
 
 impl<'a> Normalizer<'a> {
@@ -31,7 +40,45 @@ impl<'a> Normalizer<'a> {
             local: program.locals.len() as u32,
             at_stack: Vec::new(),
             let_at: HashMap::new(),
+            allow_opaque_recursive: false,
+            expand_inst_var: false,
+            in_enabled: false,
+            recursive_cache: HashMap::new(),
+            opaque_vars_cache: HashMap::new(),
         }
+    }
+
+    pub fn with_config_threshold(program: &'a Program, cfg: &'a Config) -> Self {
+        Self { allow_opaque_recursive: true, expand_inst_var: true, ..Self::with_config(program, cfg) }
+    }
+
+    pub fn opaque_vars_cache_mut(&mut self) -> &mut HashMap<DefId, Option<BTreeSet<VarId>>> {
+        &mut self.opaque_vars_cache
+    }
+
+    fn is_recursive_def(&mut self, target: DefId) -> bool {
+        if let Some(&cached) = self.recursive_cache.get(&target) {
+            return cached;
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![target];
+        let mut reaches_target = false;
+        while let Some(id) = stack.pop() {
+            if let Some(body) = Self::def_body(&self.program.defs[id.idx()]) {
+                collect_def_callees(&body, &mut |callee| {
+                    if callee == target {
+                        reaches_target = true;
+                    } else if visited.insert(callee) {
+                        stack.push(callee);
+                    }
+                });
+                if reaches_target {
+                    break;
+                }
+            }
+        }
+        self.recursive_cache.insert(target, reaches_target);
+        reaches_target
     }
 
     fn def_body(d: &Def) -> Option<Expr> {
@@ -182,7 +229,17 @@ impl<'a> Normalizer<'a> {
                         if let Some(op) = d.builtin {
                             ExprKind::Builtin { op, args }
                         } else {
-                            if self.stack.contains(id) || d.params.len() != args.len() {
+                            if d.params.len() != args.len() {
+                                return None;
+                            }
+                            if self.allow_opaque_recursive && self.is_recursive_def(*id) {
+                                // Only keep a recursive call opaque when `id` and every
+                                // transitively reachable definition are pure and lexically
+                                // closed (no free enclosing locals or `@` captures).
+                                opaque_recursive_def_vars(self.program, self.cfg, *id, &mut self.opaque_vars_cache)?;
+                                return Some(Expr::new(ExprKind::Apply { op: OpRef::Def(*id), args }, e.span));
+                            }
+                            if self.stack.contains(id) {
                                 return None;
                             }
                             if self.program.is_strict_call_def(*id) && !strict_call_preserves_args(self.program, d) {
@@ -203,6 +260,16 @@ impl<'a> Normalizer<'a> {
                     }
                     OpRef::Const(_) | OpRef::Param(_) => return None,
                 }
+            }
+            ExprKind::InstVar { subst, .. } if self.expand_inst_var && !self.in_enabled => {
+                return self.expand(subst, env, lex_at, depth + 1);
+            }
+            ExprKind::Builtin { op: crate::builtins::Builtin::Enabled, args } if self.expand_inst_var => {
+                let prev = self.in_enabled;
+                self.in_enabled = true;
+                let expanded = args.iter().map(|a| self.expand(a, env, lex_at, depth + 1)).collect::<Option<Vec<_>>>();
+                self.in_enabled = prev;
+                ExprKind::Builtin { op: crate::builtins::Builtin::Enabled, args: expanded? }
             }
             ExprKind::OpArg(_) | ExprKind::Lambda { .. } | ExprKind::InstVar { .. } => return None,
             ExprKind::Quant { kind, bounds, body } => {
@@ -235,10 +302,9 @@ impl<'a> Normalizer<'a> {
                 ExprKind::Choose { vars, set, body: self.expand(body, &scope, lex_at, depth + 1)? }
             }
             ExprKind::Except { base, updates } => {
-                let base = self.expand(base, env, lex_at, depth + 1)?;
-                let mut expanded = Vec::new();
+                let mut cur_base = self.expand(base, env, lex_at, depth + 1)?;
+                let mut expanded: Vec<(Vec<ExceptKey>, Expr)> = Vec::new();
                 for (path, rhs) in updates {
-                    let mut old = base.clone();
                     let mut keys = Vec::new();
                     for key in path {
                         let key = match key {
@@ -247,28 +313,45 @@ impl<'a> Normalizer<'a> {
                                 ExceptKey::Index(args.iter().map(|e| self.expand(e, env, lex_at, depth + 1)).collect::<Option<_>>()?)
                             }
                         };
-                        old = Expr::new(
-                            match &key {
-                                ExceptKey::Field(field) => ExprKind::Field { record: old, field: field.clone() },
-                                ExceptKey::Index(args) => ExprKind::FnApp { func: old, args: args.clone() },
-                            },
-                            e.span,
-                        );
                         keys.push(key);
                     }
+                    let build_old = |from: &Expr, ks: &[ExceptKey]| -> Expr {
+                        let mut old = from.clone();
+                        for key in ks {
+                            old = Expr::new(
+                                match key {
+                                    ExceptKey::Field(field) => ExprKind::Field { record: old, field: field.clone() },
+                                    ExceptKey::Index(args) => ExprKind::FnApp { func: old, args: args.clone() },
+                                },
+                                e.span,
+                            );
+                        }
+                        old
+                    };
+                    let old = build_old(&cur_base, &keys);
                     let at_idx = self.at_stack.len();
                     self.at_stack.push((old, false));
-                    let rhs = self.expand(rhs, env, Some(at_idx), depth + 1);
+                    let rhs_exp = self.expand(rhs, env, Some(at_idx), depth + 1);
                     let (_, at_used) = self.at_stack.pop().unwrap();
                     // EXCEPT updates are sequential. Using the original base
                     // for @ is valid only when preceding writes cannot touch
                     // this point. Check after expansion to include LET helpers.
-                    if at_used && expanded.iter().any(|(prior, _): &(Vec<ExceptKey>, Expr)| !disjoint(prior, path)) {
-                        return None;
+                    if at_used && expanded.iter().any(|(prior, _)| !disjoint(prior, &keys)) {
+                        if !self.expand_inst_var {
+                            return None;
+                        }
+                        cur_base = Expr::new(ExprKind::Except { base: cur_base, updates: std::mem::take(&mut expanded) }, e.span);
+                        let seq_old = build_old(&cur_base, &keys);
+                        let at_idx = self.at_stack.len();
+                        self.at_stack.push((seq_old, false));
+                        let seq_rhs = self.expand(rhs, env, Some(at_idx), depth + 1);
+                        self.at_stack.pop().unwrap();
+                        expanded.push((keys, seq_rhs?));
+                    } else {
+                        expanded.push((keys, rhs_exp?));
                     }
-                    expanded.push((keys, rhs?));
                 }
-                ExprKind::Except { base, updates: expanded }
+                ExprKind::Except { base: cur_base, updates: expanded }
             }
             ExprKind::QuantUnbounded { .. } | ExprKind::TemporalQuant { .. } => return None,
             _ => {
@@ -289,6 +372,232 @@ impl<'a> Normalizer<'a> {
         }
         Some(Expr::new(kind, e.span))
     }
+}
+
+fn collect_def_callees(e: &Expr, f: &mut impl FnMut(DefId)) {
+    if let ExprKind::Apply { op: OpRef::Def(id), .. } = &*e.kind {
+        f(*id);
+    }
+    visit::children(e, &mut |c| collect_def_callees(c, f));
+}
+
+/// Transitively prove that `root` is pure, state-level, and lexically closed
+/// (references no `LocalId` or `@` bound outside `root` itself, including
+/// through transitively called definitions and `.cfg` constant substitutions),
+/// returning the exact set of state `VarId`s it may read.
+///
+/// Returns `None` if any reachable expression captures an enclosing local or
+/// `@`, uses `Prime`/`Unchanged`/`Enabled`/temporal/unbounded/higher-order/
+/// `InstVar`/`Pending`/non-pure constructs, or exceeds the traversal budget.
+pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
+    program: &Program,
+    cfg: &Config,
+    root: DefId,
+    cache: &mut HashMap<DefId, Option<BTreeSet<VarId>>>,
+) -> Option<BTreeSet<VarId>> {
+    if let Some(cached) = cache.get(&root) {
+        return cached.clone();
+    }
+
+    struct Ctx<'a> {
+        program: &'a Program,
+        cfg: &'a Config,
+        visited_defs: HashSet<DefId>,
+        visited_consts: HashSet<ConstId>,
+        let_scopes: HashMap<DefId, (HashSet<LocalId>, bool)>,
+        stack: Vec<(DefId, HashSet<LocalId>, bool)>,
+        vars: BTreeSet<VarId>,
+        budget: usize,
+    }
+
+    impl Ctx<'_> {
+        fn is_allowed_builtin(b: B) -> bool {
+            !matches!(b, B::Prime | B::Unchanged | B::Enabled) && b.metadata().effect == Effect::Pure
+        }
+
+        fn walk_bounds(&mut self, bounds: &[Bound], scope: &mut HashSet<LocalId>, in_except: bool) -> bool {
+            for b in bounds {
+                if !self.walk(&b.set, scope, in_except) {
+                    return false;
+                }
+                scope.extend(b.vars.locals().iter().copied());
+            }
+            true
+        }
+
+        fn enqueue_def(&mut self, id: DefId) -> bool {
+            let d = &self.program.defs[id.idx()];
+            if let Some(b) = d.builtin {
+                return Self::is_allowed_builtin(b);
+            }
+            if self.visited_defs.insert(id) {
+                let (base_scope, base_except) = self.let_scopes.get(&id).cloned().unwrap_or_default();
+                self.stack.push((id, base_scope, base_except));
+            }
+            true
+        }
+
+        fn walk(&mut self, e: &Expr, scope: &HashSet<LocalId>, in_except: bool) -> bool {
+            if self.budget == 0 {
+                return false;
+            }
+            self.budget -= 1;
+            match &*e.kind {
+                ExprKind::Var(v) => {
+                    self.vars.insert(*v);
+                    true
+                }
+                ExprKind::Local(l) => scope.contains(l),
+                ExprKind::At => in_except,
+                ExprKind::Const(c) => {
+                    if self.cfg.last_constant_subst(&self.program.consts[c.idx()].name).is_some() {
+                        if self.program.consts[c.idx()].arity != 0 {
+                            return false;
+                        }
+                        if self.visited_consts.insert(*c) {
+                            let Some((_, terminal)) = super::resolve_const_subst_chain(self.program, self.cfg, *c) else {
+                                return false;
+                            };
+                            match terminal {
+                                ConstSubstTarget::PureBuiltin(b, _) => {
+                                    if !Self::is_allowed_builtin(b) {
+                                        return false;
+                                    }
+                                }
+                                ConstSubstTarget::Const(_) => {}
+                                ConstSubstTarget::Def(did) => {
+                                    let d = &self.program.defs[did.idx()];
+                                    if let Some(b) = d.builtin {
+                                        if !Self::is_allowed_builtin(b) {
+                                            return false;
+                                        }
+                                    } else if self.visited_defs.insert(did) {
+                                        self.stack.push((did, HashSet::new(), false));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    true
+                }
+                ExprKind::InstVar { .. }
+                | ExprKind::OpArg(_)
+                | ExprKind::Lambda { .. }
+                | ExprKind::QuantUnbounded { .. }
+                | ExprKind::TemporalQuant { .. }
+                | ExprKind::BoxAction { .. }
+                | ExprKind::AngleAction { .. }
+                | ExprKind::Fairness { .. } => false,
+                ExprKind::Builtin { op, args } => Self::is_allowed_builtin(*op) && args.iter().all(|a| self.walk(a, scope, in_except)),
+                ExprKind::Apply { op, args } => {
+                    let ok = match op {
+                        OpRef::Def(id) => self.enqueue_def(*id),
+                        OpRef::Builtin(b) => Self::is_allowed_builtin(*b),
+                        OpRef::Const(_) | OpRef::Param(_) => false,
+                    };
+                    ok && args.iter().all(|a| self.walk(a, scope, in_except))
+                }
+                ExprKind::Let { defs, body } => {
+                    for &d in defs {
+                        self.let_scopes.insert(d, (scope.clone(), in_except));
+                    }
+                    self.walk(body, scope, in_except)
+                }
+                ExprKind::Quant { bounds, body, .. } | ExprKind::FnConstruct { bounds, body } => {
+                    let mut inner = scope.clone();
+                    self.walk_bounds(bounds, &mut inner, in_except) && self.walk(body, &inner, in_except)
+                }
+                ExprKind::SetMap { expr, bounds } => {
+                    let mut inner = scope.clone();
+                    self.walk_bounds(bounds, &mut inner, in_except) && self.walk(expr, &inner, in_except)
+                }
+                ExprKind::SetFilter { bound, pred } => {
+                    if !self.walk(&bound.set, scope, in_except) {
+                        return false;
+                    }
+                    let mut inner = scope.clone();
+                    inner.extend(bound.vars.locals().iter().copied());
+                    self.walk(pred, &inner, in_except)
+                }
+                ExprKind::Choose { vars, set, body } => {
+                    if let Some(s) = set {
+                        if !self.walk(s, scope, in_except) {
+                            return false;
+                        }
+                    }
+                    let mut inner = scope.clone();
+                    inner.extend(vars.locals().iter().copied());
+                    self.walk(body, &inner, in_except)
+                }
+                ExprKind::Except { base, updates } => {
+                    if !self.walk(base, scope, in_except) {
+                        return false;
+                    }
+                    for (path, rhs) in updates {
+                        for key in path {
+                            if let ExceptKey::Index(args) = key {
+                                if !args.iter().all(|a| self.walk(a, scope, in_except)) {
+                                    return false;
+                                }
+                            }
+                        }
+                        if !self.walk(rhs, scope, true) {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    let mut ok = true;
+                    visit::children(e, &mut |c| {
+                        if ok {
+                            ok &= self.walk(c, scope, in_except);
+                        }
+                    });
+                    ok
+                }
+            }
+        }
+    }
+
+    let mut ctx = Ctx {
+        program,
+        cfg,
+        visited_defs: HashSet::from([root]),
+        visited_consts: HashSet::new(),
+        let_scopes: HashMap::new(),
+        stack: vec![(root, HashSet::new(), false)],
+        vars: BTreeSet::new(),
+        budget: 2048,
+    };
+
+    while let Some((id, mut scope, in_except)) = ctx.stack.pop() {
+        if ctx.visited_defs.len() > 64 {
+            cache.insert(root, None);
+            return None;
+        }
+        let d = &program.defs[id.idx()];
+        if let Some(b) = d.builtin {
+            if !Ctx::is_allowed_builtin(b) {
+                cache.insert(root, None);
+                return None;
+            }
+            continue;
+        }
+        scope.extend(d.params.iter().copied());
+        let ok = match &d.kind {
+            DefKind::Op(body) => ctx.walk(body, &scope, in_except),
+            DefKind::Fn { bounds, body } => ctx.walk_bounds(bounds, &mut scope, in_except) && ctx.walk(body, &scope, in_except),
+            DefKind::Pending => false,
+        };
+        if !ok {
+            cache.insert(root, None);
+            return None;
+        }
+    }
+
+    cache.insert(root, Some(ctx.vars.clone()));
+    Some(ctx.vars)
 }
 
 fn disjoint(a: &[ExceptKey], b: &[ExceptKey]) -> bool {

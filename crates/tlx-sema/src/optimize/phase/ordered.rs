@@ -196,7 +196,13 @@ fn candidate(program: &Program, cfg: &Config, init: &Expr, next: &Expr, spec: su
         Some(c) => Some(expand.attach_const_subst(c)?),
         None => None,
     };
-    Some(FieldProjection { view: Expr::new(ExprKind::Tuple(values), init.span), fields, certificate, ordered: Some(plan) })
+    Some(FieldProjection {
+        view: Expr::new(ExprKind::Tuple(values), init.span),
+        fields,
+        certificate,
+        ordered: Some(plan),
+        mathematical_counter_arithmetic: false,
+    })
 }
 
 impl Analysis<'_> {

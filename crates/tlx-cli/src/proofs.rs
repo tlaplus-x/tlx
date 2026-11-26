@@ -20,6 +20,7 @@ pub(crate) fn emit(model: &InterpModel, proofdir: Option<&Path>, applied: Option
         model.view_expr(),
         model.projection_certificate(),
         model.ordered_projection(),
+        model.mathematical_counter_arithmetic(),
     );
     let path = write(proofdir, &contents).map_err(|e| {
         out::error(code::GENERAL, &format!("Cannot write mandatory optimization Lean output: {e}"));
@@ -33,6 +34,8 @@ pub(crate) fn emit(model: &InterpModel, proofdir: Option<&Path>, applied: Option
         }
     } else if model.projection_certificate().is_some() && model.ordered_projection().is_some() {
         "parametric ordered-allocation rule-IR certificate; lowering and runtime remain trusted"
+    } else if rule == Some("threshold-counter-projection") && model.projection_certificate().is_some() {
+        "parametric threshold-counter rule-IR certificate; lowering and runtime remain trusted"
     } else if rule == Some("unobserved-state-projection") && model.projection_certificate().is_some() {
         "parametric unobserved-state rule-IR certificate; lowering and runtime remain trusted"
     } else if rule == Some("relative-age-projection") && model.projection_certificate().is_some() {

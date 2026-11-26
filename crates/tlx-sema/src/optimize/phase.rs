@@ -15,6 +15,7 @@ mod sequence;
 mod sym_groups;
 pub(crate) mod sym_norm;
 mod sym_totality;
+mod threshold;
 
 pub use age::{age_projection, age_projection_with_spec};
 pub use choose_sym::{choose_symmetry_certificate, choose_symmetry_certificate_with_spec};
@@ -27,6 +28,7 @@ pub use ordered::{ordered_projection, ordered_projection_with_spec, OrderedHisto
 pub use sequence::{sequence_length_projection, sequence_length_projection_with_spec};
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
 pub use sym_totality::cfg_constants_supported;
+pub use threshold::{threshold_counter_projection, threshold_counter_projection_with_spec};
 
 /// The largest automatic-symmetry product order (`7!`) the keyed, equivariant
 /// and choice certificate emitters accept, and the largest factor (number of
@@ -769,6 +771,10 @@ pub struct FieldProjection {
     pub certificate: Option<String>,
     /// When present, replaces the identity VIEW with a structural runtime key.
     pub ordered: Option<OrderedPlan>,
+    /// True when a threshold-counter projection relies on mathematical
+    /// natural-number semantics (at least one projected counter is not
+    /// statically proved `<= i32::MAX`).
+    pub mathematical_counter_arithmetic: bool,
 }
 
 /// Derive one field projection. An unknown transfer, observation, effect or
@@ -1088,14 +1094,18 @@ impl BranchBindings {
         ok
     }
 
-    fn get(&self, v: VarId) -> Option<Expr> {
+    fn get_with_index(&self, v: VarId) -> Option<(usize, Expr)> {
         let (idx, rhs) = self.single_eq.get(&v)?;
         if mentions_phase_var(rhs, self.primed)
             && (self.has_earlier_membership(v, *idx) || !self.var_is_grounded(v, &mut self.state.borrow_mut()))
         {
             return None;
         }
-        Some(rhs.clone())
+        Some((*idx, rhs.clone()))
+    }
+
+    fn get(&self, v: VarId) -> Option<Expr> {
+        self.get_with_index(v).map(|(_, rhs)| rhs)
     }
 
     fn get_or_reversed(&self, v: VarId) -> Option<Expr> {
@@ -1111,6 +1121,10 @@ impl BranchBindings {
 
 fn binding(branch: &Branch, v: VarId, primed: bool) -> Option<Expr> {
     BranchBindings::new(branch, primed).get(v)
+}
+
+fn binding_with_index(branch: &Branch, v: VarId, primed: bool) -> Option<(usize, Expr)> {
+    BranchBindings::new(branch, primed).get_with_index(v)
 }
 
 // Bound declarations, even unused ones, must not capture inserted inputs.

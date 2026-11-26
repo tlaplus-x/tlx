@@ -326,6 +326,7 @@ impl Proof<'_> {
                 .chain(std::iter::once(format!("{}.logical-clock", program.vars[self.clock.idx()].name)))
                 .collect(),
             certificate: None,
+            mathematical_counter_arithmetic: false,
         }
     }
 }

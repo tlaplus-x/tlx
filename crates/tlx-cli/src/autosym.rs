@@ -78,6 +78,7 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
         let arithmetic = match rule {
             "relative-age-projection" => "; mathematical clock arithmetic",
             "ordered-allocation-projection" => "; mathematical allocation arithmetic",
+            "threshold-counter-projection" if model.mathematical_counter_arithmetic() => "; mathematical counter arithmetic",
             _ => "",
         };
         let group = applied.as_ref().map(|s| s.group.as_str()).or(model.ip.cfg.symmetry.as_deref());

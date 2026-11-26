@@ -57,6 +57,7 @@ mod set_comparison;
 #[cfg(unix)]
 mod signals;
 mod symcheck;
+mod threshold_counter_projection;
 mod tiers;
 mod tlc_equality;
 mod value_store;
@@ -117,6 +118,7 @@ fn all_test_files_registered() {
         "set_comparison",
         "signals",
         "symcheck",
+        "threshold_counter_projection",
         "tiers",
         "tlc_equality",
         "value_store",

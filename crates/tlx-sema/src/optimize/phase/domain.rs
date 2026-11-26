@@ -136,7 +136,7 @@ impl Domain {
         }
     }
 
-    fn integer_min(&self) -> Option<i128> {
+    pub(super) fn integer_min(&self) -> Option<i128> {
         match self {
             Self::Integer(n) => Some(*n),
             Self::Atoms(values) if !values.is_empty() => {
