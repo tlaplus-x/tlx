@@ -17,13 +17,14 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use tlx_base::partition::{Partition, INLINE_KEYS};
 use tlx_value::order::{cmp_tlc, try_total_cmp};
 use tlx_value::{ops, Sym, Value};
 
 use crate::error::{EResult, EvalError};
 
 pub(in crate::model) use factor::symmetry_group;
-use factor::{recognize_disjoint_factors, FactorizedGroup, FallbackOrder, Partition, INLINE_KEYS};
+use factor::{recognize_disjoint_factors, FactorizedGroup, FallbackOrder};
 use refine::{
     branch_general_value, has_any_moved_atom, is_orbit_cmp_safe, minimize_across_candidates, refine_deterministic, DetOutcome,
     FactorScratch,
@@ -656,7 +657,7 @@ impl Group {
                 debug_assert!(mode == CmpMode::Tlc);
                 Ok(self.choose_explicit(perms, moved, vals, order, cache_bags)?.map(|i| ChosenPerm::borrowed(&perms[i])))
             }
-            GroupKind::Factorized(fg) => match self.choose_factorized(fg, vals, order, mode, cache_bags, |win| win.to_chosen_perm(fg))? {
+            GroupKind::Factorized(fg) => match self.choose_factorized(fg, vals, order, mode, cache_bags, |win| fg.to_chosen_perm(win))? {
                 FactorChoice::Done(p) => Ok(p),
                 FactorChoice::FallbackOrdered => {
                     Ok(choose_factorized_lazy_ordered(fg, vals, order)?.map(|img| ChosenPerm::factor_heap(fg, img)))

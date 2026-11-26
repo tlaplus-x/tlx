@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tlx_base::partition::{ImgBuf, Partition, INLINE_KEYS};
 use tlx_eval::InterpModel;
 use tlx_layout::pack::{FieldLoc, SlotLayout};
 use tlx_layout::permute::{AtomPerm, AtomTable, DomMap, FactorGroupSpec, FactorPlan, PermPlan};
@@ -16,11 +17,6 @@ use tlx_runtime::ModelError;
 use tlx_value::{Sym, Value};
 
 use super::SemFp;
-
-/// Inline key capacity for stack-allocated [`WordPartition`] and image tables:
-/// covers `S_2..S_16`, `S_4^3`, `S_4 x S_4 x S_3`, `S_5^3`, etc. with zero
-/// per-state heap allocation.
-const INLINE_KEYS: usize = 16;
 
 /// Compiled encoded-word SYMMETRY engine: factorized partition refinement for
 /// disjoint symmetric-group products of any order (`|G| <= 720` and `|G| > 720`),
@@ -156,470 +152,6 @@ pub(super) fn symmetry_order(layout: &Layout) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| (width(i), i));
     order
-}
-
-// ---------------------------------------------------------------------------
-// Stack-allocated ordered block partition & image buffers
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-enum PartBuf {
-    Inline { buf: [u16; INLINE_KEYS * 5], stride: usize },
-    Heap { buf: Vec<u16>, stride: usize },
-}
-
-impl Default for PartBuf {
-    fn default() -> Self {
-        PartBuf::Inline { buf: [0; INLINE_KEYS * 5], stride: 0 }
-    }
-}
-
-impl PartBuf {
-    #[inline]
-    fn stride(&self) -> usize {
-        match self {
-            PartBuf::Inline { stride, .. } | PartBuf::Heap { stride, .. } => *stride,
-        }
-    }
-
-    #[inline]
-    fn raw(&self) -> &[u16] {
-        match self {
-            PartBuf::Inline { buf, stride } => &buf[..stride * 5],
-            PartBuf::Heap { buf, .. } => buf,
-        }
-    }
-
-    #[inline]
-    fn split_mut(&mut self) -> (&mut [u16], &mut [u16], &mut [u16], &mut [u16], &mut [u16]) {
-        let s = self.stride();
-        let raw = match self {
-            PartBuf::Inline { buf, .. } => &mut buf[..s * 5],
-            PartBuf::Heap { buf, .. } => buf.as_mut_slice(),
-        };
-        let (dom, rest) = raw.split_at_mut(s);
-        let (tgt, rest) = rest.split_at_mut(s);
-        let (pos_of, rest) = rest.split_at_mut(s);
-        let (block_lo, block_hi) = rest.split_at_mut(s);
-        (dom, tgt, pos_of, block_lo, block_hi)
-    }
-
-    fn alloc(&mut self, stride: usize) {
-        if stride <= INLINE_KEYS {
-            match self {
-                PartBuf::Inline { stride: s, .. } => *s = stride,
-                PartBuf::Heap { .. } => *self = PartBuf::Inline { buf: [0; INLINE_KEYS * 5], stride },
-            }
-        } else {
-            let need = stride * 5;
-            match self {
-                PartBuf::Heap { buf, stride: s } => {
-                    buf.resize(need, 0);
-                    *s = stride;
-                }
-                PartBuf::Inline { .. } => {
-                    *self = PartBuf::Heap { buf: vec![0; need], stride };
-                }
-            }
-        }
-    }
-}
-
-/// Ordered block partition of every factor `K_g`: each block `[lo, hi)` maps
-/// `dom[off + lo .. off + hi]` bijectively onto the sorted target slots
-/// `tgt[off + lo .. off + hi]`.
-#[derive(Clone, Default)]
-struct WordPartition {
-    buf: PartBuf,
-    unpinned: usize,
-}
-
-impl WordPartition {
-    #[inline]
-    fn dom(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[..s]
-    }
-
-    #[inline]
-    fn tgt(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[s..2 * s]
-    }
-
-    #[inline]
-    fn pos_of(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[2 * s..3 * s]
-    }
-
-    #[inline]
-    fn block_lo(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[3 * s..4 * s]
-    }
-
-    #[inline]
-    fn block_hi(&self) -> &[u16] {
-        let s = self.buf.stride();
-        &self.buf.raw()[4 * s..5 * s]
-    }
-
-    fn reset(&mut self, fg: &FactorGroupSpec) {
-        let total = fg.total_keys;
-        self.buf.alloc(total);
-        let (dom, tgt, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        for f in fg.factors.iter() {
-            let off = f.offset;
-            let n = f.keys.len() as u16;
-            for i in 0..n {
-                let idx = off + i as usize;
-                dom[idx] = i;
-                tgt[idx] = i;
-                pos_of[idx] = i;
-                block_lo[idx] = 0;
-                block_hi[idx] = n;
-            }
-        }
-        self.unpinned = total;
-    }
-
-    #[inline]
-    fn is_complete(&self) -> bool {
-        self.unpinned == 0
-    }
-
-    #[inline]
-    fn is_pinned(&self, fg: &FactorGroupSpec, g: usize, k: usize) -> bool {
-        let off = fg.factors[g].offset;
-        let pos = self.pos_of()[off + k] as usize;
-        self.block_hi()[off + pos] - self.block_lo()[off + pos] == 1
-    }
-
-    #[inline]
-    fn pinned_target(&self, fg: &FactorGroupSpec, g: usize, k: usize) -> Option<u16> {
-        let off = fg.factors[g].offset;
-        let pos = self.pos_of()[off + k] as usize;
-        (self.block_hi()[off + pos] - self.block_lo()[off + pos] == 1).then(|| self.tgt()[off + pos])
-    }
-
-    fn pin_to_slot(&mut self, fg: &FactorGroupSpec, g: usize, k: usize, slot_pos: usize) {
-        let off = fg.factors[g].offset;
-        let (dom, tgt, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let p = pos_of[off + k] as usize;
-        let lo = block_lo[off + p] as usize;
-        let hi = block_hi[off + p] as usize;
-        debug_assert!(slot_pos >= lo && slot_pos < hi);
-        if hi - lo == 1 {
-            return;
-        }
-        if p != lo {
-            let other = dom[off + lo] as usize;
-            dom[off + lo] = k as u16;
-            dom[off + p] = other as u16;
-            pos_of[off + k] = lo as u16;
-            pos_of[off + other] = p as u16;
-        }
-        if slot_pos != lo {
-            let t = tgt[off + slot_pos];
-            tgt.copy_within((off + lo)..(off + slot_pos), off + lo + 1);
-            tgt[off + lo] = t;
-        }
-        block_hi[off + lo] = (lo + 1) as u16;
-        for q in (lo + 1)..hi {
-            block_lo[off + q] = (lo + 1) as u16;
-        }
-        self.unpinned -= 1 + usize::from(hi - (lo + 1) == 1);
-    }
-
-    #[inline]
-    fn pin_smallest(&mut self, fg: &FactorGroupSpec, g: usize, k: usize) {
-        let off = fg.factors[g].offset;
-        let p = self.pos_of()[off + k] as usize;
-        let lo = self.block_lo()[off + p] as usize;
-        self.pin_to_slot(fg, g, k, lo);
-    }
-
-    fn split_by_pred(&mut self, fg: &FactorGroupSpec, g: usize, mut in_set: impl FnMut(usize) -> bool, scratch: &mut Vec<u16>) {
-        let off = fg.factors[g].offset;
-        let n = fg.factors[g].keys.len();
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 {
-                scratch.clear();
-                let mut write = lo;
-                for pos in lo..hi {
-                    let k = dom[off + pos];
-                    if in_set(k as usize) {
-                        dom[off + write] = k;
-                        write += 1;
-                    } else {
-                        scratch.push(k);
-                    }
-                }
-                let mid = write;
-                if mid > lo && mid < hi {
-                    dom[off + mid..off + hi].copy_from_slice(scratch);
-                    for pos in lo..hi {
-                        let k = dom[off + pos] as usize;
-                        pos_of[off + k] = pos as u16;
-                    }
-                    for pos in lo..mid {
-                        block_hi[off + pos] = mid as u16;
-                    }
-                    for pos in mid..hi {
-                        block_lo[off + pos] = mid as u16;
-                    }
-                    self.unpinned -= usize::from(mid - lo == 1) + usize::from(hi - mid == 1);
-                }
-            }
-            lo = hi;
-        }
-    }
-
-    fn bulk_place_first(&mut self, fg: &FactorGroupSpec, g: usize, lo: usize, chosen: &[u16]) {
-        let off = fg.factors[g].offset;
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let hi = block_hi[off + lo] as usize;
-        let m = chosen.len();
-        debug_assert!(m > 0 && lo + m <= hi);
-        if lo + m == hi {
-            return;
-        }
-        let mut rest_inline = [0u16; INLINE_KEYS];
-        let mut rest_heap: Vec<u16> = Vec::new();
-        let mut rlen = 0usize;
-        if hi - lo - m <= INLINE_KEYS {
-            for pos in lo..hi {
-                let k = dom[off + pos];
-                if !chosen.contains(&k) {
-                    rest_inline[rlen] = k;
-                    rlen += 1;
-                }
-            }
-        } else {
-            rest_heap.reserve(hi - lo - m);
-            for pos in lo..hi {
-                let k = dom[off + pos];
-                if !chosen.contains(&k) {
-                    rest_heap.push(k);
-                }
-            }
-        }
-        let mid = lo + m;
-        dom[off + lo..off + mid].copy_from_slice(chosen);
-        if hi - lo - m <= INLINE_KEYS {
-            dom[off + mid..off + hi].copy_from_slice(&rest_inline[..rlen]);
-        } else {
-            dom[off + mid..off + hi].copy_from_slice(&rest_heap);
-        }
-        for pos in lo..hi {
-            let k = dom[off + pos] as usize;
-            pos_of[off + k] = pos as u16;
-        }
-        for pos in lo..mid {
-            block_hi[off + pos] = mid as u16;
-        }
-        for pos in mid..hi {
-            block_lo[off + pos] = mid as u16;
-        }
-        self.unpinned -= usize::from(mid - lo == 1) + usize::from(hi - mid == 1);
-    }
-
-    fn refine_by_cmp(
-        &mut self,
-        fg: &FactorGroupSpec,
-        g: usize,
-        in_dom: impl Fn(usize) -> bool,
-        mut cmp: impl FnMut(u16, u16) -> Ordering,
-        scratch: &mut Vec<u16>,
-    ) {
-        let off = fg.factors[g].offset;
-        let n = fg.factors[g].keys.len();
-        let (dom, _, pos_of, block_lo, block_hi) = self.buf.split_mut();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 && in_dom(dom[off + lo] as usize) {
-                stable_sort_u16(&mut dom[off + lo..off + hi], &mut cmp, scratch);
-                for pos in lo..hi {
-                    let k = dom[off + pos] as usize;
-                    pos_of[off + k] = pos as u16;
-                }
-                let mut sub_lo = lo;
-                while sub_lo < hi {
-                    let mut sub_hi = sub_lo + 1;
-                    while sub_hi < hi && cmp(dom[off + sub_hi - 1], dom[off + sub_hi]) == Ordering::Equal {
-                        sub_hi += 1;
-                    }
-                    if sub_lo > lo || sub_hi < hi {
-                        for pos in sub_lo..sub_hi {
-                            block_lo[off + pos] = sub_lo as u16;
-                            block_hi[off + pos] = sub_hi as u16;
-                        }
-                        if sub_hi - sub_lo == 1 {
-                            self.unpinned -= 1;
-                        }
-                    }
-                    sub_lo = sub_hi;
-                }
-            }
-            lo = hi;
-        }
-    }
-
-    fn fill_img(&self, fg: &FactorGroupSpec, dst: &mut ImgBuf) {
-        dst.resize(fg.total_keys);
-        let out = dst.as_mut_slice();
-        let dom = self.dom();
-        let tgt = self.tgt();
-        for f in fg.factors.iter() {
-            let off = f.offset;
-            for pos in 0..f.keys.len() {
-                let k = dom[off + pos] as usize;
-                out[off + k] = tgt[off + pos];
-            }
-        }
-    }
-
-    fn contains_identity(&self, fg: &FactorGroupSpec) -> bool {
-        let dom = self.dom();
-        let tgt = self.tgt();
-        let block_lo = self.block_lo();
-        let block_hi = self.block_hi();
-        for f in fg.factors.iter() {
-            let off = f.offset;
-            for pos in 0..f.keys.len() {
-                let k = dom[off + pos];
-                let lo = block_lo[off + pos] as usize;
-                let hi = block_hi[off + pos] as usize;
-                if hi - lo == 1 {
-                    if tgt[off + lo] != k {
-                        return false;
-                    }
-                } else if tgt[off + lo..off + hi].binary_search(&k).is_err() {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    fn canonicalize_unpinned_blocks(&mut self, fg: &FactorGroupSpec) {
-        let (dom, _, pos_of, _, block_hi) = self.buf.split_mut();
-        for f in fg.factors.iter() {
-            let off = f.offset;
-            let n = f.keys.len();
-            let mut lo = 0usize;
-            while lo < n {
-                let hi = block_hi[off + lo] as usize;
-                if hi - lo > 1 {
-                    dom[off + lo..off + hi].sort_unstable();
-                    for pos in lo..hi {
-                        let k = dom[off + pos] as usize;
-                        pos_of[off + k] = pos as u16;
-                    }
-                }
-                lo = hi;
-            }
-        }
-    }
-}
-
-/// Stack-allocated flat permutation image table for `total_keys <= INLINE_KEYS`.
-#[derive(Clone)]
-enum ImgBuf {
-    Inline { buf: [u16; INLINE_KEYS], len: usize },
-    Heap(Vec<u16>),
-}
-
-impl Default for ImgBuf {
-    fn default() -> Self {
-        ImgBuf::Inline { buf: [0; INLINE_KEYS], len: 0 }
-    }
-}
-
-impl ImgBuf {
-    fn resize(&mut self, len: usize) {
-        if len <= INLINE_KEYS {
-            match self {
-                ImgBuf::Inline { len: l, .. } => *l = len,
-                ImgBuf::Heap(_) => *self = ImgBuf::Inline { buf: [0; INLINE_KEYS], len },
-            }
-        } else {
-            match self {
-                ImgBuf::Heap(v) => v.resize(len, 0),
-                ImgBuf::Inline { .. } => *self = ImgBuf::Heap(vec![0; len]),
-            }
-        }
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u16] {
-        match self {
-            ImgBuf::Inline { buf, len } => &buf[..*len],
-            ImgBuf::Heap(v) => v,
-        }
-    }
-
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [u16] {
-        match self {
-            ImgBuf::Inline { buf, len } => &mut buf[..*len],
-            ImgBuf::Heap(v) => v,
-        }
-    }
-}
-
-fn stable_sort_u16(slice: &mut [u16], cmp: &mut impl FnMut(u16, u16) -> Ordering, scratch: &mut Vec<u16>) {
-    let n = slice.len();
-    if n <= 16 {
-        for i in 1..n {
-            let key = slice[i];
-            let mut j = i;
-            while j > 0 && cmp(key, slice[j - 1]) == Ordering::Less {
-                slice[j] = slice[j - 1];
-                j -= 1;
-            }
-            slice[j] = key;
-        }
-        return;
-    }
-    scratch.resize(n, 0);
-    let mut width = 1usize;
-    while width < n {
-        let mut lo = 0usize;
-        while lo < n {
-            let mid = (lo + width).min(n);
-            let hi = (lo + 2 * width).min(n);
-            let (mut i, mut j, mut out) = (lo, mid, lo);
-            while i < mid && j < hi {
-                if cmp(slice[j], slice[i]) == Ordering::Less {
-                    scratch[out] = slice[j];
-                    j += 1;
-                } else {
-                    scratch[out] = slice[i];
-                    i += 1;
-                }
-                out += 1;
-            }
-            while i < mid {
-                scratch[out] = slice[i];
-                i += 1;
-                out += 1;
-            }
-            while j < hi {
-                scratch[out] = slice[j];
-                j += 1;
-                out += 1;
-            }
-            slice[lo..hi].copy_from_slice(&scratch[lo..hi]);
-            lo = hi;
-        }
-        width *= 2;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +310,7 @@ fn apply_item(mode: WordOrder, fg: &FactorGroupSpec, img: &[u16], item: WorkItem
 }
 
 #[inline]
-fn map_scalar_part(fg: &FactorGroupSpec, table: &AtomTable, part: &WordPartition, raw: u64) -> u64 {
+fn map_scalar_part(fg: &FactorGroupSpec, table: &AtomTable, part: &Partition, raw: u64) -> u64 {
     match table.code_to_key[raw as usize] {
         None => raw,
         Some((g, k)) => {
@@ -955,7 +487,7 @@ fn for_each_moved_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], f:
     }
 }
 
-fn has_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &WordPartition) -> bool {
+fn has_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &Partition) -> bool {
     if part.is_complete() || plan.is_identity() {
         return false;
     }
@@ -968,7 +500,7 @@ fn has_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part
     found
 }
 
-fn has_unpinned_in_factor_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &WordPartition, target_g: usize) -> bool {
+fn has_unpinned_in_factor_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &Partition, target_g: usize) -> bool {
     if part.is_complete() || plan.is_identity() {
         return false;
     }
@@ -981,7 +513,7 @@ fn has_unpinned_in_factor_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[
     found
 }
 
-fn collect_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &WordPartition, out: &mut Vec<(usize, usize)>) {
+fn collect_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], part: &Partition, out: &mut Vec<(usize, usize)>) {
     out.clear();
     if part.is_complete() || plan.is_identity() {
         return;
@@ -999,7 +531,7 @@ fn collect_unpinned_words(fg: &FactorGroupSpec, plan: &FactorPlan, raw: &[u64], 
 
 #[derive(Default)]
 struct FactorScratch {
-    part: WordPartition,
+    part: Partition,
     sort: Vec<u16>,
     img: ImgBuf,
     payload_buf: Vec<u64>,
@@ -1093,7 +625,7 @@ impl Iterator for BitsetIter<'_> {
 /// (`BranchOne` at the end of the iterator) paths remain allocation-free.
 fn refine_ordered_children<'a>(
     fg: &FactorGroupSpec,
-    part: &mut WordPartition,
+    part: &mut Partition,
     mut children: impl Iterator<Item = WorkItem<'a>>,
     mode: WordOrder,
     scratch: &mut FactorScratch,
@@ -1125,7 +657,7 @@ fn refine_ordered_children<'a>(
 
 fn refine_deterministic<'a>(
     fg: &FactorGroupSpec,
-    part: &mut WordPartition,
+    part: &mut Partition,
     item: WorkItem<'a>,
     mode: WordOrder,
     scratch: &mut FactorScratch,
@@ -1321,7 +853,7 @@ fn refine_deterministic<'a>(
 #[allow(clippy::too_many_arguments)]
 fn refine_fixed_slots<'a>(
     fg: &FactorGroupSpec,
-    part: &mut WordPartition,
+    part: &mut Partition,
     len: usize,
     slot: SlotLayout,
     range: &'a FactorPlan,
@@ -1367,7 +899,7 @@ fn refine_fixed_slots<'a>(
 
 fn refine_fixed_map_slots<'a>(
     fg: &FactorGroupSpec,
-    part: &mut WordPartition,
+    part: &mut Partition,
     dims: tlx_layout::layout::MapDims,
     range: &'a FactorPlan,
     item: WorkItem<'a>,
@@ -1419,7 +951,7 @@ fn refine_fixed_map_slots<'a>(
 #[allow(clippy::too_many_arguments)]
 fn refine_keyed_slots<'a>(
     fg: &FactorGroupSpec,
-    part: &mut WordPartition,
+    part: &mut Partition,
     g: usize,
     n: usize,
     bw_opt: Option<usize>,
@@ -1491,7 +1023,7 @@ fn refine_keyed_slots<'a>(
         if all_dom_pinned {
             return DetOutcome::Done;
         }
-        part.fill_img(fg, &mut scratch.img);
+        part.fill_img_buf(fg, &mut scratch.img);
         let img = scratch.img.as_slice();
         match slot {
             SlotLayout::Bits(bits) => {
@@ -1658,11 +1190,11 @@ fn refine_keyed_slots<'a>(
 /// the first differing slot without permuting the rest of a wide function.
 fn minimize_complete_candidates(
     fg: &FactorGroupSpec,
-    candidates: Vec<WordPartition>,
+    candidates: Vec<Partition>,
     item: WorkItem<'_>,
     mode: WordOrder,
     scratch: &mut FactorScratch,
-) -> Vec<WordPartition> {
+) -> Vec<Partition> {
     if candidates.len() <= 1 || item.plan.is_identity() {
         return candidates;
     }
@@ -1683,7 +1215,7 @@ fn minimize_complete_candidates(
             if cands.len() <= 1 {
                 break;
             }
-            let mut next_best: Vec<WordPartition> = Vec::with_capacity(cands.len());
+            let mut next_best: Vec<Partition> = Vec::with_capacity(cands.len());
             for part in cands {
                 let dom = part.dom();
                 let tgt = part.tgt();
@@ -1700,7 +1232,7 @@ fn minimize_complete_candidates(
                 if range.is_identity() {
                     cur_slot.copy_from_slice(sub.canon);
                 } else {
-                    part.fill_img(fg, &mut cur_img);
+                    part.fill_img_buf(fg, &mut cur_img);
                     apply_item(mode, fg, cur_img.as_slice(), sub, &mut cur_slot);
                 }
                 if next_best.is_empty() {
@@ -1731,9 +1263,9 @@ fn minimize_complete_candidates(
     let mut best_words = std::mem::take(&mut scratch.cand_best);
     cur_words.resize(w, 0);
     best_words.resize(w, 0);
-    let mut best_parts: Vec<WordPartition> = Vec::with_capacity(candidates.len());
+    let mut best_parts: Vec<Partition> = Vec::with_capacity(candidates.len());
     for part in candidates {
-        part.fill_img(fg, &mut cur_img);
+        part.fill_img_buf(fg, &mut cur_img);
         apply_item(mode, fg, cur_img.as_slice(), item, &mut cur_words);
         if best_parts.is_empty() {
             best_words.copy_from_slice(&cur_words);
@@ -1758,11 +1290,11 @@ fn minimize_complete_candidates(
 /// Refine and prune a set of tied candidate partitions on `pending`.
 fn minimize_across_candidates(
     fg: &FactorGroupSpec,
-    candidates: Vec<WordPartition>,
+    candidates: Vec<Partition>,
     pending: PendingItem<'_>,
     mode: WordOrder,
     scratch: &mut FactorScratch,
-) -> Vec<WordPartition> {
+) -> Vec<Partition> {
     match pending {
         PendingItem::PackedAtom { table, raw_code } => {
             let mut best_val = u64::MAX;
@@ -1788,7 +1320,7 @@ fn minimize_across_candidates(
             if item.plan.is_identity() {
                 return candidates;
             }
-            if candidates.iter().all(WordPartition::is_complete) {
+            if candidates.iter().all(Partition::is_complete) {
                 return minimize_complete_candidates(fg, candidates, item, mode, scratch);
             }
             // Decompose fixed-order composites field-by-field to prune losers early.
@@ -1885,7 +1417,7 @@ fn minimize_across_candidates(
             }
 
             let w = item.plan.words();
-            let mut best_parts: Vec<WordPartition> = Vec::with_capacity(candidates.len());
+            let mut best_parts: Vec<Partition> = Vec::with_capacity(candidates.len());
             let mut cur_img = ImgBuf::default();
             let mut cur_inline = [0u64; 16];
             let mut best_inline = [0u64; 16];
@@ -1897,7 +1429,7 @@ fn minimize_across_candidates(
             for mut part in candidates {
                 match refine_deterministic(fg, &mut part, item, mode, scratch) {
                     DetOutcome::Done => {
-                        part.fill_img(fg, &mut cur_img);
+                        part.fill_img_buf(fg, &mut cur_img);
                         apply_item(mode, fg, cur_img.as_slice(), item, cur_words);
                         if best_parts.is_empty() {
                             best_words.copy_from_slice(cur_words);
@@ -1919,7 +1451,7 @@ fn minimize_across_candidates(
                         if refined.is_empty() {
                             continue;
                         }
-                        refined[0].fill_img(fg, &mut cur_img);
+                        refined[0].fill_img_buf(fg, &mut cur_img);
                         apply_item(mode, fg, cur_img.as_slice(), item, cur_words);
                         if best_parts.is_empty() {
                             best_words.copy_from_slice(cur_words);
@@ -1943,7 +1475,7 @@ fn minimize_across_candidates(
                         if refined.is_empty() {
                             continue;
                         }
-                        refined[0].fill_img(fg, &mut cur_img);
+                        refined[0].fill_img_buf(fg, &mut cur_img);
                         apply_item(mode, fg, cur_img.as_slice(), item, cur_words);
                         if best_parts.is_empty() {
                             best_words.copy_from_slice(cur_words);
@@ -1971,11 +1503,11 @@ fn minimize_across_candidates(
 /// recursive encodings to active-atom Case B.
 fn branch_single_word(
     fg: &FactorGroupSpec,
-    part: WordPartition,
+    part: Partition,
     item: WorkItem<'_>,
     mode: WordOrder,
     scratch: &mut FactorScratch,
-) -> Vec<WordPartition> {
+) -> Vec<Partition> {
     match item.plan {
         FactorPlan::Fcn { dom: DomMap::DirectFactor { factor, len }, slot, range, .. } => {
             let g = *factor as usize;
@@ -2088,7 +1620,7 @@ fn branch_single_word(
 #[allow(clippy::too_many_arguments)]
 fn branch_keyed(
     fg: &FactorGroupSpec,
-    part: WordPartition,
+    part: Partition,
     g: usize,
     slot: SlotLayout,
     range: &FactorPlan,
@@ -2098,7 +1630,7 @@ fn branch_keyed(
     dom_slots: &[u16],
     mode: WordOrder,
     scratch: &mut FactorScratch,
-) -> Vec<WordPartition> {
+) -> Vec<Partition> {
     match slot {
         SlotLayout::Bits(bits) => {
             let FactorPlan::Atom(table) = range else { unreachable!("non-copy packed range must be Atom") };
@@ -2114,7 +1646,7 @@ fn branch_keyed(
                 epoch: u64,
                 scalars_inline: [u64; INLINE_KEYS],
                 scalars_heap: Vec<u64>,
-                parts: Vec<WordPartition>,
+                parts: Vec<Partition>,
             }
             impl BitsBest {
                 #[inline]
@@ -2125,7 +1657,7 @@ fn branch_keyed(
                         &self.scalars_heap
                     }
                 }
-                fn set_best(&mut self, cur: &[u64], part: WordPartition) {
+                fn set_best(&mut self, cur: &[u64], part: Partition) {
                     self.epoch += 1;
                     if cur.len() <= INLINE_KEYS {
                         self.scalars_inline[..cur.len()].copy_from_slice(cur);
@@ -2139,7 +1671,7 @@ fn branch_keyed(
             }
             fn step_bits_run(
                 ctx: &BitsCtx<'_>,
-                mut next: WordPartition,
+                mut next: Partition,
                 slot_idx: usize,
                 run_len: usize,
                 raw: u64,
@@ -2174,7 +1706,7 @@ fn branch_keyed(
             }
             fn dfs_bits(
                 ctx: &BitsCtx<'_>,
-                part: WordPartition,
+                part: Partition,
                 slot_idx: usize,
                 beat_epoch: Option<u64>,
                 cur: &mut [u64],
@@ -2320,7 +1852,7 @@ fn branch_keyed(
                 /// Concatenated canonicalized permuted slot words (`dom_slots.len() * rw`).
                 slot_words_inline: [u64; INLINE_RUN_WORDS],
                 slot_words_heap: Vec<u64>,
-                parts: Vec<WordPartition>,
+                parts: Vec<Partition>,
             }
             impl WordsBest {
                 #[inline]
@@ -2331,7 +1863,7 @@ fn branch_keyed(
                         &self.slot_words_heap
                     }
                 }
-                fn set_best(&mut self, cur: &[u64], part: WordPartition) {
+                fn set_best(&mut self, cur: &[u64], part: Partition) {
                     self.epoch += 1;
                     if cur.len() <= INLINE_RUN_WORDS {
                         self.slot_words_inline[..cur.len()].copy_from_slice(cur);
@@ -2347,7 +1879,7 @@ fn branch_keyed(
             #[allow(clippy::too_many_arguments)]
             fn step_run(
                 ctx: &WordsCtx<'_>,
-                mut part: WordPartition,
+                mut part: Partition,
                 slot_idx: usize,
                 run_len: usize,
                 k: usize,
@@ -2374,7 +1906,7 @@ fn branch_keyed(
                 let det = refine_deterministic(ctx.fg, &mut part, item, ctx.mode, scratch);
                 match det {
                     DetOutcome::Done => {
-                        part.fill_img(ctx.fg, &mut img);
+                        part.fill_img_buf(ctx.fg, &mut img);
                         apply_item(ctx.mode, ctx.fg, img.as_slice(), item, min_w);
                         let mut next_beat = beat_epoch;
                         if let Some(b) = best.as_ref() {
@@ -2404,7 +1936,7 @@ fn branch_keyed(
                         if sub_parts.is_empty() {
                             return;
                         }
-                        sub_parts[0].fill_img(ctx.fg, &mut img);
+                        sub_parts[0].fill_img_buf(ctx.fg, &mut img);
                         apply_item(ctx.mode, ctx.fg, img.as_slice(), item, min_w);
                         let mut next_beat = beat_epoch;
                         if let Some(b) = best.as_ref() {
@@ -2439,7 +1971,7 @@ fn branch_keyed(
                         if sub_parts.is_empty() {
                             return;
                         }
-                        sub_parts[0].fill_img(ctx.fg, &mut img);
+                        sub_parts[0].fill_img_buf(ctx.fg, &mut img);
                         apply_item(ctx.mode, ctx.fg, img.as_slice(), item, min_w);
                         let mut next_beat = beat_epoch;
                         if let Some(b) = best.as_ref() {
@@ -2471,7 +2003,7 @@ fn branch_keyed(
 
             fn dfs_words(
                 ctx: &WordsCtx<'_>,
-                part: WordPartition,
+                part: Partition,
                 slot_idx: usize,
                 beat_epoch: Option<u64>,
                 cur_words: &mut [u64],
@@ -2620,54 +2152,24 @@ fn branch_keyed(
 /// exact same image of `item`).
 fn is_invariant_under_block_swaps_words(
     fg: &FactorGroupSpec,
-    part: &WordPartition,
+    part: &Partition,
     item: WorkItem<'_>,
     active: &[(usize, usize)],
     mode: WordOrder,
 ) -> bool {
-    let mut swap_img = ImgBuf::default();
-    swap_img.resize(fg.total_keys);
-    fg.fill_identity_img(swap_img.as_mut_slice());
     let w = item.plan.words();
     let mut swapped_inline = [0u64; 16];
     let mut swapped_heap: Vec<u64> = if w > 16 { vec![0u64; w] } else { Vec::new() };
     let swapped: &mut [u64] = if w <= 16 { &mut swapped_inline[..w] } else { &mut swapped_heap };
-    let dom = part.dom();
-    let block_hi = part.block_hi();
-    for (g, f) in fg.factors.iter().enumerate() {
-        if !active.iter().any(|&(ag, _)| ag == g) {
-            continue;
-        }
-        let off = f.offset;
-        let n = f.keys.len();
-        let mut lo = 0usize;
-        while lo < n {
-            let hi = block_hi[off + lo] as usize;
-            if hi - lo > 1 && (lo..hi).any(|pos| active.contains(&(g, dom[off + pos] as usize))) {
-                for pos in lo..(hi - 1) {
-                    let ka = dom[off + pos];
-                    let kb = dom[off + pos + 1];
-                    let s = swap_img.as_mut_slice();
-                    s[off + ka as usize] = kb;
-                    s[off + kb as usize] = ka;
-                    apply_item(mode, fg, swap_img.as_slice(), item, swapped);
-                    let s = swap_img.as_mut_slice();
-                    s[off + ka as usize] = ka;
-                    s[off + kb as usize] = kb;
-                    if cmp_words_mode(mode, item.plan, item.node, item.wide_bitset, swapped, item.canon) != Ordering::Equal {
-                        return false;
-                    }
-                }
-            }
-            lo = hi;
-        }
-    }
-    true
+    part.all_active_block_swaps(fg, active, |swap_img| {
+        apply_item(mode, fg, swap_img, item, swapped);
+        cmp_words_mode(mode, item.plan, item.node, item.wide_bitset, swapped, item.canon) == Ordering::Equal
+    })
 }
 
 /// Case B: active-atom branch-and-bound for general recursive encodings
 /// (`Sorted`, `BitsetRank`, multi-factor `Fcn`/`Map`, `Dyn`, `Ref`).
-fn branch_general_words(fg: &FactorGroupSpec, part: WordPartition, item: WorkItem<'_>, mode: WordOrder) -> Vec<WordPartition> {
+fn branch_general_words(fg: &FactorGroupSpec, part: Partition, item: WorkItem<'_>, mode: WordOrder) -> Vec<Partition> {
     let mut active = Vec::new();
     collect_unpinned_words(fg, item.plan, item.raw, &part, &mut active);
     if active.is_empty() {
@@ -2677,61 +2179,34 @@ fn branch_general_words(fg: &FactorGroupSpec, part: WordPartition, item: WorkIte
         return vec![part];
     }
 
-    struct GenCtx<'a> {
-        fg: &'a FactorGroupSpec,
-        item: WorkItem<'a>,
-        active: &'a [(usize, usize)],
-        mode: WordOrder,
-    }
     struct GenBest {
         words: Vec<u64>,
-        parts: Vec<WordPartition>,
+        parts: Vec<Partition>,
     }
 
     let w = item.plan.words();
-    let ctx = GenCtx { fg, item, active: &active, mode };
     let mut best: Option<GenBest> = None;
     let mut cur_img = ImgBuf::default();
     let mut cur_inline = [0u64; 16];
     let mut cur_heap: Vec<u64> = if w > 16 { vec![0u64; w] } else { Vec::new() };
     let cur_words: &mut [u64] = if w <= 16 { &mut cur_inline[..w] } else { &mut cur_heap };
-
-    fn dfs(ctx: &GenCtx<'_>, part: WordPartition, idx: usize, cur_img: &mut ImgBuf, cur_words: &mut [u64], best: &mut Option<GenBest>) {
-        if idx == ctx.active.len() {
-            part.fill_img(ctx.fg, cur_img);
-            apply_item(ctx.mode, ctx.fg, cur_img.as_slice(), ctx.item, cur_words);
-            match best {
-                None => *best = Some(GenBest { words: cur_words.to_vec(), parts: vec![part] }),
-                Some(b) => match cmp_words_mode(ctx.mode, ctx.item.plan, ctx.item.node, ctx.item.wide_bitset, cur_words, &b.words) {
-                    Ordering::Greater => {}
-                    Ordering::Equal => b.parts.push(part),
-                    Ordering::Less => {
-                        b.words.clear();
-                        b.words.extend_from_slice(cur_words);
-                        b.parts.clear();
-                        b.parts.push(part);
-                    }
-                },
-            }
-            return;
+    part.for_each_active_completion(fg, &active, |leaf| {
+        leaf.fill_img_buf(fg, &mut cur_img);
+        apply_item(mode, fg, cur_img.as_slice(), item, cur_words);
+        match &mut best {
+            None => best = Some(GenBest { words: cur_words.to_vec(), parts: vec![leaf] }),
+            Some(b) => match cmp_words_mode(mode, item.plan, item.node, item.wide_bitset, cur_words, &b.words) {
+                Ordering::Greater => {}
+                Ordering::Equal => b.parts.push(leaf),
+                Ordering::Less => {
+                    b.words.clear();
+                    b.words.extend_from_slice(cur_words);
+                    b.parts.clear();
+                    b.parts.push(leaf);
+                }
+            },
         }
-        let (g, k) = ctx.active[idx];
-        let off = ctx.fg.factors[g].offset;
-        let p = part.pos_of()[off + k] as usize;
-        let lo = part.block_lo()[off + p] as usize;
-        let hi = part.block_hi()[off + p] as usize;
-        if hi - lo == 1 {
-            dfs(ctx, part, idx + 1, cur_img, cur_words, best);
-            return;
-        }
-        for slot_pos in lo..hi {
-            let mut next = part.clone();
-            next.pin_to_slot(ctx.fg, g, k, slot_pos);
-            dfs(ctx, next, idx + 1, cur_img, cur_words, best);
-        }
-    }
-
-    dfs(&ctx, part, 0, &mut cur_img, cur_words, &mut best);
+    });
     best.map_or_else(Vec::new, |b| b.parts)
 }
 
@@ -2752,7 +2227,7 @@ fn choose_factorized_words(
     let mut part = std::mem::take(&mut scratch.part);
     let mut var_canon_buf = std::mem::take(&mut scratch.var_canon_buf);
     part.reset(fg);
-    let mut cands: Option<Vec<WordPartition>> = None;
+    let mut cands: Option<Vec<Partition>> = None;
 
     for &i in order {
         if fsym.plans[i].is_identity() {
@@ -2841,7 +2316,7 @@ fn choose_factorized_words(
                 false
             } else {
                 part.canonicalize_unpinned_blocks(fg);
-                part.fill_img(fg, &mut scratch.img);
+                part.fill_img_buf(fg, &mut scratch.img);
                 true
             }
         }
@@ -2851,7 +2326,7 @@ fn choose_factorized_words(
             } else {
                 let win = &mut cs[0];
                 win.canonicalize_unpinned_blocks(fg);
-                win.fill_img(fg, &mut scratch.img);
+                win.fill_img_buf(fg, &mut scratch.img);
                 true
             }
         }
@@ -3538,7 +3013,7 @@ Next == UNCHANGED <<x, f>>
             // Directly inspect `branch_single_word`: must return 1 partition
             // with `K_a` completely unpinned (`[0..n)`) rather than `n!` partitions.
             let mut scratch = FactorScratch::default();
-            let mut part = WordPartition::default();
+            let mut part = Partition::default();
             part.reset(&fg);
             let mut canon = vec![0u64; layout.words];
             // SAFETY: valid encoded words from `layout.encode_state`.

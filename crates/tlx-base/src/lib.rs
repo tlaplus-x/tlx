@@ -11,6 +11,7 @@ pub mod hash;
 pub mod knobs;
 pub mod padded;
 pub mod par;
+pub mod partition;
 pub mod rng;
 pub mod stack;
 pub mod sync {
