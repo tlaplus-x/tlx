@@ -638,8 +638,8 @@ Proven symmetry: define Perms == Permutations(Key) \cup Permutations(Val) \cup P
 
 ### 6.3. Automatic symmetry in the default mode
 
-Automatic symmetry applies a disjoint product of full groups (two to six model
-values each, total order at most 720) when backed by a connected Lean certificate
+Automatic symmetry applies a disjoint product of full groups (two to seven model
+values each, total order at most 5,040) when backed by a connected Lean certificate
 (`KeyedCertificate`, `EquivSymCertificate`, or `ChooseSymCertificate`). Each
 application emits standalone Lean before search, without invoking Lean. The
 [certificate coverage](optimization.md#certified-keyed-symmetry) describes

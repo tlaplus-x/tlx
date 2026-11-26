@@ -513,6 +513,220 @@ fn certified_scalar_slot_and_product_sets_preserve_verdicts_across_tiers() {
     }
 }
 
+const KEYED_SEVEN: &str = include_str!("../../../proofs/symmetry/KeyedSeven.tla");
+const KEYED_SEVEN_CFG: &str = include_str!("../../../proofs/symmetry/KeyedSeven.cfg");
+const PRODUCT_LARGE: &str = include_str!("../../../proofs/symmetry/ProductLarge.tla");
+const PRODUCT_LARGE_CFG: &str = include_str!("../../../proofs/symmetry/ProductLarge.cfg");
+
+#[test]
+fn inert_larger_group_does_not_displace_a_productive_smaller_one() {
+    // Six workers advance independently (0..=4 each: 15,625 concrete states),
+    // while `epoch` stays the all-zero map over seven shards. Every permutation
+    // of `Shards` fixes every reachable state, so the larger `7! = 5,040` group
+    // reduces nothing; it must not displace the productive `6! = 720` `Workers`
+    // group. The reduced search visits one multiset of worker values per orbit:
+    // C(10, 4) = 210 states.
+    let tla = "---- MODULE Workers ----\nEXTENDS Naturals\nCONSTANTS Workers, Shards\nVARIABLES worker, epoch\n\
+        Init == worker = [w \\in Workers |-> 0] /\\ epoch = [s \\in Shards |-> 0]\n\
+        Next == \\E w \\in Workers : worker[w] < 4 /\\ worker' = [worker EXCEPT ![w] = @ + 1] /\\ UNCHANGED epoch\n\
+        Inv == (\\A w \\in Workers : worker[w] <= 4) /\\ (\\A s \\in Shards : epoch[s] = 0)\n====\n";
+    let cfg = "CONSTANTS Workers = {w1, w2, w3, w4, w5, w6}\n          Shards = {s1, s2, s3, s4, s5, s6, s7}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("Workers", tla, cfg);
+    let reference = tlx_testkit::tlx_default!()
+        .args(["check", "Workers.tla", "-interp", "-noautosymmetry"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(120))
+        .run();
+    assert_eq!(reference.code, 0, "{}", reference.text());
+    assert!(reference.stdout.contains("15625 distinct states found"), "{}", reference.text());
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "Workers.tla", tier, "-stats"])
+            .envs([("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(r.code, 0, "{tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: symmetry Permutations(Workers) (certificate generated"), "{tier}: {}", r.text());
+        assert!(r.stdout.contains("210 distinct states found, 0 states left on queue (symmetry-reduced)."), "{tier}: {}", r.text());
+        assert!(r.text().contains("Shards: not applied"), "{tier}: the inert Shards group must be reported in -stats: {}", r.text());
+    }
+}
+
+#[test]
+fn rejected_states_and_edges_do_not_make_an_inert_group_displace_a_productive_one() {
+    // Rejected transitions (by state CONSTRAINT or ACTION_CONSTRAINT) and rejected initial
+    // states must not count as movement for group selection: in every variant below, every
+    // admitted state has `epochs = [s \in Shards |-> 0]`, so `Shards` (7! = 5,040) is inert
+    // on the admitted graph and must not displace `Workers` (6! = 720, 210 distinct states).
+    let state_constrained_tla = "---- MODULE Workers ----\nEXTENDS Naturals\nCONSTANTS Workers, Shards\nVARIABLES pc, epochs\n\
+        Init == pc = [p \\in Workers |-> 0] /\\ epochs = [s \\in Shards |-> 0]\n\
+        Tick == \\E p \\in Workers : pc[p] < 4 /\\ pc' = [pc EXCEPT ![p] = @ + 1] /\\ UNCHANGED epochs\n\
+        Rotate == \\E s \\in Shards : epochs[s] = 0 /\\ epochs' = [epochs EXCEPT ![s] = 1] /\\ UNCHANGED pc\n\
+        Next == Rotate \\/ Tick\n\
+        Bound == \\A s \\in Shards : epochs[s] = 0\n\
+        NoRotate == \\A s \\in Shards : epochs'[s] = epochs[s]\n\
+        Inv == (\\A p \\in Workers : pc[p] <= 4) /\\ (\\A s \\in Shards : epochs[s] <= 1)\n====\n";
+    let init_constrained_tla = "---- MODULE Workers ----\nEXTENDS Naturals\nCONSTANTS Workers, Shards\nVARIABLES pc, epochs\n\
+        Init == pc = [p \\in Workers |-> 0]\n\
+             /\\ (epochs = [s \\in Shards |-> 0] \\/ (\\E s \\in Shards : epochs = [x \\in Shards |-> IF x = s THEN 1 ELSE 0]))\n\
+        Tick == \\E p \\in Workers : pc[p] < 4 /\\ pc' = [pc EXCEPT ![p] = @ + 1] /\\ UNCHANGED epochs\n\
+        Next == Tick\n\
+        Bound == \\A s \\in Shards : epochs[s] = 0\n\
+        Inv == (\\A p \\in Workers : pc[p] <= 4) /\\ (\\A s \\in Shards : epochs[s] <= 1)\n====\n";
+    let base_cfg = "CONSTANTS Workers = {w1, w2, w3, w4, w5, w6}\n          Shards = {s1, s2, s3, s4, s5, s6, s7}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    for (case, tla, extra_cfg) in [
+        ("state-constraint", state_constrained_tla, "CONSTRAINT Bound\n"),
+        ("action-constraint", state_constrained_tla, "ACTION_CONSTRAINT NoRotate\n"),
+        ("init-constraint", init_constrained_tla, "CONSTRAINT Bound\n"),
+    ] {
+        let cfg = format!("{base_cfg}{extra_cfg}");
+        let dir = tlx_testkit::TempDir::with_spec("Workers", tla, &cfg);
+        for tier in ["-interp", "-compile"] {
+            let r = tlx_testkit::tlx_default!()
+                .args(["check", "Workers.tla", tier, "-workers", "1", "-stats"])
+                .envs([("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")])
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
+                .dir(&dir)
+                .timeout(Duration::from_secs(120))
+                .run();
+            assert_eq!(r.code, 0, "{case} {tier}: {}", r.text());
+            assert!(
+                r.stdout.contains("Optimizations: symmetry Permutations(Workers) (certificate generated"),
+                "{case} {tier}: {}",
+                r.text()
+            );
+            assert!(
+                r.stdout.contains("210 distinct states found, 0 states left on queue (symmetry-reduced)."),
+                "{case} {tier}: {}",
+                r.text()
+            );
+            assert!(
+                r.text().contains("Shards: not applied"),
+                "{case} {tier}: the inert Shards group must be reported in -stats: {}",
+                r.text()
+            );
+        }
+    }
+}
+
+#[test]
+fn large_disjoint_products_certify_and_reduce_across_tiers() {
+    // `S_7` (order 5,040) and a `4! x 4! x 3! = 3,456` product are above the
+    // old 720-element application bound; both must certify and reduce in the
+    // interpreter and in the compiled tier (which fingerprints the encoded
+    // state by value for groups above its plan cache and must agree).
+    for (name, tla, cfg, group, concrete, reduced) in [
+        ("KeyedSeven", KEYED_SEVEN, KEYED_SEVEN_CFG, "Permutations(Proc)", "2187 distinct states found", "36 distinct states found"),
+        (
+            "ProductLarge",
+            PRODUCT_LARGE,
+            PRODUCT_LARGE_CFG,
+            "Permutations(K) x Permutations(V) x Permutations(T)",
+            "2048 distinct states found",
+            "100 distinct states found",
+        ),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec(name, tla, cfg);
+        let tlc = tlx_testkit::tlx_default!()
+            .args(["check", &format!("{name}.tla"), "-tlc", "-interp"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(tlc.code, 0, "{name} -tlc: {}", tlc.text());
+        assert!(tlc.stdout.contains(concrete), "{name} -tlc: {}", tlc.text());
+        assert!(tlc.stdout.contains("to use it, run without -tlc"), "{name} -tlc: {}", tlc.text());
+
+        let reference = tlx_testkit::tlx_default!()
+            .args(["check", &format!("{name}.tla"), "-interp", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(reference.code, 0, "{name} reference: {}", reference.text());
+        assert!(reference.stdout.contains(concrete), "{name} reference: {}", reference.text());
+
+        for tier in ["-interp", "-compile"] {
+            let r = tlx_testkit::tlx_default!()
+                .args(["check", &format!("{name}.tla"), tier])
+                .envs([("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")])
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
+                .dir(&dir)
+                .timeout(Duration::from_secs(120))
+                .run();
+            assert_eq!(r.code, 0, "{name} {tier}: {}", r.text());
+            assert!(r.stdout.contains(&format!("Optimizations: symmetry {group} (certificate generated")), "{name} {tier}: {}", r.text());
+            assert!(r.stdout.contains(&format!("{reduced}, 0 states left on queue (symmetry-reduced).")), "{name} {tier}: {}", r.text());
+            assert!(r.stdout.contains("Lean output:"), "{name} {tier}: {}", r.text());
+        }
+    }
+}
+
+#[test]
+fn groups_above_the_certificate_bound_are_not_applied() {
+    // `S_8` has order 40,320, above both the seven-model-value factor bound and
+    // the 5,040 product bound; it must stay unreduced (with the reason in
+    // `-stats`) and must not be silently truncated to a smaller permutation.
+    let tla = "---- MODULE Eight ----\nEXTENDS Naturals\nCONSTANT Proc\nVARIABLE pc\n\
+        Init == pc = [p \\in Proc |-> 0]\n\
+        Next == \\E p \\in Proc : pc[p] < 1 /\\ pc' = [pc EXCEPT ![p] = 1]\n\
+        Inv == \\A p \\in Proc : pc[p] <= 1\n====\n";
+    let cfg = "CONSTANT Proc = {p1, p2, p3, p4, p5, p6, p7, p8}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("Eight", tla, cfg);
+    let r = tlx_testkit::tlx_default!()
+        .args(["check", "Eight.tla", "-interp", "-stats"])
+        .env("TLX_PROOF_DIR", dir.join("proofs"))
+        .dir(&dir)
+        .run();
+    assert_eq!(r.code, 0, "{}", r.text());
+    assert!(r.stdout.contains("Optimizations: none applicable."), "{}", r.text());
+    assert!(!r.stdout.contains("(symmetry-reduced)"), "{}", r.text());
+    assert!(r.stdout.contains("256 distinct states found"), "{}", r.text());
+    assert!(r.text().contains("Proc: not applied (the group would have more than 5040 elements)"), "{}", r.text());
+}
+
+#[test]
+fn large_group_counterexamples_and_deadlocks_are_preserved() {
+    // A violation reachable in the first step must lift a concrete trace of the
+    // same length through the reduced S_7 search in both tiers.
+    let bad = KEYED_SEVEN.replace(r"Inv == \A p \in Proc : pc[p].n <= Limit", r"Inv == \A p \in Proc : pc[p].n < Limit");
+    let dir = tlx_testkit::TempDir::with_spec("KeyedSeven-ceed", &bad, KEYED_SEVEN_CFG);
+    let tlc = tlx_testkit::tlx_default!().args(["check", "KeyedSeven.tla", "-tlc", "-interp"]).dir(&dir).run();
+    assert_eq!(tlc.code, 12, "{}", tlc.text());
+    let tlc_len = tlc.stdout.lines().filter(|l| l.starts_with("State ")).count();
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "KeyedSeven.tla", tier])
+            .envs([("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
+            .dir(&dir)
+            .run();
+        assert_eq!(r.code, 12, "{tier}: {}", r.text());
+        assert!(r.stdout.contains("Permutations(Proc) (certificate generated"), "{tier}: {}", r.text());
+        assert_eq!(r.stdout.lines().filter(|l| l.starts_with("State ")).count(), tlc_len, "{tier}: {}", r.text());
+    }
+
+    // Removing `Finish` leaves the all-done state without successors; the
+    // reduced search must still report its deadlock.
+    let dead = KEYED_SEVEN.replace(r"Next == \E p \in Proc : Advance(p) \/ Finish(p)", r"Next == \E p \in Proc : Advance(p)");
+    let dead_cfg = KEYED_SEVEN_CFG.replace("CHECK_DEADLOCK FALSE", "CHECK_DEADLOCK TRUE");
+    let dir = tlx_testkit::TempDir::with_spec("KeyedSeven-deadlock", &dead, &dead_cfg);
+    let tlc = tlx_testkit::tlx_default!().args(["check", "KeyedSeven.tla", "-tlc", "-interp"]).dir(&dir).run();
+    assert_eq!(tlc.code, 11, "{}", tlc.text());
+    assert!(tlc.stdout.contains("Deadlock reached"), "{}", tlc.text());
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "KeyedSeven.tla", tier])
+            .envs([("TLX_PARANOID", "1"), ("TLX_SYMMETRY_PARANOID", "1")])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
+            .dir(&dir)
+            .run();
+        assert_eq!(r.code, 11, "{tier}: {}", r.text());
+        assert!(r.stdout.contains("Permutations(Proc) (certificate generated"), "{tier}: {}", r.text());
+        assert!(r.stdout.contains("Deadlock reached"), "{tier}: {}", r.text());
+    }
+}
+
 #[test]
 fn ambiguous_membership_and_mixed_map_nested_except_refuse_autosym_and_find_violations() {
     // 1. ScalarSlot membership combined with extra primed equalities (`x' \in Proc /\ x' = x /\ x' = Pick`)
@@ -559,7 +773,8 @@ fn ambiguous_membership_and_mixed_map_nested_except_refuse_autosym_and_find_viol
 #[test]
 fn multi_group_subset_search_picks_largest_order_despite_many_small_sets() {
     // 12 disjoint 2-element sets (whose subsets exceed the 1,024-subset budget if enumerated
-    // before sorting) followed by two 4-element sets `Big1` and `Big2` (order 24 * 24 = 576 <= 720).
+    // before sorting) followed by two 4-element sets `Big1` and `Big2`: the largest product
+    // `2^3 * 24 * 24 = 4,608` stays `<= 5,040`, while a fourth order-2 factor would exceed it.
     let dir = tlx_testkit::TempDir::new("autosym-many-groups");
     let mut const_names = Vec::new();
     let mut cfg_lines = Vec::new();
@@ -604,8 +819,10 @@ fn multi_group_subset_search_picks_largest_order_despite_many_small_sets() {
         .run();
     assert_eq!(r.code, 0, "{}", r.text());
     assert!(
-        r.stdout.contains("Optimizations: symmetry Permutations(Big1) x Permutations(Big2) (certificate generated"),
-        "expected order-576 product Big1 x Big2, got:\n{}",
+        r.stdout.contains(
+            "Optimizations: symmetry Permutations(S1) x Permutations(S2) x Permutations(S3) x Permutations(Big1) x Permutations(Big2) (certificate generated"
+        ),
+        "expected order-4,608 product S1 x S2 x S3 x Big1 x Big2, got:\n{}",
         r.text()
     );
     assert!(r.stdout.contains("25 distinct states found, 0 states left on queue (symmetry-reduced)."), "{}", r.text());
@@ -613,8 +830,9 @@ fn multi_group_subset_search_picks_largest_order_despite_many_small_sets() {
 
 #[test]
 fn multi_group_attainable_order_beats_greedy_prefix_truncation() {
-    // 20 disjoint 3-element sets (`6!`-bounded prefixes `6^3 = 216`, `C(20,3) = 1,140`)
-    // and 4 disjoint 2-element sets (`2^4 = 16`): `6^2 * 2^4 = 576` fits `<= 720` and beats `6^3 * 2 = 432`.
+    // 20 disjoint 3-element sets (`C(20,3) = 1,140` order-216 prefixes) and 4 disjoint
+    // 2-element sets (`2^4 = 16`): `6^3 * 2^4 = 3,456` fits `<= 5,040` and beats the greedy
+    // prefix `6^4 * 2 = 2,592`.
     let dir = tlx_testkit::TempDir::new("autosym-attainable-order");
     let mut const_names = Vec::new();
     let mut cfg_lines = Vec::new();
@@ -659,9 +877,9 @@ fn multi_group_attainable_order_beats_greedy_prefix_truncation() {
     assert_eq!(r.code, 0, "{}", r.text());
     assert!(
         r.stdout.contains(
-            "Optimizations: symmetry Permutations(T1) x Permutations(T2) x Permutations(P1) x Permutations(P2) x Permutations(P3) x Permutations(P4) (certificate generated"
+            "Optimizations: symmetry Permutations(T1) x Permutations(T2) x Permutations(T3) x Permutations(P1) x Permutations(P2) x Permutations(P3) x Permutations(P4) (certificate generated"
         ),
-        "expected order-576 product T1 x T2 x P1 x P2 x P3 x P4 (not 432), got:\n{}",
+        "expected order-3,456 product T1 x T2 x T3 x P1 x P2 x P3 x P4 (not the greedy 2,592), got:\n{}",
         r.text()
     );
 }

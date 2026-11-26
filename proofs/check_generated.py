@@ -50,6 +50,8 @@ DEFAULT_CASES = (
     ("GeneratedField", "check", "proofs/field/Phase.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedPipeline", "optimize", "proofs/counter/Counter.tla", None, (), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/Keyed.tla", None, ("-interp",), (0,)),
+    ("GeneratedSymmetry", "check", "proofs/symmetry/KeyedSeven.tla", None, ("-interp",), (0,)),
+    ("GeneratedSymmetry", "check", "proofs/symmetry/ProductLarge.tla", None, ("-interp",), (0,)),
     ("GeneratedEquivSymmetry", "check", "proofs/symmetry/KeyValMaps.tla", None, ("-interp",), (0,)),
     ("GeneratedChooseSymmetry", "check", "proofs/symmetry/ChooseSym.tla", None, ("-interp",), (0,)),
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
@@ -492,9 +494,11 @@ def find_tlx(requested):
 def generate_default_certificates(tlx, workdir):
     generated = []
     covered = set()
-    for namespace, subcommand, spec_rel, inline_cfg, extra_args, ok_codes in DEFAULT_CASES:
+    for index, (namespace, subcommand, spec_rel, inline_cfg, extra_args, ok_codes) in enumerate(DEFAULT_CASES):
         spec = ROOT / spec_rel
-        case_dir = workdir / namespace
+        # One output directory per case: several cases share a namespace, and
+        # each run must produce exactly one certificate for the assertion below.
+        case_dir = workdir / namespace / f"{index:02d}-{Path(spec_rel).stem}"
         case_dir.mkdir(parents=True, exist_ok=True)
         if subcommand == "optimize":
             out_dir = case_dir / "out"

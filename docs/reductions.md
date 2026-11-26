@@ -113,9 +113,26 @@ constraints and action properties. A violation witness (`Ok` with `witness`) on 
 check disagree. An evaluation or resource-limit error (`Err`) during `check_perms` refuses automatic
 symmetry (`not applied: cross-check failed (...)` under `-stats`) and leaves the run unreduced.
 
-A group larger than 720 elements is not applied: the search tries every element of the group on each
-state it finds, so the cost of the canonical form grows with the group. Skipped groups are named
-under `-stats`.
+When competing proven factors do not all fit in the selected product, a single bounded probe over
+admitted states (filtered by state and action constraints) tests every competing factor on the same
+state sample. A certified factor that fixes every admitted state the probe reaches reduces nothing,
+yet its larger order can keep a smaller productive factor out of the selected product. When an
+unselected proven factor is observed to move admitted states, the inert selected factor is left out
+and the next product is certified (`-stats` reports `not applied (its permutations fix every
+admitted state the bounded probe reached, and it would displace a productive group)`). The
+equivariance cross-check still runs over raw edges so constraint mismatches remain detectable. This
+movement probe is bounded evidence, not a proof; not applying a proven symmetry is always sound, and
+when every factor appears inert the largest product is kept.
+
+A product larger than 5,040 elements (or with a factor above seven model values) is not applied:
+the certificate emitters bound their parametric Lean obligations there, and the candidate search
+enumerates disjoint products up to that order. The runtime canonicalizes an applied disjoint
+product by partition refinement without enumerating `|G|` permutations
+(`crates/tlx-eval/src/model/symmetry/refine.rs`), so the bound is certificate and search cost, not a
+per-state permutation cost. Skipped groups are named under `-stats`. In the compiled tier a
+declared or automatic group above 720 elements (the compiled plan cache's bound) is fingerprinted
+by decoding the state and reducing its values in the interpreter; that path is correct and applies
+the same certified group, but it does not use encoded words.
 
 ### 2.4 When it is applied
 
