@@ -206,6 +206,28 @@ class Drivers(unittest.TestCase):
             got = tlxlib.judge_case(tlxlib.CaseResult("A", status, {}), entries, "corpus-compile")
             self.assertEqual(got.status, want)
 
+    def test_worker_exceptions_accept_only_their_verdict(self):
+        # The multi-worker exceptions name the alternative verdict they accept:
+        # a checker that reports success instead of the violation must fail.
+        with open(os.path.join(tlxlib.ROOT, "tests", "expected_failures.json")) as source:
+            entries = json.load(source)["expected_failures"]
+        suite = "spectest-compile-w8"
+        for name, kind, passing in (("FzWorkersAPropFirst", "property failure", "pass"),
+                                    ("LZS2", "liveness failure", "xpass"),
+                                    ("SN21", "deadlock", "pass")):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                path = os.path.join(root, "report.json")
+                accepted = tlxlib.judge_case(tlxlib.CaseResult(name, "fail", {"kind": kind}), entries, suite)
+                self.assertEqual(accepted.status, "xfail")
+                report = tlxlib.finish_cases([accepted], [name], path, suite=suite)
+                self.assertEqual(report["exit_code"], 0)
+                self.assertEqual(report["suite"], suite)
+                false_success = tlxlib.judge_case(tlxlib.CaseResult(name, "fail", {"kind": "success"}), entries, suite)
+                self.assertEqual(false_success.status, "fail")
+                self.assertEqual(tlxlib.finish_cases([false_success], [name], suite=suite)["exit_code"], 1)
+                passed = tlxlib.judge_case(tlxlib.CaseResult(name, "pass", {"kind": "success"}), entries, suite)
+                self.assertEqual(passed.status, passing)
+
     def test_tlcsuite_standalone_matches_verify(self):
         with tempfile.TemporaryDirectory() as root:
             os.makedirs(os.path.join(root, "test-model"))

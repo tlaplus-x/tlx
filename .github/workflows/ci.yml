@@ -163,16 +163,47 @@ jobs:
       - name: Build checker for conformance tests
         run: cargo build --profile test-release --locked
       - name: Interpreter conformance
-        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-interp --results-json target/ci/interpreter.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest --extra=-interp --results-json target/ci/interpreter.json
       - name: Compiled conformance
         env:
           TLX_CACHE: ${{ runner.temp }}/tlx-cache
-        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/compiled.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-compile --extra=-compile --results-json target/ci/compiled.json
       - name: Paranoid compiled conformance
         env:
           TLX_PARANOID: "1"
           TLX_CACHE: ${{ runner.temp }}/tlx-cache
-        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --extra=-compile --results-json target/ci/paranoid.json
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-paranoid --extra=-compile --results-json target/ci/paranoid.json
+      # TLX_PARANOID implies TLX_NATIVE_SYNC, so the default tiering in the
+      # step above builds and runs C and does not exercise the Cranelift JIT.
+      # TLX_JIT=1 selects Cranelift codegen, whose results are cross-checked
+      # against the interpreter.
+      - name: JIT paranoid compiled conformance
+        env:
+          TLX_JIT: "1"
+          TLX_PARANOID: "1"
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-jit-paranoid --extra=-compile --results-json target/ci/jit-paranoid.json
+      # Runs after Paranoid compiled conformance, which already built the C
+      # libraries into the shared TLX_CACHE. TLX_NATIVE_SYNC loads them before
+      # exploration (with TLX_JIT=0 a cached library would otherwise still be
+      # loaded by the background builder, and short searches would finish on
+      # the IR executor first); the pre-run reuse is disabled so the search
+      # must execute C, and TLX_JIT=0 excludes the JIT.
+      - name: C-only compiled conformance
+        env:
+          TLX_JIT: "0"
+          TLX_PRERUN_REUSE: "0"
+          TLX_NATIVE_SYNC: "1"
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-c --extra=-compile --results-json target/ci/c-only.json
+      - name: Multi-worker compiled conformance
+        env:
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-compile-w8 --extra="-compile -workers 8" --results-json target/ci/compiled-w8.json
+      - name: Default-mode conformance
+        env:
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
+          TLX_PROOF_DIR: ${{ runner.temp }}/tlx-proofs
+        run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-default --default-mode --results-json target/ci/default-mode.json
       - name: Retain conformance results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
