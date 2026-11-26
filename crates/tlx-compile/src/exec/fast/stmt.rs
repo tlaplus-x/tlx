@@ -29,8 +29,13 @@ pub(crate) enum ValIter {
     /// (`x' \in S`: a set filter over a set that is not enumerated is not
     /// materialized, as in the interpreter).
     Enumerate,
-    /// `ops::enumerate_normalized` (CHOOSE, sorted `ForEach`).
+    /// Normalized order, streaming via `ops::for_each_enumerated` when
+    /// `ops::streams_normalized` holds (`SUBSET S` / `kSubset(k, S)`), used by
+    /// `IterMode::Normalized` (`x' \subseteq S`).
     Normalized,
+    /// `ops::enumerate_normalized` materialized upfront (`CHOOSE`, keeping
+    /// parity with the interpreter until `CHOOSE` streams).
+    NormalizedEager,
 }
 
 /// Largest bitset universe whose element encodings are tabulated.
@@ -325,65 +330,65 @@ impl Src {
                     }
                     Ok(())
                 };
+                let mut done = true;
+                let mut err = None;
+                let mut visit = |x: Value| {
+                    let r = put(fx, x).and_then(|()| f(fx));
+                    match r {
+                        Ok(true) => Ok(true),
+                        Ok(false) => {
+                            done = false;
+                            Ok(false)
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            Ok(false)
+                        }
+                    }
+                };
                 match how {
-                    ValIter::Bound | ValIter::Enumerate => {
-                        let mut done = true;
-                        let mut err = None;
-                        let mut visit = |x: Value| {
-                            let r = put(fx, x).and_then(|()| f(fx));
-                            match r {
-                                Ok(true) => Ok(true),
-                                Ok(false) => {
-                                    done = false;
-                                    Ok(false)
-                                }
-                                Err(e) => {
-                                    err = Some(e);
-                                    Ok(false)
-                                }
+                    ValIter::Bound => {
+                        // A quantifier's domain, exactly as the
+                        // interpreter's `bound_elems`: `ops::bound_kind`
+                        // decides whether TLC streams the domain, shares
+                        // it, or materializes it (where the `-maxSetSize`
+                        // bound applies, and an error anywhere in the
+                        // domain surfaces before the body runs). Sharing
+                        // and streaming both iterate without building the
+                        // set.
+                        match ops::bound_kind(&v) {
+                            ops::BoundKind::Share | ops::BoundKind::Stream => {
+                                ops::for_each_enumerated(&v, &mut visit)?;
                             }
-                        };
-                        if *how == ValIter::Bound {
-                            // A quantifier's domain, exactly as the
-                            // interpreter's `bound_elems`: `ops::bound_kind`
-                            // decides whether TLC streams the domain, shares
-                            // it, or materializes it (where the `-maxSetSize`
-                            // bound applies, and an error anywhere in the
-                            // domain surfaces before the body runs). Sharing
-                            // and streaming both iterate without building the
-                            // set.
-                            match ops::bound_kind(&v) {
-                                ops::BoundKind::Share | ops::BoundKind::Stream => {
-                                    ops::for_each_enumerated(&v, &mut visit)?;
-                                }
-                                ops::BoundKind::Materialize => {
-                                    for x in ops::enumerate(&v)? {
-                                        if !visit(x)? {
-                                            break;
-                                        }
+                            ops::BoundKind::Materialize => {
+                                for x in ops::enumerate(&v)? {
+                                    if !visit(x)? {
+                                        break;
                                     }
                                 }
-                                ops::BoundKind::Overflow => {
-                                    return Err(tlx_value::limits::too_many_elements().into());
-                                }
                             }
-                        } else {
-                            ops::for_each_enumerated(&v, &mut visit)?;
-                        }
-                        match err {
-                            Some(e) => Err(e),
-                            None => Ok(done),
+                            ops::BoundKind::Overflow => {
+                                return Err(tlx_value::limits::too_many_elements().into());
+                            }
                         }
                     }
-                    ValIter::Normalized => {
+                    ValIter::Enumerate => {
+                        ops::for_each_enumerated(&v, &mut visit)?;
+                    }
+                    ValIter::Normalized if ops::streams_normalized(&v) => {
+                        ops::for_each_enumerated(&v, &mut visit)?;
+                    }
+                    ValIter::Normalized | ValIter::NormalizedEager => {
                         for x in ops::enumerate_normalized(&v)? {
-                            put(fx, x)?;
-                            if !f(fx)? {
-                                return Ok(false);
+                            if !visit(x)? {
+                                break;
                             }
                         }
-                        Ok(true)
                     }
+                }
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(done),
                 }
             }
         }
@@ -443,7 +448,7 @@ impl Compiler<'_> {
 
     /// `src_how` for quantifiers (`sorted` = false) and CHOOSE (true).
     pub(crate) fn src(&mut self, set: &Expr, sorted: bool) -> C<Src> {
-        self.src_how(set, if sorted { ValIter::Normalized } else { ValIter::Enumerate })
+        self.src_how(set, if sorted { ValIter::NormalizedEager } else { ValIter::Enumerate })
     }
 
     pub(crate) fn stmt(&mut self, s: &Stmt) -> C<StmtF> {
