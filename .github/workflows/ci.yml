@@ -159,7 +159,6 @@ jobs:
       CARGO_BUILD_JOBS: ${{ matrix.jobs }}
       RUST_TEST_THREADS: ${{ matrix.jobs }}
       TLX_TLC_XMX: 2g
-      TLX_CACHE: ${{ runner.temp }}/tlx-cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -187,6 +186,8 @@ jobs:
           echo "TLX_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
           bash scripts/fetch-deps.sh
       - name: Rust unit and integration tests
+        env:
+          TLX_CACHE: ${{ runner.temp }}/tlx-cache
         run: cargo test --workspace --profile test-release --locked --no-fail-fast
 
   spectest:
