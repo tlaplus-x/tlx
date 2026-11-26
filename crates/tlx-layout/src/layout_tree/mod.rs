@@ -255,8 +255,21 @@ impl LayoutNode {
     }
 
     /// Zero every trailing dynamic function-domain witness word in `words`
-    /// so semantically equal encodings agree bit-for-bit.
+    /// and canonicalize `Dyn` handles so semantically equal encodings agree
+    /// bit-for-bit.
     pub fn canonicalize_words(&self, words: &mut [u64]) {
+        self.canonicalize_words_impl::<true>(words);
+    }
+
+    /// Zero every trailing dynamic function-domain witness / `key_variants`
+    /// word and re-sort sorted sets without touching `Dyn` slots (used after
+    /// `FactorPlan::apply_orbit_unchecked`, which already replaces `Dyn` slots
+    /// with deterministic value digests).
+    pub fn canonicalize_orbit_words(&self, words: &mut [u64]) {
+        self.canonicalize_words_impl::<false>(words);
+    }
+
+    fn canonicalize_words_impl<const CANON_DYN: bool>(&self, words: &mut [u64]) {
         if !self.has_dynamic_witness {
             return;
         }
@@ -265,7 +278,7 @@ impl LayoutNode {
                 if range.has_dynamic_witness {
                     if let SlotLayout::Words(rw) = *slot {
                         for i in 0..dom.len() {
-                            range.canonicalize_words(&mut words[i * rw..]);
+                            range.canonicalize_words_impl::<CANON_DYN>(&mut words[i * rw..]);
                         }
                     }
                 }
@@ -278,7 +291,7 @@ impl LayoutNode {
                     if let SlotLayout::Words(rw) = dims.slot {
                         for r in 0..*universe as usize {
                             if words[r / 64] >> (r % 64) & 1 != 0 {
-                                range.canonicalize_words(&mut words[dims.bitset_words + r * rw..]);
+                                range.canonicalize_words_impl::<CANON_DYN>(&mut words[dims.bitset_words + r * rw..]);
                             }
                         }
                     }
@@ -291,7 +304,7 @@ impl LayoutNode {
                 for (_, n, loc) in fs {
                     if n.has_dynamic_witness {
                         if let FieldLoc::Words(o) = *loc {
-                            n.canonicalize_words(&mut words[o..]);
+                            n.canonicalize_words_impl::<CANON_DYN>(&mut words[o..]);
                         }
                     }
                 }
@@ -300,7 +313,7 @@ impl LayoutNode {
                 for (n, loc) in ss {
                     if n.has_dynamic_witness {
                         if let FieldLoc::Words(o) = *loc {
-                            n.canonicalize_words(&mut words[o..]);
+                            n.canonicalize_words_impl::<CANON_DYN>(&mut words[o..]);
                         }
                     }
                 }
@@ -310,7 +323,7 @@ impl LayoutNode {
                     if let SlotLayout::Words(ew) = *slot {
                         let len = words[0] as usize;
                         for i in 0..len {
-                            elem.canonicalize_words(&mut words[1 + i * ew..]);
+                            elem.canonicalize_words_impl::<CANON_DYN>(&mut words[1 + i * ew..]);
                         }
                     }
                 }
@@ -318,7 +331,7 @@ impl LayoutNode {
             Kind::Union { arms, .. } => {
                 let arm = &arms[words[0] as usize];
                 if arm.has_dynamic_witness {
-                    arm.canonicalize_words(&mut words[1..]);
+                    arm.canonicalize_words_impl::<CANON_DYN>(&mut words[1..]);
                 }
             }
             Kind::Set { elem, bitset: None, .. } => {
@@ -326,7 +339,7 @@ impl LayoutNode {
                     let len = words[0] as usize;
                     let ew = elem.words;
                     for i in 0..len {
-                        elem.canonicalize_words(&mut words[1 + i * ew..]);
+                        elem.canonicalize_words_impl::<CANON_DYN>(&mut words[1 + i * ew..]);
                     }
                     if len > 1 && ew == 1 {
                         words[1..1 + len].sort_unstable();
@@ -338,7 +351,9 @@ impl LayoutNode {
                 }
             }
             Kind::Dyn => {
-                words[0] = dynval::canonical(words[0]);
+                if CANON_DYN {
+                    words[0] = dynval::canonical(words[0]);
+                }
             }
             _ => {}
         }
@@ -378,6 +393,39 @@ impl LayoutNode {
     pub fn set_elem(&self) -> Option<&LayoutNode> {
         match &self.kind {
             Kind::Set { elem, .. } => Some(elem),
+            _ => None,
+        }
+    }
+
+    /// The element node of a sequence shape.
+    pub fn seq_elem(&self) -> Option<&LayoutNode> {
+        match &self.kind {
+            Kind::Seq { elem, .. } => Some(elem),
+            _ => None,
+        }
+    }
+
+    /// The range node of a fixed-domain function or map shape.
+    pub fn range_node(&self) -> Option<&LayoutNode> {
+        match &self.kind {
+            Kind::Fcn { range, .. } | Kind::Map { range, .. } => Some(range),
+            _ => None,
+        }
+    }
+
+    /// The arm node `idx` of a union shape.
+    pub fn union_arm(&self, idx: usize) -> Option<&LayoutNode> {
+        match &self.kind {
+            Kind::Union { arms, .. } => arms.get(idx),
+            _ => None,
+        }
+    }
+
+    /// Child node `idx` of a record or tuple shape.
+    pub fn product_child(&self, idx: usize) -> Option<&LayoutNode> {
+        match &self.kind {
+            Kind::Record { fields, .. } => fields.get(idx).map(|(_, n, _)| n),
+            Kind::Tuple { elems, .. } => elems.get(idx).map(|(n, _)| n),
             _ => None,
         }
     }

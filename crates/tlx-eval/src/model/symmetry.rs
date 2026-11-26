@@ -493,6 +493,15 @@ impl Group {
         }
     }
 
+    /// Read-only per-factor sorted `Sym` slices when this group is a disjoint
+    /// product of full symmetric groups `S_{n_1} x ... x S_{n_k}`.
+    pub(super) fn symmetry_factors(&self) -> Option<Vec<&[Sym]>> {
+        match &self.kind {
+            GroupKind::Factorized(fg) => Some(fg.factors.iter().map(|f| f.keys.as_slice()).collect()),
+            _ => None,
+        }
+    }
+
     /// The non-identity permutation maps for `InterpModel::symmetry_maps()`,
     /// materialized on demand for factorized groups while `|G| <= 720`.
     pub(super) fn symmetry_maps(&self) -> &[Perm] {
@@ -569,6 +578,61 @@ impl Group {
                 }
                 Ok(best.map(|(i, _)| ChosenPerm::borrowed(&perms[i])))
             }
+        }
+    }
+
+    /// Canonicalize a state under `try_total_cmp` (used by compiled escape
+    /// mode for genuine outlier states under factorized symmetry).
+    pub(super) fn least_total_state_perm(&self, vals: &[Value], order: &[usize]) -> EResult<Option<ChosenPerm<'_>>> {
+        match &self.kind {
+            GroupKind::Empty => Ok(None),
+            GroupKind::Factorized(_) => self.choose_perm(&mut StateVals::Given(vals), order, CmpMode::Total, false),
+            GroupKind::Explicit { perms, moved, .. } => {
+                // Explicit groups are small (`<= 720`): compare under `try_total_cmp`.
+                let mut best: Option<usize> = None;
+                let mut support = Vec::new();
+                let mut sv = StateVals::Given(vals);
+                let dedup = !collect_support(moved, &mut sv, order, &mut support);
+                let mut key = Vec::new();
+                let mut seen: Vec<Vec<u32>> = Vec::new();
+                'perm: for (pi, p) in perms.iter().enumerate() {
+                    if dedup && p.images(&support, &mut key) {
+                        if key == support || seen.contains(&key) {
+                            continue;
+                        }
+                        seen.push(key.clone());
+                    }
+                    let q = best.map_or(PermMap::Id, |q| PermMap::Fast(&perms[q]));
+                    for &i in order {
+                        match cmp_images_mode(CmpMode::Total, PermMap::Fast(p), &vals[i], q, &vals[i])? {
+                            Ordering::Greater => continue 'perm,
+                            Ordering::Equal => {}
+                            Ordering::Less => {
+                                best = Some(pi);
+                                continue 'perm;
+                            }
+                        }
+                    }
+                }
+                Ok(best.map(|i| ChosenPerm::borrowed(&perms[i])))
+            }
+        }
+    }
+
+    /// Flat target-index image table of the TLC-least permutation for a
+    /// factorized group of any order (including `|G| > 720`), or `None` when
+    /// identity is least or the group is not factorized.
+    pub(super) fn least_factor_perm(&self, vals: &mut StateVals, order: &[usize], cache_bags: bool) -> EResult<Option<Vec<u16>>> {
+        let GroupKind::Factorized(fg) = &self.kind else {
+            return Ok(None);
+        };
+        match self.choose_factorized(fg, vals, order, CmpMode::Tlc, cache_bags, |win| {
+            let mut img = vec![0u16; fg.total_keys];
+            win.fill_img_slice(fg, &mut img);
+            img
+        })? {
+            FactorChoice::Done(img) => Ok(img),
+            FactorChoice::FallbackOrdered => choose_factorized_lazy_ordered(fg, vals, order),
         }
     }
 

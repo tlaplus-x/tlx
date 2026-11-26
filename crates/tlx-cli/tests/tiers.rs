@@ -504,3 +504,72 @@ V == inbox
     assert_eq!(hb_res.code, 0, "Heartbeats:\n{}", hb_res.text());
     assert!(hb_res.text().contains("2 states generated, 1 distinct states found"), "Heartbeats:\n{}", hb_res.text());
 }
+
+#[test]
+fn large_factorized_symmetry_executes_on_encoded_words_under_paranoid() {
+    // KeyedSeven (S_7 = 5040) and ProductLarge (4!*4!*3! = 3456) must execute
+    // on Fingerprint::Symmetry encoded words (not Fingerprint::Values) under
+    // both TLX_PARANOID=1 and TLX_SYMMETRY_PARANOID=1.
+    let keyed_seven = include_str!("../../../proofs/symmetry/KeyedSeven.tla");
+    let keyed_seven_cfg = include_str!("../../../proofs/symmetry/KeyedSeven.cfg");
+    let product_large = include_str!("../../../proofs/symmetry/ProductLarge.tla");
+    let product_large_cfg = include_str!("../../../proofs/symmetry/ProductLarge.cfg");
+
+    for (name, spec, cfg, expected_distinct) in [
+        ("KeyedSeven", keyed_seven, keyed_seven_cfg, "36 distinct states found"),
+        ("ProductLarge", product_large, product_large_cfg, "100 distinct states found"),
+    ] {
+        let dir = tlx_testkit::TempDir::with_spec(&format!("large-enc-{name}"), spec, cfg);
+        let compile = tlx_testkit::tlx_default!()
+            .check(format!("{name}.tla"))
+            .cfg(format!("{name}.cfg"))
+            .args(["-compile", "-workers", "1", "-stats"])
+            .dir(dir.path())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PRERUN_REUSE", "0")
+            .run();
+        assert_eq!(compile.code, 0, "{name} compile:\n{}", compile.text());
+        assert!(compile.text().contains(expected_distinct), "{name} compile:\n{}", compile.text());
+        assert!(
+            compile.text().contains("symmetry: permuting encodings"),
+            "{name} must use encoded-word symmetry rather than Fingerprint::Values:\n{}",
+            compile.text()
+        );
+    }
+
+    // VIEW + SYMMETRY with S_7 (order 5040) over keyed functions & sets must
+    // run on Fingerprint::SymView encoded words and pass TLX_PARANOID=1.
+    let view_s7_spec = r#"---- MODULE ViewSeven ----
+EXTENDS Naturals, TLC
+CONSTANT N
+VARIABLES active, val
+Sym == Permutations(N)
+V == <<active, val>>
+Init == active = {} /\ val = [n \in N |-> 0]
+Next == \E n \in N :
+          /\ val[n] < 1
+          /\ active' = active \cup {n}
+          /\ val' = [val EXCEPT ![n] = 1]
+===="#;
+    let view_s7_cfg = "CONSTANT N = {n1,n2,n3,n4,n5,n6,n7}\nINIT Init\nNEXT Next\nSYMMETRY Sym\nVIEW V\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("view-seven-enc", view_s7_spec, view_s7_cfg);
+    let interp =
+        tlx_testkit::tlx!().check("ViewSeven.tla").cfg("ViewSeven.cfg").args(["-tlc", "-workers", "1", "-interp"]).dir(dir.path()).run();
+    let compile = tlx_testkit::tlx!()
+        .check("ViewSeven.tla")
+        .cfg("ViewSeven.cfg")
+        .args(["-tlc", "-workers", "1", "-compile", "-stats"])
+        .dir(dir.path())
+        .env("TLX_PARANOID", "1")
+        .env("TLX_PRERUN_REUSE", "0")
+        .run();
+    assert_eq!(interp.code, 0, "ViewSeven interp:\n{}", interp.text());
+    assert_eq!(compile.code, 0, "ViewSeven compile:\n{}", compile.text());
+    assert_eq!(result_lines(&compile.text()), result_lines(&interp.text()));
+    assert!(
+        compile.text().contains("symmetry: least state on encodings, VIEW of its permuted encoding"),
+        "ViewSeven must use encoded-word SymView:\n{}",
+        compile.text()
+    );
+}

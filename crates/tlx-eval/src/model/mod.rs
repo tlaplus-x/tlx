@@ -562,6 +562,12 @@ impl InterpModel {
         !self.init_props.is_empty()
     }
 
+    /// Read-only per-factor ordered `Sym` slices (`m_{g,0} <_{tlc} ... <_{tlc} m_{g,n_g-1}`)
+    /// when `SYMMETRY` is a factorized disjoint symmetric-group product.
+    pub fn symmetry_factors(&self) -> Option<Vec<&[Sym]>> {
+        self.group.symmetry_factors()
+    }
+
     /// Whether fingerprints depend on VIEW or SYMMETRY (not just the values).
     /// The SYMMETRY group (without the identity): each element maps the
     /// model values it moves to their images (materialized on demand for
@@ -976,6 +982,34 @@ impl InterpModel {
     /// permute encodings; it decodes the variables as they are compared).
     pub fn least_perm(&self, vals: &mut StateVals) -> Result<Option<usize>, ModelError> {
         self.least_perm_of(vals).map_err(|e| self.error(e))
+    }
+
+    /// Flat target-index image table of the TLC-least permutation in
+    /// `self.var_order` for a factorized `SYMMETRY` group of any order
+    /// (including `|G| > 720`), or `None` when identity is least.
+    pub fn least_factor_perm(&self, vals: &mut StateVals) -> Result<Option<Vec<u16>>, ModelError> {
+        if self.group.is_empty() {
+            return Ok(None);
+        }
+        let order = self.var_order(vals.len());
+        self.group.least_factor_perm(vals, order, self.view.is_some()).map_err(|e| self.error(e))
+    }
+
+    /// The TLC-least concrete state in the `SYMMETRY` orbit of `vals` (in
+    /// `self.var_order`), or `None` when `vals` itself is least. Works for
+    /// both explicit and factorized groups of any order.
+    pub fn least_state_in_orbit(&self, vals: &[Value]) -> Result<Option<Vec<Value>>, ModelError> {
+        self.least_in_orbit(vals).map_err(|e| self.error(e))
+    }
+
+    /// Canonical representative state in the `SYMMETRY` orbit of `vals` under
+    /// total structural order (`try_total_cmp`, never failing on incomparable
+    /// values), or `None` when `vals` itself is canonical.
+    pub fn canonical_total_orbit(&self, vals: &[Value], order: &[usize]) -> Result<Option<Vec<Value>>, ModelError> {
+        let Some(p) = self.group.least_total_state_perm(vals, order).map_err(|e| self.error(e))? else {
+            return Ok(None);
+        };
+        vals.iter().map(|v| Ok(p.apply(v)?.unwrap_or_else(|| v.clone()))).collect::<EResult<Vec<_>>>().map(Some).map_err(|e| self.error(e))
     }
 
     /// The fingerprints of the values of `vals`; those of values shared with
