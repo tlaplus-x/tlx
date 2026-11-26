@@ -320,7 +320,12 @@ mod tests {
     /// bits 26 and 27 take every value. Keyed `(s << 32) | q`, those bits
     /// were fixed by the slot (82% of the groups), and the liveness check
     /// of a 176M-state graph ran for more than three hours without ending.
+    // A pure `FxHasher` statistics check over 2^20 entries (no `unsafe`); a
+    // smaller sample would defeat testing bucket bits 26-27.
+    // `node_map_keys_by_state_and_slot` still covers `sparse_key` and
+    // `NodeMap::Sparse` under Miri.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn sparse_keys_spread_past_two_to_the_26_buckets() {
         let n = 1u32 << 20;
         let mask = (1u64 << 28) - 1;

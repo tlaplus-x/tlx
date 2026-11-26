@@ -71,6 +71,11 @@ usage: scripts/spectest.py [--refresh] [--extra=ARGS] [--timeout S] [--default-m
                 violated names, the validity of a differing counterexample
                 (TLC checks it) and the fields the optimizations it used
                 preserve (suite spectest-default)
+  --require-native  fail a case whose tlx run reports that generated C was not
+                used: native code disabled, a failed C build or load, or a
+                whole-model compiler fallback. The sanitizer suites use it so
+                an unavailable sanitizer runtime cannot pass as an interpreter
+                run
 Environment variables (e.g. TLX_PARANOID=1) are passed on to tlx; TLX_JAVA
 selects the java of TLC (see scripts/tlc.py).
 """
@@ -82,6 +87,12 @@ from modelcheck.results import must, layout_free  # re-export for existing drive
 from contract import compare as compare_contract
 from tlxlib import CaseResult, add_result_args, finish_cases, case_summary, judge_case, load_expected_cases, ROOT, add_profile_args, build_tlx, profile_of, run_proc, parity_args, parity_env, tlx_env, no_foreign_home
 SPECS = os.path.join(ROOT, "tests", "specs")
+NATIVE_MISSING = ("native code disabled:", "C build failed, keeping the JIT code:")
+
+
+def native_missing(out):
+    """Why `out` reports that generated C was not used (None when it was)."""
+    return compile_fallback(out) or next((marker for marker in NATIVE_MISSING if marker in out), None)
 TLC_OUT = os.path.join(SPECS, "tlc")
 # The third_party directory whose jars and -I modules TLC names in its output.
 # `third_party/` is a symlink to the shared copy (worktrees share one), so its
@@ -89,7 +100,7 @@ TLC_OUT = os.path.join(SPECS, "tlc")
 # first, so that a cache refreshed in the main checkout and one refreshed in a
 # worktree come out identical.
 THIRD_PARTY = os.path.realpath(os.path.join(ROOT, "third_party"))
-from tlc import parse, run_tlc_raw
+from tlc import compile_fallback, parse, run_tlc_raw
 import tracecheck
 from tracecheck import trace_blocks as trace
 
@@ -220,6 +231,9 @@ def main():
                     help="per-case timeout in seconds (default 120, or TLX_SPEC_TIMEOUT)")
     add_result_args(ap)
     ap.add_argument("--no-build", action="store_true", help="reuse the selected profile binary built by the caller")
+    ap.add_argument("--require-native", action="store_true",
+                    help="fail a case whose tlx run reports that generated C was not used (native code disabled, "
+                         "a failed C build or load, or a whole-model compiler fallback)")
     add_profile_args(ap)
     a = ap.parse_args()
     if a.jobs < 1:
@@ -296,6 +310,8 @@ def run_specs(a, names, binary):
                 cpu = p.rusage.ru_utime + p.rusage.ru_stime
                 raise subprocess.TimeoutExpired(f"{n} (CPU timeout: {cpu:.3f}s > {cpu_limit:g}s)", cpu_limit)
             out = p.stdout + p.stderr
+            if getattr(a, "require_native", False) and (missing := native_missing(out)):
+                raise RuntimeError(f"generated C was not used ({missing}): {out[-600:]}")
             got = must(out, p.returncode)
             if got["result"] in (None, "unknown") or p.returncode < 0 or (got["result"] == "success" and p.returncode != 0):
                 raise RuntimeError(f"tlx did not complete: exit {p.returncode}: {out[-600:]}")

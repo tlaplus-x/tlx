@@ -69,7 +69,18 @@ where
 
 /// Bounds of the current thread's stack: (lowest usable address, size), or
 /// `None` where the platform does not tell.
-#[cfg(target_vendor = "apple")]
+#[cfg(miri)]
+fn bounds() -> Option<(usize, usize)> {
+    // Miri cannot query a thread's stack bounds (`pthread_getattr_np`), and
+    // cannot provide the alternate signal stack the fatal fallback needs (see
+    // `overflow`). Reporting unknown keeps the depth guards on their fixed
+    // nesting caps; the guard itself is covered by the native tests.
+    None
+}
+
+/// Bounds of the current thread's stack: (lowest usable address, size), or
+/// `None` where the platform does not tell.
+#[cfg(all(not(miri), target_vendor = "apple"))]
 fn bounds() -> Option<(usize, usize)> {
     // SAFETY: plain queries about the calling thread.
     unsafe {
@@ -82,7 +93,7 @@ fn bounds() -> Option<(usize, usize)> {
 
 /// Bounds of the current thread's stack: (lowest usable address, size), or
 /// `None` where the platform does not tell.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(not(miri), any(target_os = "linux", target_os = "android")))]
 fn bounds() -> Option<(usize, usize)> {
     // SAFETY: `attr` is initialized by `pthread_getattr_np` before it is
     // read and destroyed afterwards.
@@ -101,7 +112,7 @@ fn bounds() -> Option<(usize, usize)> {
     }
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(all(not(miri), not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))))]
 fn bounds() -> Option<(usize, usize)> {
     None
 }

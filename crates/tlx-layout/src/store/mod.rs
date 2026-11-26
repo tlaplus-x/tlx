@@ -74,6 +74,10 @@ pub(crate) const TAG_NODE: u64 = 5;
 const STORE_BITS: u32 = 16;
 const INDEX_SHIFT: u32 = TAG_BITS + STORE_BITS;
 
+/// Miri initializes every `OnceLock` in the radix table one at a time, so the
+/// interpreter uses a 16x16 directory grid (`MAX_NODES` = 65,536) instead of
+/// the production 4096x16384 one; handle packing (`INDEX_SHIFT`) is unaffected
+/// and the native geometry is unchanged.
 /// Two-level radix page table for monotonic node indices:
 /// `PAGE = 256` nodes/page (~20 KiB per active dense page),
 /// `DIR = 4096` pages per L2 directory (32 KiB inline `dir0` covers the first
@@ -85,9 +89,9 @@ const INDEX_SHIFT: u32 = TAG_BITS + STORE_BITS;
 /// proportional to live survivors and accurately accounted against `budget`.
 const PAGE_BITS: u32 = 8;
 const PAGE: usize = 1 << PAGE_BITS;
-const DIR_BITS: u32 = 12;
+const DIR_BITS: u32 = if cfg!(miri) { 4 } else { 12 };
 const DIR: usize = 1 << DIR_BITS;
-const ROOT_BITS: u32 = 14;
+const ROOT_BITS: u32 = if cfg!(miri) { 4 } else { 14 };
 const ROOT: usize = 1 << ROOT_BITS;
 pub(crate) const MAX_NODES: u64 = (ROOT as u64) * (DIR as u64) * (PAGE as u64);
 

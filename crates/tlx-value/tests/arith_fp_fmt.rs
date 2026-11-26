@@ -262,7 +262,7 @@ fn randomized_collision_sanity() {
     let mut distinct = 0;
     // Miri runs ~1000x slower; shrink the sample (the fingerprint code is
     // identical) but keep enough values to catch a systematic collision.
-    let iters = if cfg!(miri) { 2_000 } else { 200_000 };
+    let iters = if cfg!(miri) { 200 } else { 200_000 };
     for _ in 0..iters {
         let v = random_value(&mut r, 3);
         let f = fingerprint(&v).unwrap();
@@ -276,7 +276,7 @@ fn randomized_collision_sanity() {
     }
     assert!(distinct > iters / 20, "only {distinct} distinct values generated");
     // integer states: no collisions among the sampled pairs
-    let pairs = if cfg!(miri) { 30 } else { 1000 };
+    let pairs = if cfg!(miri) { 10 } else { 1000 };
     let mut fps = std::collections::HashSet::new();
     for i in 0..pairs as i64 {
         for j in 0..pairs as i64 {

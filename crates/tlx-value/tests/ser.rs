@@ -106,7 +106,7 @@ fn random_values_round_trip() {
     let mut seen = [0usize; 256];
     // Miri runs ~1000x slower; shrink the sample, keeping the generator depth
     // cycling and the round-trip assertions identical.
-    let n = if cfg!(miri) { 500 } else { 20_000 };
+    let n = if cfg!(miri) { 100 } else { 20_000 };
     for i in 0..n {
         let v = value(&mut r, 1 + (i % 5));
         let bytes = reencode(&v);
@@ -173,7 +173,7 @@ fn malformed_input_is_rejected() {
     let mut samples = Vec::new();
     // Miri runs ~1000x slower; each sample decodes every proper prefix, so
     // a smaller sample still covers the rejection paths.
-    let samples_n = if cfg!(miri) { 30 } else { 300 };
+    let samples_n = if cfg!(miri) { 8 } else { 300 };
     for _ in 0..samples_n {
         samples.push(reencode(&value(&mut r, 4)));
     }

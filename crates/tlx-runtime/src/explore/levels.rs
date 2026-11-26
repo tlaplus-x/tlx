@@ -94,8 +94,11 @@ struct Sleeper {
 impl LevelBarrier {
     /// Bounds of the spin budget (iterations of `spin_loop`, each some
     /// nanoseconds to tens of nanoseconds).
-    const MIN_SPINS: u32 = 1 << 6;
-    const MAX_SPINS: u32 = 1 << 12;
+    // Miri emulates a single CPU and runs every spin iteration at
+    // interpreter speed, so its budget is two orders of magnitude smaller;
+    // the adaptive halving still separates MIN from MAX.
+    const MIN_SPINS: u32 = if cfg!(miri) { 1 << 3 } else { 1 << 6 };
+    const MAX_SPINS: u32 = if cfg!(miri) { 1 << 6 } else { 1 << 12 };
     /// `yield_now` calls after spinning, before parking.
     const YIELDS: u32 = 4;
 
@@ -471,7 +474,11 @@ mod tests {
     /// others park.
     #[test]
     fn barrier_rounds_and_actions() {
-        for (n, rounds) in [(1, 100), (2, 2000), (5, 1000), (16, 300)] {
+        // Miri cannot afford the native round counts; the late-arrival
+        // pattern (every 97th round) and the per-round leader assertion stay.
+        let cases: [(usize, u64); 4] =
+            if cfg!(miri) { [(1, 20), (2, 100), (5, 50), (16, 20)] } else { [(1, 100), (2, 2000), (5, 1000), (16, 300)] };
+        for (n, rounds) in cases {
             let b = LevelBarrier::new(n);
             let done = AtomicU64::new(0);
             let leaders = AtomicU64::new(0);

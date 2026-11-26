@@ -320,6 +320,9 @@ mod tests {
     /// a task during the safepoint, and the crew covers every part.
     #[test]
     fn workers_are_quiescent_while_serving() {
+        // Miri needs far fewer task iterations to exercise the same
+        // quiescence assertions.
+        let served_target = if cfg!(miri) { 20 } else { 200 };
         for n in [1, 2, 3, 8] {
             let sp = Safepoint::new(n);
             let in_task = AtomicUsize::new(0);
@@ -357,7 +360,7 @@ mod tests {
                                 sp.control().request(REQ);
                             }
                             in_task.fetch_sub(1, Ordering::SeqCst);
-                            if served.load(Ordering::SeqCst) >= 200 {
+                            if served.load(Ordering::SeqCst) >= served_target {
                                 done.store(true, Ordering::SeqCst);
                             }
                         }
@@ -365,7 +368,7 @@ mod tests {
                     });
                 }
             });
-            assert!(served.load(Ordering::SeqCst) >= 200, "{n} workers");
+            assert!(served.load(Ordering::SeqCst) >= served_target, "{n} workers");
             assert_eq!(sp.served(), served.load(Ordering::SeqCst));
         }
     }

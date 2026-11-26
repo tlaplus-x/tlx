@@ -1,0 +1,270 @@
+name: Sanitizers
+
+# Generated-C AddressSanitizer + UndefinedBehaviorSanitizer and nightly Rust
+# Miri over the audited `unsafe` crates. These are the slow, specialized checks
+# that the main CI cannot afford on every job: they run nightly, on pushes to
+# main, on manual dispatch, and on pull requests that can change Rust `unsafe`
+# code or the generated C. See docs/testing.md section 11 and
+# docs/unsafe-audit.md for the commands and the Miri skip list.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "tests/specs/**"
+      - "scripts/spectest.py"
+      - "scripts/tlc.py"
+      - "scripts/tlxlib.py"
+      - "scripts/contract.py"
+      - "scripts/modelcheck/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/sanitizers.yml"
+  schedule:
+    # Nightly, so a drifted Miri toolchain is caught without a matching change.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_TEST_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_TEST_RELEASE_OPT_LEVEL: "1"
+  RUST_BACKTRACE: "1"
+  AWS_EC2_METADATA_DISABLED: "true"
+
+jobs:
+  c-sanitizers:
+    name: Generated C ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CC: clang
+      TLX_CC_SANITIZE: "1"
+      TLX_NATIVE_SYNC: "1"
+      TLX_JIT: "0"
+      TLX_PRERUN_REUSE: "0"
+      ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1:disable_coredump=1:allow_user_segv_handler=1:print_stacktrace=1"
+      UBSAN_OPTIONS: "halt_on_error=1:disable_coredump=1:print_stacktrace=1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Select the repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "c-sanitizers-opt1"
+      - name: Cache sanitized generated C
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tlx-asan-cache
+          key: tlx-asan-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/tlx-compile/**', 'crates/tlx-native/**', 'crates/tlx-layout/**') }}
+          restore-keys: tlx-asan-cache-${{ runner.os }}-${{ runner.arch }}-
+      - name: Test dependencies
+        run: |
+          echo "TLX_JAVA=$JAVA_HOME/bin/java" >> "$GITHUB_ENV"
+          bash scripts/fetch-deps.sh --tests-only
+          mkdir -p target/sanitizers
+      - name: Build checker
+        run: cargo build --profile test-release --locked
+      - name: Resolve the Clang ASan runtime
+        run: |
+          ASAN_RT="$(clang -print-file-name="libclang_rt.asan-$(uname -m).so")"
+          if [ ! -f "$ASAN_RT" ]; then
+            sudo apt-get update
+            sudo apt-get install -y "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+            ASAN_RT="$(clang -print-file-name="libclang_rt.asan-$(uname -m).so")"
+          fi
+          test -f "$ASAN_RT"
+          echo "ASAN_RT=$ASAN_RT" >> "$GITHUB_ENV"
+          echo "resolved $ASAN_RT"
+      - name: Negative sanitizer self-test
+        # The test is `#[ignore]`d in the ordinary `cargo test` matrix (which
+        # need not install compiler-rt); here it is the check that the build
+        # settings do anything at all: it builds its probe through the
+        # production C builder and loads it into a preloaded child. `CI` is
+        # set, so a missing sanitizer runtime fails instead of skipping.
+        run: cargo test --profile test-release --locked -p tlx-native --test sanitizer_selftest -- --ignored --nocapture
+      - name: Sanitizer build and runtime are required (A1 control)
+        # Positive and negative control for the strict check the suites run
+        # with, on a fresh cache so no earlier library can stand in. A1's
+        # generated model must carry ASan instrumentation and pass with the
+        # runtime preloaded; without the preload the library cannot load, and
+        # the run must fail instead of silently falling back to the
+        # interpreter.
+        run: |
+          mkdir -p target/sanitizers
+          CACHE="$RUNNER_TEMP/tlx-asan-control"
+          rm -rf "$CACHE"
+          LD_PRELOAD="$ASAN_RT" TLX_CACHE="$CACHE" \
+          python3 scripts/spectest.py -j 1 --no-build --profile test-release \
+            --require-native --suite spectest-asan-control --extra="-compile -workers 1" A1 \
+            > target/sanitizers/control-preloaded.log 2>&1
+          model="$(find "$CACHE" -name 'model.so' | head -n 1)"
+          test -n "$model"
+          # The library itself must reference the ASan runtime: a model that
+          # only runs because the runtime is preloaded would not.
+          nm -u "$model" | grep -q __asan_init
+          if TLX_CACHE="$CACHE" \
+             python3 scripts/spectest.py -j 1 --no-build --profile test-release \
+               --require-native --suite spectest-asan-control --extra="-compile -workers 1" A1 \
+               > target/sanitizers/control-no-preload.log 2>&1; then
+            echo "the sanitizer suite passed without the ASan runtime"
+            exit 1
+          fi
+          grep -q "generated C was not used" target/sanitizers/control-no-preload.log
+      - name: Generated C ASan + UBSan (single worker, paranoid)
+        run: |
+          LD_PRELOAD="$ASAN_RT" \
+          TLX_PARANOID=1 \
+          TLX_CACHE="$RUNNER_TEMP/tlx-asan-cache" \
+          python3 scripts/spectest.py -j 4 --no-build --profile test-release \
+            --require-native \
+            --suite spectest-asan-paranoid --extra="-compile -workers 1" \
+            --results-json target/sanitizers/c-asan-paranoid.json
+      - name: Generated C ASan + UBSan (eight workers, warm cache)
+        run: |
+          LD_PRELOAD="$ASAN_RT" \
+          TLX_CACHE="$RUNNER_TEMP/tlx-asan-cache" \
+          python3 scripts/spectest.py -j 2 --no-build --profile test-release \
+            --require-native \
+            --suite spectest-asan-w8 --extra="-compile -workers 8" \
+            --results-json target/sanitizers/c-asan-w8.json
+      - name: Require exercised sanitized cache artifacts
+        # An empty or bypassed cache would make both spectest passes green
+        # without ever building a sanitized library.
+        run: find "$RUNNER_TEMP/tlx-asan-cache" -name 'model.so' | grep -q .
+      - name: Retain sanitizer results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sanitizers-c
+          path: target/sanitizers/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  miri:
+    name: Miri (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # The five invocations are independent; each runs in its own job so the
+    # suite's wall time is the slowest invocation, not their sum.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: tlx-value
+            args: >-
+              -p tlx-value -- --skip fresh_process_reproduces_fingerprints_only_after_restoring_the_order
+              --skip malformed_input_is_rejected --test-threads=1
+          - name: tlx-live
+            args: -p tlx-live -- --test-threads=1
+          - name: raw-handles
+            args: -p tlx-layout --test raw_handles -- --test-threads=1
+          - name: encoded-order
+            args: >-
+              -p tlx-compile --lib encoded_order:: --
+              --skip c_declarations_match_schema --test-threads=1
+          - name: tlx-runtime
+            args: >-
+              -p tlx-runtime --lib -- --skip mem::tests --skip io::tests --skip io::durable
+              --skip io::spillvec --skip explore::checkpoint --skip explore::frontier::tests
+              --skip a_corrupt_page_of_a_run_is_detected --skip pressure_drains_idle_queue_segments
+              --skip first_rotation_at_slot_limit_drains_idle_queue_segments
+              --skip relieve_requests_drop_old_while_frontier_spills --skip encoded_candidates_roundtrip
+              --skip cleared_candidates_keep_capacity_charged_until_pressure_reclaims_it
+              --skip pending_and_failed_writes_stay_charged_in_queue_mem
+              --skip explore::safepoint::tests
+              --skip size::tests::memory_fraction
+              --skip drained_non_aligned_queue_levels_reclaim_quota
+              --skip overlapping_levels_reuse_quota_across_rotations --skip rotating_to_disk_matches_a_hash_set
+              --skip sections_rebuild_the_set --skip rotating_without_the_old_table
+              --skip a_large_table_written_in_ranges --skip a_failed_rotation_leaves_the_set_full
+              --skip concurrent_inserts_while_rotating --skip concurrent_inserts_while_growing
+              --skip compact_tiers_round_trip_boundaries_collisions_and_overflow
+              --skip concurrent_overflow_displacements_across_segments --skip spilled_records_give_the_same_graph
+              --skip spilled_levels_read_back_in_order --skip concurrent_claims_of_spilled_segments
+              --skip failed_writes_keep_segments --skip corrupt_segment_fails_its_claim
+              --skip claims_take_parts_of_blocks --skip write_install_read_in_order
+              --skip concurrent_claims --skip xor_blocks_compress --test-threads=1
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install the nightly Miri toolchain
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "miri-${{ matrix.name }}"
+      - name: Set up Miri
+        run: cargo +nightly miri setup
+      - name: Miri (${{ matrix.name }})
+        # Every filtered invocation must execute at least one test: a renamed
+        # test or module would otherwise pass silently as `running 0 tests`.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/miri-logs
+          log="target/miri-logs/${{ matrix.name }}.log"
+          set +e
+          cargo +nightly miri test --locked ${{ matrix.args }} 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Miri ${{ matrix.name }} failed (exit $rc)"
+            exit "$rc"
+          fi
+          if ! grep -qE '^running [1-9][0-9]* tests?$' "$log"; then
+            echo "::error::Miri ${{ matrix.name }} executed no tests (filter drift)"
+            exit 1
+          fi
+      - name: Retain Miri logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sanitizers-miri-${{ matrix.name }}
+          path: target/miri-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  sanitizers:
+    name: Sanitizers
+    if: always()
+    needs: [c-sanitizers, miri]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass
+        env:
+          C_SANITIZERS_RESULT: ${{ needs.c-sanitizers.result }}
+          MIRI_RESULT: ${{ needs.miri.result }}
+        run: |
+          test "$C_SANITIZERS_RESULT" = success
+          test "$MIRI_RESULT" = success
+      - name: Notify Multica on failure
+        if: failure() && (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
+        run: |
+          curl -sS -X POST "${{ secrets.MULTICA_CI_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","run_id":"${{ github.run_id }}","ref":"${{ github.ref_name }}","sha":"${{ github.sha }}","workflow":"sanitizers"}'

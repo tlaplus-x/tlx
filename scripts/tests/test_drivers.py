@@ -985,5 +985,23 @@ public class %s extends ModelCheckerTestCase {
                 self.assertTrue(e["id"] and e["reason"], e)
 
 
+class NativeCRequirement(unittest.TestCase):
+    """`--require-native`: a sanitizer suite fails when generated C was not used."""
+
+    def test_reports_a_disabled_native_build(self):
+        out = "compile: native code disabled: cannot load /cache/1/model.so: dlopen failed\n4 states generated\n"
+        self.assertIn("native code disabled", spectest.native_missing(out))
+
+    def test_reports_a_failed_c_build(self):
+        out = "compile: C build failed, keeping the JIT code: compiler not found\n"
+        self.assertIn("C build failed", spectest.native_missing(out))
+
+    def test_reports_a_whole_model_fallback(self):
+        self.assertIsNotNone(spectest.native_missing("compile: IR verification failed; interpreting the model\n"))
+
+    def test_accepts_a_native_run(self):
+        self.assertIsNone(spectest.native_missing("compile: native code: 4/4 actions, 1/1 invariants, Init\n4 states generated\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
