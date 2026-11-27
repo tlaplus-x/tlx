@@ -23,6 +23,31 @@ pub(in crate::optimize::phase) fn ordinary_unchanged(e: &Expr) -> bool {
     }
 }
 
+/// Collect every variable expression inside an ordinary `UNCHANGED` frame that
+/// is not excluded by `exclude`. Fails closed (`None`) on non-variable /
+/// non-tuple expressions.
+pub(in crate::optimize::phase) fn collect_unchanged_excluding(
+    e: &Expr,
+    exclude: &mut impl FnMut(VarId) -> bool,
+    out: &mut Vec<Expr>,
+) -> Option<()> {
+    match &*e.kind {
+        ExprKind::Var(v) => {
+            if !exclude(*v) {
+                out.push(e.clone());
+            }
+            Some(())
+        }
+        ExprKind::Tuple(es) => {
+            for x in es {
+                collect_unchanged_excluding(x, exclude, out)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 /// Whether `e` references any state variable accepted by `selected`.
 pub(in crate::optimize::phase) fn mentions_var_where(e: &Expr, selected: &mut impl FnMut(VarId) -> bool) -> bool {
     let selected_var = match &*e.kind {
@@ -241,6 +266,14 @@ mod tests {
         assert!(!ordinary_unchanged(&num(1)));
         assert!(!ordinary_unchanged(&e(ExprKind::Tuple(vec![var(0), num(1)]))));
         assert!(!ordinary_unchanged(&e(ExprKind::FnApp { func: var(0), args: vec![] })));
+
+        let nested = e(ExprKind::Tuple(vec![var(0), e(ExprKind::Tuple(vec![var(1), var(2)]))]));
+        let mut kept = Vec::new();
+        assert!(collect_unchanged_excluding(&nested, &mut |v| v == VarId(1), &mut kept).is_some());
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(&*kept[0].kind, ExprKind::Var(VarId(0))));
+        assert!(matches!(&*kept[1].kind, ExprKind::Var(VarId(2))));
+        assert!(collect_unchanged_excluding(&e(ExprKind::Tuple(vec![var(0), num(1)])), &mut |_| false, &mut kept).is_none());
     }
 
     #[test]

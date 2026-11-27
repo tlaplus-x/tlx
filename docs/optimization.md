@@ -55,7 +55,7 @@ negative mutation checks are explicit.
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–7 model values each, product order `<= 5040`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
-| Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, and `FieldSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure or phase-dependent field masking composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure or phase-dependent fields and the corresponding symmetry certificate matches the exact installed `VIEW` |
+| Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, `FieldSymCertificate.lean`, and `ThresholdSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure, phase-dependent field masking, or in-place threshold-counter saturation composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure, phase-dependent fields, or threshold counters and the corresponding symmetry certificate matches the exact installed `VIEW` |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
 State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-arity
@@ -64,11 +64,12 @@ automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTI
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
 `ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `FieldSymCertificate`,
-`OrderedCertificate`, `NestedCertificate`, `LiveCertificate`, and `ThresholdCounterCertificate`
+`OrderedCertificate`, `NestedCertificate`, `LiveCertificate`, `ThresholdCounterCertificate`, and
+`ThresholdSymCertificate`
 when every action check factors through the retained representative. `Field` and `FieldSym`
 certify checks whose unprimed and primed field reads are recorded, and record each such field
-as globally observed so its value survives at both endpoints. `Ordered`, `Nested`, `Live`, and
-`ThresholdCounter` certify checks that read only
+as globally observed so its value survives at both endpoints. `Ordered`, `Nested`, `Live`,
+`ThresholdCounter`, and `ThresholdSym` certify checks that read only
 retained core state, refusing any read of a projected allocation magnitude, rank pattern,
 live-version table, or projected counter. `Length`, `History`, `Age`, and
 `AgeHistory` still fail closed when action constraints or action properties are present.
@@ -730,6 +731,13 @@ concrete source model via `Rules.lean`'s `compose` and `composeConstrained`:
    symmetry-only distinct states drop to 13,919 composed distinct states (6.71x fewer states and
    2.05x faster release wall time than symmetry alone; 9.38x fewer states and 3.76x faster at 6
    processes; see [proofs/field/README.md](../proofs/field/README.md)).
+3. **Threshold-counter saturation × equivariant symmetry (`phase/threshold/sym.rs`,
+   `phase/threshold/sym/{lower,output}.rs` + `OrbitQuotient.lean` +
+   `ThresholdSymCertificate.lean`):** composes in-place threshold-counter saturation (scalar,
+   fixed-key, and uniform-cap symmetric `[K -> Nat]` counter maps) with recursive equivariant
+   symmetry (`EquivSymCertificate.lean`), including constrained state checks and counter-independent
+   action checks (`CONSTRAINT`, `init_props`, `ACTION_CONSTRAINT`, `[][A]_sub`, and
+   `CONSTANT C <- Def`). See [proofs/counter/README.md](../proofs/counter/README.md).
 
 ### Scope
 
@@ -746,6 +754,15 @@ concrete source model via `Rules.lean`'s `compose` and `composeConstrained`:
   `FieldRule.State`. When an eligible `phase-field-projection` does not compose with symmetry
   (for example under `ChooseSymCertificate`), a bounded BFS probe compares both reduced graphs so
   `-optimize` does not displace a stronger certified symmetry.
+- **Threshold saturation × symmetry (`GeneratedThresholdSymmetry`):** `-optimize` selects
+  `threshold-counter-projection`, each projected counter map's domain partitions cleanly into
+  key-free fixed atoms and complete symmetric groups with kernel-checked uniform per-group caps
+  (`capUniform : by decide`), and all retained state, counter tests, transfers, initial seeds, and
+  state/action checks lower into the shared `ThresholdSymRule` IR. Scoped totality permits
+  non-negative constant increments on proven mathematical natural counters while keeping 32-bit
+  overflow checks strict on all retained expressions. When an eligible
+  `threshold-counter-projection` does not compose with symmetry, the same bounded BFS probe
+  compares both reduced graphs so `-optimize` does not displace a stronger certified symmetry.
 
 ### Lowered Rule & Lean Certificate
 
@@ -763,22 +780,32 @@ intermediate system is the exact projected image of the source model:
   and constructs the `EquivRule.OrbitQuotient` on the exact `FieldRule.reduced` /
   `constrainedReduced` intermediate system, composing both stages via `TlxOptimization.compose` and
   `TlxOptimization.composeConstrained`.
+- **`ThresholdSymCertificate.lean` + `OrbitQuotient.lean`:** embeds `ThresholdCounterRule.Model`
+  inside `ThresholdSymRule.Model` (with `Core = EquivRule.State CoreVar sizes A`), discharges
+  `slotBounds`, `slotClosed`, `capUniform`, `templateUniform`, and `SymTest`/`SymTransfer` validity
+  via kernel-checked `decide`, proves `saturate_rename`, `evalSymTest_equivariant`, and
+  `evalSymTransfer_reduced_equivariant`, and constructs the `EquivRule.OrbitQuotient` on the exact
+  `ThresholdCounterRule.reduced` / `constrainedReduced` intermediate system, composing both stages
+  via `TlxOptimization.compose` and `TlxOptimization.composeConstrained`.
 
 Two independently generated certificates for unrelated models cannot authorize application. At run
 time, `tlx` projects first and canonicalizes the projected value under the total structural order
-(`InterpModel::projected_orbit`), so forgotten fields or variables containing moved keys cannot
-split or bias orbits. Theorem audits cover the intermediate stage certificate (`erasure_certificate`
-or `field_certificate`), the orbit-quotient `symmetry_certificate`, the composed `certificate`,
-safety with and without stuttering, counterexample lifting, deadlocks, formal `orbit_key_equivalent`,
-and (when constrained) all constrained and constant-substitution theorems.
+(`InterpModel::projected_orbit`), so forgotten fields, forgotten variables, or counter magnitudes
+above their caps cannot split or bias orbits. Theorem audits cover the intermediate stage
+certificate (`erasure_certificate`, `field_certificate`, or `threshold_certificate`), the
+orbit-quotient `symmetry_certificate`, the composed `certificate`, safety with and without
+stuttering, counterexample lifting, deadlocks, formal `orbit_key_equivalent`, and (when constrained)
+all constrained and constant-substitution theorems.
 
 ### Refusals & Trusted Computing Base (TCB)
 
 - **Refusals:** projection families without a composed certificate (age, history, sequence-length,
-  ordered-allocation, and threshold-counter projections), `ChooseSymCertificate` composition (falls
-  back via bounded probe for `phase-field-projection`), non-equivariant sentinels, overlapping
-  `EXCEPT` `@` updates, unsupported hidden/field transfers, and user-declared `VIEW` or `SYMMETRY`.
-  Passing `-noautosymmetry` retains standalone `ErasureCertificate.lean` or `FieldCertificate.lean`.
+  and ordered-allocation projections), `ChooseSymCertificate` composition (falls back via bounded
+  probe for `phase-field-projection` and `threshold-counter-projection`), non-equivariant sentinels,
+  asymmetric per-key counter caps, overlapping `EXCEPT` `@` updates, unsupported
+  hidden/field/counter transfers, and user-declared `VIEW` or `SYMMETRY`. Passing `-noautosymmetry`
+  retains standalone `ErasureCertificate.lean`, `FieldCertificate.lean`, or
+  `ThresholdCounterCertificate.lean`.
 - **TCB:** union of the constituent projection and symmetry TCB boundaries, plus runtime projection
   prior to orbit canonicalization.
 

@@ -67,6 +67,22 @@ the generated `GeneratedThresholdCounter` file against the standard axioms,
 rejecting the off-by-one-cap, dropped-increment, discarded-guard-feedback and
 changed-observation mutations.
 
+### Composition with automatic symmetry (`ThresholdSymCertificate.lean`)
+
+When `Actor` is configured as a set of model values (for example
+`Actor = {a1, a2, a3}`) and `-optimize` runs with automatic symmetry enabled,
+`threshold-counter-projection` composes directly with certified equivariant
+symmetry via `ThresholdSymCertificate.lean` (`GeneratedThresholdSymmetry`,
+unconstrained and constrained, reusing `OrbitQuotient.lean`) over one shared
+concrete source model. Symmetric-group counter slots carry kernel-checked
+uniform caps (`capUniform : by decide`) so `saturate` commutes with `GroupPerm`,
+and `tlx` projects before orbit canonicalization while reconstructing un-capped
+concrete counterexample traces. Both unconstrained and constrained
+`GeneratedThresholdSymmetry` certificates are audited by
+`python3 proofs/check_generated.py --lean lean --negative`, rejecting asymmetric
+per-key counter caps, weakened `Cmp.reqCap`, dropped `Transfer.add`, broken slot
+renamings, and disconnected intermediate models.
+
 ### External evidence
 
 `scripts/fetch-deps.sh` installs the upstream tlaplus/Examples corpus. The

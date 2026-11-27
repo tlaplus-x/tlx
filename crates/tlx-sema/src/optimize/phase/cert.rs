@@ -7,7 +7,7 @@ use crate::hir::Expr;
 use crate::Program;
 
 use super::spec::CheckSpec;
-use super::{choose_sym, equiv_sym, keyed, liveness};
+use super::{choose_sym, equiv_sym, keyed, liveness, threshold};
 
 /// An emitted Lean certificate body whose `TlxOptimization.<namespace>` section
 /// remains open until optional constrained and constant-substitution obligations
@@ -238,7 +238,8 @@ pub fn symmetry_projection_certificate(
 /// Certify a structural projection followed by symmetry covering invariants,
 /// init properties, constraints, action constraints, and action properties:
 /// unobserved-variable erasure (`ErasedKeyedCertificate` / `ErasedEquivCertificate`),
-/// or phase-dependent field masking (`FieldSymCertificate`).
+/// phase-dependent field masking (`FieldSymCertificate`), or in-place
+/// threshold-counter saturation (`ThresholdSymCertificate`).
 pub fn symmetry_projection_certificate_with_spec(
     program: &Program,
     cfg: &Config,
@@ -251,4 +252,5 @@ pub fn symmetry_projection_certificate_with_spec(
     keyed::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view)
         .or_else(|| equiv_sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
         .or_else(|| liveness::sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
+        .or_else(|| threshold::sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
 }

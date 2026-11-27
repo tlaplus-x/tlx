@@ -56,8 +56,8 @@ pub(in crate::optimize::phase) use const_subst::{
     ConstSubstTarget,
 };
 pub(in crate::optimize::phase) use hir_util::{
-    atom_nat, expr_alpha_eq, expr_alpha_eq_with_locals, expr_structurally_eq, max_local, mentions_local, mentions_var, mentions_var_where,
-    mentions_vars, ordinary_unchanged,
+    atom_nat, collect_unchanged_excluding, expr_alpha_eq, expr_alpha_eq_with_locals, expr_structurally_eq, max_local, mentions_local,
+    mentions_var, mentions_var_where, mentions_vars, ordinary_unchanged,
 };
 pub(in crate::optimize::phase) use spec::{parse_retained_view, ObsBundle, OwnedCheckSpec};
 

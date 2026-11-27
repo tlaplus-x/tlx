@@ -4546,5 +4546,41 @@ theorem constrained_certificate :
     · intro h t hst hpt
       exact h ⟨s, t, rfl, hst, hpt⟩ s t rfl hpt hst
 end Model
+
+def pushList {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (env : Env sizes A) : List (Val sizes A) → Env sizes A
+  | [] => env
+  | w :: ws => pushList (push env w) ws
+
+theorem renameEnv_pushList {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) :
+    ∀ (env : Env sizes A) (ws : List (Val sizes A)),
+      renameEnv p (pushList env ws) = pushList (renameEnv p env) (ws.map (renameVal p))
+  | _, [] => rfl
+  | env, w :: ws => by
+    simp only [pushList, List.map_cons, renameEnv_push, renameEnv_pushList p (push env w) ws]
+
+def evalBounds {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A]
+    (ops : AtomOps A) (s t : EquivRule.State V sizes A) :
+    Env sizes A → List (SetPred d V) → List (Val sizes A) → Prop
+  | _, [], [] => True
+  | env, dom :: doms, w :: ws =>
+      evalSetPred ops s t env dom w ∧ evalBounds ops s t (push env w) doms ws
+  | _, _, _ => False
+
+theorem evalBounds_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (ops : AtomOps A) (s t : EquivRule.State V sizes A) :
+    ∀ (env : Env sizes A) (doms : List (SetPred d V)) (ws : List (Val sizes A)),
+      evalBounds ops (renameState p s) (renameState p t) (renameEnv p env) doms (ws.map (renameVal p)) ↔
+        evalBounds ops s t env doms ws
+  | _, [], [] => Iff.rfl
+  | _, [], _ :: _ => Iff.rfl
+  | _, _ :: _, [] => Iff.rfl
+  | env, dom :: doms, w :: ws => by
+    simp only [List.map_cons, evalBounds]
+    exact and_congr
+      (evalSetPred_equivariant p ops s t env dom w)
+      (by rw [← renameEnv_push]; exact evalBounds_equivariant p ops s t (push env w) doms ws)
+
 end
 end TlxOptimization.EquivRule

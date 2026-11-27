@@ -9,6 +9,8 @@
 //! are preserved exactly.
 
 mod lean;
+mod shape;
+pub(super) mod sym;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -56,27 +58,15 @@ pub fn threshold_counter_projection(
     threshold_counter_projection_with_spec(program, cfg, init, next, CheckSpec::invariants_only(observations))
 }
 
-/// Prove an in-place threshold-counter saturation projection covering invariants,
-/// init properties, state constraints, and counter-independent action checks.
-pub fn threshold_counter_projection_with_spec(
+pub(super) fn analyze_counters(
     program: &Program,
     cfg: &Config,
-    init: &Expr,
-    next: &Expr,
-    spec: CheckSpec<'_>,
-) -> Option<FieldProjection> {
-    if !super::cfg_constants_supported(program, cfg) {
-        return None;
-    }
-    let mut expand = Normalizer::with_config_threshold(program, cfg);
-    let initial = branches_with_if(&expand.root(init)?)?;
-    let steps = branches_with_if(&expand.root(next)?)?;
-    if initial.is_empty() || steps.is_empty() {
-        return None;
-    }
-    let norm = spec.try_map(|e| expand.root(e))?;
-    let norm_spec = norm.as_spec();
-    let domains = Domains::infer(program, cfg, &initial, &steps)?;
+    initial: &[Branch],
+    steps: &[Branch],
+    norm_spec: CheckSpec<'_>,
+    opaque_cache: &mut HashMap<DefId, Option<BTreeSet<VarId>>>,
+) -> Option<(Domains, Vec<CounterSpec>)> {
+    let domains = Domains::infer(program, cfg, initial, steps)?;
 
     let mut candidates = BTreeMap::new();
     for (i, dom) in domains.vars.iter().enumerate() {
@@ -137,12 +127,12 @@ pub fn threshold_counter_projection_with_spec(
             domains: &domains,
             candidates: &mut candidates,
             invalid: BTreeSet::new(),
-            opaque_cache: expand.opaque_vars_cache_mut(),
+            opaque_cache,
             remaining: MAX_CHECK_WORK,
             aborted: false,
         };
 
-        checker.check_all(&initial, &steps, norm_spec);
+        checker.check_all(initial, steps, norm_spec);
         if checker.aborted {
             return None;
         }
@@ -158,7 +148,7 @@ pub fn threshold_counter_projection_with_spec(
         let mut to_prune = Vec::new();
         let vars: Vec<VarId> = candidates.keys().copied().collect();
         for v in vars {
-            let (ub, eval_ub) = compute_bounds(&domains, &candidates[&v], &initial, &steps, norm_spec.constraints);
+            let (ub, eval_ub) = compute_bounds(&domains, &candidates[&v], initial, steps, norm_spec.constraints);
             let spec_c = candidates.get_mut(&v).unwrap();
             spec_c.upper_bound = ub;
             spec_c.eval_upper_bound = eval_ub;
@@ -190,6 +180,30 @@ pub fn threshold_counter_projection_with_spec(
     if total_slots == 0 || total_slots > MAX_TOTAL_SLOTS {
         return None;
     }
+    Some((domains, counters))
+}
+
+/// Prove an in-place threshold-counter saturation projection covering invariants,
+/// init properties, state constraints, and counter-independent action checks.
+pub fn threshold_counter_projection_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+) -> Option<FieldProjection> {
+    if !super::cfg_constants_supported(program, cfg) {
+        return None;
+    }
+    let mut expand = Normalizer::with_config_threshold(program, cfg);
+    let initial = branches_with_if(&expand.root(init)?)?;
+    let steps = branches_with_if(&expand.root(next)?)?;
+    if initial.is_empty() || steps.is_empty() {
+        return None;
+    }
+    let norm = spec.try_map(|e| expand.root(e))?;
+    let norm_spec = norm.as_spec();
+    let (domains, counters) = analyze_counters(program, cfg, &initial, &steps, norm_spec, expand.opaque_vars_cache_mut())?;
 
     if spec.is_constrained() && !super::sym_totality::check_projection_observations_total(program, cfg, init, next, spec) {
         return None;
@@ -208,7 +222,7 @@ pub fn threshold_counter_projection_with_spec(
     Some(FieldProjection { ordered: None, view, fields, certificate: Some(certificate), mathematical_counter_arithmetic })
 }
 
-fn build_view(program: &Program, counters: &[CounterSpec], span: Span) -> Expr {
+pub(super) fn build_view(program: &Program, counters: &[CounterSpec], span: Span) -> Expr {
     let by_var: HashMap<VarId, &CounterSpec> = counters.iter().map(|c| (c.var, c)).collect();
     let mut next_local = program.locals.len() as u32;
     let values = program
@@ -518,32 +532,27 @@ impl Checker<'_> {
         if !self.tick() {
             return false;
         }
-        if atom_nat(self.domains, rhs).is_some() {
-            return true;
-        }
-        if let ExprKind::If { cond, then, els } = &*rhs.kind {
-            if self.mentions_any_candidate(cond) {
-                return false;
+        match shape::seed_shape(self.domains, rhs) {
+            Some(shape::SeedShape::Const(_)) => true,
+            Some(shape::SeedShape::Ite { cond, then, els }) => {
+                !self.mentions_any_candidate(cond) && self.check_scalar_init(then) && self.check_scalar_init(els)
             }
-            return self.check_scalar_init(then) && self.check_scalar_init(els);
+            None => false,
         }
-        false
     }
 
     fn check_map_init(&mut self, keys: &BTreeSet<Atom>, rhs: &Expr) -> bool {
         if !self.tick() {
             return false;
         }
-        match &*rhs.kind {
-            ExprKind::FnConstruct { bounds, body } if bounds.len() == 1 => {
-                matches!(&bounds[0].vars, BoundVars::Many(ids) if ids.len() == 1)
-                    && self.domains.exact_set(&bounds[0].set).as_ref() == Some(keys)
-                    && self.check_scalar_init(body)
+        match shape::map_seed_shape(rhs) {
+            Some(shape::MapSeedShape::FnConstruct { set, body, .. }) => {
+                self.domains.exact_set(set).as_ref() == Some(keys) && self.check_scalar_init(body)
             }
-            ExprKind::If { cond, then, els } => {
+            Some(shape::MapSeedShape::Ite { cond, then, els }) => {
                 !self.mentions_any_candidate(cond) && self.check_map_init(keys, then) && self.check_map_init(keys, els)
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -559,33 +568,21 @@ impl Checker<'_> {
         if !self.tick() {
             return false;
         }
-        if variable(rhs, false) == Some(v) {
-            return true;
-        }
-        if atom_nat(self.domains, rhs).is_some() {
-            return true;
-        }
-        match &*rhs.kind {
-            ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-                for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                    if variable(lhs, false) == Some(v) {
-                        if let Some(d) = atom_nat(self.domains, delta_e) {
-                            if d > 0 {
-                                if let Some(c) = self.candidates.get_mut(&v) {
-                                    c.has_positive_add = true;
-                                }
-                            }
-                            return true;
-                        }
+        match shape::scalar_update(self.domains, v, rhs) {
+            Some(shape::SlotUpdate::Keep | shape::SlotUpdate::Reset(_)) => true,
+            Some(shape::SlotUpdate::Add(d)) => {
+                if d > 0 {
+                    if let Some(c) = self.candidates.get_mut(&v) {
+                        c.has_positive_add = true;
                     }
                 }
-                false
+                true
             }
-            ExprKind::If { cond, then, els } => {
+            Some(shape::SlotUpdate::Ite { cond, then, els }) => {
                 self.check_pred(cond, locals);
                 self.check_scalar_transfer(v, then, locals) && self.check_scalar_transfer(v, els, locals)
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -593,26 +590,18 @@ impl Checker<'_> {
         if !self.tick() {
             return false;
         }
-        if variable(rhs, false) == Some(v) {
-            return true;
-        }
-        match &*rhs.kind {
-            ExprKind::FnConstruct { bounds, body } if bounds.len() == 1 => {
-                let BoundVars::Many(ids) = &bounds[0].vars else { return false };
-                if ids.len() != 1 || self.domains.exact_set(&bounds[0].set).as_ref() != Some(keys) {
+        match shape::map_transfer_shape(v, rhs) {
+            Some(shape::MapTransferShape::Keep) => true,
+            Some(shape::MapTransferShape::FnConstruct { local, set, body }) => {
+                if self.domains.exact_set(set).as_ref() != Some(keys) {
                     return false;
                 }
                 let mut inner_locals = locals.clone();
-                inner_locals.insert(ids[0], Domain::Atoms(keys.clone()));
-                self.check_map_slot_transfer(v, &Expr::new(ExprKind::Local(ids[0]), body.span), body, &inner_locals)
+                inner_locals.insert(local, Domain::Atoms(keys.clone()));
+                self.check_map_slot_transfer(v, &Expr::new(ExprKind::Local(local), body.span), body, &inner_locals)
             }
-            ExprKind::Except { base, updates } if variable(base, false) == Some(v) => {
-                if updates.is_empty() {
-                    return true;
-                }
-                for (path, val) in updates {
-                    let [ExceptKey::Index(indices)] = path.as_slice() else { return false };
-                    let [idx] = indices.as_slice() else { return false };
+            Some(shape::MapTransferShape::Except(updates)) => {
+                for (idx, val) in updates {
                     if self.mentions_any_candidate(idx) || !is_index_in_domain(self.domains, idx, keys, locals) {
                         return false;
                     }
@@ -622,50 +611,33 @@ impl Checker<'_> {
                 }
                 true
             }
-            ExprKind::If { cond, then, els } => {
+            Some(shape::MapTransferShape::Ite { cond, then, els }) => {
                 self.check_pred(cond, locals);
                 self.check_map_transfer(v, keys, then, locals) && self.check_map_transfer(v, keys, els, locals)
             }
-            _ => false,
+            None => false,
         }
-    }
-
-    fn is_same_map_slot(&self, e: &Expr, v: VarId, expected_idx: &Expr) -> bool {
-        let ExprKind::FnApp { func, args } = &*e.kind else { return false };
-        args.len() == 1 && variable(func, false) == Some(v) && expr_structurally_eq(&args[0], expected_idx)
     }
 
     fn check_map_slot_transfer(&mut self, v: VarId, idx: &Expr, val: &Expr, locals: &Locals) -> bool {
         if !self.tick() {
             return false;
         }
-        if self.is_same_map_slot(val, v, idx) {
-            return true;
-        }
-        if atom_nat(self.domains, val).is_some() {
-            return true;
-        }
-        match &*val.kind {
-            ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-                for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                    if self.is_same_map_slot(lhs, v, idx) {
-                        if let Some(d) = atom_nat(self.domains, delta_e) {
-                            if d > 0 {
-                                if let Some(c) = self.candidates.get_mut(&v) {
-                                    c.has_positive_add = true;
-                                }
-                            }
-                            return true;
-                        }
+        match shape::map_slot_update(self.domains, v, idx, val) {
+            Some(shape::SlotUpdate::Keep | shape::SlotUpdate::Reset(_)) => true,
+            Some(shape::SlotUpdate::Add(d)) => {
+                if d > 0 {
+                    if let Some(c) = self.candidates.get_mut(&v) {
+                        c.has_positive_add = true;
                     }
                 }
-                false
+                true
             }
-            ExprKind::If { cond, then, els } => {
+            Some(shape::SlotUpdate::Ite { cond, then, els }) => {
                 self.check_pred(cond, locals);
                 self.check_map_slot_transfer(v, idx, then, locals) && self.check_map_slot_transfer(v, idx, els, locals)
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -982,33 +954,18 @@ fn scan_transfer_ub(domains: &Domains, counter: &CounterSpec, rhs: &Expr, branch
 }
 
 fn scan_scalar_transfer_ub(domains: &Domains, counter: &CounterSpec, rhs: &Expr, pre_ub: Option<i128>) -> Option<i128> {
-    if variable(rhs, false) == Some(counter.var) {
-        return Some(0);
-    }
-    if let Some(r) = atom_nat(domains, rhs) {
-        return Some(r);
-    }
-    match &*rhs.kind {
-        ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-            for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                if variable(lhs, false) == Some(counter.var) {
-                    let d = atom_nat(domains, delta_e)?;
-                    if d == 0 {
-                        return Some(0);
-                    }
-                    return pre_ub?.checked_add(d);
-                }
-            }
-            None
-        }
-        ExprKind::If { cond, then, els } => {
+    match shape::scalar_update(domains, counter.var, rhs)? {
+        shape::SlotUpdate::Keep => Some(0),
+        shape::SlotUpdate::Reset(r) => Some(r),
+        shape::SlotUpdate::Add(0) => Some(0),
+        shape::SlotUpdate::Add(d) => pre_ub?.checked_add(d),
+        shape::SlotUpdate::Ite { cond, then, els } => {
             let then_ub = tighten_ub(pre_ub, extract_universal_ub(domains, counter, cond, false));
             let els_ub = tighten_ub(pre_ub, extract_universal_ub(domains, counter, cond, true));
             let a = scan_scalar_transfer_ub(domains, counter, then, then_ub)?;
             let b = scan_scalar_transfer_ub(domains, counter, els, els_ub)?;
             Some(a.max(b))
         }
-        _ => None,
     }
 }
 
@@ -1019,20 +976,15 @@ fn scan_map_transfer_ub(
     branch_terms: &[Expr],
     univ_ub: Option<i128>,
 ) -> Option<i128> {
-    if variable(rhs, false) == Some(counter.var) {
-        return Some(0);
-    }
-    match &*rhs.kind {
-        ExprKind::FnConstruct { bounds, body } if bounds.len() == 1 => {
-            let BoundVars::Many(ids) = &bounds[0].vars else { return None };
-            let idx = Expr::new(ExprKind::Local(ids[0]), body.span);
+    match shape::map_transfer_shape(counter.var, rhs)? {
+        shape::MapTransferShape::Keep => Some(0),
+        shape::MapTransferShape::FnConstruct { local, body, .. } => {
+            let idx = Expr::new(ExprKind::Local(local), body.span);
             scan_map_slot_transfer_ub(domains, counter, &idx, body, univ_ub)
         }
-        ExprKind::Except { base, updates } if variable(base, false) == Some(counter.var) => {
+        shape::MapTransferShape::Except(updates) => {
             let mut max_val = 0i128;
-            for (path, val) in updates {
-                let [ExceptKey::Index(indices)] = path.as_slice() else { return None };
-                let [idx] = indices.as_slice() else { return None };
+            for (idx, val) in updates {
                 let mut slot_ub = univ_ub;
                 for t in branch_terms {
                     slot_ub = tighten_ub(slot_ub, extract_slot_ub(domains, counter.var, Some(idx), t, false));
@@ -1042,47 +994,29 @@ fn scan_map_transfer_ub(
             }
             Some(max_val)
         }
-        ExprKind::If { cond, then, els } => {
+        shape::MapTransferShape::Ite { cond, then, els } => {
             let then_ub = tighten_ub(univ_ub, extract_universal_ub(domains, counter, cond, false));
             let els_ub = tighten_ub(univ_ub, extract_universal_ub(domains, counter, cond, true));
             let a = scan_map_transfer_ub(domains, counter, then, branch_terms, then_ub)?;
             let b = scan_map_transfer_ub(domains, counter, els, branch_terms, els_ub)?;
             Some(a.max(b))
         }
-        _ => None,
     }
 }
 
 fn scan_map_slot_transfer_ub(domains: &Domains, counter: &CounterSpec, idx: &Expr, val: &Expr, pre_ub: Option<i128>) -> Option<i128> {
-    if matches!(&*val.kind, ExprKind::FnApp { func, args } if args.len() == 1 && variable(func, false) == Some(counter.var) && expr_structurally_eq(&args[0], idx))
-    {
-        return Some(0);
-    }
-    if let Some(r) = atom_nat(domains, val) {
-        return Some(r);
-    }
-    match &*val.kind {
-        ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-            for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                if matches!(&*lhs.kind, ExprKind::FnApp { func, args } if args.len() == 1 && variable(func, false) == Some(counter.var) && expr_structurally_eq(&args[0], idx))
-                {
-                    let d = atom_nat(domains, delta_e)?;
-                    if d == 0 {
-                        return Some(0);
-                    }
-                    return pre_ub?.checked_add(d);
-                }
-            }
-            None
-        }
-        ExprKind::If { cond, then, els } => {
+    match shape::map_slot_update(domains, counter.var, idx, val)? {
+        shape::SlotUpdate::Keep => Some(0),
+        shape::SlotUpdate::Reset(r) => Some(r),
+        shape::SlotUpdate::Add(0) => Some(0),
+        shape::SlotUpdate::Add(d) => pre_ub?.checked_add(d),
+        shape::SlotUpdate::Ite { cond, then, els } => {
             let then_ub = tighten_ub(pre_ub, extract_slot_ub(domains, counter.var, Some(idx), cond, false));
             let els_ub = tighten_ub(pre_ub, extract_slot_ub(domains, counter.var, Some(idx), cond, true));
             let a = scan_map_slot_transfer_ub(domains, counter, idx, then, then_ub)?;
             let b = scan_map_slot_transfer_ub(domains, counter, idx, els, els_ub)?;
             Some(a.max(b))
         }
-        _ => None,
     }
 }
 
