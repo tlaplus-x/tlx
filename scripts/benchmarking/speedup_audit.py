@@ -7,6 +7,11 @@ for a stored tlx row whose recorded TLC baseline matches it under
 inventory built by pairing the raw store by model name would treat excluded
 or incomplete rows as claims the report never made.
 
+Each case also carries its same-instance unreduced `-tlc` twin when the store
+holds one (same model, revision, instance, workers and input), so a reduced
+row's TLC ratio can be read next to the like-for-like reduction factor instead
+of the two being conflated.
+
 This module is read-only. It returns data (and `main` writes JSON/markdown to
 the caller's chosen path); it never runs a model or changes the store.
 
@@ -90,10 +95,11 @@ def verify_digest(model_id, models):
     return content_digest(m) if m and m.get('tla') and m.get('cfg') else None
 
 
-def case(r, tc):
+def case(r, tc, twins=None):
     """One candidate row with the pairing facts an auditor has to check."""
     tlx_wall = r['metrics']['wall_s']
     tlc_wall = tc['metrics']['wall_s']
+    twin = bench_records.unreduced_twin(r, twins or {})
     return {
         'model': r['model'],
         'mode': r['mode'],
@@ -130,6 +136,20 @@ def case(r, tc):
             'provenance': tc['provenance'],
             'evidence': _samples(tc),
         },
+        'unreduced_twin': None if twin is None else {
+            'id': twin['id'],
+            'path': record_path(twin),
+            'date': twin['date'],
+            'revision': twin['revision'],
+            'instance': twin['instance'],
+            'content_digest': twin['content_digest'],
+            'tlc_version': twin['tlc_version'],
+            'counts': twin['counts'],
+            'metrics': twin['metrics'],
+            'configuration': twin['configuration'],
+            'provenance': twin['provenance'],
+            'ratio': twin['metrics']['wall_s'] / tlx_wall,
+        },
         'checks': {
             'result_equal': r['counts']['result'] == tc['counts']['result'],
             'distinct_comparable': r['mode'] != 'default' and r['configuration'].get('compatibility') is not False,
@@ -141,6 +161,10 @@ def case(r, tc):
             'arch_equal': r['instance']['arch'] == tc['instance']['arch'],
             'cgroup_equal': r['configuration'].get('cgroup_mib') == tc['configuration'].get('cgroup_mib'),
             'compatibility': r['configuration'].get('compatibility'),
+            'unreduced_twin': twin is not None,
+            'twin_counts_equal_tlc': None if twin is None else (
+                twin['counts']['result'] == tc['counts']['result']
+                and twin['counts']['distinct'] == tc['counts']['distinct']),
         },
     }
 
@@ -148,7 +172,12 @@ def case(r, tc):
 def inventory(records, threshold=100.0):
     """Every selected tlx/TLC pair whose recorded ratio exceeds `threshold`."""
     by_id = {r['id']: r for r in records}
-    cases = [case(r, tc) for r, tc in paired(selection(records), by_id)]
+    rows = selection(records)
+    # (The whole store, not the report's latest-per-key rows: `latest` does not
+    # key by revision, so a twin of an older revision must not be evicted from
+    # the lookup by a newer run of the same mode.)
+    twins = bench_records.unreduced_twins(records)
+    cases = [case(r, tc, twins) for r, tc in paired(rows, by_id)]
     cases = [c for c in cases if c['ratio'] > threshold]
     cases.sort(key=lambda c: -c['ratio'])
     return cases
@@ -187,16 +216,27 @@ def add_digest_checks(cases, models):
 
 
 def markdown(cases):
-    """A compact table of the inventory, one row per candidate."""
-    out = ['| # | model | mode | workers | ratio | tlx warm s | tlx cold s | TLC s | tlx distinct | TLC distinct | digest |',
-           '|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    """A compact table of the inventory, one row per candidate.
+
+    A default-mode candidate with a same-instance unreduced `-tlc` twin carries
+    the twin's time and its factor over the reduced row: the published TLC ratio
+    then has both the like-for-like reduction factor and TLC's own denominator.
+    """
+    twinned = any(c.get('unreduced_twin') for c in cases)
+    twin_head = ' -tlc s | -tlc / default |' if twinned else ''
+    out = ['| # | model | mode | workers | ratio |' + twin_head + ' tlx warm s | tlx cold s | TLC s | tlx distinct | TLC distinct | digest |',
+           '|---:|---|---|---:|---:|' + ('---:|---:|' if twinned else '') + '---:|---:|---:|---:|---:|---|']
     for i, c in enumerate(cases, 1):
         cold = c['cold_tlx_s']
         digest = c.get('digest') or {}
         ok = 'verified' if digest.get('tlx_matches') and digest.get('tlc_matches') else (
             'mismatch' if digest.get('recomputed') else 'unresolved')
-        out.append(f"| {i} | {c['model']} | {c['mode']} | {c['workers']} | {c['ratio']:.2f}× | "
-                   f"{c['tlx']['metrics']['wall_s']:.3f} | " +
+        twin = c.get('unreduced_twin')
+        twin_cells = (f" {twin['metrics']['wall_s']:.3f} | {twin['ratio']:.2f}× |" if twin
+                      else ' — | — |') if twinned else ''
+        out.append(f"| {i} | {c['model']} | {c['mode']} | {c['workers']} | {c['ratio']:.2f}× |"
+                   + twin_cells +
+                   f" {c['tlx']['metrics']['wall_s']:.3f} | " +
                    (f"{cold:.3f}" if cold else "—") + f" | {c['tlc']['metrics']['wall_s']:.3f} | "
                    f"{c['tlx']['counts']['distinct']} | {c['tlc']['counts']['distinct']} | {ok} |")
     return '\n'.join(out) + '\n'

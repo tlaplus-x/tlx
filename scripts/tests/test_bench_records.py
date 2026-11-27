@@ -1138,6 +1138,108 @@ class RecordsTest(unittest.TestCase):
         self.assertIn('cannot be resolved', bench_suite.resolution_problems(manifest, {'ext/right/Trace': {}})[0])
         self.assertEqual(bench_suite.resolution_problems(manifest, {'ext/wrong/Trace': {}}), [])
 
+    def twin_pair(self, default=None, twin=None, header=None, twin_header=None):
+        """A default-mode row and its same-instance tlx `-tlc` companion."""
+        header = {'commit': 'abc123', 'date': '2026-10-07', 'machine': 'x86_64, tencent SA5.4XLARGE32',
+                  **(header or {})}
+        base = {'model': 'M', 'workers': 1, 'walls': [1.0, 1.0, 1.0], 'cpu': [1.0, 1.0, 1.0],
+                'result': 'success', 'distinct': 10, 'generated': 20, 'depth': 3,
+                'content_digest': 'd', 'tlc_version': 'v',
+                # Every suite/track/run record states its cache conditions; the
+                # pairing key requires them, so the fixture states them too.
+                'cache': {'mode': 'shared-batch', 'initial_state': 'unknown', 'warmup': True}}
+        reduced = normalize(header, {**base, 'mode': 'default', **(default or {})},
+                            'bench/history/a.json', '/runs/default')
+        companion = normalize(twin_header or header,
+                              {**base, 'mode': '-tlc', 'tool': 'tlx', 'distinct': 100,
+                               'walls': [9.0, 9.0, 9.0], 'cpu': [9.0, 9.0, 9.0], **(twin or {})},
+                              'bench/history/a.json', '/runs/tlc')
+        return reduced, companion
+
+    def test_report_pairs_a_default_mode_row_with_its_same_instance_tlc_twin(self):
+        # The reduced default-mode row carries the unreduced twin's own timing:
+        # the factor is quotable because both were measured on one instance.
+        reduced, companion = self.twin_pair()
+        text = br.render([reduced, companion], {'models': []})
+        detail = text.split('## ' + br.SECTIONS[1])[1].split('\n## ')[0]
+        self.assertIn('| -tlc twin s | -tlc / default |', detail)
+        self.assertIn('| 9.00 | 9.00× |', detail)
+        self.assertIn('-tlc / default` divides it', text)
+        # Every published number is named by its record: the twin time/factor
+        # cite the `-tlc` row in the same row's Evidence column.
+        self.assertIn('-tlc twin (', detail)
+        self.assertIn(br.store_file(companion), detail)
+        # A store without a twin renders exactly the old header and no new prose.
+        alone = br.render([reduced], {'models': []})
+        self.assertNotIn('-tlc twin', alone)
+        self.assertNotIn('-tlc / default', alone)
+
+    def test_twin_pairing_requires_one_instance_revision_input_and_configuration(self):
+        reduced, companion = self.twin_pair()
+        changes = {
+            'another instance': {'instance': {'type': 'other', 'arch': 'x86_64', 'description': 'x'}},
+            'another architecture': {'instance': {'type': 'SA5.4XLARGE32', 'arch': 'aarch64', 'description': 'x'}},
+            'another worker count': {'workers': 2},
+            'another revision': {'revision': 'def456'},
+            'other input bytes': {'content_digest': 'other'},
+            'other arguments': {'configuration': {**companion['configuration'], 'args': ['-maxmem', '512']}},
+            'another TLC version': {'tlc_version': 'w'},
+            # Unknown provenance fails closed: two untyped hosts, two unknown
+            # inputs and two unknown cache regimes are not the same measurement.
+            'unknown instance type': {'instance': {'type': None, 'arch': 'x86_64', 'description': 'x'}},
+            'unknown architecture': {'instance': {'type': 'SA5.4XLARGE32', 'arch': None, 'description': 'x'}},
+            'unknown input bytes': {'content_digest': None},
+            'another cache regime': {'provenance': {**companion['provenance'],
+                                                    'cache': {'mode': 'fresh-per-model', 'initial_state': 'empty',
+                                                              'warmup': True}}},
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self.assertNotIn('-tlc twin', br.render([reduced, {**companion, **change}], {'models': []}))
+        # Equal recorded cache conditions are part of what makes a twin match.
+        cache = {'mode': 'fresh-per-model', 'initial_state': 'empty', 'warmup': True}
+        same_cache = ([{**reduced, 'provenance': {**reduced['provenance'], 'cache': cache}},
+                       {**companion, 'provenance': {**companion['provenance'], 'cache': cache}}])
+        self.assertIn('-tlc twin', br.render(same_cache, {'models': []}))
+
+    def test_an_unknown_pairing_dimension_on_both_sides_is_not_paired(self):
+        # `None == None` is not evidence: two rows that both omit the machine
+        # type, architecture, input bytes or cache provenance are not shown to
+        # be the same measurement and must not publish a ratio.
+        reduced, companion = self.twin_pair()
+        def drop_cache(r):
+            return {**r, 'provenance': {k: v for k, v in r['provenance'].items() if k != 'cache'}}
+        cases = {
+            'unknown instance type': lambda r: {**r, 'instance': {**r['instance'], 'type': None}},
+            'unknown architecture': lambda r: {**r, 'instance': {**r['instance'], 'arch': None}},
+            'unknown input bytes': lambda r: {**r, 'content_digest': None},
+            'unknown cache provenance': drop_cache,
+        }
+        for label, change in cases.items():
+            with self.subTest(change=label):
+                text = br.render([change(reduced), change(companion)], {'models': []})
+                self.assertNotIn('-tlc twin', text)
+                self.assertNotIn('-tlc / default', text)
+        # Rejected evidence cannot label a published ratio either.
+        rejected = {**companion, 'provenance': {**companion['provenance'], 'count_problems': ['1 != 2']}}
+        self.assertNotIn('-tlc twin', br.render([reduced, rejected], {'models': []}))
+        unfinished = {**companion, 'counts': {**companion['counts'], 'result': 'timeout'}}
+        self.assertNotIn('-tlc twin', br.render([reduced, unfinished], {'models': []}))
+        # A reduced compiled row has no `default`-mode twin by this protocol.
+        compiled, _ = self.twin_pair(default={'mode': '-compile'})
+        self.assertNotIn('-tlc twin', br.render([compiled, companion], {'models': []}))
+
+    def test_a_newer_twin_on_another_revision_does_not_hide_the_matching_one(self):
+        # The report's latest-per-key selection does not key by revision, so a
+        # newer `-tlc` run of the same configuration must not evict the older
+        # revision's twin from the pairing lookup.
+        reduced, companion = self.twin_pair()
+        newer = {**companion, 'id': 'newer', 'date': '2026-11-01', 'revision': 'newrev'}
+        detail = br.render([reduced, companion, newer], {'models': []}).split('## ' + br.SECTIONS[1])[1].split('\n## ')[0]
+        self.assertIn('| 9.00 | 9.00× |', detail)
+        self.assertIn(br.store_file(companion), detail)
+        self.assertNotIn(br.store_file(newer), detail)
+
     def test_report_sections_ratios_and_gaps(self):
         tx = self.record(category=['corpus', 'compiled'], content_digest='digest')
         tc = self.record(tool='tlc', mode='-tlc', content_digest='digest', tlc_version='v')

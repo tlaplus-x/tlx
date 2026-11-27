@@ -69,6 +69,40 @@ class Manifest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown mode"):
             S.entries(m, "all", modes="compiled")
 
+    def test_companion_entries_pair_each_default_run_with_its_tlc_twin(self):
+        # (The companion is scheduled from the manifest, not from a run result:
+        # one `default` run may reduce its search or not, and the twin is what
+        # makes either timing comparable with TLC's own run on the same machine.)
+        m = {"version": 1, "models": [
+            {"id": "T/pinned", "size": "small", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1},
+                      {"mode": "default", "workers": 4, "args": ["-maxmem", "512"], "env": {"TLX_MIXED_ADAPT": "0"}}],
+             "expect": {"result": "success", "source": "tlx-pinned", "distinct": 2}},
+            {"id": "O/oracle", "size": "small", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}, {"mode": "tlc", "workers": 1},
+                      {"mode": "default", "workers": 2, "args": ["-tlc"]}],
+             "expect": {"result": "success", "source": "tlc-oracle", "distinct": 5}}]}
+        self.assertEqual([e["mode"] for e in S.entries(m, "small")],
+                         ["default", "default", "default", "tlc", "default"])
+        es = S.entries(m, "small", with_tlc_companion=True)
+        self.assertEqual([e["mode"] for e in es],
+                         ["default", "tlc", "default", "tlc", "default", "tlc", "default"])
+        self.assertEqual([e["model"] for e in es], ["T/pinned"] * 4 + ["O/oracle"] * 3)
+        for i in (0, 2):
+            self.assertEqual(es[i]["key"].replace(":default:", ":tlc:", 1), es[i + 1]["key"])
+            self.assertEqual({k: es[i][k] for k in ("workers", "args", "cgroup_mib", "env", "timeout_s")},
+                             {k: es[i + 1][k] for k in ("workers", "args", "cgroup_mib", "env", "timeout_s")})
+        # A pin taken from a reduced run cannot be the unreduced twin's contract;
+        # a pin taken from TLC applies unchanged (here: the explicit `tlc` run,
+        # which therefore needed no companion).
+        self.assertEqual(es[1]["expect"], {"result": "success", "source": "unpinned"})
+        self.assertEqual(es[3]["expect"], {"result": "success", "source": "unpinned"})
+        self.assertEqual(es[5]["expect"], {"result": "success", "source": "tlc-oracle", "distinct": 5})
+        # A default run that already asks for `-tlc` gets no second twin.
+        self.assertFalse(any(e["mode"] == "tlc" and "-tlc" in e["args"] for e in es))
+        self.assertEqual(S.companion_expect({"result": "deadlock", "source": "tlc-bench"}),
+                         {"result": "deadlock", "source": "tlc-bench"})
+
     def test_oracle_problems(self):
         m = man()
         ok = {"A/one": {"tlc": {"result": "success", "distinct": 5, "generated": 10, "depth": 3}},
@@ -492,6 +526,37 @@ print("The depth of the complete state graph search is 3.")
         self.assertEqual(rc, 0, out)
         self.assertEqual(history['verdict']['count_failures'], [])
 
+    def test_with_tlc_companion_measures_a_same_instance_twin(self):
+        self.man["models"] = [self.man["models"][0]]
+        self.man["models"][0]["runs"] = [{"mode": "default", "workers": 1}]
+        rc, out, h = self.run_suite(fake(self.d, "companion"), with_tlc_companion=True, isolate_cache=True)
+        self.assertEqual((rc, h["verdict"]["outcome"]), (0, "BASELINE"), out)
+        self.assertEqual(list(h["runs"]), ["small:A/one:default:1w", "small:A/one:tlc:1w"])
+        reduced, twin = (h["runs"][k] for k in h["runs"])
+        self.assertEqual(twin["mode"], "tlc")
+        self.assertEqual((twin["workers"], twin["args"]), (1, []))
+        self.assertEqual(len(twin["samples"]), 3)
+        # One cache policy for both sides of the pair, each configuration with
+        # its own fresh cache rather than the reduced run's.
+        self.assertEqual({r["cache"]["mode"] for r in (reduced, twin)}, {"fresh-per-model"})
+        # The stored twin is a tlx `-tlc` row, never a TLC baseline row: the two
+        # are different measurements even though they share a mode name.
+        from benchmarking.records import normalize
+        row = normalize({"commit": h["commit"], "date": h["date"], "machine": h["machine"],
+                         "suite": True, "repeat": 3}, twin, "bench/history/x.json", "/runs/twin")
+        self.assertEqual((row["tool"], row["mode"]), ("tlx", "-tlc"))
+
+    def test_a_reduced_pin_does_not_reject_the_unreduced_twin(self):
+        # The manifest pinned this model's distinct count from a reduced run.
+        # The default-mode row is allowed to differ by contract; the companion
+        # exists to measure the unreduced count, so its pin is its verdict only.
+        self.man["models"] = [{**self.man["models"][0], "runs": [{"mode": "default", "workers": 1}],
+                               "expect": {"result": "success", "source": "tlx-pinned", "distinct": 2}}]
+        rc, out, h = self.run_suite(fake(self.d, "pinned"), with_tlc_companion=True)
+        self.assertEqual((rc, h["verdict"]["outcome"]), (0, "BASELINE"), out)
+        self.assertEqual(h["verdict"]["count_failures"], [])
+        self.assertEqual([s["distinct"] for s in h["runs"]["small:A/one:tlc:1w"]["samples"]], [5, 5, 5])
+
     def test_time_budget_skips_and_is_inconclusive(self):
         rc, out, h = self.run_suite(fake(self.d, "new"), max_minutes=-1)
         self.assertEqual((rc, h["verdict"]["outcome"]), (2, "INCONCLUSIVE"), out)
@@ -551,6 +616,10 @@ class Track(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--max-minutes") + 1], "60")      # one launch of at most 60 minutes
         self.assertNotIn("--bench-bin", S.cloud_command(a, "def456", None, S.remote_args(a, None)))
         self.assertNotIn("--base-bin", S.remote_args(a, None))
+        # The companion collection travels to the cloud launch with the rest of
+        # the run's protocol, so the twin is measured on the same instance.
+        a.with_tlc_companion = True
+        self.assertIn("--with-tlc-companion", S.remote_args(a, None))
 
 
 class TrackReceipt(testkit.GuardedTestCase):

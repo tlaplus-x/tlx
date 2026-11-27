@@ -46,6 +46,18 @@ published only when both records carry a positive measurement; a missing or zero
 so a legacy history's timed `samples[*].maxrss_mib` and a `tlcbase` run's scalar `maxrss_mib`
 name the same statistic.
 
+A default-mode row can apply automatic symmetry, so its ratio compares a reduced search with TLC's
+unreduced one. When the store also holds a same-instance unreduced twin - an eligible tlx `-tlc`
+record with the same model, revision, instance type and architecture, worker count, input digest,
+TLC version, configuration (arguments, environment and memory limit) and recorded cache provenance -
+the per-model tables gain `-tlc twin s` and `-tlc / default` columns: the twin's timed wall time
+(cited in the row's Evidence) and the factor by which the reduced run was faster on the same machine.
+The pairing fails closed: a row whose machine type, architecture, input digest or cache provenance
+is unknown is not paired, because a ratio across unknown hosts, inputs or cache regimes is not
+quotable. The TLC ratio beside them is unchanged: it still compares the reduced run with TLC's own
+run, and neither number is inferred when the store holds no twin (`—`). A store without companions
+renders the report exactly as before; section 4 owns how a run is collected.
+
 New TLC baselines can collect repeated process runs, for example on a cloud instance:
 
 ```sh
@@ -307,6 +319,20 @@ configurations (`bench/MCLamportMutex_clock14`, and with `huge` `MultiPaxos_MC` 
 `bench/cf1s_folklore_N5`). A model whose SYMMETRY is not equivariant (`ext/neon`) runs at 1
 worker only. Legacy `tlc_1w_s` fields are retained as historical metadata; they do not supply
 report ratios because they were measured on another machine.
+
+**Reduced rows and their unreduced twin.** `bench.py suite --with-tlc-companion` (also accepted by
+`track` and forwarded to its cloud launch) schedules, immediately after every `default`-mode
+manifest run that does not already pass `-tlc`, one companion `tlc` run of the same model, worker
+count, timeout, extra arguments, environment and memory limit on the same instance, under the same
+cache policy (both rows record that policy in `provenance.cache`, which the report requires to match).
+That is the like-for-like twin the speedup audit requires: the two rows can be divided without mixing
+machines or cache regimes. The companion's counts are checked against the manifest's pin when
+that pin came from TLC (`tlc-oracle`, `tlc-bench`); when the pin came from a reduced run
+(`tlx-pinned`) only its verdict is enforced, because the companion exists to measure the unreduced
+counts and checking them against a reduced pin would reject the measurement. The option is off by
+default: it roughly doubles the runs of a default-mode selection and consumes the same budget. The
+stored twin is mode `-tlc`, tool `tlx`, so it is not confused with a TLC baseline row. Section 1
+describes how the report pairs the two.
 
 Use `bench.py suite --modes compile` to select only compiled entries when a manifest
 also contains default-mode runs. The CCF and MongoDB compiled entries pass `-tlc`

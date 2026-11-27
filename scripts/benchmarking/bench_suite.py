@@ -157,8 +157,62 @@ def validate_manifest(man):
 # verdict is tier-determined; a run pins them only when it is asked to.
 PIN_ADAPT = {"TLX_MIXED_ADAPT": "0"}
 
+# A manifest run mode whose search may be reduced, and the TLC-compatible mode
+# that measures the same configuration unreduced. A default-mode run applies
+# automatic symmetry, so its timing is not the unreduced search's; running the
+# companion on the same instance is what makes the two quotable as a ratio
+# (docs/research/speedup-audit.md section 3, item 3).
+COMPANION_MODES = {"default": "tlc"}
+# The expectation sources a companion's counts may be checked against: they were
+# pinned from TLC itself. A pin taken from a reduced run (`tlx-pinned`) says what
+# the reduction reached, not what the unreduced twin explores.
+TLC_DERIVED_EXPECT = ("tlc-oracle", "tlc-bench")
 
-def entries(man, sizes=DEFAULT_SIZES, models="", modes="", pin_adapt=""):
+
+def companion_expect(expect):
+    """The mode contract of a default-mode run's unreduced companion.
+
+    The companion's counts are TLC's, so a manifest pin taken from TLC applies
+    unchanged. A pin taken from a reduced run cannot: the companion exists to
+    measure the unreduced counts, and checking them against the reduced pin
+    would reject the very measurement it was scheduled to collect. Its verdict
+    still applies.
+    """
+    expect = expect or {}
+    if expect.get("source") in TLC_DERIVED_EXPECT:
+        return dict(expect)
+    return {"result": expect.get("result"), "source": "unpinned"}
+
+
+def with_companions(es):
+    """`es` with each default-mode run followed by its same-instance `-tlc` twin.
+
+    The twin repeats the run's model, worker count, timeout, extra arguments,
+    environment and memory limit, so both sides are measured under one cache
+    policy; it is measured immediately after its reduced run, and it is skipped
+    when the manifest already measures that exact configuration with `-tlc`, or
+    when the default run already asks for `-tlc` through its arguments.
+    """
+    known = {(e["mode"], e["model"], e["workers"], tuple(e.get("args") or []), e.get("cgroup_mib"),
+              repr(sorted((e.get("env") or {}).items()))) for e in es}
+    out = []
+    for e in es:
+        out.append(e)
+        mode = COMPANION_MODES.get(e["mode"])
+        if mode is None or "-tlc" in (e.get("args") or []):
+            continue
+        identity = (mode, e["model"], e["workers"], tuple(e.get("args") or []), e.get("cgroup_mib"),
+                    repr(sorted((e.get("env") or {}).items())))
+        if identity in known:
+            continue
+        known.add(identity)
+        out.append({**e, "mode": mode,
+                    "key": e["key"].replace(f":{e['mode']}:", f":{mode}:", 1),
+                    "expect": companion_expect(e["expect"])})
+    return out
+
+
+def entries(man, sizes=DEFAULT_SIZES, models="", modes="", pin_adapt="", with_tlc_companion=False):
     """The runs to measure: [{key, model, size, mode, workers, timeout_s, expect, tlc_1w_s}].
     `key` has the form of bench.py's history keys (tier:model:mode:Nw, tier = size)."""
     sizes = [s for s in sizes.split(",") if s] if sizes != "all" else list(SIZES)
@@ -191,7 +245,7 @@ def entries(man, sizes=DEFAULT_SIZES, models="", modes="", pin_adapt=""):
                         "tlc_1w_s": m.get("tlc_1w_s"), "args": r.get("args", []),
                         "cgroup_mib": r.get("cgroup_mib"), "env": r.get("env") or None,
                         "category": r.get("category", m.get("category", []))})
-    return out
+    return with_companions(out) if with_tlc_companion else out
 
 
 def check_counts(rec, expect):
@@ -577,7 +631,8 @@ def run_suite(a, bench=None, resolve=None, man=None):
     if bench is None:
         import bench
     man = man or load_manifest(a.manifest)
-    es = entries(man, a.sizes, a.models, getattr(a, "modes", ""), getattr(a, "pin_adapt", ""))
+    es = entries(man, a.sizes, a.models, getattr(a, "modes", ""), getattr(a, "pin_adapt", ""),
+                 with_tlc_companion=getattr(a, "with_tlc_companion", False))
     if not es:
         sys.exit("no benchmark runs selected")
     resolve = resolve or (lambda mid: resolve_model(bench, mid))
@@ -823,6 +878,8 @@ def remote_args(a, base):
     parts = ["suite", f"--sizes {a.sizes}", f"--repeat {a.repeat}", f"--max-minutes {a.max_minutes}"]
     if getattr(a, "isolate_cache", False):
         parts.append("--isolate-cache")
+    if getattr(a, "with_tlc_companion", False):
+        parts.append("--with-tlc-companion")
     if getattr(a, "deadline_min", None):
         parts.append(f"--deadline-min {a.deadline_min}")
     if getattr(a, "pin_adapt", ""):
@@ -935,6 +992,8 @@ def add_args(sub):
     p.add_argument("--base-bin", default="", help="tlx binary of the previous recorded revision (A/B)")
     p.add_argument("--base-rev", default="", help="the revision of --base-bin (recorded, names the commit range)")
     p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
+    p.add_argument("--with-tlc-companion", action="store_true",
+                   help="also measure a same-instance `-tlc` twin of every default-mode run (same model, workers, arguments, environment and cache policy)")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--max-minutes", type=int, default=0, help="stop starting new runs after M minutes (the rest is reported as skipped: inconclusive)")
     p.add_argument("--threshold", type=float, default=0.05)
@@ -963,6 +1022,8 @@ def add_args(sub):
     p.add_argument("--sizes", default=DEFAULT_SIZES)
     p.add_argument("--models", default="")
     p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
+    p.add_argument("--with-tlc-companion", action="store_true",
+                   help="also measure a same-instance `-tlc` twin of every default-mode run (same model, workers, arguments, environment and cache policy)")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--max-minutes", type=int, default=40, help="the suite's own budget (default 40)")
     p.add_argument("--setup-minutes", type=int, default=20, help="added to --max-minutes for the instance's dead-man switch (default 20)")
