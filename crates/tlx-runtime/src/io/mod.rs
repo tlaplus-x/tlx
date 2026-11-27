@@ -269,11 +269,20 @@ pub struct Spill(Arc<Inner>);
 
 struct Inner {
     ctx: Arc<Ctx>,
-    /// The directory, while a store in it exists.
-    dir: Mutex<Weak<Dir>>,
+    /// The directory, while a store or a hold uses it (see `DirLease`).
+    dir: Mutex<DirSlot>,
     /// Numbers the files.
     files: AtomicU64,
     threads: OnceLock<Threads>,
+}
+
+/// The spill directory of a `Spill` and how many stores and holds use it.
+#[derive(Default)]
+struct DirSlot {
+    /// The directory, while a lease uses it.
+    dir: Option<Arc<Dir>>,
+    /// The live leases (see `DirLease`).
+    leases: usize,
 }
 
 /// The IO threads (started with the first asynchronous request).
@@ -322,7 +331,12 @@ impl Spill {
             phys_used: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
         };
-        Spill(Arc::new(Inner { ctx: Arc::new(ctx), dir: Mutex::new(Weak::new()), files: AtomicU64::new(0), threads: OnceLock::new() }))
+        Spill(Arc::new(Inner {
+            ctx: Arc::new(ctx),
+            dir: Mutex::new(DirSlot::default()),
+            files: AtomicU64::new(0),
+            threads: OnceLock::new(),
+        }))
     }
 
     pub fn mode(&self) -> SpillMode {
@@ -363,7 +377,7 @@ impl Spill {
 
     /// The spill directory, if it exists now.
     pub fn dir(&self) -> Option<PathBuf> {
-        self.0.dir.lock().upgrade().map(|d| d.path.clone())
+        self.0.dir.lock().dir.as_ref().map(|d| d.path.clone())
     }
 
     /// A new store (a file named after `name`) in the spill directory,
@@ -375,19 +389,18 @@ impl Spill {
     /// The spill directory, created if needed, kept (with its lock) while
     /// the hold lives: for checkpoints, which are not block stores.
     pub fn hold_dir(&self) -> Result<DirHold, IoError> {
-        self.dir_arc().map(DirHold)
+        self.dir_lease().map(DirHold)
     }
 
-    fn dir_arc(&self) -> Result<Arc<Dir>, IoError> {
-        let mut d = self.0.dir.lock();
-        match d.upgrade() {
-            Some(dir) => Ok(dir),
-            None => {
-                let dir = Arc::new(Dir::create(&self.0.ctx.cfg).map_err(|e| self.0.ctx.fail(e))?);
-                *d = Arc::downgrade(&dir);
-                Ok(dir)
-            }
+    /// Take the directory, created if needed, and count a store or hold as
+    /// a user of it: the last `DirLease` to go gives it back, removing it.
+    fn dir_lease(&self) -> Result<DirLease, IoError> {
+        let mut slot = self.0.dir.lock();
+        if slot.dir.is_none() {
+            slot.dir = Some(Arc::new(Dir::create(&self.0.ctx.cfg).map_err(|e| self.0.ctx.fail(e))?));
         }
+        slot.leases += 1;
+        Ok(DirLease { spill: Arc::downgrade(&self.0), dir: slot.dir.clone() })
     }
 
     /// `store`, for a file read at random and often (the fingerprint set's
@@ -398,9 +411,9 @@ impl Spill {
     }
 
     fn new_store(&self, name: &str, nocache: bool) -> Result<Arc<BlockStore>, IoError> {
-        let dir = self.dir_arc()?;
+        let dir = self.dir_lease()?;
         let n = self.0.files.fetch_add(1, Ordering::Relaxed);
-        let path = dir.path.join(format!("{name}-{n}.spill"));
+        let path = dir.dir().path.join(format!("{name}-{n}.spill"));
         BlockStore::create(path, dir, self.0.ctx.clone(), nocache).map(Arc::new).map_err(|e| self.0.ctx.fail(e))
     }
 
@@ -617,23 +630,62 @@ impl Prefetch {
     }
 }
 
+/// A store's or a hold's use of the spill directory (`Inner::dir`): the
+/// last lease to go gives the directory back, removing it.
+pub(crate) struct DirLease {
+    /// The `Spill` (weak: a store that outlives its `Spill` only gives the
+    /// directory back, it does not keep the IO threads alive).
+    spill: Weak<Inner>,
+    /// The directory while leased (taken when the lease is dropped).
+    dir: Option<Arc<Dir>>,
+}
+
+impl DirLease {
+    pub(crate) fn dir(&self) -> &Arc<Dir> {
+        self.dir.as_ref().expect("a live directory lease")
+    }
+}
+
+impl Drop for DirLease {
+    fn drop(&mut self) {
+        let Some(spill) = self.spill.upgrade() else {
+            // (No `Spill` is left to create a new directory in: this lease
+            // drops it, if it is the last.)
+            return;
+        };
+        let mut slot = spill.dir.lock();
+        slot.leases -= 1;
+        let own = self.dir.take();
+        if slot.leases == 0 {
+            // (The removal happens with the slot locked, so a store that
+            // arrives meanwhile waits for it: it would otherwise create the
+            // directory while the lock file here is still flocked, or
+            // remove what the store creates.)
+            drop(slot.dir.take());
+        }
+        // (After the slot's reference, under the lock: the directory goes
+        // while no new one can be created for the same path.)
+        drop(own);
+    }
+}
+
 /// A hold on the spill directory (`Spill::hold_dir`).
-pub struct DirHold(Arc<Dir>);
+pub struct DirHold(DirLease);
 
 impl DirHold {
     pub fn path(&self) -> &Path {
-        &self.0.path
+        &self.0.dir().path
     }
 
     /// Keep the directory (what is left in it) when it is released: a
     /// checkpoint to recover from.
     pub fn keep(&self) {
-        self.0.keep.store(true, Ordering::SeqCst);
+        self.0.dir().keep.store(true, Ordering::SeqCst);
     }
 }
 
-/// The spill directory, while a store in it exists. Removed when dropped
-/// (if tlx created it; else only the lock file).
+/// The spill directory, while a store or a hold uses it (see `DirLease`).
+/// Removed when dropped (if tlx created it; else only the lock file).
 pub(crate) struct Dir {
     pub(crate) path: PathBuf,
     /// Created by tlx (removed with its contents when dropped).
@@ -717,8 +769,16 @@ fn register(reg: &mut Vec<ActiveDir>, path: &Path, created: bool, parent: Option
     id
 }
 
+/// Testing: how long `Dir::drop` pauses before giving the directory back,
+/// so that a test can hold a store's creation against the removal (see
+/// `a_store_created_during_the_removal_of_the_last_one_waits`).
+#[cfg(test)]
+static DROP_PAUSE_US: AtomicU64 = AtomicU64::new(0);
+
 impl Drop for Dir {
     fn drop(&mut self) {
+        #[cfg(test)]
+        std::thread::sleep(std::time::Duration::from_micros(DROP_PAUSE_US.load(Ordering::Relaxed)));
         if self.keep.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(self.path.join("LOCK"));
             ACTIVE_DIRS.lock().retain(|d| d.id != self.id);
