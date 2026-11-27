@@ -2,7 +2,7 @@
 mod leaves;
 mod output;
 
-use super::super::{binding, variable, Branch};
+use super::super::{binding, mentions_local, variable, Branch};
 use super::{Analysis, Atom, Control, ObsContext, Slot};
 use crate::{builtins::Builtin as B, hir::*};
 
@@ -111,7 +111,7 @@ impl Emitter<'_, '_> {
                     let [bound] = bounds.as_slice() else { return None };
                     let BoundVars::Many(ids) = &bound.vars else { return None };
                     let [id] = ids.as_slice() else { return None };
-                    if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) || super::mentions_local(body, *id) {
+                    if self.a.domains.exact_set(&bound.set).as_ref() != Some(keys) || mentions_local(body, *id) {
                         return None;
                     }
                     body

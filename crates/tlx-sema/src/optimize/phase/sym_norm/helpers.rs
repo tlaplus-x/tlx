@@ -54,15 +54,6 @@ pub(super) fn expr_contains_at(e: &Expr) -> bool {
     found
 }
 
-pub(in crate::optimize::phase) fn mentions_local(e: &Expr, target: LocalId) -> bool {
-    if matches!(&*e.kind, ExprKind::Local(id) if *id == target) {
-        return true;
-    }
-    let mut found = false;
-    visit::children(e, &mut |c| found |= mentions_local(c, target));
-    found
-}
-
 /// Look up an already-resolved root definition or constant by name without
 /// mutating `Program`. Fails closed if absent or still `Pending`.
 pub(in crate::optimize::phase) fn lookup_resolved_root(program: &Program, name: &str) -> Option<RootSymbol> {
@@ -126,6 +117,11 @@ pub(super) fn paths_disjoint(a: &[ExceptKey], b: &[ExceptKey]) -> bool {
     })
 }
 
+/// Deliberately narrower than `hir_util::expr_structurally_eq`: the `EXCEPT`
+/// merge below only needs the scalar, field, application and tuple arms, and
+/// widening the relation would accept additional merges and change normalized
+/// output. `SetEnum` / `Builtin` equality is sound in general, so this stays a
+/// separate documented relation rather than a duplicate of the threshold walker.
 pub(super) fn expr_syntactically_eq(a: &Expr, b: &Expr) -> bool {
     match (&*a.kind, &*b.kind) {
         (ExprKind::Var(x), ExprKind::Var(y)) => x == y,

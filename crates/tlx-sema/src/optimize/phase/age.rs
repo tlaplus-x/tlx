@@ -12,7 +12,7 @@ use super::{
     binding, branches,
     domain::{Atom, Domain, Domains},
     normalize::Normalizer,
-    variable, Branch, FieldProjection,
+    ordinary_unchanged, variable, Branch, FieldProjection,
 };
 
 mod lean;
@@ -328,13 +328,5 @@ impl Proof<'_> {
             certificate: None,
             mathematical_counter_arithmetic: false,
         }
-    }
-}
-
-fn ordinary_unchanged(e: &Expr) -> bool {
-    match &*e.kind {
-        ExprKind::Var(_) => true,
-        ExprKind::Tuple(es) => es.iter().all(ordinary_unchanged),
-        _ => false,
     }
 }

@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use super::{
-    branches_with_if, mentions_phase_var,
+    branches_with_if, mentions_phase_var, mentions_var, mentions_vars, ordinary_unchanged,
     sym_norm::SymNormalizer,
     sym_totality::{collect_const_info, CheckEnv, TotalityChecker},
     unchanged, variable, Branch, CheckSpec, FieldProjection,
 };
-use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit, Program};
+use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, Program};
 use tlx_front::cfg::Config;
 
 /// Single deterministic binding of an omitted variable on one normalized branch.
@@ -155,23 +155,6 @@ fn constrained_observations_total(totality: &TotalityChecker<'_>, spec: CheckSpe
     true
 }
 
-fn expr_mentions_var(e: &Expr, target: VarId) -> bool {
-    if matches!(&*e.kind, ExprKind::Var(v) if *v == target) {
-        return true;
-    }
-    let mut found = false;
-    visit::children(e, &mut |child| found |= expr_mentions_var(child, target));
-    found
-}
-
-fn is_var_or_tuple_frame(e: &Expr) -> bool {
-    match &*e.kind {
-        ExprKind::Var(_) => true,
-        ExprKind::Tuple(es) => es.iter().all(is_var_or_tuple_frame),
-        _ => false,
-    }
-}
-
 /// Verify that candidate omitted variable `v` is single-bound, pure, total,
 /// 32-bit overflow-free, and unreferenced by retained terms/bounds on every
 /// `Init` and `Next` branch.
@@ -183,7 +166,7 @@ fn var_certifiable(totality: &TotalityChecker<'_>, v: VarId, omitted: &[VarId], 
             };
             // Every branch bound and every retained (non-omitted-assignment)
             // term must be independent of `v`.
-            if b.bounds.iter().any(|bnd| expr_mentions_var(&bnd.set, v)) {
+            if b.bounds.iter().any(|bnd| mentions_var(&bnd.set, v)) {
                 return false;
             }
             for term in &b.terms {
@@ -191,12 +174,12 @@ fn var_certifiable(totality: &TotalityChecker<'_>, v: VarId, omitted: &[VarId], 
                     ExprKind::Builtin { op: B::Eq, args }
                         if args.len() == 2 && variable(&args[0], primed).is_some_and(|u| omitted.contains(&u)) => {}
                     ExprKind::Builtin { op: B::Unchanged, args } if primed && args.len() == 1 => {
-                        if expr_mentions_var(&args[0], v) && !is_var_or_tuple_frame(&args[0]) {
+                        if mentions_var(&args[0], v) && !ordinary_unchanged(&args[0]) {
                             return false;
                         }
                     }
                     _ => {
-                        if expr_mentions_var(term, v) {
+                        if mentions_var(term, v) {
                             return false;
                         }
                     }
@@ -245,12 +228,7 @@ struct Emitter<'a> {
 }
 impl Emitter<'_> {
     fn independent(&self, e: &Expr) -> bool {
-        if matches!(&*e.kind, ExprKind::Var(v) if self.omitted.contains(v)) {
-            return false;
-        }
-        let mut independent = true;
-        visit::children(e, &mut |child| independent &= self.independent(child));
-        independent
+        !mentions_vars(e, self.omitted)
     }
 
     fn atom(&mut self, e: &Expr) -> Option<usize> {

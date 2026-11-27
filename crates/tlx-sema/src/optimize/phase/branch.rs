@@ -2,7 +2,7 @@
 //! one normalized branch.
 
 use crate::builtins::Builtin as B;
-use crate::hir::{Bound, Expr, ExprKind, LocalId, QuantKind, VarId};
+use crate::hir::{Bound, Expr, ExprKind, QuantKind, VarId};
 
 #[derive(Clone)]
 pub(in crate::optimize::phase) struct Branch {
@@ -300,29 +300,4 @@ pub(in crate::optimize::phase) fn binding(branch: &Branch, v: VarId, primed: boo
 
 pub(in crate::optimize::phase) fn binding_with_index(branch: &Branch, v: VarId, primed: bool) -> Option<(usize, Expr)> {
     BranchBindings::new(branch, primed).get_with_index(v)
-}
-
-// Bound declarations, even unused ones, must not capture inserted inputs.
-pub(in crate::optimize::phase) fn max_local(e: &Expr) -> u32 {
-    let mut max = 0;
-    let mut ids = |ids: &[LocalId]| {
-        for id in ids {
-            max = max.max(id.0);
-        }
-    };
-    match &*e.kind {
-        ExprKind::Local(id) => ids(&[*id]),
-        ExprKind::Quant { bounds, .. } | ExprKind::FnConstruct { bounds, .. } | ExprKind::SetMap { bounds, .. } => {
-            for b in bounds {
-                ids(b.vars.locals());
-            }
-        }
-        ExprKind::SetFilter { bound, .. } => ids(bound.vars.locals()),
-        ExprKind::Choose { vars, .. } => ids(vars.locals()),
-        ExprKind::Lambda { params, .. } => ids(params),
-        ExprKind::QuantUnbounded { vars, .. } | ExprKind::TemporalQuant { vars, .. } => ids(vars),
-        _ => {}
-    }
-    crate::visit::children(e, &mut |e| max = max.max(max_local(e)));
-    max
 }

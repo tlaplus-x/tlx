@@ -1,5 +1,6 @@
 //! Substitute proved summary predicates into otherwise history-free consumers.
 //! Each hole is a Boolean, never a raw history or an assumed preservation fact.
+use super::super::super::max_local;
 use super::Emitter;
 use crate::{builtins::Builtin as B, hir::*, visit};
 
@@ -16,14 +17,7 @@ impl Emitter<'_> {
     }
 
     pub(super) fn feedback(&mut self, e: &Expr, kind: &str) -> Option<String> {
-        fn max_local(e: &Expr, max: &mut u32) {
-            if let ExprKind::Local(l) = &*e.kind {
-                *max = (*max).max(l.0);
-            }
-            visit::children(e, &mut |child| max_local(child, max));
-        }
-        let mut local = 0;
-        max_local(e, &mut local);
+        let local = max_local(e);
         let mut next_local = local.checked_add(1)?;
         let mut holes = vec![];
         let mut remaining = 10_000;

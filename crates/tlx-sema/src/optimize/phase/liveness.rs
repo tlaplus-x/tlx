@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 
 use super::domain::{self, Atom, Domain, Domains};
-use super::{binding, variable, Branch, FieldProjection};
+use super::{binding, mentions_local, mentions_var, mentions_var_where, variable, Branch, FieldProjection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Control {
@@ -383,33 +383,6 @@ fn is_singleton_domain(d: &Domain) -> bool {
     }
 }
 
-pub(super) fn mentions_var(e: &Expr, var: VarId) -> bool {
-    if matches!(&*e.kind, ExprKind::Var(v) if *v == var) {
-        return true;
-    }
-    let mut found = false;
-    visit::children(e, &mut |c| found |= mentions_var(c, var));
-    found
-}
-
-fn mentions_any_var(e: &Expr, vars: &BTreeSet<VarId>) -> bool {
-    if matches!(&*e.kind, ExprKind::Var(v) if vars.contains(v)) {
-        return true;
-    }
-    let mut found = false;
-    visit::children(e, &mut |c| found |= mentions_any_var(c, vars));
-    found
-}
-
-fn mentions_local(e: &Expr, local: LocalId) -> bool {
-    if matches!(&*e.kind, ExprKind::Local(l) if *l == local) {
-        return true;
-    }
-    let mut found = false;
-    visit::children(e, &mut |c| found |= mentions_local(c, local));
-    found
-}
-
 fn is_closed_const_expr(domains: &Domains, e: &Expr, depth: usize) -> bool {
     if depth >= 16 {
         return false;
@@ -492,7 +465,7 @@ fn valid_companion_init(domains: &Domains, v: VarId, keys: Option<&BTreeSet<Atom
                 body
             }
         };
-        if mentions_any_var(body, active) {
+        if mentions_var_where(body, &mut |v| active.contains(&v)) {
             return false;
         }
     }

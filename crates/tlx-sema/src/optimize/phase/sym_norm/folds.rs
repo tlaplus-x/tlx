@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::{builtins::Builtin as B, hir::*, Program};
 
-use super::helpers::mentions_local;
+use super::super::mentions_local;
 use super::{EnvMap, NormMode, OpBinding, SymNormalizer};
 
 /// Verified commutative-associative binary operator over finite sets.

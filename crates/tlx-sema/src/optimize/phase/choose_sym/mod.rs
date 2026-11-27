@@ -20,8 +20,8 @@ mod step;
 
 use super::domain::{Atom, Domain, Domains, Locals};
 use super::sym_groups::{subst_local, ActionKeyRef, GroupInfo, GroupMask, KeyRef};
-use super::sym_norm::{mentions_local, SymNormalizer};
-use super::{max_local, variable, Branch};
+use super::sym_norm::SymNormalizer;
+use super::{max_local, mentions_local, variable, Branch};
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 use bounds::{infer_model_bounds, LocalBounds, ModelBounds};
 use domain_infer::{

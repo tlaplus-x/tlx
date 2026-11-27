@@ -4,8 +4,8 @@
 //! The module root keeps the projection entry points and re-exports the
 //! supporting items its children import from `super`: check specifications and
 //! retained views (`spec`), `.cfg` constant substitutions (`const_subst`), Lean
-//! certificate bodies and symmetry dispatch (`cert`), and disjunctive branch
-//! splitting (`branch`).
+//! certificate bodies and symmetry dispatch (`cert`), disjunctive branch
+//! splitting (`branch`), and shared structural HIR walkers (`hir_util`).
 
 mod age;
 mod branch;
@@ -15,6 +15,7 @@ mod const_subst;
 mod domain;
 mod equiv_sym;
 mod erasure;
+mod hir_util;
 mod history;
 mod keyed;
 mod liveness;
@@ -46,13 +47,16 @@ pub use threshold::{threshold_counter_projection, threshold_counter_projection_w
 
 // Supporting items the `phase` submodules import from `super`.
 pub(in crate::optimize::phase) use branch::{
-    binding, binding_with_index, branches, branches_positioned, branches_with_if, branches_with_if_positioned, max_local,
-    mentions_phase_var, unchanged, variable, Branch, BranchBindings,
+    binding, binding_with_index, branches, branches_positioned, branches_with_if, branches_with_if_positioned, mentions_phase_var,
+    unchanged, variable, Branch, BranchBindings,
 };
 pub(in crate::optimize::phase) use cert::OpenCert;
 pub(in crate::optimize::phase) use const_subst::{
     attach_const_subst_obligation, canonical_expr_repr, resolve_const_subst_chain, resolve_const_subst_name, resolve_const_subst_target,
     ConstSubstTarget,
+};
+pub(in crate::optimize::phase) use hir_util::{
+    atom_nat, expr_structurally_eq, max_local, mentions_local, mentions_var, mentions_var_where, mentions_vars, ordinary_unchanged,
 };
 pub(in crate::optimize::phase) use spec::{parse_retained_view, ObsBundle, OwnedCheckSpec};
 
