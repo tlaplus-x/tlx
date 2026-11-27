@@ -19,8 +19,10 @@
 
 mod explicit;
 mod factor;
+mod orbits;
 #[cfg(test)]
 mod tests;
 
 pub use explicit::*;
 pub use factor::*;
+pub use orbits::AtomOrbits;

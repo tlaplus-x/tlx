@@ -1051,13 +1051,8 @@ impl<'a> DefProbe<'a> {
         // A tuple VIEW whose dynamic parts are all state variables is kept:
         // those components are encoded like the variables (`View::compile`),
         // as handles of values the states hold anyway.
-        let mut view_dyn_ok = false;
         if let Some((i, parts)) = &self.view_parts {
-            let parts = parts.finalize(hints);
-            view_dyn_ok = view_tuple(self.base, self.defs[*i]).is_some_and(|es| {
-                es.len() == parts.len() && es.iter().zip(&parts).all(|(e, s)| !has_dyn(s) || matches!(&*e.kind, hir::ExprKind::Var(_)))
-            });
-            shapes[*i] = Shape::Tuple(parts.into());
+            shapes[*i] = Shape::Tuple(parts.finalize(hints).into());
         }
         let view_at = self.view_at;
         shapes
@@ -1078,11 +1073,19 @@ impl<'a> DefProbe<'a> {
                 // (A scalar VIEW is kept: its encoding is what the
                 // fingerprints are computed from.)
                 let scalar_view = view_at == Some(i) && s.is_scalar();
-                let dyn_ok = view_at == Some(i) && view_dyn_ok;
+                let dyn_ok = view_at == Some(i) && self.view_parts.is_some() && view_allows_dyn(self.base, self.defs[i], &s);
                 (!failed && (container || scalar_view) && (!has_dyn(&s) || dyn_ok)).then_some(s)
             })
             .collect()
     }
+}
+
+/// Dynamic VIEW components can reuse handles already held by state variables.
+pub(super) fn view_allows_dyn(base: &InterpModel, d: DefId, shape: &Shape) -> bool {
+    let Shape::Tuple(parts) = shape else { return false };
+    view_tuple(base, d).is_some_and(|es| {
+        es.len() == parts.len() && es.iter().zip(parts.iter()).all(|(e, s)| !has_dyn(s) || matches!(&*e.kind, hir::ExprKind::Var(_)))
+    })
 }
 
 /// No lazy parts (a lazy set's shape could only be found by enumerating it).
