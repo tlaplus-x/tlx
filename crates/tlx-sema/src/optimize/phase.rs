@@ -68,7 +68,7 @@ use std::sync::Arc;
 
 use tlx_front::cfg::Config;
 
-use crate::hir::Expr;
+use crate::hir::{Expr, ExprKind, Span, VarId};
 use crate::Program;
 
 use domain::Domains;
@@ -141,4 +141,36 @@ pub fn phase_projection_with_spec_avoiding(
         p.certificate = Some(expand.attach_const_subst(c)?);
     }
     Some(p)
+}
+
+/// Certify a declared tuple `VIEW`, described by the exact retained variable
+/// list its cfg-aware resolver produced, composed with a disjoint product of
+/// full permutation groups. A `VIEW` that retains every state variable uses
+/// the plain symmetry certificate (the view is a bijection on states); one
+/// that omits variables composes unobserved-variable erasure
+/// (`ErasedKeyedCertificate` / `ErasedEquivCertificate`) with the orbit
+/// quotient over the exact retained tuple. Fails closed on an empty list, a
+/// repeated variable, an out-of-range variable, or an omitted variable that is
+/// not certified erasable by the shared erasure walkers.
+#[allow(clippy::too_many_arguments)] // mirrors the certificate dispatch signatures; `span` only locates the flat view
+pub fn symmetry_view_certificate_with_spec(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[Vec<String>],
+    retained: &[VarId],
+    span: Span,
+) -> Option<String> {
+    let unique =
+        !retained.is_empty() && retained.iter().enumerate().all(|(i, v)| v.idx() < program.vars.len() && !retained[..i].contains(v));
+    if !unique {
+        return None;
+    }
+    if retained.len() == program.vars.len() {
+        return symmetry_certificate_with_spec(program, cfg, init, next, spec, groups);
+    }
+    let flat = Expr::new(ExprKind::Tuple(retained.iter().map(|&v| Expr::new(ExprKind::Var(v), span)).collect()), span);
+    symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, &flat)
 }

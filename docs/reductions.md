@@ -138,9 +138,18 @@ the same certified group, but it does not use encoded words.
 
 Application happens once, after the model is built and before the search, and only in the default
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
-unchanged except for that line. An inferred group is not applied over a user `VIEW`, temporal
-properties, a state-dependent effect, or an incomplete analysis — each reason is reported under
-`-stats`. A declared `.cfg` `SYMMETRY` is handled separately (§2.6). Connected certificate
+unchanged except for that line. An inferred group is not applied over temporal properties, a
+state-dependent effect, or an incomplete analysis — each reason is reported under `-stats`. A
+declared `.cfg` `SYMMETRY` is handled separately (§2.6). A user `VIEW` does not block the
+default-mode group by itself when it is a (possibly nested) tuple of distinct state variables,
+where zero-arity variable-group definitions expand recursively: a
+full-retention tuple is a bijection on states, so the plain certificate covers the orbit quotient
+and the fingerprint stays TLC's `VIEW` of the least orbit state; a tuple that omits variables
+composes certified unobserved-variable erasure with the orbit quotient over the exact retained
+tuple, and the fingerprint becomes the orbit of the projected value. Computed or duplicated views,
+views whose omitted variables a guard, update, bound, or check reads, and any view under a declared
+verbatim `SYMMETRY` keep the declared `VIEW` search completely intact and report the refusal under
+`-stats`. Connected certificate
 coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init `PROPERTY`,
 `[][A]_sub` action `PROPERTY` conjuncts, and `.cfg` substitutions (emitting
 `ConstrainedCertificate` theorems when any constrained check is active), while excluding
@@ -155,10 +164,11 @@ their conjunction so `certificate`/`certificate_with_overrides` consume it. Recu
 targets and composed constrained emitters refuse overrides rather than emit an unguarded
 certificate. Certified unobserved-variable
 erasure can compose with certified automatic keyed symmetry (including disjoint products of full
-keyed groups) through `ErasedKeyedCertificate`
-([optimization.md](optimization.md#composing-projection-with-symmetry)); other projections stay
-standalone. Mandatory Lean is written before exploration; it is not verified automatically.
-`-noautosymmetry` turns the whole reduction off.
+keyed groups) through `ErasedKeyedCertificate`, both for the `-optimize`
+`unobserved-state-projection` and for a declared tuple `VIEW` that omits certified-erasable
+variables ([optimization.md](optimization.md#composing-projection-with-symmetry)); other
+projections stay standalone. Mandatory Lean is written before exploration; it is not verified
+automatically. `-noautosymmetry` turns the whole reduction off.
 
 `-checksymmetry` (`crates/tlx-cli/src/symcheck.rs`, `crates/tlx-eval/src/model/symcheck.rs`) is the
 separate declared-symmetry diagnostic: unlike `autosym`'s 20 ms generator cross-check, it runs an

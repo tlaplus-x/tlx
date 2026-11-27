@@ -220,7 +220,10 @@ that application:
    set-sum folds). A declared `.cfg` `SYMMETRY` that already factors into such groups may be
    enlarged by the same analysis in the default mode, provided one connected certificate
    covers the whole combined product; `-tlc` and `-noautosymmetry` use the declaration verbatim
-   ([details](docs/reductions.md)).
+   ([details](docs/reductions.md)). A user-declared `VIEW` that is a (possibly nested) tuple of
+   distinct state variables composes with the certified group: a full-retention tuple is a
+   bijection on states, and a tuple that omits certified-erasable variables reuses the erasure
+   composition below; computed or guard-live views keep their declared search.
 2. **Opt-in state projections (`-optimize`).** Installs a certified `VIEW` key while keeping
    concrete states and transitions intact for counterexample replay; each certificate proves
    initialization, successor correspondence, observations, counterexample lifting and deadlock

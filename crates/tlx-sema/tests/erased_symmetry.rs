@@ -124,11 +124,13 @@ fn erased_equiv_symmetry_refuses_observed_partial_overflow_primed_and_wrong_view
     ] {
         assert!(multi_key_certificate(&mutated, &[0, 1], &groups).is_none(), "unexpectedly accepted:\n{mutated}");
     }
-    // Wrong views: duplicate retained var, wrong order, all vars kept, missing retained var.
+    // Wrong views: duplicate retained var, all vars kept, missing retained var.
     assert!(multi_key_certificate(source, &[0, 0], &groups).is_none());
-    assert!(multi_key_certificate(source, &[1, 0], &groups).is_none());
     assert!(multi_key_certificate(source, &[0, 1, 2, 3, 4], &groups).is_none());
     assert!(multi_key_certificate(source, &[0], &groups).is_none());
+    // A retained tuple in another variable order is the same view re-encoded,
+    // so the projection slots follow that order and the certificate stands.
+    assert!(multi_key_certificate(source, &[1, 0], &groups).is_some());
     // Unused second group must refuse.
     let extra_group = [vec!["n1".into(), "n2".into(), "n3".into()], vec!["x1".into(), "x2".into()]];
     assert!(multi_key_certificate(source, &[0, 1], &extra_group).is_none());

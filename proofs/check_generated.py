@@ -56,7 +56,9 @@ DEFAULT_CASES = (
     ("GeneratedSymmetry", "check", "proofs/symmetry/KeyedSeven.tla", None, ("-interp",), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/ProductLarge.tla", None, ("-interp",), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/DeclaredProduct.tla", None, ("-interp",), (0,)),
+    ("GeneratedSymmetry", "check", "proofs/symmetry/TupleView.tla", None, ("-interp",), (0,)),
     ("GeneratedEquivSymmetry", "check", "proofs/symmetry/KeyValMaps.tla", None, ("-interp",), (0,)),
+    ("GeneratedErasedSymmetry", "check", "proofs/symmetry/TupleViewErased.tla", None, ("-interp",), (0,)),
     ("GeneratedChooseSymmetry", "check", "proofs/symmetry/ChooseSym.tla", None, ("-interp",), (0,)),
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedLive", "check", "proofs/ordered/LiveVersions.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
@@ -72,6 +74,7 @@ DEFAULT_CASES = (
         (0,),
     ),
     ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/ErasedMultiKey.tla", None, ("-interp", "-optimize"), (0,)),
+    ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/TupleViewEquiv.tla", None, ("-interp",), (0,)),
     ("GeneratedThresholdCounter", "check", "proofs/counter/ThresholdProtocol.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedFieldSymmetry", "check", "proofs/field/ActionChecks.tla", None, ("-interp", "-optimize"), (0,)),
     (

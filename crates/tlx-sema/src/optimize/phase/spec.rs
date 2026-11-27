@@ -108,12 +108,15 @@ impl OwnedCheckSpec {
     }
 }
 
-/// Validate that `view` is a strictly ascending retained-variable tuple and
-/// return `(retained, omitted)` with `!omitted.is_empty()`.
+/// Validate that `view` is a tuple of distinct retained state variables and
+/// return `(retained, omitted)` with `!omitted.is_empty()`. The tuple may use
+/// any variable order: the projection emits the retained slots in that same
+/// order, so it stays connected to the installed `VIEW`.
 pub(in crate::optimize::phase) fn parse_retained_view(program: &Program, view: &Expr) -> Option<(Vec<VarId>, Vec<VarId>)> {
     let ExprKind::Tuple(values) = &*view.kind else { return None };
     let retained = values.iter().map(|e| variable(e, false)).collect::<Option<Vec<_>>>()?;
-    if retained.windows(2).any(|pair| pair[0].0 >= pair[1].0) || retained.iter().any(|v| v.idx() >= program.vars.len()) {
+    let unique = retained.iter().enumerate().all(|(i, v)| v.idx() < program.vars.len() && !retained[..i].contains(v));
+    if !unique {
         return None;
     }
     let omitted: Vec<_> = (0..program.vars.len()).map(|i| VarId(i as u32)).filter(|v| !retained.contains(v)).collect();

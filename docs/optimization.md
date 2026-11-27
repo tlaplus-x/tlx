@@ -56,6 +56,7 @@ negative mutation checks are explicit.
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, `FieldSymCertificate.lean`, and `ThresholdSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure, phase-dependent field masking, or in-place threshold-counter saturation composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure, phase-dependent fields, or threshold counters and the corresponding symmetry certificate matches the exact installed `VIEW` |
+| Declared tuple `VIEW` | `KeyedCertificate.lean`, `EquivSymCertificate.lean`, or `ChooseSymCertificate.lean` for a full-retention tuple (a bijection on states); `ErasedKeyedCertificate.lean` / `ErasedEquivCertificate.lean` for a tuple that omits certified-erasable variables, over the exact retained tuple | Enabled in default mode; computed, duplicated, guard-live, or otherwise uncertifiable views keep the declared `VIEW` search and report the refusal under `-stats` |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
 State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and `.cfg` substitutions are
@@ -94,8 +95,13 @@ Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = valu
 module-scoped/cyclic/impure/arity-changing `<-` overrides remain outside the certified checking
 subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
-projection. (A declared `SYMMETRY` may still be enlarged in the default mode by certified
-automatic symmetry; see [reductions.md](reductions.md) section 2.6.)
+projection. A user `VIEW` that is a (possibly nested) tuple of distinct state variables may still
+compose with **automatic symmetry** in the default mode: a full-retention tuple is certified by the
+plain symmetry certificate, and a tuple that omits variables composes certified erasure over the
+exact retained tuple. Computed or duplicated views, views that omit guard-live variables, and views
+under a declared `SYMMETRY` keep the declared search and report the refusal under `-stats`. (A
+declared `SYMMETRY` may still be enlarged in the default mode by certified automatic symmetry when
+no `VIEW` is present; see [reductions.md](reductions.md) sections 2.4 and 2.6.)
 
 When `-optimize` runs, `InterpModel::project_state` tries projection families in priority order —
 unobserved variables, relative ages (including combined age/history), standalone finite history,
@@ -334,10 +340,12 @@ order (`KeyedCertificate.lean`, then fallback `EquivSymCertificate.lean`, or
 - **Refusals:** overlapping or unused groups in a requested product, partial/pinned subgroups,
   product order above 720, unproved `CHOOSE` dependencies, multi-actor partial record patches that
   may alias in `KeyedCertificate`, primed non-core reads where unsupported, incomparable slot
-  payloads, temporal properties, declared `VIEW`/`SYMMETRY`, constraints, action/init properties,
-  aliases, and state-dependent effects. Even forced candidates (`TLX_AUTOSYM_FORCE`) require a
-  connected certificate. When a product subset fails certification within `autosym`'s search budget,
-  `autosym` falls back to the largest-order certifiable disjoint product or singleton subgroup.
+  payloads, temporal properties, a declared verbatim `SYMMETRY`, a user `VIEW` that is not a
+  duplicate-free tuple of state variables (computed or repeated expressions), constraints,
+  action/init properties, aliases, and state-dependent effects. Even forced candidates
+  (`TLX_AUTOSYM_FORCE`) require a connected certificate. When a product subset fails certification
+  within `autosym`'s search budget, `autosym` falls back to the largest-order certifiable disjoint
+  product or singleton subgroup.
 - **TCB:** parsing and HIR normalization (`SymNormalizer`), forward structural domain inference and
   shape bijection (`phase/domain.rs`), the shared `phase/sym_totality/` gate (which proves totality,
   TLC comparability including typed vs. untyped model values, 32-bit checked-arithmetic bounds, and
@@ -782,6 +790,19 @@ concrete source model via `Rules.lean`'s `compose` and `composeConstrained`:
   overflow checks strict on all retained expressions. When an eligible
   `threshold-counter-projection` does not compose with symmetry, the same bounded BFS probe
   compares both reduced graphs so `-optimize` does not displace a stronger certified symmetry.
+- **Declared tuple `VIEW`s × symmetry:** in the default mode a user `VIEW` that flattens to a
+  duplicate-free tuple of state variables composes with the certified automatic group. Zero-arity
+  variable-group definitions expand recursively (`serverVars == <<pc, log>>`,
+  `View == <<serverVars, logVars>>`), with `.cfg` definition redirects followed and a group
+  assigned a `.cfg` value refused. A
+  full-retention tuple is a bijection on states, so the plain `KeyedCertificate` /
+  `EquivSymCertificate` / `ChooseSymCertificate` orbit quotient covers it and the runtime keeps
+  TLC's `VIEW`-of-the-least-orbit-state fingerprint. A tuple that omits variables passes the exact
+  retained tuple to `symmetry_projection_certificate_with_spec`, whose shared erasure walkers reject
+  any omitted variable read by a retained guard, update, bound, or check; the accepted composition
+  then keys the fingerprint by the orbit of the projected value (the certificate's key). A
+  computed or duplicated view, an unparseable nested expression, and a view under a declared
+  verbatim `SYMMETRY` fail closed and leave the user's `VIEW` search untouched.
 
 ### Lowered Rule & Lean Certificate
 
@@ -810,7 +831,8 @@ intermediate system is the exact projected image of the source model:
 Two independently generated certificates for unrelated models cannot authorize application. At run
 time, `tlx` projects first and canonicalizes the projected value under the total structural order
 (`InterpModel::projected_orbit`), so forgotten fields, forgotten variables, or counter magnitudes
-above their caps cannot split or bias orbits. Theorem audits cover the intermediate stage
+above their caps cannot split or bias orbits. A certified declared tuple `VIEW` that omits
+variables uses the same projected-orbit key over the exact retained tuple. Theorem audits cover the intermediate stage
 certificate (`erasure_certificate`, `field_certificate`, or `threshold_certificate`), the
 orbit-quotient `symmetry_certificate`, the composed `certificate`, safety with and without
 stuttering, counterexample lifting, deadlocks, formal `orbit_key_equivalent`, and (when constrained)
@@ -822,8 +844,9 @@ all constrained and constant-substitution theorems.
   and ordered-allocation projections), `ChooseSymCertificate` composition (falls back via bounded
   probe for `phase-field-projection` and `threshold-counter-projection`), non-equivariant sentinels,
   asymmetric per-key counter caps, overlapping `EXCEPT` `@` updates, unsupported
-  hidden/field/counter transfers, and user-declared `VIEW` or `SYMMETRY`. Passing `-noautosymmetry`
-  retains standalone `ErasureCertificate.lean`, `FieldCertificate.lean`, or
+  hidden/field/counter transfers, a declared verbatim `SYMMETRY`, and computed or guard-live user
+  `VIEW`s (a certified duplicate-free tuple `VIEW` is the supported exception). Passing
+  `-noautosymmetry` retains standalone `ErasureCertificate.lean`, `FieldCertificate.lean`, or
   `ThresholdCounterCertificate.lean`.
 - **TCB:** union of the constituent projection and symmetry TCB boundaries, plus runtime projection
   prior to orbit canonicalization.
