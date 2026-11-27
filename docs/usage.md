@@ -326,7 +326,10 @@ cannot. Such a prefix shows that the property fails; it is not a complete execut
 and without `SYMMETRY`, where the same violation is reported with a complete trace.
 
 TLC's `-view` command-line option is not implemented; the `VIEW` configuration keyword is
-([features.md](features.md) section 1).
+([features.md](features.md) section 1). In the default mode a `VIEW` that is a tuple of state
+variables may additionally compose with automatic symmetry
+([section 6.3](#63-automatic-symmetry-in-the-default-mode)); `-tlc` and `-noautosymmetry` keep the
+plain `VIEW` search.
 
 ### 2.8 Diagnosed before or during the run
 
@@ -673,6 +676,17 @@ outside the certificate subset (`ALIAS`, `_POSSIBLE`, `POSTCONDITION`, unsupport
 operations), or a failed certificate keeps the declared group unchanged; the reason is
 recorded under `-stats`. `-noautosymmetry` disables the enlargement. See
 [reductions.md](reductions.md) section 2.6.
+
+A declared `VIEW` does not by itself disable the group when it is a (possibly nested) tuple of
+distinct state variables, including zero-arity variable-group definitions such as
+`View == <<serverVars, logVars>>` (a group assigned a `.cfg` value is refused). In the default mode
+a full-retention tuple is a bijection on states, so
+the plain symmetry certificate covers it and the fingerprint stays TLC's `VIEW` of the least orbit
+state; a tuple that omits variables composes certified unobserved-variable erasure with the orbit
+quotient over the exact retained tuple, keyed by the orbit of the projected value. Computed or
+duplicated views, views whose omitted variables a guard, update, bound, or check reads, and views
+under a declared `SYMMETRY` keep their declared search; the refusal reason is recorded under
+`-stats`. Certified state projections under `-optimize` still decline a declared `VIEW`.
 
 Every default-mode run names applied optimizations (message code 9100 under `-tool`)
 and records an `optimizations` array in JSON statistics. A certified symmetry is

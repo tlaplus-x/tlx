@@ -255,7 +255,13 @@ pub fn analyze(model: &InterpModel) -> Analysis {
     let mask_of = |m: Sym| masks.get(&m).copied().unwrap_or(0);
     let mut an = analyze::Analyzer::new(ip, &mask_of);
     if !analyzed.is_empty() && model.has_behavior {
-        an.run(&checked_parts(model));
+        // The declared `VIEW` shapes the reduced fingerprint, so its own
+        // effects and (non-)equivariance are part of the reduction: a view that
+        // reads run-time counters or breaks the group makes the orbit quotient
+        // unsound and must refuse automatic symmetry.
+        let mut parts = checked_parts(model);
+        parts.extend(model.view.iter().cloned());
+        an.run(&parts);
     }
     let state_mask = an.vars.iter().fold(0, |a, s| a | s.mask());
     let mut sets = Vec::new();

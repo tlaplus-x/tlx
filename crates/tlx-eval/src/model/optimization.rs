@@ -439,7 +439,7 @@ impl InterpModel {
     fn symmetry_cert_next_with(&self, declared: bool) -> Option<Expr> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
-            || (self.has_view() && !self.state_projection)
+            || (self.has_view() && !self.state_projection && self.tuple_view_vars().is_none())
             || self.ordered_projection.is_some()
             || (!declared && (!self.group.is_empty() || cfg.symmetry.is_some()))
             || !self.possible.is_empty()
@@ -451,6 +451,92 @@ impl InterpModel {
         }
         let Ok(Behavior::Full { next, .. }) = behavior(&self.ip, cfg) else { return None };
         Some(next)
+    }
+
+    /// The maximum nesting of `VIEW` variable-group definitions resolved
+    /// before the declared view fails closed.
+    const VIEW_GROUP_RESOLUTION_LIMIT: usize = 64;
+
+    /// Flatten the declared cfg `VIEW` when it is exactly an unprimed state
+    /// variable or a (possibly nested) tuple of distinct state variables, in
+    /// the order the user wrote them. Zero-arity variable-group definitions
+    /// (`serverVars == <<pc, log>>`, `View == <<serverVars, logVars>>`) expand
+    /// recursively after `.cfg` `Def <- OtherDef` redirects. This is the single
+    /// cfg-aware resolver: the certificate emitter is handed the retained list
+    /// it returns, so eligibility and emission cannot disagree.
+    ///
+    /// Any other `VIEW` returns `None`, so automatic symmetry fails closed
+    /// while the declared `VIEW` search stays exactly as it was: computed or
+    /// primed subexpressions, repeated variables (including across groups),
+    /// empty tuples, parameterized or function definitions, builtins, a
+    /// definition assigned a `.cfg` value (`serverVars = <<1, 2>>`), and a
+    /// definition-reference cycle.
+    pub fn tuple_view_vars(&self) -> Option<Vec<VarId>> {
+        let mut retained = Vec::new();
+        let mut stack = Vec::new();
+        self.flatten_view_var(self.view.as_ref()?, &mut retained, &mut stack, 0)?;
+        (!retained.is_empty()).then_some(retained)
+    }
+
+    fn flatten_view_var(&self, e: &Expr, retained: &mut Vec<VarId>, stack: &mut Vec<DefId>, depth: usize) -> Option<()> {
+        if depth > Self::VIEW_GROUP_RESOLUTION_LIMIT {
+            return None;
+        }
+        match &*e.kind {
+            ExprKind::Var(v) => {
+                if v.idx() >= self.ip.prog.vars.len() || retained.contains(v) {
+                    return None;
+                }
+                retained.push(*v);
+            }
+            ExprKind::Tuple(es) => {
+                if es.is_empty() {
+                    return None;
+                }
+                for e in es {
+                    self.flatten_view_var(e, retained, stack, depth + 1)?;
+                }
+            }
+            ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => {
+                // `name = value` in the cfg replaces the definition with a
+                // value; it is not a variable group, before or after redirect.
+                if self.ip.has_def_value(*d) {
+                    return None;
+                }
+                let d = self.ip.redirect_def(*d);
+                if self.ip.has_def_value(d) || stack.contains(&d) {
+                    return None;
+                }
+                let def = &self.ip.prog.defs[d.idx()];
+                if !def.params.is_empty() || def.builtin.is_some() {
+                    return None;
+                }
+                let DefKind::Op(body) = &def.kind else { return None };
+                stack.push(d);
+                let flattened = self.flatten_view_var(body, retained, stack, depth + 1);
+                stack.pop();
+                flattened?;
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Whether the declared tuple `VIEW` retains every state variable (a
+    /// permutation of them), so a plain symmetry certificate covers it: the
+    /// view is then a bijection on states and the orbit quotient is unchanged.
+    pub fn view_retains_all(&self) -> bool {
+        self.tuple_view_vars().is_some_and(|retained| retained.len() == self.ip.prog.vars.len())
+    }
+
+    /// Canonicalize the declared tuple `VIEW`'s projected value at the
+    /// fingerprint boundary after a certified erasure+symmetry group is
+    /// installed. The composed certificate's key is exactly the orbit of the
+    /// projected value, whereas the plain `VIEW`-with-symmetry fingerprint
+    /// picks a whole-state least representative first, which would refine the
+    /// certified quotient and can lose counterexample replay.
+    pub fn install_view_projection(&mut self) {
+        self.view_projection = true;
     }
 
     /// Certify a disjoint product of full key permutation groups. This does not install it.
@@ -469,6 +555,13 @@ impl InterpModel {
                 groups,
                 self.view.as_ref()?,
             )
+        } else if let Some(retained) = self.tuple_view_vars() {
+            // A declared tuple `VIEW`: a full-retention view is a bijection on
+            // states (plain symmetry certificate); an omitting view composes
+            // certified erasure with the orbit quotient over the exact
+            // retained tuple.
+            let span = self.view.as_ref()?.span;
+            tlx_sema::optimize::symmetry_view_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups, &retained, span)
         } else {
             tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups)
         }
@@ -480,7 +573,7 @@ impl InterpModel {
     /// one of those factors appears verbatim in `combined`, so the certificate
     /// covers the group actually installed. This does not install it.
     pub fn augmented_symmetry_certificate(&self, combined: &[Vec<String>]) -> Option<String> {
-        if self.state_projection || self.ip.cfg.symmetry.is_none() {
+        if self.state_projection || self.has_view() || self.ip.cfg.symmetry.is_none() {
             return None;
         }
         let declared: Vec<Vec<String>> =
@@ -499,6 +592,12 @@ impl InterpModel {
     /// `Init` equivariance as well as `CHOOSE` invariance. This does not install it.
     pub fn choose_symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
         if self.state_projection {
+            return None;
+        }
+        // Choice symmetry has no erasure counterpart, so a declared `VIEW` that
+        // omits a variable cannot use it; a full-retention tuple view is a
+        // bijection on states and the plain certificate still covers it.
+        if self.has_view() && !self.view_retains_all() {
             return None;
         }
         let next = self.symmetry_cert_next()?;
@@ -551,7 +650,7 @@ impl InterpModel {
     }
 
     pub fn has_projected_symmetry(&self) -> bool {
-        self.state_projection && !self.group.is_empty()
+        (self.state_projection || self.view_projection) && !self.group.is_empty()
     }
 
     /// Canonicalize the projected value, so forgotten fields cannot decide
@@ -682,6 +781,40 @@ Syn == Permutations(TxId)
         let p = Program::load(&dir.join("Declared.tla"), &[]).unwrap();
         let ip = Interp::new(p, tlx_front::cfg::parse_cfg(plain).unwrap()).unwrap();
         assert!(InterpModel::new(ip).unwrap().augmented_symmetry_certificate(&combined[1..]).is_none());
+    }
+
+    const NESTED_VIEW: &str = r#"---- MODULE NestedView ----
+EXTENDS TLC, Naturals, FiniteSets
+CONSTANT Proc
+VARIABLES pc, phase, ghost
+serverVars == <<pc>>
+logVars == <<phase>>
+ghostVars == <<ghost>>
+Init == pc = [p \in Proc |-> 0] /\ phase = FALSE /\ ghost = FALSE
+Next == UNCHANGED <<pc, phase, ghost>>
+Inv == TRUE
+View == <<logVars, serverVars>>
+====
+"#;
+
+    fn nested_view_model(cfg: &str) -> InterpModel {
+        let dir = tlx_testkit::TempDir::with_spec("nested-view", NESTED_VIEW, cfg);
+        let program = Program::load(&dir.join("NestedView.tla"), &[]).unwrap();
+        let ip = Interp::new(program, tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
+        InterpModel::new(ip).unwrap()
+    }
+
+    #[test]
+    fn declared_view_group_definitions_resolve_recursively_and_fail_closed() {
+        let cfg = "CONSTANT Proc = {p1, p2}\nINIT Init\nNEXT Next\nVIEW View\n";
+        // `<<logVars, serverVars>>` expands to `<<phase, pc>>` in that order.
+        assert_eq!(nested_view_model(cfg).tuple_view_vars(), Some(vec![VarId(1), VarId(0)]));
+        // A `.cfg` value assignment replaces the group with a value.
+        let value = "CONSTANT Proc = {p1, p2}\nCONSTANT serverVars = <<1, 2>>\nINIT Init\nNEXT Next\nVIEW View\n";
+        assert!(nested_view_model(value).tuple_view_vars().is_none());
+        // A `.cfg` `Def <- OtherDef` redirect is followed to the replacement group.
+        let redirect = "CONSTANT Proc = {p1, p2}\nCONSTANT serverVars <- ghostVars\nINIT Init\nNEXT Next\nVIEW View\n";
+        assert_eq!(nested_view_model(redirect).tuple_view_vars(), Some(vec![VarId(1), VarId(2)]));
     }
 
     #[test]

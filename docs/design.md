@@ -176,8 +176,11 @@ each representation:
    preservation without correctness premises. `tlx-eval` (`crates/tlx-eval/src/model/optimization.rs`
    `InterpModel::project_state`) and `tlx-cli` (`crates/tlx-cli/src/autosym.rs`) enforce this gate
    before installing a projection or symmetry group and persist the mandatory Lean file (`proofs.rs`)
-   before exploration without invoking a Lean process at run time. Explicit user `VIEW`
-   declarations keep TLC's contract; a declared `SYMMETRY` is used verbatim under `-tlc` and
+   before exploration without invoking a Lean process at run time. A declared tuple `VIEW` over
+   distinct state variables composes with an automatic group (the plain certificate for a
+   full-retention tuple, certified erasure+symmetry for one that omits certified-erasable
+   variables); other user `VIEW` declarations keep TLC's contract. A declared `SYMMETRY` is used
+   verbatim under `-tlc` and
    `-noautosymmetry` and enlarged only by a certificate covering the whole combined product.
    `-tlc` bypasses automatic reductions. See
    [optimization.md](optimization.md#proof-coverage),

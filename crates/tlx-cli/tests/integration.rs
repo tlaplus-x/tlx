@@ -63,6 +63,7 @@ mod threshold_counter_projection;
 mod tiers;
 mod tlc_equality;
 mod value_store;
+mod view_symmetry;
 mod view_trace;
 mod widening;
 
@@ -126,6 +127,7 @@ fn all_test_files_registered() {
         "tiers",
         "tlc_equality",
         "value_store",
+        "view_symmetry",
         "view_trace",
         "widening",
     ];

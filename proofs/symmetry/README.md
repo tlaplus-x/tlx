@@ -71,6 +71,21 @@ connected Lean certificate emitters:
   (direct and `LET`-bound), and recursive `CHOOSE` integer set-sum fold
   (`TotalVotes`) certified by `ChooseSymCertificate`. 81 concrete states become
   22 classes.
+- [TupleView.tla](TupleView.tla) ([TupleView.cfg](TupleView.cfg)): a nested,
+  reordered **declared** tuple `VIEW` built from zero-arity variable-group
+  definitions (`View == <<logVars, serverVars>>`) that retains every variable, so
+  the plain keyed certificate covers it and the runtime keeps TLC's
+  VIEW-of-least-state fingerprint. 54 concrete states become 20 classes.
+- [TupleViewErased.tla](TupleViewErased.tla)
+  ([TupleViewErased.cfg](TupleViewErased.cfg)): a declared tuple `VIEW` built
+  from zero-arity variable-group definitions in non-declaration order that omits
+  a certified-erasable `ghost` variable, composing `ErasedKeyedCertificate` with
+  the orbit quotient and keying the fingerprint by the orbit of the projected
+  value.
+- [TupleViewEquiv.tla](TupleViewEquiv.tla) ([TupleViewEquiv.cfg](TupleViewEquiv.cfg)):
+  the same composition built from variable-group definitions over a set of
+  two-key records, outside the keyed rule IR, certified by
+  `ErasedEquivCertificate`.
 
 A declared `.cfg` `SYMMETRY` that already factors into disjoint `Permutations(...)`
 groups is enlarged by the same certified analysis in the default mode
@@ -89,6 +104,9 @@ cargo build --release
 ./target/release/tlx check proofs/symmetry/MultiKeyMsgs.tla -compile
 ./target/release/tlx check proofs/symmetry/KeyValMaps.tla -compile
 ./target/release/tlx check proofs/symmetry/ChooseSym.tla -compile
+./target/release/tlx check proofs/symmetry/TupleView.tla -interp
+./target/release/tlx check proofs/symmetry/TupleViewErased.tla -interp
+./target/release/tlx check proofs/symmetry/TupleViewEquiv.tla -interp
 python3 proofs/check_generated.py --lean lean --negative \
   /path/to/Optimization.lean
 ```
@@ -185,7 +203,10 @@ TLX_PARANOID=1 TLX_SYMMETRY_PARANOID=1 ./target/release/tlx check proofs/symmetr
 The installed projection must be the exact retained-variable tuple. Unknown,
 partial, overflowing, primed-RHS, or multi-binding hidden updates, reads of omitted
 variables, unsupported symmetry shapes and other projection kinds refuse
-composition. Existing user VIEW/SYMMETRY declarations retain the TLC path. Source
+composition. A declared tuple `VIEW` over distinct state variables uses the same gate: a
+full-retention tuple keeps the TLC fingerprint under the plain certificate, and a tuple that omits
+certified-erasable variables composes erasure with the orbit quotient (see the `TupleView`
+examples above); other user `VIEW` and `SYMMETRY` declarations retain the TLC path. Source
 lowering, domain/totality inference (`sym_totality`), independent semantic leaves,
 group closure and runtime projection/canonicalization remain trusted.
 

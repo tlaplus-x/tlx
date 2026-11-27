@@ -153,6 +153,10 @@ pub struct InterpModel {
     view: Option<Expr>,
     /// A proved state projection is canonicalized before symmetry.
     state_projection: bool,
+    /// A declared tuple `VIEW` that omits variables and was certified erased+
+    /// symmetric: the fingerprint canonicalizes the projected value, matching
+    /// the composed certificate's key.
+    view_projection: bool,
     ordered_projection: Option<Arc<tlx_sema::optimize::OrderedPlan>>,
     /// Optional Lean certificate emitted with the accepted projection.
     projection_certificate: Option<Arc<str>>,
@@ -515,6 +519,7 @@ impl InterpModel {
             fp_mode: if reduce { FpMode::Reduced } else { FpMode::Plain },
             view,
             state_projection: false,
+            view_projection: false,
             ordered_projection: None,
             projection_certificate: None,
             mathematical_counter_arithmetic: false,

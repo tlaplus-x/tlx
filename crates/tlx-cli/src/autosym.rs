@@ -48,22 +48,29 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
     stats::phase("auto symmetry analysis", an.elapsed);
     report(&an);
     if a.tlc {
-        let cert_group = if model.live.is_empty() {
-            if !an.group_text().is_empty() && not_applicable(model, &an).is_none() {
-                let text = match &precertified {
-                    Some(pc) => Some(pc.group_text.clone()),
-                    None => certify_groups(model, &eligible_proven(&an))
-                        .map(|(sel, _)| sel.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ")),
-                };
-                Some(text)
+        // With a `VIEW`, TLC's verbatim path (least orbit state, then the view)
+        // needs the view to be a symmetry-compatible encoding of the whole
+        // state: only a full-retention tuple is a bijection. An omitting tuple's
+        // certified composition is a default-mode reduction, not advice to
+        // declare the group, so it gets no suggestion.
+        if !model.has_view() || model.view_retains_all() {
+            let cert_group = if model.live.is_empty() {
+                if !an.group_text().is_empty() && not_applicable(model, &an).is_none() {
+                    let text = match &precertified {
+                        Some(pc) => Some(pc.group_text.clone()),
+                        None => certify_groups(model, &eligible_proven(&an))
+                            .map(|(sel, _)| sel.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ")),
+                    };
+                    Some(text)
+                } else {
+                    Some(None)
+                }
             } else {
-                Some(None)
+                None
+            };
+            if let Some(line) = an.suggestion_for(cert_group.as_ref().map(|o| o.as_deref())) {
+                out::info(code::GENERAL, &line);
             }
-        } else {
-            None
-        };
-        if let Some(line) = an.suggestion_for(cert_group.as_ref().map(|o| o.as_deref())) {
-            out::info(code::GENERAL, &line);
         }
         return Ok(None);
     }
@@ -313,7 +320,11 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
                 pending_notes.clear();
                 break prev;
             }
-            note("not applied: no connected Lean certificate for automatic symmetry");
+            if model.has_view() {
+                note("not applied: no connected Lean certificate covers automatic symmetry over the cfg VIEW (an omitted variable may be live in a retained predicate or update)");
+            } else {
+                note("not applied: no connected Lean certificate for automatic symmetry");
+            }
             return Ok(None);
         };
         let unselected: Vec<&autosym::SetResult> =
@@ -386,6 +397,13 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
     if let Err(e) = model.apply_symmetry(gens) {
         note(&format!("not applied: {}", e.message));
         return Ok(None);
+    }
+    // A declared tuple `VIEW` that omits certified-erasable variables is keyed
+    // by the orbit of the projected value (the composed certificate's key)
+    // instead of a whole-state least representative, which would refine the
+    // certified quotient and could lose counterexample replay.
+    if model.tuple_view_vars().is_some() && !model.view_retains_all() {
+        model.install_view_projection();
     }
     model.record_symmetry_certificate(certificate);
     Ok(Some(Applied { group: text }))
@@ -991,7 +1009,16 @@ fn not_applicable_with(model: &InterpModel, an: &Analysis, allow_declared: bool)
         return Some("the cfg declares a SYMMETRY".into());
     }
     if model.has_view() && !model.has_automatic_projection() {
-        return Some("the cfg has a VIEW".into());
+        // A declared tuple `VIEW` that is a permutation of the state variables
+        // is a bijection on states, and one that omits variables composes with
+        // certified erasure; both are certified below. Any other view, and any
+        // view under a declared verbatim `SYMMETRY`, keeps the original search.
+        if model.ip.cfg.symmetry.is_some() {
+            return Some("the cfg has a VIEW".into());
+        }
+        if model.tuple_view_vars().is_none() {
+            return Some("the cfg VIEW is not a tuple of distinct state variables".into());
+        }
     }
     if !model.live.is_empty() {
         return Some("temporal properties are checked (the proof covers safety only)".into());
