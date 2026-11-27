@@ -70,5 +70,10 @@ Keep their samples visible and repeat measurements before using them to establis
 
 The [audit of ratios above 100x](research/speedup-audit.md) identifies further validation work:
 repeated TLC measurements on the same instance, explicit cache conditions, comparable runs with
-and without automatic reduction, and per-property correctness checks. Matching counts and a log line
-announcing liveness checking do not prove that every temporal property was translated correctly.
+and without automatic reduction, and per-property correctness checks. The per-property check is now
+automated: reduced probes in `tests/specs/` (`TP1`-`TP7`) make each temporal and refinement property
+shape of the >100x cohort false one property at a time, and `cargo test` plus `scripts/spectest.py`
+require `tlx` to report the named violation with a counterexample in default and `-tlc` modes, with
+TLC confirming the property and validating the lasso. Matching counts and a log line announcing
+liveness checking alone still do not prove that every configured property is correct; the probes
+cover the cohort's shapes, not every configuration.

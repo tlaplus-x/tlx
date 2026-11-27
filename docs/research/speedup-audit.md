@@ -183,6 +183,29 @@ detected in both `default` and `-tlc` modes, matching TLC), or validating each l
 counterexample against TLC. All 13 rows expect `success`, so a dropped or mistranslated property
 would not show up in their verdicts.
 
+That probe is now checked in as reduced models (`tests/specs/TP1`-`TP7`, run by `cargo test` and
+`scripts/spectest.py`). Each makes one property false at a time and requires the named violation and
+a counterexample in `default`, `-tlc -interp` and `-tlc -compile`:
+
+* `TP1` keeps MultiCarElevator's `TemporalInvariant` shape, a conjunction of leads-to obligations
+  under `WF`/`SF`, and mutates one consequent; it prints four temporal branches with three people
+  (the corpus configurations print six and eight with two elevators and two people).
+* `TP2` states the same obligation as `[]<>` under that fairness and drops the strong fairness of
+  the service action.
+* `TP3` keeps RaftMongo's `CommitPointEventuallyPropagates` shape, ordered-pair leads-to
+  obligations inside `[]` under `SF`, with two servers (four branches; the corpus's three servers
+  give nine) and mutates the inner `<>` consequent.
+* `TP4` keeps MisraReachability's `Termination == <>(pc = "Done")` under `WF` and removes the
+  finishing action from `Next`.
+* `TP5`-`TP7` keep `Refines == R!Spec` for an `INSTANCE` refinement and falsify its initial, action
+  and fairness conjuncts separately: `R!Init` (an initial property violation),
+  `[][R!Next]_R!vars` (an action property violation) and `WF_R!vars(R!Next)` (a temporal property
+  violation, on the concrete specification without its fairness).
+
+`scripts/spectest.py` compares each probe with TLC's cached output, which reports the same violated
+name, and TLC validates the counterexample lassos (`trace differs, valid`). The probes show that
+these shapes are translated and checked; they do not re-run every configuration of the 13 rows.
+
 **F6 - unexplained sample variation in the batch.** [issues.md](../issues.md) lists four
 default-mode rows whose sample range over the median exceeds 25%. Their raw samples classify as
 follows (`warmups` is the recorded warm-up):
@@ -424,8 +447,9 @@ time at the recorded times, and most of it is dominated by four rows):
   (`MCReachable` and `MCParReach` too, now that their TLC phases are attributed).
 * It does claim that the six rows whose recorded warm-up is 3.4-6.8x the timed value and the two
   reduction rows are not yet evidence for the *size* of the number they publish, and that the
-  missing TLC repeats (F1) and the unverified per-property correctness (F5) are the two items to
-  fix first.
+  missing TLC repeats (F1) remain the item to fix first. The per-property correctness question (F5)
+  is now covered by the probes listed under F5; they were added after this audit and are not part of
+  the 2026-10-11 record.
 
 ## Appendix: published rows whose records name an optimization
 
