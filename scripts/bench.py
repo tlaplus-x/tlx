@@ -82,6 +82,11 @@ usage:
       (A/B against the previous recorded revision, bench/history/<rev>.json;
       `track` runs it on one cloud instance): see
       scripts/benchmarking/bench_suite.py and docs/benchmarking.md.
+      `suite`/`track --with-tlc-companion` also measure a same-instance `-tlc`
+      twin of every default-mode run (same model, workers, arguments, environment
+      and cache policy), so a reduced row has a like-for-like unreduced timing;
+      the report pairs the two by model, instance, revision, workers, input
+      digest and configuration.
   scripts/bench.py table
       Regenerate the fixed report docs/performance.md from the canonical
       records (bench/records); it measures nothing. Also the default without

@@ -142,6 +142,76 @@ def eligible(r):
             and not any((c.get('env') or {}).values()))
 
 
+# The run modes whose search is reduced by default, and the TLC-compatible mode
+# that measures the same configuration unreduced. A companion `-tlc` run is only
+# a like-for-like twin when it was measured on the same instance (the store
+# records the instance type and architecture), from the same revision and input,
+# with the same worker count, TLC version and configuration.
+REDUCED_MODES = ('default',)
+TWIN_MODE = '-tlc'
+
+
+def twin_key(r):
+    """The dimensions a reduced row and its unreduced twin must share, or None.
+
+    Instance type and architecture stand for "the same instance": they are what
+    the store records about the machine, and a ratio across machines is not
+    quotable (docs/research/speedup-audit.md section 3, item 3). The input
+    digest and the recorded cache conditions decide whether the two searched the
+    same bytes under the same cache regime (F2/F3); they are part of the key
+    because a warm and an isolated run differ by several times on fast models.
+
+    Fails closed: a row whose machine type, architecture, input digest or cache
+    provenance is unknown cannot be shown to be the same measurement, so it has
+    no twin key and is never paired.
+    """
+    i = r.get('instance') or {}
+    cache = (r.get('provenance') or {}).get('cache')
+    if not i.get('type') or not i.get('arch') or not r.get('content_digest') or not cache:
+        return None
+    c = r.get('configuration') or {}
+    return (r['model'], r['revision'], i['type'], i['arch'], r['workers'],
+            r['content_digest'], r['tlc_version'], tuple(c.get('args') or []),
+            json.dumps(c.get('env') or {}, sort_keys=True), c.get('cgroup_mib'), c.get('hogs') or 0,
+            c.get('variant'), json.dumps(cache, sort_keys=True))
+
+
+def unreduced_twins(rows):
+    """Map each configuration's `twin_key` to the eligible unreduced `-tlc` row.
+
+    Only an eligible row with a wall time is evidence, the same gate the report
+    and the speedup inventory apply to a published row: a twin the report would
+    reject cannot label a published ratio. The newest such row wins, on the same
+    (date, id) order the report's own selection uses.
+    """
+    out = {}
+    for r in rows:
+        if r.get('tool') != 'tlx' or r.get('mode') != TWIN_MODE or not eligible(r) or not r['metrics'].get('wall_s'):
+            continue
+        key = twin_key(r)
+        if key is None:
+            continue
+        if key not in out or (r['date'] or '', r['id']) >= (out[key]['date'] or '', out[key]['id']):
+            out[key] = r
+    return out
+
+
+def unreduced_twin(r, twins):
+    """The same-instance unreduced twin of a default-mode row, or None.
+
+    The store must hold an eligible tlx `-tlc` record whose configuration,
+    revision, instance, worker count and input match this row's; otherwise there
+    is no like-for-like number and the report prints none.
+    """
+    if r.get('tool') != 'tlx' or r.get('mode') not in REDUCED_MODES:
+        return None
+    key = twin_key(r)
+    if key is None:
+        return None
+    twin = twins.get(key)
+    return twin if twin is not None and twin['id'] != r['id'] else None
+
+
 def scaling_identity(r):
     args = r['configuration'].get('args', [])
     stripped, i = [], 0
@@ -167,6 +237,12 @@ def render(records, suite, *, stale_after=20, ages=None, baseline_inputs=None, r
                    tuple(r['category']), tuple(r['configuration'].get('args', [])), r['configuration'].get('cgroup_mib'))
             latest[key] = r
     rows = sorted(latest.values(), key=lambda r: (r['model'], r['mode'], r['workers'], r['instance']['type'] or '', r['id']))
+    # (The whole store, not the report's latest-per-key rows: `latest` does not
+    # key by revision, so a twin of an older revision would be evicted from it
+    # by a newer run of the same mode and the valid pair silently lost.)
+    twins = unreduced_twins(records)
+    twin_of = {r['id']: unreduced_twin(r, twins) for r in rows}
+    has_twins = any(twin_of.values())
     def baseline(r):
         tc = by_id.get(r.get('baseline'))
         return tc if tc and historical_match(r, tc) else None
@@ -196,6 +272,14 @@ def render(records, suite, *, stale_after=20, ages=None, baseline_inputs=None, r
            'state it for every sample.',
            'See [benchmark inputs and evidence](../bench/README.md) for verification and reproduction. '
            'Superseded measurements and backup archives are kept outside the published tree.', '']
+    if has_twins:
+        out += ['When the store holds one, a default-mode row is paired with its unreduced same-instance twin: an eligible '
+                'tlx `-tlc` record with the same model, revision, instance type and architecture, worker count, input digest, '
+                'TLC version, configuration (arguments, environment and memory limit) and recorded cache conditions. `-tlc twin s` '
+                'is that record\'s timed wall time (cited in Evidence), and `-tlc / default` divides it by this row\'s, so a value '
+                'above one is the factor the reduced search saved on the same machine; the TLC ratio beside it remains a comparison '
+                'with TLC\'s own run. A row without a twin, or whose machine type, input digest or cache conditions are unknown, '
+                'shows `—`: a ratio across unknown hosts, inputs or cache regimes is not quotable and no number is inferred.', '']
     if report_note:
         if not isinstance(report_note, str):
             raise ValueError('report_note must be a string')
@@ -299,15 +383,26 @@ def render(records, suite, *, stale_after=20, ages=None, baseline_inputs=None, r
             if not rs:
                 out += ['No eligible records. See Coverage and gaps.', '']
                 continue
-            out += ['| Model / mode | Workers | Result / distinct / generated / depth | Wall s | CPU s | RSS MiB | Instructions | TLC wall / CPU s | TLC RSS MiB | TLC / tlx | TLC / tlx RSS | tlx optimizations | Evidence |',
-                    '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|']
+            header = ('| Model / mode | Workers | Result / distinct / generated / depth | Wall s | CPU s | RSS MiB | '
+                      'Instructions | TLC wall / CPU s | TLC RSS MiB | TLC / tlx | TLC / tlx RSS | tlx optimizations | Evidence |')
+            rule = ('|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|' if has_twins
+                    else '|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|')
+            if has_twins:
+                header = header.replace('| tlx optimizations | Evidence |',
+                                        '| -tlc twin s | -tlc / default | tlx optimizations | Evidence |')
+            out += [header, rule]
             for r in rs:
                 tc = baseline(r)
+                twin = twin_of.get(r['id']) if has_twins else None
                 counts = r['counts']
                 count_text = ' / '.join(str(counts.get(k) if counts.get(k) is not None else '—') for k in ('result', 'distinct', 'generated', 'depth'))
                 baseline_text = (number(tc['metrics']['wall_s']) + ' / ' + number(tc['metrics']['cpu_s'])) if tc else '—'
                 tlc_rss_text = number(peak_rss(tc['metrics'])) if tc else '—'
                 evidence = ref(r) + (' / ' + ref(tc, 'TLC ' + (tc['tlc_version'] or 'unknown version')) if tc else '')
+                if twin:
+                    # Every published number is named by its record: the twin's
+                    # time and factor cite the `-tlc` row they came from.
+                    evidence += ' / ' + ref(twin, '-tlc twin')
                 configuration = r['configuration']
                 label = r['model'] + ' / ' + r['mode']
                 args = configuration.get('args', [])
@@ -315,11 +410,16 @@ def render(records, suite, *, stale_after=20, ages=None, baseline_inputs=None, r
                     label += ' / -maxmem ' + args[args.index('-maxmem') + 1]
                 if configuration.get('cgroup_mib'):
                     label += f" / cgroup {configuration['cgroup_mib']} MiB"
-                out.append(f"| {label} | {r['workers']} | {count_text} | "
-                           + ' | '.join(number(peak_rss(r['metrics'])) if k == 'rss_mib' else number(r['metrics'][k])
-                                        for k in METRICS)
-                           + f" | {baseline_text} | {tlc_rss_text} | {number(ratio(r), '×')} | "
-                           + f"{number(rss_ratio(r, tc), '×')} | {reduction_note(r)} | {evidence} |")
+                line = (f"| {label} | {r['workers']} | {count_text} | "
+                        + ' | '.join(number(peak_rss(r['metrics'])) if k == 'rss_mib' else number(r['metrics'][k])
+                                     for k in METRICS)
+                        + f" | {baseline_text} | {tlc_rss_text} | {number(ratio(r), '×')} | "
+                        + f"{number(rss_ratio(r, tc), '×')} | ")
+                if has_twins:
+                    line += (f"{number(twin['metrics']['wall_s'])} | "
+                             + f"{number(twin['metrics']['wall_s'] / r['metrics']['wall_s'], '×')} | " if twin
+                             else '— | — | ')
+                out.append(line + f"{reduction_note(r)} | {evidence} |")
         out += ['']
     return '\n'.join(out)
 
