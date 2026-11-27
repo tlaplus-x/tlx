@@ -436,3 +436,561 @@ Inv == x[1] # y[1]
         }
     }
 }
+
+fn parse_distinct(stdout: &str) -> u64 {
+    for line in stdout.lines() {
+        if let Some(idx) = line.find(" distinct states found") {
+            let prefix = line[..idx].trim_end();
+            if let Some(num) = prefix.rsplit(|c: char| !c.is_ascii_digit()).next() {
+                if let Ok(v) = num.parse::<u64>() {
+                    return v;
+                }
+            }
+        }
+    }
+    panic!("missing distinct state count in:\n{stdout}");
+}
+
+fn read_single_lean(proof_dir: &std::path::Path) -> String {
+    let entries: Vec<_> = std::fs::read_dir(proof_dir).unwrap().map(|e| e.unwrap().path().join("Optimization.lean")).collect();
+    assert_eq!(entries.len(), 1, "expected 1 certificate under {}, found {entries:?}", proof_dir.display());
+    std::fs::read_to_string(&entries[0]).unwrap()
+}
+
+fn trace_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter(|l| l.starts_with("State ") || l.starts_with("/\\ ")).collect()
+}
+
+#[test]
+fn field_sym_record_and_parallel_maps_compose_across_all_tiers() {
+    let record_spec = r#"---- MODULE FieldSymRec ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLE r, done
+Init == r = [a \in Actors |-> [mode |-> "idle", buf |-> 0]] /\ done = FALSE
+Start(a) == \E v \in {0, 1, 2} :
+              /\ r[a].mode = "idle"
+              /\ r' = [r EXCEPT ![a].mode = "busy", ![a].buf = v]
+              /\ UNCHANGED done
+Finish(a) == /\ r[a].mode = "busy"
+             /\ r[a].buf >= 0
+             /\ r' = [r EXCEPT ![a].mode = "idle"]
+             /\ done' = (done \/ r[a].buf = 2)
+Next == \E a \in Actors : Start(a) \/ Finish(a)
+Inv == (\A a \in Actors : r[a].mode \in {"idle", "busy"} /\ (r[a].mode = "busy" => r[a].buf \in {0, 1, 2})) /\ done \in BOOLEAN
+====
+"#;
+    let parallel_spec = r#"---- MODULE FieldSymPar ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLES pc, buf, done
+Init == pc = [a \in Actors |-> "idle"] /\ buf = [a \in Actors |-> 0] /\ done = FALSE
+Start(a) == \E v \in {0, 1, 2} :
+              /\ pc[a] = "idle"
+              /\ pc' = [pc EXCEPT ![a] = "busy"]
+              /\ buf' = [buf EXCEPT ![a] = v]
+              /\ UNCHANGED done
+Finish(a) == /\ pc[a] = "busy"
+             /\ buf[a] >= 0
+             /\ pc' = [pc EXCEPT ![a] = "idle"]
+             /\ done' = (done \/ buf[a] = 2)
+             /\ UNCHANGED buf
+Next == \E a \in Actors : Start(a) \/ Finish(a)
+Inv == (\A a \in Actors : pc[a] \in {"idle", "busy"} /\ (pc[a] = "busy" => buf[a] \in {0, 1, 2})) /\ done \in BOOLEAN
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2, a3}\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    for (name, spec) in [("FieldSymRec", record_spec), ("FieldSymPar", parallel_spec)] {
+        let dir = tlx_testkit::TempDir::with_spec(&format!("field-sym-{name}"), spec, cfg);
+        let file = format!("{name}.tla");
+        let proj_only = tlx_testkit::tlx_default!()
+            .check(&file)
+            .args(["-interp", "-workers", "1", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(proj_only.code, 0, "{name} proj-only: {}", proj_only.text());
+        let proj_distinct = parse_distinct(&proj_only.stdout);
+
+        let sym_only =
+            tlx_testkit::tlx_default!().check(&file).args(["-interp", "-workers", "1"]).dir(&dir).timeout(Duration::from_secs(60)).run();
+        assert_eq!(sym_only.code, 0, "{name} sym-only: {}", sym_only.text());
+        let sym_distinct = parse_distinct(&sym_only.stdout);
+
+        for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+            let proof_dir = dir.join(format!("proofs-{idx}"));
+            let cache_dir = dir.join(format!("cache-{idx}"));
+            let run = tlx_testkit::tlx_default!()
+                .check(&file)
+                .args(["-workers", "1", "-optimize", "-maxmem", "32"])
+                .args(*args)
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .env("TLX_SYMMETRY_PARANOID", "1")
+                .env("TLX_PROOF_DIR", &proof_dir)
+                .env("TLX_CACHE", &cache_dir)
+                .dir(&dir)
+                .timeout(Duration::from_secs(120))
+                .run();
+            assert_eq!(run.code, 0, "{name}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("phase-field-projection"), "{name}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "{name}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("phase-field/equivariant-symmetry composition certificate"), "{name}/{tier}: {}", run.text());
+            let composed = parse_distinct(&run.stdout);
+            assert!(
+                composed < proj_distinct && composed < sym_distinct,
+                "{name}/{tier}: expected composed {composed} < min(proj={proj_distinct}, sym={sym_distinct})"
+            );
+            let lean = read_single_lean(&proof_dir);
+            for expected in [
+                "namespace TlxOptimization.GeneratedFieldSymmetry",
+                "theorem field_certificate",
+                "theorem symmetry_certificate",
+                "theorem certificate",
+                "theorem orbit_key_equivalent",
+            ] {
+                assert!(lean.contains(expected), "{name}/{tier}: missing `{expected}`");
+            }
+            assert!(!lean.contains("sorry"), "{name}/{tier}");
+        }
+    }
+
+    // Concrete safety violation and deadlock traces preserve real unmasked field values across all tiers.
+    let bad_spec = record_spec.replace("done \\in BOOLEAN", "~done");
+    let bad_dir = tlx_testkit::TempDir::with_spec("field-sym-cex", &bad_spec, cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("FieldSymRec.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", bad_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", bad_dir.join(format!("cache-{idx}")))
+            .dir(&bad_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 12, "cex/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "cex/{tier}: {}", run.text());
+        assert!(run.stdout.contains("buf |-> 2"), "cex/{tier} must retain concrete unmasked buf = 2:\n{}", run.text());
+        assert!(run.stdout.contains("done = TRUE"), "cex/{tier}: {}", run.text());
+    }
+
+    let dl_spec = r#"---- MODULE FieldSymDeadlock ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLE r
+Init == r = [a \in Actors |-> [mode |-> "idle", buf |-> 0]]
+Start(a) == \E v \in {0, 1} :
+              /\ r[a].mode = "idle"
+              /\ r' = [r EXCEPT ![a].mode = "busy", ![a].buf = v]
+Stop(a) == /\ r[a].mode = "busy"
+           /\ r[a].buf = 1
+           /\ r' = [r EXCEPT ![a].mode = "done"]
+Next == \E a \in Actors : Start(a) \/ Stop(a)
+Inv == \A a \in Actors : r[a].mode \in {"idle", "busy", "done"}
+====
+"#;
+    let dl_cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANT Inv\nCHECK_DEADLOCK TRUE\n";
+    let dl_dir = tlx_testkit::TempDir::with_spec("field-sym-dl", dl_spec, dl_cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("FieldSymDeadlock.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dl_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", dl_dir.join(format!("cache-{idx}")))
+            .dir(&dl_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 11, "dl/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "dl/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Deadlock reached"), "dl/{tier}: {}", run.text());
+    }
+}
+
+#[test]
+fn field_sym_dead_field_holding_moved_keys_uses_key_free_sentinel_across_all_tiers() {
+    // Dead field `partner` ranges strictly over moved symmetric keys `Actors`.
+    // Installing a moved key (e.g. `a1`) as the dead-field sentinel would break
+    // equivariance and split orbits; `project_state_with_sym_keys` must pick a
+    // key-free sentinel so `GeneratedFieldSymmetry` certifies and merges orbits.
+    let spec = r#"---- MODULE MovedKeySentinel ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLES pc, partner, seen
+Init == /\ pc = [a \in Actors |-> "idle"]
+        /\ partner = [a \in Actors |-> a]
+        /\ seen = FALSE
+Start(a) == \E other \in Actors :
+              /\ pc[a] = "idle"
+              /\ pc' = [pc EXCEPT ![a] = "busy"]
+              /\ partner' = [partner EXCEPT ![a] = other]
+              /\ UNCHANGED seen
+Finish(a) == /\ pc[a] = "busy"
+             /\ partner[a] \in Actors
+             /\ pc' = [pc EXCEPT ![a] = "idle"]
+             /\ seen' = (seen \/ partner[a] = a)
+             /\ UNCHANGED partner
+Next == \E a \in Actors : Start(a) \/ Finish(a)
+Inv == /\ pc \in [Actors -> {"idle", "busy"}]
+       /\ seen \in BOOLEAN
+       /\ \A a \in Actors : pc[a] = "busy" => partner[a] \in Actors
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2, a3}\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("field-sym-moved-key", spec, cfg);
+
+    let proj_only = tlx_testkit::tlx_default!()
+        .check("MovedKeySentinel.tla")
+        .args(["-interp", "-workers", "1", "-optimize", "-noautosymmetry"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(proj_only.code, 0, "proj-only: {}", proj_only.text());
+    let proj_distinct = parse_distinct(&proj_only.stdout);
+
+    let sym_only = tlx_testkit::tlx_default!()
+        .check("MovedKeySentinel.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(sym_only.code, 0, "sym-only: {}", sym_only.text());
+    let sym_distinct = parse_distinct(&sym_only.stdout);
+
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let proof_dir = dir.join(format!("proofs-{idx}"));
+        let cache_dir = dir.join(format!("cache-{idx}"));
+        let run = tlx_testkit::tlx_default!()
+            .check("MovedKeySentinel.tla")
+            .args(["-workers", "1", "-optimize", "-maxmem", "32"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &proof_dir)
+            .env("TLX_CACHE", &cache_dir)
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("phase-field-projection (partner[*]"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "{tier}: {}", run.text());
+        let composed = parse_distinct(&run.stdout);
+        assert!(
+            composed < proj_distinct && composed < sym_distinct,
+            "{tier}: expected composed {composed} < min(proj={proj_distinct}, sym={sym_distinct})"
+        );
+        let lean = read_single_lean(&proof_dir);
+        assert!(lean.contains("namespace TlxOptimization.GeneratedFieldSymmetry"), "{tier}");
+        assert!(!lean.contains("sorry"), "{tier}");
+    }
+}
+
+#[test]
+fn field_sym_constrained_action_checks_and_action_prop_violation_across_all_tiers() {
+    let spec = r#"---- MODULE FieldSymConstrained ----
+EXTENDS Naturals
+CONSTANTS Actors, MaxRounds, a1, a2, a3
+DefaultActors == {a1, a2, a3}
+DefaultMaxRounds == 2
+VARIABLE r, count
+Init == r = [a \in Actors |-> [mode |-> "idle", buf |-> 0]] /\ count = 0
+Start == \E a \in Actors :
+           /\ r[a].mode = "idle"
+           /\ count < MaxRounds
+           /\ \E v \in {0, 1} : r' = [r EXCEPT ![a].mode = "busy", ![a].buf = v]
+           /\ count' = count + 1
+Finish == \E a \in Actors :
+            /\ r[a].mode = "busy"
+            /\ r[a].buf >= 0
+            /\ r' = [r EXCEPT ![a].mode = "idle"]
+            /\ count' = count
+Next == Start \/ Finish
+Inv == \A a \in Actors : r[a].mode \in {"idle", "busy"} /\ count <= MaxRounds
+InitProp == count = 0
+StateLimit == count <= MaxRounds
+ActLimit == \A a \in Actors : r[a].mode \in {"idle", "busy"}
+ActPropOk == [][ \A a \in Actors : r'[a].mode \in {"idle", "busy"} ]_count
+ActPropBad == [][ count' <= 1 ]_count
+====
+"#;
+    let ok_cfg = "\
+INIT Init
+NEXT Next
+CONSTANTS
+  a1 = a1
+  a2 = a2
+  a3 = a3
+  Actors <- DefaultActors
+  MaxRounds <- DefaultMaxRounds
+INVARIANT Inv
+PROPERTY InitProp
+PROPERTY ActPropOk
+CONSTRAINT StateLimit
+ACTION_CONSTRAINT ActLimit
+CHECK_DEADLOCK FALSE
+";
+    let dir = tlx_testkit::TempDir::with_spec("field-sym-constrained", spec, ok_cfg);
+    let proj_only = tlx_testkit::tlx_default!()
+        .check("FieldSymConstrained.tla")
+        .args(["-interp", "-workers", "1", "-optimize", "-noautosymmetry"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(proj_only.code, 0, "proj-only: {}", proj_only.text());
+    let proj_distinct = parse_distinct(&proj_only.stdout);
+
+    let sym_only = tlx_testkit::tlx_default!()
+        .check("FieldSymConstrained.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(sym_only.code, 0, "sym-only: {}", sym_only.text());
+    let sym_distinct = parse_distinct(&sym_only.stdout);
+
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let proof_dir = dir.join(format!("proofs-{idx}"));
+        let cache_dir = dir.join(format!("cache-{idx}"));
+        let run = tlx_testkit::tlx_default!()
+            .check("FieldSymConstrained.tla")
+            .args(["-workers", "1", "-optimize", "-maxmem", "32"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &proof_dir)
+            .env("TLX_CACHE", &cache_dir)
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "{tier}: {}", run.text());
+        let composed = parse_distinct(&run.stdout);
+        assert!(
+            composed < proj_distinct && composed < sym_distinct,
+            "{tier}: expected composed {composed} < min(proj={proj_distinct}, sym={sym_distinct})"
+        );
+        let lean = read_single_lean(&proof_dir);
+        for expected in [
+            "namespace TlxOptimization.GeneratedFieldSymmetry",
+            "theorem field_constrained_certificate",
+            "theorem symmetry_constrained_certificate",
+            "theorem constrained_certificate",
+            "theorem const_subst_bindings_match",
+            "theorem const_subst_constrained_sound",
+        ] {
+            assert!(lean.contains(expected), "{tier}: missing `{expected}`");
+        }
+        assert!(!lean.contains("sorry"), "{tier}");
+    }
+
+    // Violated `[][A]_sub` action property lifts concrete counterexample matching `-tlc`.
+    let bad_cfg = ok_cfg.replace("ActPropOk", "ActPropBad");
+    let bad_dir = tlx_testkit::TempDir::with_spec("field-sym-act-bad", spec, &bad_cfg);
+    let tlc = tlx_testkit::tlx_default!()
+        .check("FieldSymConstrained.tla")
+        .args(["-tlc", "-interp", "-workers", "1"])
+        .dir(&bad_dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(tlc.code, 13, "tlc: {}", tlc.text());
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("FieldSymConstrained.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", bad_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", bad_dir.join(format!("cache-{idx}")))
+            .dir(&bad_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 13, "act-bad/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "act-bad/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Action property ActPropBad is violated."), "act-bad/{tier}: {}", run.text());
+        assert_eq!(trace_lines(&run.stdout).len(), trace_lines(&tlc.stdout).len(), "act-bad/{tier}: {}", run.text());
+    }
+}
+
+#[test]
+fn uncomposable_field_projection_does_not_displace_stronger_certified_symmetry() {
+    // Unique-witness `CHOOSE` over `Actors` is certified by `ChooseSymCertificate`
+    // (default automatic symmetry), while `FieldSymCertificate` declines `CHOOSE`
+    // over keys. With 4 symmetric actors, certified symmetry beats standalone
+    // `phase-field-projection` on the bounded probe, so `-optimize` must keep
+    // `Permutations(Actors)` rather than regressing to projection-only.
+    let field_choose_spec = r#"---- MODULE UncomposableField ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLES pc, buf, picked
+Init == /\ pc = [a \in Actors |-> "idle"]
+        /\ buf = [a \in Actors |-> 0]
+        /\ picked = [a \in Actors |-> FALSE]
+Start(a) == \E v \in {0, 1} :
+              /\ pc[a] = "idle"
+              /\ (CHOOSE x \in Actors : x = a) = a
+              /\ pc' = [pc EXCEPT ![a] = "busy"]
+              /\ buf' = [buf EXCEPT ![a] = v]
+              /\ picked' = [k \in Actors |-> k = a]
+Finish(a) == /\ pc[a] = "busy"
+             /\ buf[a] >= 0
+             /\ pc' = [pc EXCEPT ![a] = "idle"]
+             /\ UNCHANGED <<buf, picked>>
+Next == \E a \in Actors : Start(a) \/ Finish(a)
+Inv == /\ pc \in [Actors -> {"idle", "busy"}]
+       /\ picked \in [Actors -> BOOLEAN]
+       /\ \A a \in Actors : pc[a] = "busy" => buf[a] \in {0, 1}
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2, a3, a4}\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("uncomposable-field-vs-sym", field_choose_spec, cfg);
+    let sym_only = tlx_testkit::tlx_default!()
+        .check("UncomposableField.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(sym_only.code, 0, "sym-only: {}", sym_only.text());
+    assert!(sym_only.stdout.contains("symmetry Permutations(Actors)"), "sym-only: {}", sym_only.text());
+    let sym_distinct = parse_distinct(&sym_only.stdout);
+
+    let opt = tlx_testkit::tlx_default!()
+        .check("UncomposableField.tla")
+        .args(["-interp", "-workers", "1", "-optimize"])
+        .env("TLX_PARANOID", "1")
+        .env("TLX_SYMMETRY_PARANOID", "1")
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(opt.code, 0, "opt: {}", opt.text());
+    let opt_distinct = parse_distinct(&opt.stdout);
+    assert!(
+        opt_distinct <= sym_distinct,
+        "uncomposable projection must not regress past certified symmetry ({opt_distinct} > {sym_distinct}):\n{}",
+        opt.text()
+    );
+    assert!(opt.stdout.contains("symmetry Permutations(Actors)"), "opt: {}", opt.text());
+}
+
+#[test]
+fn field_sym_witness_bound_records_live_field_reads_and_reproduces_violation() {
+    // `Finish(a)` reads `r[a].buf` ONLY inside a witness bound domain `{r[a].buf}`
+    // (not in the guard terms or writes). `lower_step_cases` must record that read
+    // in `readsActor` so `FieldRule.enabled` supplies the live buffer value rather
+    // than the dead-field sentinel 0.
+    let spec = r#"---- MODULE FieldSymBoundRead ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLES r, done
+Init == r = [a \in Actors |-> [mode |-> "idle", buf |-> 0]] /\ done = FALSE
+Start(a) == \E v \in {0, 2} :
+              /\ r[a].mode = "idle"
+              /\ r' = [r EXCEPT ![a].mode = "busy", ![a].buf = v]
+              /\ UNCHANGED done
+Finish(a) == /\ r[a].mode = "busy"
+             /\ \E seen \in {r[a].buf} :
+                  /\ r' = [r EXCEPT ![a].mode = "idle"]
+                  /\ done' = (done \/ seen = 2)
+Next == \E a \in Actors : Start(a) \/ Finish(a)
+Inv == (\A a \in Actors : r[a].mode \in {"idle", "busy"} /\ (r[a].mode = "busy" => r[a].buf \in {0, 2})) /\ ~done
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("field-sym-bound-read", spec, cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let proof_dir = dir.join(format!("proofs-{idx}"));
+        let cache_dir = dir.join(format!("cache-{idx}"));
+        let run = tlx_testkit::tlx_default!()
+            .check("FieldSymBoundRead.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &proof_dir)
+            .env("TLX_CACHE", &cache_dir)
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 12, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actors)"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("Invariant Inv is violated"), "{tier}: {}", run.text());
+        let lean = read_single_lean(&proof_dir);
+        assert!(lean.contains("namespace TlxOptimization.GeneratedFieldSymmetry"), "{tier}");
+        let reads_actor_block = lean
+            .split("def readsActor (b : Fin BranchCount) (f : Fin FieldCount) : Bool :=")
+            .nth(1)
+            .and_then(|s| s.split("def readsGlobal").next())
+            .expect("readsActor table");
+        assert!(
+            reads_actor_block.contains("=> true"),
+            "{tier}: witness-bound live field read must be recorded in readsActor:\n{reads_actor_block}"
+        );
+    }
+}
+
+#[test]
+fn overlapping_except_at_declines_field_sym_certificate_and_preserves_violation() {
+    // Overlapping `@` in a retained core map (`[marked EXCEPT ![a] = TRUE, ![b] = ~@]`):
+    // when `a = b`, sequential EXCEPT semantics leaves `marked[a] = FALSE`, violating
+    // `BusyMarked` on the first step. `FieldSym` must decline composition rather
+    // than rewriting `@` against the original `marked`.
+    let overlap_field = r#"---- MODULE OverlapField ----
+EXTENDS Integers
+CONSTANT Actors
+VARIABLES r, marked
+Init == r = [a \in Actors |-> [mode |-> "idle", buf |-> 0]] /\ marked = [a \in Actors |-> FALSE]
+Start == \E a, b \in Actors :
+           \E v \in {0, 1} :
+             /\ r[a].mode = "idle"
+             /\ r' = [r EXCEPT ![a].mode = "busy", ![a].buf = v]
+             /\ marked' = [marked EXCEPT ![a] = TRUE, ![b] = ~@]
+Finish == \E a \in Actors :
+            /\ r[a].mode = "busy"
+            /\ r[a].buf >= 0
+            /\ r' = [r EXCEPT ![a].mode = "idle"]
+            /\ UNCHANGED marked
+Next == Start \/ Finish
+TypeOK == (\A a \in Actors : r[a].mode \in {"idle", "busy"}) /\ marked \in [Actors -> BOOLEAN]
+BusyMarked == (\E a \in Actors : r[a].mode = "busy") => (\E a \in Actors : marked[a])
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANTS\n  TypeOK\n  BusyMarked\nCHECK_DEADLOCK FALSE\n";
+    let f_dir = tlx_testkit::TempDir::with_spec("overlap-except-field", overlap_field, cfg);
+    for (idx, (tier, args, env)) in [ALL_TIERS[0], ALL_TIERS[2]].iter().enumerate() {
+        let f_proof = f_dir.join(format!("proofs-{idx}"));
+        let f_cache = f_dir.join(format!("cache-{idx}"));
+        let f_run = tlx_testkit::tlx_default!()
+            .check("OverlapField.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &f_proof)
+            .env("TLX_CACHE", &f_cache)
+            .dir(&f_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(f_run.code, 12, "field/{tier}: {}", f_run.text());
+        assert!(f_run.stdout.contains("Invariant BusyMarked is violated"), "field/{tier}: {}", f_run.text());
+        if f_proof.exists() {
+            for entry in std::fs::read_dir(&f_proof).unwrap() {
+                let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+                assert!(
+                    !lean.contains("namespace TlxOptimization.GeneratedFieldSymmetry"),
+                    "field/{tier}: overlapping EXCEPT @ must decline GeneratedFieldSymmetry"
+                );
+            }
+        }
+    }
+}

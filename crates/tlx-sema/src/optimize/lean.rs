@@ -67,6 +67,8 @@ pub fn projection_lean(
                 } else {
                     "The certified full key-permutation group is closed and canonicalized at the fingerprint boundary."
                 }
+            } else if certificate.is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedFieldSymmetry")) {
+                "The afterViewHIR expression masks phase-dead fields with equivariant sentinels before full-group orbit canonicalization at the fingerprint boundary."
             } else if certificate.is_some_and(|c| c.contains("namespace TlxOptimization.GeneratedErasedEquivSymmetry")) {
                 "The afterViewHIR expression projects to retained variables before equivariant full-group orbit canonicalization at the fingerprint boundary."
             } else if ordered.is_some() {

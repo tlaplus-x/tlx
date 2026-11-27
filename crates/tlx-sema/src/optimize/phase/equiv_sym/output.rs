@@ -41,7 +41,13 @@ pub(super) struct ErasedSpec<'a> {
     pub(super) constrained: bool,
 }
 
-fn write_common_header(out: &mut String, groups: &[GroupInfo], var_count: usize, ctx: &LowerCtx<'_>, initial: &Expr) {
+pub(in crate::optimize::phase) fn write_common_header(
+    out: &mut String,
+    groups: &[GroupInfo],
+    var_count: usize,
+    ctx: &LowerCtx<'_>,
+    initial: &Expr,
+) {
     writeln!(out, "abbrev GroupCount : Nat := {}", groups.len()).unwrap();
     out.push_str("def groupSizes (g : Fin GroupCount) : Nat :=\n  match g.val with\n");
     for (i, g) in groups.iter().enumerate() {

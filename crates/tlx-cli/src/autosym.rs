@@ -68,12 +68,24 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
         return Ok(None);
     }
     // Projection keeps priority when it composes with symmetry or reduces more
-    // states. When `phase-field-projection` does not compose with an eligible
-    // certified symmetry group, compare both reduced graphs on a bounded probe
-    // so `-optimize` does not displace a stronger certified symmetry.
-    let mut unprojected = (a.optimize && !a.noautosymmetry && not_applicable(model, &an).is_none() && !eligible_proven(&an).is_empty())
-        .then(|| model.clone());
-    let mut projection = a.optimize.then(|| model.project_state()).flatten();
+    // states. Pass eligible proven symmetry keys into state projection so
+    // dead-field sentinels avoid moved keys and preserve VIEW equivariance.
+    // When `phase-field-projection` does not compose with an eligible certified
+    // symmetry group, compare both reduced graphs on a bounded probe so
+    // `-optimize` does not displace a stronger certified symmetry.
+    let sym_eligible = !a.noautosymmetry && not_applicable(model, &an).is_none();
+    let eligible_sets = if sym_eligible { eligible_proven(&an) } else { Vec::new() };
+    let sym_keys: std::collections::BTreeSet<std::sync::Arc<str>> = eligible_sets
+        .iter()
+        .flat_map(|s| {
+            s.candidate.elems.iter().filter_map(|e| match e {
+                tlx_value::Value::ModelValue(sym) => Some(std::sync::Arc::from(sym.as_str())),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut unprojected = (a.optimize && !eligible_sets.is_empty()).then(|| model.clone());
+    let mut projection = a.optimize.then(|| model.project_state_with_sym_keys(&sym_keys)).flatten();
     let reusable = if projection.is_none() { precertified.take() } else { None };
     let stats_before_apply = tlx_runtime::stats::section("auto symmetry");
     let mut applied = apply(model, &mut an, a.noautosymmetry, reusable)?;

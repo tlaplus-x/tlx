@@ -5,14 +5,15 @@
 //! products of full permutation groups (order <= 5040). Used as a certified
 //! fallback when the narrower `keyed` certificate does not apply.
 
-mod lower;
-mod output;
+pub(in crate::optimize::phase) mod lower;
+pub(in crate::optimize::phase) mod output;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tlx_front::cfg::{CfgValue, Config, EffectiveConst};
 
+use super::domain::Atom;
 use super::sym_norm::SymNormalizer;
 use super::CheckSpec;
 use crate::{hir::*, Program};
@@ -26,7 +27,7 @@ pub(in crate::optimize::phase) struct GroupInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum AtomKey {
+pub(in crate::optimize::phase) enum AtomKey {
     Int(i128),
     Str(Arc<str>),
     Bool(bool),
@@ -35,7 +36,16 @@ pub(super) enum AtomKey {
 }
 
 impl AtomKey {
-    pub(super) fn describe(&self) -> String {
+    pub(in crate::optimize::phase) fn from_key_free_atom(a: &Atom, all_keys: &BTreeSet<Arc<str>>) -> Option<Self> {
+        match a {
+            Atom::Num(n) => Some(Self::Int(*n)),
+            Atom::Bool(b) => Some(Self::Bool(*b)),
+            Atom::Str(s) => Some(Self::Str(s.clone())),
+            Atom::Model(m) => (!all_keys.contains(m)).then(|| Self::Model(m.clone())),
+        }
+    }
+
+    pub(in crate::optimize::phase) fn describe(&self) -> String {
         match self {
             Self::Int(n) => format!("int:{n}"),
             Self::Str(s) => format!("str:{s:?}"),
@@ -44,6 +54,16 @@ impl AtomKey {
             Self::Decimal(d) => format!("decimal:{d}"),
         }
     }
+}
+
+/// Fold lowered `EquivRule.Form` conjuncts into one formula, defaulting to
+/// `(Form.truth true)` when empty.
+pub(in crate::optimize::phase) fn fold_form_conj(forms: impl IntoIterator<Item = String>) -> String {
+    let mut it = forms.into_iter();
+    let Some(first) = it.next() else {
+        return "(Form.truth true)".to_string();
+    };
+    it.fold(first, |acc, f| format!("(Form.conj {acc} {f})"))
 }
 
 /// Generate a connected `EquivRule` certificate for a disjoint product of full
@@ -277,7 +297,10 @@ pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option
     Some((groups, all_keys))
 }
 
-fn collect_const_bindings<'a>(program: &Program, cfg: &'a Config) -> Option<BTreeMap<ConstId, &'a CfgValue>> {
+pub(in crate::optimize::phase) fn collect_const_bindings<'a>(
+    program: &Program,
+    cfg: &'a Config,
+) -> Option<BTreeMap<ConstId, &'a CfgValue>> {
     if super::sym_totality::cfg_overrides_or_tables(program, cfg) {
         return None;
     }
