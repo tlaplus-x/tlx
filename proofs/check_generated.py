@@ -645,7 +645,7 @@ def main():
             else:
                 tlx = find_tlx(args.tlx)
                 if tlx is None:
-                    raise RuntimeError("tlx binary not found; build with `cargo build --profile test-release -p tlx-cli` or pass --tlx")
+                    raise RuntimeError("tlx binary not found; build with `cargo build --profile test-release -p tlx` or pass --tlx")
                 paths = generate_default_certificates(tlx, Path(tmp))
             workers = max(1, args.jobs)
             if args.shard is not None and args.shard[1] > 1:

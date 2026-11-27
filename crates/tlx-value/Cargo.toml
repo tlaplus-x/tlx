@@ -3,6 +3,9 @@ name = "tlx-value"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TLA+ value representation, TLC-compatible total order, fingerprints, and operations for the tlx model checker"
 
 [dependencies]
 tlx-base.workspace = true

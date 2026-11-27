@@ -37,14 +37,14 @@ TIMEOUT = 300
 #: listed in OPTIONAL_EDGES: they exist only when a declared feature turns
 #: them on, but they are still normal edges for direction and cycle purposes.
 NORMAL_EDGES = frozenset({
-    ("tlx-cli", "tlx-base"),
-    ("tlx-cli", "tlx-compile"),
-    ("tlx-cli", "tlx-eval"),
-    ("tlx-cli", "tlx-front"),
-    ("tlx-cli", "tlx-live"),
-    ("tlx-cli", "tlx-runtime"),
-    ("tlx-cli", "tlx-sema"),
-    ("tlx-cli", "tlx-value"),
+    ("tlx", "tlx-base"),
+    ("tlx", "tlx-compile"),
+    ("tlx", "tlx-eval"),
+    ("tlx", "tlx-front"),
+    ("tlx", "tlx-live"),
+    ("tlx", "tlx-runtime"),
+    ("tlx", "tlx-sema"),
+    ("tlx", "tlx-value"),
     ("tlx-native", "tlx-base"),
     ("tlx-native", "tlx-value"),
     ("tlx-compile", "tlx-base"),
@@ -88,7 +88,7 @@ OPTIONAL_EDGES = frozenset({
 #: Dev-only edges (the test harness). Every cycle of the combined graph must
 #: run through at least one of these.
 DEV_EDGES = frozenset({
-    ("tlx-cli", "tlx-testkit"),
+    ("tlx", "tlx-testkit"),
     ("tlx-native", "tlx-runtime"),
     ("tlx-compile", "tlx-testkit"),
     ("tlx-eval", "tlx-testkit"),
@@ -106,9 +106,9 @@ EDGE_KINDS = {"normal": NORMAL_EDGES, "optional": OPTIONAL_EDGES, "dev": DEV_EDG
 #: name prefixes; `cranelift` therefore matches every Cranelift crate without
 #: listing the five backends (ARCH-04, F11).
 CLOSURES = (
-    {"name": "cli-jit-off", "package": "tlx-cli", "features": (), "no_default": True,
+    {"name": "cli-jit-off", "package": "tlx", "features": (), "no_default": True,
      "edges": "normal,build", "forbidden": ("cranelift",), "required": ()},
-    {"name": "cli-jit-on", "package": "tlx-cli", "features": (), "no_default": False,
+    {"name": "cli-jit-on", "package": "tlx", "features": (), "no_default": False,
      "edges": "normal,build", "forbidden": (), "required": ("cranelift-codegen",)},
     {"name": "testkit-basic", "package": "tlx-testkit", "features": (), "no_default": True,
      "edges": "normal", "required": ("tlx-base",),

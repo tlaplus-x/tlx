@@ -3,6 +3,9 @@ name = "tlx-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Parallel BFS exploration, fingerprint sets, checkpoints, and liveness runtime for the tlx TLA+ model checker"
 autotests = false
 
 [[test]]

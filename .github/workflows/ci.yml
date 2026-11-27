@@ -58,7 +58,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --release --all-targets --locked -- -D warnings
       - name: Build binary for Python tests and documentation examples
-        run: cargo build --profile test-release -p tlx-cli --locked
+        run: cargo build --profile test-release -p tlx --locked
       - name: Python driver tests
         run: |
           python3 -c '
@@ -134,7 +134,7 @@ jobs:
           echo "LEAN_BIN=$LEAN_DIR/lean-4.34.1-linux/bin/lean" >> "$GITHUB_ENV"
           "$LEAN_DIR/lean-4.34.1-linux/bin/lean" --version
       - name: Build checker for certificate generation
-        run: cargo build --profile test-release -p tlx-cli --locked
+        run: cargo build --profile test-release -p tlx --locked
       - name: Lean 4 certificate and negative-mutation checks
         run: |
           python3 proofs/check_generated.py --lean "$LEAN_BIN" --negative --shard "${{ matrix.shard }}/4"
@@ -236,7 +236,7 @@ jobs:
           bash scripts/fetch-deps.sh --tests-only
           mkdir -p target/ci
       - name: Build checker for conformance tests
-        run: cargo build --profile test-release -p tlx-cli --locked
+        run: cargo build --profile test-release -p tlx --locked
       - name: Interpreter conformance
         run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest --extra=-interp --results-json target/ci/interpreter.json
       - name: Compiled conformance

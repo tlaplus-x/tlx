@@ -3,6 +3,9 @@ name = "tlx-eval"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TLA+ interpreter, model semantics, and symmetry engine for the tlx model checker"
 
 [dependencies]
 tlx-base.workspace = true

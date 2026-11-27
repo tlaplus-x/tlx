@@ -3,6 +3,9 @@ name = "tlx-native"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Generated-C compilation, caching, and dynamic loading for the tlx TLA+ model checker"
 
 [dependencies]
 tlx-base.workspace = true
@@ -11,7 +14,7 @@ libloading = "0.9.0"
 tlx-value.workspace = true
 
 [dev-dependencies]
-tlx-runtime = { version = "0.1.1", path = "../tlx-runtime" }
+tlx-runtime = { version = "0.1.2", path = "../tlx-runtime" }
 
 [lints]
 workspace = true

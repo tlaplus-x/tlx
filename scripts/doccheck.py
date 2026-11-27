@@ -294,7 +294,7 @@ problems.extend(tla_check([p for p in docs if p != 'AGENTS.md'], runner=example_
 if args.require_examples and not example_counts['available'] and not example_counts['skipped']:
     why = 'cannot parse a trivial module' if example_counts['probed'] else 'missing'
     problems.append(f'required example parsing unavailable: target/test-release/tlx {why}; '
-                    'build with cargo build --profile test-release -p tlx-cli')
+                    'build with cargo build --profile test-release -p tlx')
 executed, failed, skipped = (example_counts[k] for k in ('executed', 'failed', 'skipped'))
 print(f'TLA+ parse-only: selected={executed + skipped} executed={executed} '
       f'passed={executed - failed} failed={failed} skipped={skipped}; model execution is not checked')

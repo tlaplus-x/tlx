@@ -3,6 +3,9 @@ name = "tlx-sema"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Name resolution, HIR lowering, semantic checks, and Lean-certified state reductions for the tlx TLA+ model checker"
 autotests = false
 
 [[test]]

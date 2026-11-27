@@ -3,6 +3,9 @@ name = "tlx-front"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Tree-sitter TLA+ parser, AST, and .cfg parser for the tlx model checker"
 
 [dependencies]
 tree-sitter = "0.27.0"

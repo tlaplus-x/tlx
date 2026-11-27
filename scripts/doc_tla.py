@@ -71,5 +71,5 @@ def check_files(paths, root='.', binary=None, runner=subprocess.run, note=print)
     if skipped:
         why = 'cannot parse a trivial module (built before `tlx parse`?)' if stale else 'missing'
         note(f'TLA+ module parsing skipped ({skipped} blocks): {binary} {why}; '
-             'build with cargo build --profile test-release -p tlx-cli')
+             'build with cargo build --profile test-release -p tlx')
     return problems

@@ -420,11 +420,11 @@ def release_preflight(root=ROOT, build=None, dry_run=False, binary=None, stale=N
     cargo = shutil.which("cargo")
     if cargo is None and build is None:
         return True, f"prelaunch build skipped: no local cargo (target/release/tlx is older than {older})"
-    argv = [cargo or "cargo", "build", "--release", "-p", "tlx-cli"]
+    argv = [cargo or "cargo", "build", "--release", "-p", "tlx"]
     rc = _run_status(argv, root) if build is None else build(argv)
     if rc != 0:
         return False, (f"the release build failed (exit {rc}); nothing was provisioned. Fix the build "
-                       "(cargo build --release -p tlx-cli), or launch a revision that compiles")
+                       "(cargo build --release -p tlx), or launch a revision that compiles")
     still = (stale or _stale_release)(binary)
     if still:
         return False, (f"target/release/tlx is still older than {still} after cargo build --release: cargo "
@@ -517,13 +517,13 @@ def bench_script(home, cc, machine, bins, cmds, deadline_at=None):
          "echo '== cargo clippy --workspace --release --all-targets'",
          "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1",
          "echo '== cargo build --release'",
-         "cargo build -q --release -p tlx-cli || exit 1"]
+         "cargo build -q --release -p tlx || exit 1"]
     for name, sha, features in bins:
         src = f"{home}/bench-src/{name}"
         feat = f" --features {q(features)}" if features else ""
         s += [f"echo {q(f'== bench binary {name}: {sha[:12]}' + (f' (features {features})' if features else ''))}",
               f"git worktree add -q -f --detach {src} {sha} || exit 1",
-              f"(cd {src} && cargo build -q --release -p tlx-cli{feat}) || exit 1",
+              f"(cd {src} && cargo build -q --release -p tlx{feat}) || exit 1",
               f"mkdir -p {BENCH_BINS}/{name} && cp {src}/target/release/tlx {BENCH_BINS}/{name}/tlx"]
     for c in cmds:
         deadline = f" --deadline-at {deadline_at}" if deadline_at is not None else ""

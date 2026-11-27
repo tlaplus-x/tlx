@@ -67,7 +67,7 @@ def require_fresh(exe, build=None):
         return
     if os.path.exists(exe) and stale_source(exe):
         print(f"{exe} is older than {stale_source(exe)}: cargo build --release", file=sys.stderr, flush=True)
-        (build or (lambda: subprocess.run(["cargo", "build", "--release", "-q", "-p", "tlx-cli"], cwd=ROOT)))()
+        (build or (lambda: subprocess.run(["cargo", "build", "--release", "-q", "-p", "tlx"], cwd=ROOT)))()
         newer = stale_source(exe) if os.path.exists(exe) else "the binary is missing"
         if newer:
             sys.exit(f"STOP: {exe} is still older than {newer} after cargo build --release")

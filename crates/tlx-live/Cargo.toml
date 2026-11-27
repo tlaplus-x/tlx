@@ -3,6 +3,9 @@ name = "tlx-live"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Tableau construction and SCC liveness checking algorithms for the tlx TLA+ model checker"
 
 [dependencies]
 tlx-base.workspace = true

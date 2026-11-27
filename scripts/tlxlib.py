@@ -192,7 +192,7 @@ def profile_of(args):
 def build_tlx(copy=True, *, profile=None, prefix="tlx-run-", build=True):
     profile = profile or build_profile()
     if build:
-        subprocess.run(["cargo", "build", "-q", "-p", "tlx-cli", "--profile", profile], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "build", "-q", "-p", "tlx", "--profile", profile], cwd=ROOT, check=True)
     binary = os.path.join(ROOT, "target", profile_dir(profile), "tlx")
     if not copy:
         yield binary

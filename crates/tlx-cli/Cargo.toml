@@ -1,8 +1,14 @@
 [package]
-name = "tlx-cli"
+name = "tlx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "A compiled TLA+ model checker with Cranelift JIT, generated C, and Lean-certified state reductions"
+keywords = ["tla", "tlaplus", "model-checking", "formal-methods", "verification"]
+categories = ["command-line-utilities", "development-tools::testing"]
 autotests = false
 
 [[bin]]

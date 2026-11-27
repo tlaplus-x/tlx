@@ -74,7 +74,13 @@ supported. [docs/usage.md](docs/usage.md#1-installation) owns the installation r
   the default build can keep using the JIT.
 - Java is **not** needed to build or run tlx. Running TLC or SANY for comparison requires Java.
 
-Download or clone these sources, then run from the repository root:
+Install from [crates.io](https://crates.io/crates/tlx):
+
+```sh
+cargo install tlx
+```
+
+Or build from source at the repository root:
 
 ```sh
 cargo build --release                  # binary: target/release/tlx
@@ -116,7 +122,7 @@ macOS arm64; startup, timing and other progress lines are omitted.
 ```
 $ cd third_party/Examples/specifications/DieHard
 $ tlx check DieHard.tla
-tlx version 0.1.1
+tlx version 0.1.2
 compile: native code: 6/6 actions, 2/2 invariants, Init
 Error: Invariant NotSolved is violated.
 Error: The behavior up to this point is:
@@ -354,7 +360,7 @@ Details: [docs/design.md](docs/design.md) (executor tiering in section 6.6),
 
 ## Project status
 
-Version 0.1.1 ([Cargo.toml](Cargo.toml)). Results are tested against TLC on the `tests/specs`
+Version 0.1.2 ([Cargo.toml](Cargo.toml)). Results are tested against TLC on the `tests/specs`
 suite (small specs, each targeting one semantic point) and on the tlaplus/Examples corpus (see
 [Testing](#testing)). Expect rough edges: some error messages are worded differently from TLC's
 and some TLC options are missing.

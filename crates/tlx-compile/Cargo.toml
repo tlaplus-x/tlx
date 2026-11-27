@@ -3,6 +3,9 @@ name = "tlx-compile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Compiled execution tier (typed IR, Cranelift JIT, and C codegen) for the tlx TLA+ model checker"
 autotests = false
 
 [[test]]

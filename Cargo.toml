@@ -3,26 +3,28 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/tlaplus-x/tlx"
+homepage = "https://github.com/tlaplus-x/tlx"
 
 [workspace.dependencies]
-tlx-front = { path = "crates/tlx-front" }
-tlx-sema = { path = "crates/tlx-sema" }
-tlx-value = { path = "crates/tlx-value" }
-tlx-eval = { path = "crates/tlx-eval" }
-tlx-runtime = { path = "crates/tlx-runtime" }
-tlx-layout = { path = "crates/tlx-layout" }
+tlx-front = { version = "0.1.2", path = "crates/tlx-front" }
+tlx-sema = { version = "0.1.2", path = "crates/tlx-sema" }
+tlx-value = { version = "0.1.2", path = "crates/tlx-value" }
+tlx-eval = { version = "0.1.2", path = "crates/tlx-eval" }
+tlx-runtime = { version = "0.1.2", path = "crates/tlx-runtime" }
+tlx-layout = { version = "0.1.2", path = "crates/tlx-layout" }
 # Without the defaults: `cargo check --workspace --no-default-features` must
 # really build every crate without the JIT (2026-10-07: the JIT-less build of
-# `tlx-compile` had rotted, and no command compiled it). `tlx-cli` turns the
-# JIT back on with its own default feature, `tlx-testkit` with `jit`.
-tlx-compile = { path = "crates/tlx-compile", default-features = false }
-tlx-native = { path = "crates/tlx-native" }
-tlx-live = { path = "crates/tlx-live" }
+# `tlx-compile` had rotted, and no command compiled it). `tlx` (crates/tlx-cli)
+# turns the JIT back on with its own default feature, `tlx-testkit` with `jit`.
+tlx-compile = { version = "0.1.2", path = "crates/tlx-compile", default-features = false }
+tlx-native = { version = "0.1.2", path = "crates/tlx-native" }
+tlx-live = { version = "0.1.2", path = "crates/tlx-live" }
 tlx-testkit = { path = "crates/tlx-testkit" }
-tlx-base = { path = "crates/tlx-base" }
+tlx-base = { version = "0.1.2", path = "crates/tlx-base" }
 
 # The lint set is declared once here; every crate opts in with `[lints]
 # workspace = true`. Default levels, minus the deliberate allows below.

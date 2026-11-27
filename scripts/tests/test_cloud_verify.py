@@ -898,10 +898,10 @@ class Bench(unittest.TestCase):
         self.assertIn("rm -f corpus/out/bench-tlc.json", s)
         clippy = "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1"
         self.assertIn(clippy, s)
-        self.assertLess(s.index(clippy), s.index("cargo build -q --release -p tlx-cli"))
+        self.assertLess(s.index(clippy), s.index("cargo build -q --release -p tlx"))
         self.assertLess(s.index(clippy), s.index("python3 -u scripts/bench.py"))
         self.assertIn(f"git worktree add -q -f --detach /root/bench-src/nostats {'a' * 40}", s)
-        self.assertIn("cargo build -q --release -p tlx-cli --features no-stats", s)
+        self.assertIn("cargo build -q --release -p tlx --features no-stats", s)
         self.assertIn("cp /root/bench-src/nostats/target/release/tlx target/bench-bins/nostats/tlx", s)
         self.assertLess(s.index("python3 -u scripts/bench.py table --measure-tlc || rc=1"), s.index("python3 -u scripts/bench.py run --tlc || rc=1"))
         self.assertTrue(s.endswith("exit $rc\n"))
@@ -1328,7 +1328,7 @@ class ReleasePreflight(unittest.TestCase):
         self.assertEqual(note, "prelaunch build ok")
         self.assertEqual([1 for argv in seen], [1])
         self.assertTrue(seen[0][0].endswith("cargo"))
-        self.assertEqual(seen[0][1:], ["build", "--release", "-p", "tlx-cli"])
+        self.assertEqual(seen[0][1:], ["build", "--release", "-p", "tlx"])
 
     def test_a_failing_build_refuses_naming_the_build_not_the_stale_file(self):
         ok, note = cloud_common.release_preflight(build=lambda argv: 101, binary=self.BIN,
