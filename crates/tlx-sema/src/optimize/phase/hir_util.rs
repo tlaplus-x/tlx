@@ -117,6 +117,97 @@ pub(in crate::optimize::phase) fn expr_structurally_eq(a: &Expr, b: &Expr) -> bo
     }
 }
 
+/// Alpha-equivalent structural equality on HIR expressions (ignoring spans).
+pub(in crate::optimize::phase) fn expr_alpha_eq(a: &Expr, b: &Expr) -> bool {
+    let mut map = Vec::new();
+    expr_alpha_eq_rec(a, b, &mut map)
+}
+
+/// Alpha-equivalent structural equality seeded with an initial local-binder mapping.
+pub(in crate::optimize::phase) fn expr_alpha_eq_with_locals(a: &Expr, b: &Expr, locals: &[(LocalId, LocalId)]) -> bool {
+    let mut map = locals.to_vec();
+    expr_alpha_eq_rec(a, b, &mut map)
+}
+
+fn expr_alpha_eq_rec(a: &Expr, b: &Expr, locals: &mut Vec<(LocalId, LocalId)>) -> bool {
+    match (&*a.kind, &*b.kind) {
+        (ExprKind::Bool(x), ExprKind::Bool(y)) => x == y,
+        (ExprKind::Num(x), ExprKind::Num(y)) => x == y,
+        (ExprKind::Str(x), ExprKind::Str(y)) => x == y,
+        (ExprKind::Decimal(x), ExprKind::Decimal(y)) => x == y,
+        (ExprKind::Var(x), ExprKind::Var(y)) => x == y,
+        (ExprKind::Const(x), ExprKind::Const(y)) => x == y,
+        (ExprKind::Local(x), ExprKind::Local(y)) => {
+            if let Some((_, mapped)) = locals.iter().rev().find(|(l, _)| l == x) {
+                mapped == y
+            } else {
+                x == y
+            }
+        }
+        (ExprKind::Tuple(xs), ExprKind::Tuple(ys)) | (ExprKind::SetEnum(xs), ExprKind::SetEnum(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+        }
+        (ExprKind::Record(xs), ExprKind::Record(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|((k1, v1), (k2, v2))| k1 == k2 && expr_alpha_eq_rec(v1, v2, locals))
+        }
+        (ExprKind::Field { record: r1, field: f1 }, ExprKind::Field { record: r2, field: f2 }) => {
+            f1 == f2 && expr_alpha_eq_rec(r1, r2, locals)
+        }
+        (ExprKind::FnApp { func: f1, args: a1 }, ExprKind::FnApp { func: f2, args: a2 }) => {
+            expr_alpha_eq_rec(f1, f2, locals) && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+        }
+        (ExprKind::Builtin { op: o1, args: a1 }, ExprKind::Builtin { op: o2, args: a2 }) => {
+            o1 == o2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+        }
+        (ExprKind::If { cond: c1, then: t1, els: e1 }, ExprKind::If { cond: c2, then: t2, els: e2 }) => {
+            expr_alpha_eq_rec(c1, c2, locals) && expr_alpha_eq_rec(t1, t2, locals) && expr_alpha_eq_rec(e1, e2, locals)
+        }
+        (ExprKind::Except { base: b1, updates: u1 }, ExprKind::Except { base: b2, updates: u2 }) => {
+            expr_alpha_eq_rec(b1, b2, locals)
+                && u1.len() == u2.len()
+                && u1.iter().zip(u2).all(|((p1, v1), (p2, v2))| {
+                    p1.len() == p2.len()
+                        && p1.iter().zip(p2).all(|(k1, k2)| match (k1, k2) {
+                            (ExceptKey::Field(f1), ExceptKey::Field(f2)) => f1 == f2,
+                            (ExceptKey::Index(i1), ExceptKey::Index(i2)) => {
+                                i1.len() == i2.len() && i1.iter().zip(i2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+                            }
+                            _ => false,
+                        })
+                        && expr_alpha_eq_rec(v1, v2, locals)
+                })
+        }
+        (ExprKind::FnConstruct { bounds: b1, body: body1 }, ExprKind::FnConstruct { bounds: b2, body: body2 }) => {
+            if b1.len() != b2.len() {
+                return false;
+            }
+            let saved = locals.len();
+            let mut ok = true;
+            for (x, y) in b1.iter().zip(b2) {
+                if !expr_alpha_eq_rec(&x.set, &y.set, locals) {
+                    ok = false;
+                    break;
+                }
+                match (&x.vars, &y.vars) {
+                    (BoundVars::Many(l1), BoundVars::Many(l2)) | (BoundVars::Tuple(l1), BoundVars::Tuple(l2)) if l1.len() == l2.len() => {
+                        for (&id1, &id2) in l1.iter().zip(l2) {
+                            locals.push((id1, id2));
+                        }
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let res = ok && expr_alpha_eq_rec(body1, body2, locals);
+            locals.truncate(saved);
+            res
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +300,20 @@ mod tests {
         assert!(expr_structurally_eq(&app(num(1)), &app(num(1))));
         assert!(!expr_structurally_eq(&app(num(1)), &app(num(2))));
         assert!(!expr_structurally_eq(&e(ExprKind::Tuple(vec![num(1)])), &e(ExprKind::SetEnum(vec![num(1)]))));
+    }
+
+    #[test]
+    fn expr_alpha_eq_matches_renamed_fn_binders_and_respects_free_locals() {
+        let fn1 = e(ExprKind::FnConstruct {
+            bounds: vec![Bound { vars: BoundVars::Many(vec![LocalId(1)]), set: var(0) }],
+            body: e(ExprKind::FnApp { func: var(1), args: vec![local(1)] }),
+        });
+        let fn2 = e(ExprKind::FnConstruct {
+            bounds: vec![Bound { vars: BoundVars::Many(vec![LocalId(9)]), set: var(0) }],
+            body: e(ExprKind::FnApp { func: var(1), args: vec![local(9)] }),
+        });
+        assert!(expr_alpha_eq(&fn1, &fn2));
+        assert!(!expr_alpha_eq(&local(1), &local(9)));
+        assert!(expr_alpha_eq_with_locals(&local(1), &local(9), &[(LocalId(1), LocalId(9))]));
     }
 }

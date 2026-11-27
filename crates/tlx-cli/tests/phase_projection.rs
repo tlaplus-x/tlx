@@ -142,17 +142,19 @@ fn symmetric_spec() -> String {
 }
 
 #[test]
-fn uncertified_composition_keeps_projection_and_symmetry_separate() {
+fn declared_symmetry_stays_separate_while_automatic_symmetry_composes() {
     for declared in [false, true] {
         let cfg = format!("{CFG}CONSTANT Actors = {{a, b}}\n{}", if declared { "SYMMETRY Sym\n" } else { "" });
         let dir = tlx_testkit::TempDir::with_spec("phase-symmetry", &symmetric_spec(), &cfg);
         for (tier, args, env) in tlx_testkit::cli::TIERS {
             // Four local states give ten multisets; projecting idle data
-            // leaves three local states and six multisets of two actors.
-            for (flags, count) in [
-                (vec![], 10),
-                (vec!["-optimize"], if declared { 10 } else { 9 }),
-                (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 }),
+            // leaves three local states (9 concrete projected states) and
+            // six multisets of two actors when composed with automatic symmetry.
+            for (flags, count, expect_composed) in [
+                (vec![], 10, false),
+                (vec!["-optimize"], if declared { 10 } else { 6 }, !declared),
+                (vec!["-optimize", "-noautosymmetry"], if declared { 10 } else { 9 }, false),
+                (vec!["-optimize", "-tlc"], if declared { 10 } else { 16 }, false),
             ] {
                 let run = tlx_testkit::tlx_default!()
                     .check("Phase.tla")
@@ -166,7 +168,7 @@ fn uncertified_composition_keeps_projection_and_symmetry_separate() {
                     .run();
                 assert_eq!(run.code, 0, "{tier}: {}", run.text());
                 assert!(run.stdout.contains(&format!("{count} distinct states found")), "{tier}: {}", run.text());
-                assert!(!run.stdout.contains("composed with symmetry"), "{tier}: {}", run.text());
+                assert_eq!(run.stdout.contains("composed with symmetry"), expect_composed, "{tier}: {}", run.text());
             }
         }
     }
@@ -605,11 +607,12 @@ Inv == pc \in {"idle", "busy"}
 }
 
 #[test]
-fn parallel_maps_preserve_stronger_certified_symmetry_and_fixed_domain_action_constraints() {
-    // 1. With automatic symmetry enabled, 5 interchangeable actors must keep
-    // `Permutations(Actors)` (378 distinct states) instead of displacing it
-    // with `phase-field-projection` (2,048 distinct states). With 2 actors,
-    // `phase-field-projection` (32) beats `Permutations(Actors)` (36) and wins.
+fn parallel_maps_compose_with_certified_symmetry_and_fixed_domain_action_constraints() {
+    // 1. With automatic symmetry enabled, `phase-field-projection (buf[*])`
+    // composes with `Permutations(Actors)` (`GeneratedFieldSymmetry`),
+    // delivering multiplicative reduction strictly below both standalone
+    // symmetry (378 for 5 actors; 36 for 2 actors) and standalone projection
+    // (2,048 for 5 actors; 32 for 2 actors).
     let sym_parallel = r#"---- MODULE ParallelSym ----
 EXTENDS Integers
 CONSTANT Actors
@@ -633,6 +636,20 @@ Inv == /\ pc \in [Actors -> {"idle", "busy"}]
        /\ \A k \in Actors: pc[k] = "busy" => buf[k] \in {0, 1, 2}
 ====
 "#;
+    let parse_distinct = |stdout: &str| -> u64 {
+        for line in stdout.lines() {
+            if let Some(idx) = line.find(" distinct states found") {
+                let prefix = line[..idx].trim_end();
+                if let Some(num) = prefix.rsplit(|c: char| !c.is_ascii_digit()).next() {
+                    if let Ok(v) = num.parse::<u64>() {
+                        return v;
+                    }
+                }
+            }
+        }
+        panic!("missing distinct state count in:\n{stdout}");
+    };
+
     let cfg5 = format!("{CFG}CONSTANT Actors = {{a1, a2, a3, a4, a5}}\n");
     let dir5 = tlx_testkit::TempDir::with_spec("phase-parallel-sym5", sym_parallel, &cfg5);
     for (tier, args, env) in [ALL_FOUR_TIERS[0], ALL_FOUR_TIERS[2]] {
@@ -642,6 +659,7 @@ Inv == /\ pc \in [Actors -> {"idle", "busy"}]
             .args(["-workers", "1"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
             .dir(&dir5)
             .timeout(Duration::from_secs(60))
             .run();
@@ -654,13 +672,15 @@ Inv == /\ pc \in [Actors -> {"idle", "busy"}]
             .args(["-workers", "1", "-optimize"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
             .dir(&dir5)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(opt.code, 0, "opt5/{tier}: {}", opt.text());
-        assert!(opt.stdout.contains("378 distinct states found"), "opt5/{tier}: {}", opt.text());
-        assert!(opt.stdout.contains("symmetry Permutations(Actors)"), "opt5/{tier}: {}", opt.text());
-        assert!(!opt.stdout.contains("phase-field-projection"), "opt5/{tier}: {}", opt.text());
+        let opt5_distinct = parse_distinct(&opt.stdout);
+        assert!(opt5_distinct < 378, "opt5/{tier}: expected {opt5_distinct} < 378:\n{}", opt.text());
+        assert!(opt.stdout.contains("phase-field-projection (buf[*]"), "opt5/{tier}: {}", opt.text());
+        assert!(opt.stdout.contains("composed with symmetry Permutations(Actors)"), "opt5/{tier}: {}", opt.text());
     }
 
     let cfg2 = format!("{CFG}CONSTANT Actors = {{a1, a2}}\n");
@@ -669,16 +689,18 @@ Inv == /\ pc \in [Actors -> {"idle", "busy"}]
         .check("ParallelSym.tla")
         .args(["-interp", "-workers", "1", "-optimize"])
         .env("TLX_PARANOID", "1")
+        .env("TLX_SYMMETRY_PARANOID", "1")
         .dir(&dir2)
         .timeout(Duration::from_secs(60))
         .run();
     assert_eq!(opt2.code, 0, "opt2: {}", opt2.text());
-    assert!(opt2.stdout.contains("32 distinct states found"), "opt2: {}", opt2.text());
+    let opt2_distinct = parse_distinct(&opt2.stdout);
+    assert!(opt2_distinct < 32, "opt2: expected {opt2_distinct} < 32:\n{}", opt2.text());
     assert!(opt2.stdout.contains("phase-field-projection (buf[*]"), "opt2: {}", opt2.text());
+    assert!(opt2.stdout.contains("composed with symmetry Permutations(Actors)"), "opt2: {}", opt2.text());
 
-    // 1b. Deterministic startup prefix exhausting the probe's depth budget
-    // produces equal incomplete probes; `-optimize` must retain the default
-    // certified symmetry rather than displacing it with `phase-field-projection`.
+    // 1b. Deterministic startup prefix also composes `phase-field-projection`
+    // with `Permutations(Actors)` instead of choosing only one reduction.
     let startup_parallel = r#"---- MODULE ParallelStartupSym ----
 EXTENDS Integers
 CONSTANT Actors
@@ -715,6 +737,7 @@ Inv == /\ boot \in 0..8
             .args(["-workers", "1"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
             .dir(&dir_boot)
             .timeout(Duration::from_secs(60))
             .run();
@@ -727,13 +750,15 @@ Inv == /\ boot \in 0..8
             .args(["-workers", "1", "-optimize"])
             .envs(env.iter().copied())
             .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
             .dir(&dir_boot)
             .timeout(Duration::from_secs(60))
             .run();
         assert_eq!(opt.code, 0, "boot-opt/{tier}: {}", opt.text());
-        assert!(opt.stdout.contains("386 distinct states found"), "boot-opt/{tier}: {}", opt.text());
-        assert!(opt.stdout.contains("symmetry Permutations(Actors)"), "boot-opt/{tier}: {}", opt.text());
-        assert!(!opt.stdout.contains("phase-field-projection"), "boot-opt/{tier}: {}", opt.text());
+        let boot_distinct = parse_distinct(&opt.stdout);
+        assert!(boot_distinct < 386, "boot-opt/{tier}: expected {boot_distinct} < 386:\n{}", opt.text());
+        assert!(opt.stdout.contains("phase-field-projection (buf[*]"), "boot-opt/{tier}: {}", opt.text());
+        assert!(opt.stdout.contains("composed with symmetry Permutations(Actors)"), "boot-opt/{tier}: {}", opt.text());
     }
 
     // 2. Fixed-domain `DOMAIN buf = {1, 2}` in `ACTION_CONSTRAINT` certifies

@@ -226,7 +226,8 @@ that application:
      [compose with keyed symmetry](proofs/symmetry/README.md) through one shared source model).
    - *Phase-dependent fields:* [erases record, map-of-records, or parallel companion slots](proofs/field/README.md)
      in phases where they are overwritten before their next use, with Lean-checked finite liveness
-     and phase-indexed observation tables.
+     and phase-indexed observation tables (and composes with automatic equivariant symmetry over
+     one shared source model).
    - *Sequence lengths:* merges sequences when every consumer depends only on current lengths.
    - *Ordered allocation and live versions:* reduces scalar or fixed nested allocation frontiers
      ([nested allocation example](proofs/ordered/README.md), 13 states across two families) and

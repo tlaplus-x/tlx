@@ -117,6 +117,81 @@ pub(super) fn paths_disjoint(a: &[ExceptKey], b: &[ExceptKey]) -> bool {
     })
 }
 
+const MAX_DESUGAR_AT_NODES: usize = 100_000;
+
+/// Desugar `ExprKind::At` inside `ExprKind::Except` using exact lexical `@`
+/// scoping (outer `@` for `base` and update `path` indices, inner `@` for each
+/// update RHS). Fails closed (`None`) whenever a later update uses `@` after an
+/// earlier update that is not provably disjoint (`paths_disjoint`), or when a
+/// bare `@` appears outside an `Except` RHS, or on budget exhaustion.
+pub(in crate::optimize::phase) fn desugar_except_at(e: &Expr) -> Option<Expr> {
+    let mut unused = false;
+    let mut budget = MAX_DESUGAR_AT_NODES;
+    desugar_except_at_rec(e, None, &mut unused, &mut budget)
+}
+
+fn desugar_except_at_rec(e: &Expr, outer_at: Option<&Expr>, used_outer_at: &mut bool, budget: &mut usize) -> Option<Expr> {
+    *budget = budget.checked_sub(1)?;
+    match &*e.kind {
+        ExprKind::At => {
+            let repl = outer_at?;
+            *used_outer_at = true;
+            Some(repl.clone())
+        }
+        ExprKind::Except { base, updates } => {
+            let base_d = desugar_except_at_rec(base, outer_at, used_outer_at, budget)?;
+            let mut expanded: Vec<(Vec<ExceptKey>, Expr)> = Vec::with_capacity(updates.len());
+            for (path, rhs) in updates {
+                let mut keys = Vec::with_capacity(path.len());
+                let mut old = base_d.clone();
+                for key in path {
+                    let key_d = match key {
+                        ExceptKey::Field(f) => ExceptKey::Field(f.clone()),
+                        ExceptKey::Index(args) => {
+                            let args_d = args
+                                .iter()
+                                .map(|a| desugar_except_at_rec(a, outer_at, used_outer_at, budget))
+                                .collect::<Option<Vec<_>>>()?;
+                            ExceptKey::Index(args_d)
+                        }
+                    };
+                    old = Expr::new(
+                        match &key_d {
+                            ExceptKey::Field(f) => ExprKind::Field { record: old, field: f.clone() },
+                            ExceptKey::Index(args) => ExprKind::FnApp { func: old, args: args.clone() },
+                        },
+                        rhs.span,
+                    );
+                    keys.push(key_d);
+                }
+                let mut inner_used = false;
+                let rhs_d = desugar_except_at_rec(rhs, Some(&old), &mut inner_used, budget)?;
+                // TLA+ EXCEPT updates are sequential: reading from `base_d` is
+                // sound only when no prior update can alias `keys`.
+                if inner_used && expanded.iter().any(|(prior, _)| !paths_disjoint(prior, &keys)) {
+                    return None;
+                }
+                expanded.push((keys, rhs_d));
+            }
+            Some(Expr::new(ExprKind::Except { base: base_d, updates: expanded }, e.span))
+        }
+        _ => {
+            let mut out = e.clone();
+            let mut ok = true;
+            visit::children_mut(&mut out, &mut |child| {
+                if ok {
+                    if let Some(c) = desugar_except_at_rec(child, outer_at, used_outer_at, budget) {
+                        *child = c;
+                    } else {
+                        ok = false;
+                    }
+                }
+            });
+            ok.then_some(out)
+        }
+    }
+}
+
 /// Deliberately narrower than `hir_util::expr_structurally_eq`: the `EXCEPT`
 /// merge below only needs the scalar, field, application and tuple arms, and
 /// widening the relation would accept additional merges and change normalized

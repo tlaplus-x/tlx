@@ -31,7 +31,7 @@ enum AtomKind {
     AtomSet,
 }
 
-pub(super) struct LowerCtx<'a> {
+pub(in crate::optimize::phase) struct LowerCtx<'a> {
     var_map: Vec<Option<usize>>,
     groups: &'a [GroupInfo],
     all_keys: &'a BTreeSet<Arc<str>>,
@@ -42,23 +42,23 @@ pub(super) struct LowerCtx<'a> {
     locals: Vec<Slot>,
     nodes: usize,
     emitted_bytes: usize,
-    pub(super) used_groups: GroupMask,
-    pub(super) atoms: Vec<AtomKey>,
+    pub(in crate::optimize::phase) used_groups: GroupMask,
+    pub(in crate::optimize::phase) atoms: Vec<AtomKey>,
     atom_ids: BTreeMap<AtomKey, usize>,
-    pub(super) atom_ops: Vec<String>,
+    pub(in crate::optimize::phase) atom_ops: Vec<String>,
     atom_op_ids: BTreeMap<String, usize>,
-    pub(super) atom_set_ops: Vec<String>,
+    pub(in crate::optimize::phase) atom_set_ops: Vec<String>,
     atom_set_op_ids: BTreeMap<String, usize>,
-    pub(super) atom_set_aggs: Vec<String>,
+    pub(in crate::optimize::phase) atom_set_aggs: Vec<String>,
     atom_set_agg_ids: BTreeMap<String, usize>,
-    pub(super) atom_rels: Vec<String>,
+    pub(in crate::optimize::phase) atom_rels: Vec<String>,
     atom_rel_ids: BTreeMap<String, usize>,
-    pub(super) atom_preds: Vec<String>,
+    pub(in crate::optimize::phase) atom_preds: Vec<String>,
     atom_pred_ids: BTreeMap<String, usize>,
 }
 
 impl<'a> LowerCtx<'a> {
-    pub(super) fn new(
+    pub(in crate::optimize::phase) fn new(
         program: &'a Program,
         groups: &'a [GroupInfo],
         all_keys: &'a BTreeSet<Arc<str>>,
@@ -69,7 +69,7 @@ impl<'a> LowerCtx<'a> {
         Self::with_var_map(var_map, groups, all_keys, consts, totality)
     }
 
-    pub(super) fn with_retained(
+    pub(in crate::optimize::phase) fn with_retained(
         program: &'a Program,
         groups: &'a [GroupInfo],
         all_keys: &'a BTreeSet<Arc<str>>,
@@ -251,14 +251,92 @@ impl<'a> LowerCtx<'a> {
         self.atom_id(AtomKey::Str(s.clone()))
     }
 
-    pub(super) fn lower_form(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
+    pub(in crate::optimize::phase) fn lower_form(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
         let out = self.lower_form_rec(e, allow_prime, false, allow_prime)?;
         self.charge(out)
     }
 
-    pub(super) fn lower_action_pred(&mut self, e: &Expr) -> Option<String> {
+    pub(in crate::optimize::phase) fn lower_action_pred(&mut self, e: &Expr) -> Option<String> {
         let out = self.lower_form_rec(e, true, false, false)?;
         self.charge(out)
+    }
+
+    pub(in crate::optimize::phase) fn lower_expr(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
+        let out = self.lower_expr_rec(e, allow_prime, false)?;
+        self.charge(out)
+    }
+
+    pub(in crate::optimize::phase) fn lower_empty_var_expr(&mut self, e: &Expr) -> Option<String> {
+        let len = self.var_map.len();
+        let saved_vars = std::mem::replace(&mut self.var_map, vec![None; len]);
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_env = std::mem::take(&mut self.check_env);
+        let out = self.lower_expr_rec(e, false, false);
+        self.var_map = saved_vars;
+        self.locals = saved_locals;
+        self.check_env = saved_env;
+        self.charge(out?)
+    }
+
+    pub(in crate::optimize::phase) fn atom_id_of(&mut self, key: AtomKey) -> usize {
+        self.atom_id(key)
+    }
+
+    pub(in crate::optimize::phase) fn mark_group_used(&mut self, mask: GroupMask) {
+        self.used_groups |= mask;
+    }
+
+    pub(in crate::optimize::phase) fn push_bound_local(&mut self, id: LocalId, set_expr: Option<&Expr>) {
+        let ak = set_expr.map_or(AtomKind::Unknown, |s| self.elem_atom_kind(s));
+        let (shape, origin) = set_expr.map(|s| self.totality.bound_elem_info(s, false, &self.check_env)).unwrap_or((Shape::Top, None));
+        self.locals.push(Slot::Local(id, ak));
+        self.check_env.bind_local(id, shape, origin);
+    }
+
+    pub(in crate::optimize::phase) fn push_temp_local(&mut self) {
+        self.locals.push(Slot::Temp);
+    }
+
+    pub(in crate::optimize::phase) fn pop_temp_local(&mut self) {
+        self.locals.pop();
+    }
+
+    pub(in crate::optimize::phase) fn pop_bound_local(&mut self, id: LocalId) {
+        self.locals.pop();
+        self.check_env.unbind_local(id);
+    }
+
+    pub(in crate::optimize::phase) fn lower_witness_bounds(
+        &mut self,
+        bounds: &[Bound],
+        allow_prime: bool,
+        skip_local: Option<LocalId>,
+    ) -> Option<(Vec<String>, Vec<LocalId>)> {
+        let mut doms = Vec::new();
+        let mut pushed = Vec::new();
+        for b in bounds {
+            let BoundVars::Many(ids) = &b.vars else {
+                for id in pushed.into_iter().rev() {
+                    self.pop_bound_local(id);
+                }
+                return None;
+            };
+            for &id in ids {
+                if Some(id) == skip_local {
+                    continue;
+                }
+                let Some(dom) = self.lower_set_pred_rec(&b.set, allow_prime, false) else {
+                    for pid in pushed.into_iter().rev() {
+                        self.pop_bound_local(pid);
+                    }
+                    return None;
+                };
+                doms.push(dom);
+                self.push_bound_local(id, Some(&b.set));
+                pushed.push(id);
+            }
+        }
+        Some((doms, pushed))
     }
 
     fn lower_form_rec(&mut self, e: &Expr, allow_prime: bool, in_prime: bool, in_action_pos: bool) -> Option<String> {

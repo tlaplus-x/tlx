@@ -44,10 +44,44 @@ states) and improves median single-worker release wall time from 2.792 s to 0.94
 generated `Optimization.lean` files pass `proofs/check_generated.py --lean lean --negative`.
 
 HIR lowering, inferred domains/totality, independent leaf interpretation and
-runtime VIEW execution remain trusted. The certificate currently requires
-constant initial phases and excludes primed projected reads and symmetry
-composition. Exact lengths and keys remain retained. Field erasure alone does
+runtime VIEW execution remain trusted. The standalone certificate requires
+constant initial phases and excludes primed projected reads and user-declared
+`SYMMETRY`. Exact lengths and keys remain retained. Field erasure alone does
 not guarantee a finite state space.
+
+## Composition with automatic symmetry (`FieldSymCertificate.lean`)
+
+When automatic symmetry is enabled alongside `-optimize` (without `-noautosymmetry`),
+`phase-field-projection` composes directly with certified equivariant symmetry via
+`FieldSymCertificate.lean` (`GeneratedFieldSymmetry`, reusing `OrbitQuotient.lean`)
+over one shared concrete source model (`Rules.lean`'s `compose` and
+`composeConstrained`). Dead-field sentinels avoid moved symmetric keys so
+`FieldRule.mask` commutes with `GroupPerm`, and `tlx` projects first before
+canonicalizing the projected orbit (`projected_orbit`).
+
+For example, on `ActionChecks.tla` (with `CONSTRAINT`, `ACTION_CONSTRAINT`, and
+`PROPERTY [][A]_sub`), `tlx check proofs/field/ActionChecks.tla -optimize` emits a
+constrained `GeneratedFieldSymmetry` certificate and reduces 16,033 concrete / 1,750
+field-projected / 1,205 symmetry-only distinct states to 196 distinct states. On
+unchanged upstream `third_party/Examples/specifications/MisraReachability/APParReach.tla`
+(same `Nodes <- NodesVal`, `Succ <- SuccVal`, `Root <- RootVal`, `INVARIANT Inv` as
+upstream `APParReach.cfg`, with model-value `Procs`, release build, `-workers 1`,
+1 discarded warmup and 5 interleaved rounds):
+
+| `Procs` | Mode | Generated | Distinct | Median wall |
+| --- | --- | ---: | ---: | ---: |
+| `{p1..p5}` | `phase-field-projection` only (`-optimize -noautosymmetry`) | 4,013,762 | 757,749 | 2.434 s |
+| `{p1..p5}` | `Permutations(Procs)` only (default) | 455,575 | 93,407 | 0.885 s |
+| `{p1..p5}` | Composed (`-optimize`, `GeneratedFieldSymmetry`) | 73,305 | 13,919 | 0.431 s |
+| `{p1..p6}` | `Permutations(Procs)` only (default) | 1,454,430 | 255,447 | 2.443 s |
+| `{p1..p6}` | Composed (`-optimize`, `GeneratedFieldSymmetry`) | 169,275 | 27,239 | 0.650 s |
+
+At 5 processes, composition achieves 6.71x fewer distinct states and 2.05x faster wall time
+than symmetry alone (54.44x fewer states / 5.65x faster than projection alone); at 6
+processes, 9.38x fewer distinct states and 3.76x faster wall time than symmetry alone.
+`python3 proofs/check_generated.py --lean lean --negative` checks both unconstrained and
+constrained `GeneratedFieldSymmetry` certificates and rejects non-equivariant sentinels,
+broken liveness/frame tables, broken key renamings, and disconnected intermediate models.
 
 `BoundedLedger.tla` imports the unchanged external BookKeeper `LedgerChaining`
 model and adds a 30-transition limit. Its default configuration uses two clients

@@ -344,11 +344,21 @@ impl InterpModel {
         false
     }
 
-    /// Forget proved irrelevant values in fingerprints, retaining concrete    /// Forget proved irrelevant values in fingerprints, retaining concrete
+    /// Forget proved irrelevant values in fingerprints, retaining concrete
     /// values and original actions for execution and counterexample replay.
     /// Certified mathematical allocation may eliminate eventual overflow.
     /// Safety only. Existing VIEWs and symmetry exclude automatic projection.
     pub fn project_state(&mut self) -> Option<(&'static str, Vec<String>)> {
+        self.project_state_with_sym_keys(&std::collections::BTreeSet::new())
+    }
+
+    /// Like [`Self::project_state`], while avoiding any model value in `sym_keys`
+    /// as a dead-field sentinel so a phase-field `VIEW` stays equivariant under
+    /// permutations moving `sym_keys`.
+    pub fn project_state_with_sym_keys(
+        &mut self,
+        sym_keys: &std::collections::BTreeSet<std::sync::Arc<str>>,
+    ) -> Option<(&'static str, Vec<String>)> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
             || self.has_view()
@@ -381,7 +391,7 @@ impl InterpModel {
             ("threshold-counter-projection", opt::threshold_counter_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
         }))
         .chain(std::iter::once_with(|| {
-            ("phase-field-projection", opt::phase_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))
+            ("phase-field-projection", opt::phase_projection_with_spec_avoiding(&self.ip.prog, cfg, &self.init, &next, spec, sym_keys))
         }))
         .chain(std::iter::once_with(|| {
             ("sequence-length-projection", opt::sequence_length_projection_with_spec(&self.ip.prog, cfg, &self.init, &next, spec))

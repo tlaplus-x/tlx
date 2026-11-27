@@ -7,7 +7,7 @@ use crate::hir::Expr;
 use crate::Program;
 
 use super::spec::CheckSpec;
-use super::{choose_sym, equiv_sym, keyed};
+use super::{choose_sym, equiv_sym, keyed, liveness};
 
 /// An emitted Lean certificate body whose `TlxOptimization.<namespace>` section
 /// remains open until optional constrained and constant-substitution obligations
@@ -37,6 +37,69 @@ impl OpenCert {
         }
         Self { body, namespace, constrained }
     }
+
+    pub(in crate::optimize::phase) fn new_composed(
+        mut body: String,
+        tail: &str,
+        namespace: &'static str,
+        constrained: bool,
+        stage_prefix: &'static str,
+        stage_project: &'static str,
+    ) -> Self {
+        body.push_str(tail);
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        if constrained {
+            push_composed_constrained_theorems(&mut body, stage_prefix, stage_project);
+        }
+        Self { body, namespace, constrained }
+    }
+}
+
+fn push_composed_constrained_theorems(out: &mut String, stage_prefix: &str, stage_project: &str) {
+    out.push_str(&format!(
+        "def constrainedBefore := (model sem).constrainedConcrete\n\
+         def constrainedIntermediate := (model sem).constrainedIntermediate\n\
+         def constrainedAfter := (model sem).constrainedReduced\n\
+         theorem {stage_prefix}_constrained_certificate :\n\
+         \x20 ConstrainedCertificate (constrainedBefore sem) (constrainedIntermediate sem) ({stage_project} sem) :=\n\
+         \x20 (model sem).{stage_prefix}_constrained_certificate\n\
+         theorem symmetry_constrained_certificate :\n\
+         \x20 ConstrainedCertificate (constrainedIntermediate sem) (constrainedAfter sem) (symProject sem) :=\n\
+         \x20 (model sem).symmetry_constrained_certificate\n\
+         theorem constrained_certificate :\n\
+         \x20 ConstrainedCertificate (constrainedBefore sem) (constrainedAfter sem) (project sem) :=\n\
+         \x20 (model sem).constrained_certificate\n\
+         theorem constrained_optimization_correct :\n\
+         \x20 ConstrainedSafe (constrainedBefore sem) ↔ ConstrainedSafe (constrainedAfter sem) :=\n\
+         \x20 TlxOptimization.constrained_safety_iff (constrained_certificate sem)\n\
+         theorem constrained_init_counterexample_lifts {{a}}\n\
+         \x20 (ha : (constrainedAfter sem).initial a)\n\
+         \x20 (bad : ¬ ((constrainedAfter sem).safe a ∧ (constrainedAfter sem).initSafe a)) :\n\
+         \x20 ∃ s, (constrainedBefore sem).initial s ∧ project sem s = a ∧\n\
+         \x20   ¬ ((constrainedBefore sem).safe s ∧ (constrainedBefore sem).initSafe s) :=\n\
+         \x20 TlxOptimization.constrained_init_counterexample_lifts (constrained_certificate sem) ha bad\n\
+         theorem constrained_step_counterexample_lifts {{a b}}\n\
+         \x20 (ha : AdmittedReachable (constrainedAfter sem) a)\n\
+         \x20 (hab : (constrainedAfter sem).next a b)\n\
+         \x20 (bad : ¬ ((constrainedAfter sem).safe b ∧ (constrainedAfter sem).actionSafe a b)) :\n\
+         \x20 ∃ s t, AdmittedReachable (constrainedBefore sem) s ∧ (constrainedBefore sem).next s t ∧\n\
+         \x20   project sem s = a ∧ project sem t = b ∧\n\
+         \x20   ¬ ((constrainedBefore sem).safe t ∧ (constrainedBefore sem).actionSafe s t) :=\n\
+         \x20 TlxOptimization.constrained_step_counterexample_lifts (constrained_certificate sem) ha hab bad\n\
+         theorem admitted_deadlock_preserved :\n\
+         \x20 (∃ s, AdmittedReachable (constrainedBefore sem) s ∧ ¬ ∃ t, (constrainedBefore sem).next s t) ↔\n\
+         \x20 (∃ a, AdmittedReachable (constrainedAfter sem) a ∧ ¬ ∃ b, (constrainedAfter sem).next a b) :=\n\
+         \x20 TlxOptimization.constrained_deadlock_iff (constrained_certificate sem)\n\
+         #print axioms {stage_prefix}_constrained_certificate\n\
+         #print axioms symmetry_constrained_certificate\n\
+         #print axioms constrained_certificate\n\
+         #print axioms constrained_optimization_correct\n\
+         #print axioms constrained_init_counterexample_lifts\n\
+         #print axioms constrained_step_counterexample_lifts\n\
+         #print axioms admitted_deadlock_preserved\n"
+    ));
 }
 
 fn push_constrained_theorems(out: &mut String, include_erasure_cert: bool, is_choose: bool) {
@@ -172,8 +235,10 @@ pub fn symmetry_projection_certificate(
     symmetry_projection_certificate_with_spec(program, cfg, init, next, CheckSpec::invariants_only(observations), groups, view)
 }
 
-/// Certify unobserved-variable erasure followed by symmetry covering invariants,
-/// init properties, constraints, action constraints, and action properties.
+/// Certify a structural projection followed by symmetry covering invariants,
+/// init properties, constraints, action constraints, and action properties:
+/// unobserved-variable erasure (`ErasedKeyedCertificate` / `ErasedEquivCertificate`),
+/// or phase-dependent field masking (`FieldSymCertificate`).
 pub fn symmetry_projection_certificate_with_spec(
     program: &Program,
     cfg: &Config,
@@ -185,4 +250,5 @@ pub fn symmetry_projection_certificate_with_spec(
 ) -> Option<String> {
     keyed::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view)
         .or_else(|| equiv_sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
+        .or_else(|| liveness::sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
 }

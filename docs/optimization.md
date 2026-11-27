@@ -55,7 +55,7 @@ negative mutation checks are explicit.
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–7 model values each, product order `<= 5040`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
 | Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
-| Projection composed with symmetry | `ErasedKeyedCertificate.lean` and `ErasedEquivCertificate.lean`: unobserved-variable erasure composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared source IR | Enabled when `-optimize` selects unobserved-variable erasure and keyed or equivariant symmetry certifies the retained tuple |
+| Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, and `FieldSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure or phase-dependent field masking composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure or phase-dependent fields and the corresponding symmetry certificate matches the exact installed `VIEW` |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
 State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-arity
@@ -63,11 +63,12 @@ State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-
 automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTION_CONSTRAINT`
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
-`ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `OrderedCertificate`,
-`NestedCertificate`, `LiveCertificate`, and `ThresholdCounterCertificate` when every action check
-factors through the retained representative. `Field` certifies checks whose unprimed and primed field
-reads are recorded, and records each such field as globally observed so its value survives at both
-endpoints. `Ordered`, `Nested`, `Live`, and `ThresholdCounter` certify checks that read only
+`ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `FieldSymCertificate`,
+`OrderedCertificate`, `NestedCertificate`, `LiveCertificate`, and `ThresholdCounterCertificate`
+when every action check factors through the retained representative. `Field` and `FieldSym`
+certify checks whose unprimed and primed field reads are recorded, and record each such field
+as globally observed so its value survives at both endpoints. `Ordered`, `Nested`, `Live`, and
+`ThresholdCounter` certify checks that read only
 retained core state, refusing any read of a projected allocation magnitude, rank pattern,
 live-version table, or projected counter. `Length`, `History`, `Age`, and
 `AgeHistory` still fail closed when action constraints or action properties are present.
@@ -702,7 +703,7 @@ against the endpoint it denotes.
   or multi-key `FnConstruct` (`|K| > 1`) resets, uncertain `EXCEPT` / `LET` aliasing, duplicate
   writes, singleton-only dead slots, un-overwritten dead-to-live transitions, unknown map domains,
   higher-order or recursive action expansion, effectful actuals (even if unused), budget exhaustion,
-  and symmetry composition. Action checks refuse whole-record/map or primed whole-record/map reads,
+  and user-declared `SYMMETRY`. Action checks refuse whole-record/map or primed whole-record/map reads,
   `UNCHANGED`/`ENABLED`/`@` shapes that would observe a managed variable, angle (non-stuttering)
   actions, and `[A]_sub` subscripts that mention the control or any projected companion variable.
 - **TCB:** HIR call/`LET` expansion and alias checking, forward structural domain/totality
@@ -711,45 +712,75 @@ against the endpoint it denotes.
 
 ## Composing projection with symmetry
 
-Unobserved-variable erasure is the one checking projection certified to compose with automatic
-keyed symmetry (`phase/keyed/erasure.rs` + `ErasedKeyedCertificate.lean`), supporting **both single
-groups and disjoint products of full keyed permutation groups** (total order `<= 720`). On the
-[symmetry composition example](../proofs/symmetry/README.md), 811 concrete states drop to 27 with
-erasure alone and 10 with erasure composed with keyed symmetry across both execution tiers,
-preserving concrete safety violations and deadlocks.
+Two checking projection families are certified to compose with automatic symmetry over one shared
+concrete source model via `Rules.lean`'s `compose` and `composeConstrained`:
+
+1. **Unobserved-variable erasure × symmetry (`phase/keyed/erasure.rs` +
+   `ErasedKeyedCertificate.lean`, `phase/equiv_sym/` + `ErasedEquivCertificate.lean`):** supports
+   both single groups and disjoint products of full permutation groups (order `<= 5040`) over the
+   exact retained-variable tuple. On the [symmetry composition example](../proofs/symmetry/README.md),
+   811 concrete states drop to 27 with erasure alone and 10 with erasure composed with keyed
+   symmetry across all execution tiers, preserving concrete safety violations and deadlocks.
+2. **Phase-dependent field masking × equivariant symmetry (`phase/liveness/sym.rs`,
+   `phase/liveness/sym/{lower,output}.rs` + `OrbitQuotient.lean` + `FieldSymCertificate.lean`):**
+   composes record, map-of-records, scalar companion, or parallel companion-map field projections
+   with recursive equivariant symmetry (`EquivSymCertificate.lean`), including constrained checks
+   (`CONSTRAINT`, `init_props`, `ACTION_CONSTRAINT`, `[][A]_sub`, and `CONSTANT C <- Def`).
+   On unchanged upstream `APParReach.tla` (`Procs = {p1..p5}`), 757,749 field-projected / 93,407
+   symmetry-only distinct states drop to 13,919 composed distinct states (6.71x fewer states and
+   2.05x faster release wall time than symmetry alone; 9.38x fewer states and 3.76x faster at 6
+   processes; see [proofs/field/README.md](../proofs/field/README.md)).
 
 ### Scope
 
-- `-optimize` selects `unobserved-state-projection`, installing a retained-variable tuple `VIEW` in
-  source variable order, and the retained variables plus `Init`, `Next`, and `INVARIANT` satisfy
-  `KeyedCertificate`'s shapes and operations for a disjoint product of full model-value groups while
-  every omitted variable uses scalar literal, retained-variable copy, hidden-variable copy, or frame
-  updates.
+- **Erasure × symmetry:** `-optimize` selects `unobserved-state-projection`, installing a
+  retained-variable tuple `VIEW` in source variable order, and the retained variables plus `Init`,
+  `Next`, and checks satisfy `KeyedCertificate` or `EquivSymCertificate` for a disjoint product of
+  full model-value groups while omitted variables use certified pure/total updates.
+- **Field masking × symmetry (`GeneratedFieldSymmetry`):** `-optimize` selects
+  `phase-field-projection` while passing eligible proven symmetry keys
+  (`project_state_with_sym_keys`) so dead-field sentinels avoid moved keys and preserve
+  `GroupPerm` equivariance. Phases must be key-free atoms, the key domain must be a disjoint union
+  of key-free fixed atoms and complete symmetric groups, and all branch guards, witness bounds,
+  slot writes, and state/action predicates must lower into the shared `EquivRule` IR over
+  `FieldRule.State`. When an eligible `phase-field-projection` does not compose with symmetry
+  (for example under `ChooseSymCertificate`), a bounded BFS probe compares both reduced graphs so
+  `-optimize` does not displace a stronger certified symmetry.
 
 ### Lowered Rule & Lean Certificate
 
-`symmetry_projection_certificate` verifies the installed `VIEW` is the exact source-ordered tuple of
-retained variables and lowers hidden updates alongside the keyed branch guards, slot writes, and map
-writes in one shared `ErasedKeyedRule.Model GroupCount groupSizes` (whose intermediate initial
-relation is the projected image of the full source `Init`). `ErasedKeyedCertificate.lean` proves the
-erasure certificate from every hidden representative and composes it (via the shared composition
-lemma in `Rules.lean`) with `KeyedCertificate`'s orbit quotient on that exact intermediate model;
-two independently generated certificates for unrelated models cannot authorize application. At run
-time, `tlx` projects first and canonicalizes the projected tuple under the total structural order
-(`InterpModel::projected_orbit`), so forgotten variables containing moved keys cannot split or bias
-orbits. Seven theorem audits cover the intermediate erasure certificate, the composed certificate,
-safety with and without stuttering, counterexample lifting, deadlocks, and formal orbit-key
-equality.
+`symmetry_projection_certificate_with_spec` matches the exact installed `VIEW` expression (rejecting
+any sentinel or structure mismatch) and constructs one unified concrete source model whose
+intermediate system is the exact projected image of the source model:
+
+- **`ErasedKeyedCertificate.lean` / `ErasedEquivCertificate.lean`:** proves the erasure certificate
+  from every hidden representative and composes it with the orbit quotient on that exact
+  intermediate model.
+- **`FieldSymCertificate.lean` + `OrbitQuotient.lean`:** embeds `FieldRule.Model` inside
+  `FieldSymRule.Model` (with `V = EquivRule.Val`), discharges `actorLive`, `globalLive`,
+  `frameLive`, and `observedLive` via kernel-checked `decide`, proves equivariance of
+  `FieldRule.mask` (because every dead-field sentinel is a closed key-free `EquivRule.Expr d Empty`),
+  and constructs the `EquivRule.OrbitQuotient` on the exact `FieldRule.reduced` /
+  `constrainedReduced` intermediate system, composing both stages via `TlxOptimization.compose` and
+  `TlxOptimization.composeConstrained`.
+
+Two independently generated certificates for unrelated models cannot authorize application. At run
+time, `tlx` projects first and canonicalizes the projected value under the total structural order
+(`InterpModel::projected_orbit`), so forgotten fields or variables containing moved keys cannot
+split or bias orbits. Theorem audits cover the intermediate stage certificate (`erasure_certificate`
+or `field_certificate`), the orbit-quotient `symmetry_certificate`, the composed `certificate`,
+safety with and without stuttering, counterexample lifting, deadlocks, formal `orbit_key_equivalent`,
+and (when constrained) all constrained and constant-substitution theorems.
 
 ### Refusals & Trusted Computing Base (TCB)
 
-- **Refusals:** any projection family other than unobserved-variable erasure (age, history, field,
-  sequence-length, and ordered-allocation projections keep priority and run standalone without
-  automatic symmetry), fallback symmetry engines (`EquivSymCertificate` / `ChooseSymCertificate`),
-  unsupported hidden transfers, and user-declared `VIEW` or `SYMMETRY`. Passing `-noautosymmetry`
-  retains standalone `ErasureCertificate.lean`.
-- **TCB:** same union of TCB boundaries as `ErasureCertificate` and `KeyedCertificate`, plus runtime
-  tuple projection prior to orbit canonicalization.
+- **Refusals:** projection families without a composed certificate (age, history, sequence-length,
+  ordered-allocation, and threshold-counter projections), `ChooseSymCertificate` composition (falls
+  back via bounded probe for `phase-field-projection`), non-equivariant sentinels, overlapping
+  `EXCEPT` `@` updates, unsupported hidden/field transfers, and user-declared `VIEW` or `SYMMETRY`.
+  Passing `-noautosymmetry` retains standalone `ErasureCertificate.lean` or `FieldCertificate.lean`.
+- **TCB:** union of the constituent projection and symmetry TCB boundaries, plus runtime projection
+  prior to orbit canonicalization.
 
 ## Checking boundary
 
