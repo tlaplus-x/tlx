@@ -45,6 +45,12 @@ connected Lean certificate emitters:
   the product `Permutations(K) x Permutations(V) x Permutations(T)` with orders
   `4! x 4! x 3! = 3,456` over three independent fixed-domain maps; 2,048
   concrete states become 100 classes.
+- [DeclaredProduct.tla](DeclaredProduct.tla) ([DeclaredProduct.cfg](DeclaredProduct.cfg)):
+  a declared `.cfg` `SYMMETRY TxIdSymmetric` enlarged in the default mode by the
+  independent `Key` and `Val` groups; one connected certificate covers
+  `Permutations(TxId) x Permutations(Key) x Permutations(Val)`, and 256 concrete
+  states become 48 permutation classes. `-tlc` and `-noautosymmetry` keep the
+  declared group alone (128 classes).
 - [ScalarSlot.tla](ScalarSlot.tla) ([ScalarSlot.cfg](ScalarSlot.cfg)):
   optional key slot `owner \in Proc \cup {"none"}` paired with a keyed map `pc`
   read and updated at `pc[owner]`. 108 concrete states become 28 classes.
@@ -66,11 +72,16 @@ connected Lean certificate emitters:
   (`TotalVotes`) certified by `ChooseSymCertificate`. 81 concrete states become
   22 classes.
 
+A declared `.cfg` `SYMMETRY` that already factors into disjoint `Permutations(...)`
+groups is enlarged by the same certified analysis in the default mode
+(`DeclaredProduct.tla`); any failure keeps the declaration verbatim.
+
 From the repository root:
 
 ```sh
 cargo build --release
 ./target/release/tlx check proofs/symmetry/Keyed.tla -interp
+./target/release/tlx check proofs/symmetry/DeclaredProduct.tla -interp
 ./target/release/tlx check proofs/symmetry/KeyedSeven.tla -interp
 ./target/release/tlx check proofs/symmetry/ProductLarge.tla -interp
 ./target/release/tlx check proofs/symmetry/ScalarSlot.tla -compile

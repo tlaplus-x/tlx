@@ -76,7 +76,8 @@ live-version table, or projected counter. `Length`, `History`, `Age`, and
 Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
 builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
-projection.
+projection. (A declared `SYMMETRY` may still be enlarged in the default mode by certified
+automatic symmetry; see [reductions.md](reductions.md) section 2.6.)
 
 When `-optimize` runs, `InterpModel::project_state` tries projection families in priority order —
 unobserved variables, relative ages (including combined age/history), standalone finite history,

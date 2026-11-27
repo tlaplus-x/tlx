@@ -660,8 +660,19 @@ or incomplete check refuses automatic symmetry (`not applied: cross-check failed
 rather than applying it.
 
 Other candidates remain available through analysis and `-checksymmetry -suggest`.
-Their refusal is recorded in the `auto symmetry` section of `-stats`. Explicit user
-`SYMMETRY` declarations keep their TLC behavior and responsibility.
+Their refusal is recorded in the `auto symmetry` section of `-stats`.
+
+A declared `.cfg` `SYMMETRY` is used verbatim under `-tlc` and `-noautosymmetry`. In the
+default mode, when it factors as a disjoint product of full permutation groups over model
+values, tlx may add proven candidates the declaration does not move (for example
+`Key = {k1, k2, k3}` next to a declared `Permutations(TxId)`) and certifies the whole
+combined product with one connected Lean certificate; the `Optimizations:` line then names
+the enlarged group. A non-factorized declaration (a cyclic or custom subgroup), a product
+above the certificate bounds, a candidate overlapping the declaration, a specification
+outside the certificate subset (`ALIAS`, `_POSSIBLE`, `POSTCONDITION`, unsupported
+operations), or a failed certificate keeps the declared group unchanged; the reason is
+recorded under `-stats`. `-noautosymmetry` disables the enlargement. See
+[reductions.md](reductions.md) section 2.6.
 
 Every default-mode run names applied optimizations (message code 9100 under `-tool`)
 and records an `optimizations` array in JSON statistics. A certified symmetry is
