@@ -56,10 +56,16 @@ before they become a new baseline.
 
 ## Enumeration resource limits
 
-`SpanTreeTest5Nodes` no longer fails immediately on cardinality overflow, but reached the
-600-second warm-up limit with no timed samples in the
-[post-fix validation](research/post-fix-validation.md); its large `Init` enumeration still needs
-optimization or a documented larger resource bound.
+`SpanningTree/SpanTreeTest5Nodes` (`Nodes = {n1..n5}`, `SUBSET (SUBSET Nodes)` = 2^32 subsets
+filtered by `\A e \in E : Cardinality(e) = 2`) previously reached the 600-second warm-up limit with
+no timed samples in the [post-fix validation](research/post-fix-validation.md) (TLC completed in
+598.2 s / 1 worker and 588.9 s / 16 workers with 410,112 distinct states, 3,150,464 generated
+states, depth 5, and 2,652.4 MiB peak RSS). After adding leading-prefix powerset filter pruning
+(`subsetfilter` + `for_each_constrained_subset`) and promoting nested bitset `max_card` to full
+bitmask ranking when `2^n` fits in the same 64-bit word count, local single-worker `test-release`
+verification now completes in both default and `-tlc` modes with exact oracle counts (410,112
+distinct states, 3,150,464 generated states, depth 5, 128.2 MiB peak RSS, 0 boxed/interpreter IR
+nodes); repeated cloud benchmark samples remain open.
 
 `CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC` (`N = 121`, `P = 5`, `[1..5 -> 1..121]` =
 25,937,424,601 functions) previously hit the 600-second warm-up limit in the same validation pass

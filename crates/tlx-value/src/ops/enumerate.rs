@@ -1,5 +1,6 @@
 //! Enumeration of sets in TLC's enumeration order (tlc-semantics.md §1.5).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{cardinality, is_empty_set, is_enumerable, member, next_combination};
@@ -622,6 +623,149 @@ pub fn for_each_enumerated_seqs(s: &Value, v: &mut dyn SeqsVisitor) -> Result<bo
     }
 }
 
+/// Normalized read-only view over the base elements of `SUBSET base`, in TLC's
+/// order (avoiding materializing an integer interval just to inspect it).
+pub struct SubsetBase<'a>(crate::repr::Elems<'a>);
+
+impl<'a> SubsetBase<'a> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> Cow<'_, Value> {
+        self.0.get(i)
+    }
+
+    /// `(lo, hi)` when the base is a non-empty integer interval `lo..hi`.
+    pub fn as_interval(&self) -> Option<(i64, i64)> {
+        match self.0 {
+            crate::repr::Elems::Range(lo, len) if len > 0 => Some((lo, lo + len as i64 - 1)),
+            _ => None,
+        }
+    }
+}
+
+/// What `for_each_enumerated_subsets` visits.
+pub trait SubsetVisitor {
+    /// One element; `Ok(false)` stops the enumeration.
+    fn elem(&mut self, v: Value) -> Result<bool>;
+    /// The subsets of `base` (normalized elements in TLC's order), visited in
+    /// `SUBSET` enumeration order (increasing cardinality, then lexicographic
+    /// by index): `Ok(None)` if not handled (then each subset is visited via
+    /// `elem`), else whether the enumeration completed.
+    fn subsets(&mut self, base: &SubsetBase<'_>) -> Result<Option<bool>>;
+}
+
+/// `for_each_enumerated`, except that each powerset `SUBSET B` enumerated (the
+/// set itself or an element of a `UNION`) is offered to `v.subsets` as a whole
+/// (e.g. to filter it without visiting every subset). Same order, same errors.
+pub fn for_each_enumerated_subsets(s: &Value, v: &mut dyn SubsetVisitor) -> Result<bool> {
+    let Value::LazySet(l) = s else { return for_each_element(s, &mut |x| v.elem(x)) };
+    match &**l {
+        LazySet::Subset(base) => subsets_with(base, v),
+        LazySet::Union(sets) => {
+            if !is_enumerable(sets) {
+                return err(format!("Attempted to enumerate the nonenumerable set:\n{s}"));
+            }
+            for_each_enumerated(sets, &mut |e| {
+                if !is_enumerable(&e) {
+                    return err("Attempted to enumerate UNION(s), but some element of s is nonenumerable.");
+                }
+                match &e {
+                    Value::LazySet(l) => match &**l {
+                        LazySet::Subset(base) => subsets_with(base, v),
+                        _ => for_each_enumerated(&e, &mut |x| v.elem(x)),
+                    },
+                    _ => for_each_enumerated(&e, &mut |x| v.elem(x)),
+                }
+            })
+        }
+        _ => for_each_enumerated(s, &mut |x| v.elem(x)),
+    }
+}
+
+fn subsets_with(base: &Value, v: &mut dyn SubsetVisitor) -> Result<bool> {
+    let elems = SubsetBase(subset_base_elems(base)?);
+    if let Some(done) = v.subsets(&elems)? {
+        return Ok(done);
+    }
+    for_each_subset_of(&elems.0, &mut |x| v.elem(x))
+}
+
+/// Visit all subsets `E` of `base` (already in TLC's normalized order) such
+/// that every index in `required` is present, all remaining elements come from
+/// `optional`, and `min_card <= |E| <= max_card`, in TLC's exact `SUBSET`
+/// enumeration order (increasing cardinality, then lexicographic by index).
+///
+/// `required` and `optional` must be strictly increasing, disjoint index
+/// slices into `0..base.len()`. Because inserting a fixed disjoint set
+/// `required` preserves both equal-cardinality symmetric differences and
+/// element order, enumerating `optional` combinations in lexicographic order
+/// reproduces the exact subsequence of `SUBSET base` order.
+pub fn for_each_constrained_subset(
+    base: &SubsetBase<'_>,
+    required: &[usize],
+    optional: &[usize],
+    min_card: usize,
+    max_card: usize,
+    f: &mut dyn FnMut(Value) -> Result<bool>,
+) -> Result<bool> {
+    debug_assert!(required.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(optional.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(required.last().is_none_or(|&i| i < base.len()));
+    debug_assert!(optional.last().is_none_or(|&i| i < base.len()));
+    if min_card > max_card || max_card < required.len() || min_card > required.len() + optional.len() {
+        return Ok(true);
+    }
+    let k_lo = min_card.saturating_sub(required.len());
+    let k_hi = (max_card - required.len()).min(optional.len());
+    let n_opt = optional.len();
+    for k_opt in k_lo..=k_hi {
+        let mut idx: Vec<usize> = (0..k_opt).collect();
+        let total_len = required.len() + k_opt;
+        loop {
+            let subset: Arc<[Value]> = if required.is_empty() {
+                idx.iter().map(|&j| base.get(optional[j]).into_owned()).collect()
+            } else if k_opt == 0 {
+                required.iter().map(|&i| base.get(i).into_owned()).collect()
+            } else {
+                let mut merged = Vec::with_capacity(total_len);
+                let (mut ri, mut oi) = (0usize, 0usize);
+                while ri < required.len() && oi < k_opt {
+                    let r = required[ri];
+                    let o = optional[idx[oi]];
+                    debug_assert!(r != o, "required and optional must be disjoint");
+                    if r < o {
+                        merged.push(base.get(r).into_owned());
+                        ri += 1;
+                    } else {
+                        merged.push(base.get(o).into_owned());
+                        oi += 1;
+                    }
+                }
+                for &r in &required[ri..] {
+                    merged.push(base.get(r).into_owned());
+                }
+                for &j in &idx[oi..] {
+                    merged.push(base.get(optional[j]).into_owned());
+                }
+                Arc::from(merged)
+            };
+            if !f(Value::Set(subset))? {
+                return Ok(false);
+            }
+            if !next_combination(&mut idx, n_opt) {
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// The elements of `s` = `[dom -> range]` (as `for_each_element`), offered
 /// to `v.seqs` if they are sequences.
 fn seqs_with(s: &Value, dom: &Value, range: &Value, v: &mut dyn SeqsVisitor) -> Result<bool> {
@@ -1020,5 +1164,43 @@ mod tests {
         assert!(!done);
         assert_eq!(got, vec![Value::Int(1)]);
         assert!(!crate::ops::is_empty_checked(&s).unwrap());
+    }
+
+    #[test]
+    fn constrained_subset_matches_filtered_tlc_order() {
+        let base_val = Value::Set((0..6).map(Value::Int).collect::<Vec<_>>().into());
+        let base = super::SubsetBase(super::subset_base_elems(&base_val).unwrap());
+        let cases: &[(&[usize], &[usize], usize, usize)] = &[
+            (&[], &[0, 1, 2, 3, 4, 5], 0, 6),
+            (&[], &[1, 3, 5], 0, 6),
+            (&[1, 4], &[0, 2, 3, 5], 0, 6),
+            (&[1, 3], &[0, 2, 4, 5], 2, 4),
+            (&[2], &[], 1, 1),
+            (&[2], &[0, 1], 0, 0),
+            (&[2], &[0, 1], 4, 6),
+            (&[], &[0, 2, 4], 2, 2),
+        ];
+        let all = reference_powerset(6);
+        for &(req, opt, min_c, max_c) in cases {
+            let mut got: Vec<Vec<usize>> = Vec::new();
+            let done = super::for_each_constrained_subset(&base, req, opt, min_c, max_c, &mut |s| {
+                let Value::Set(es) = s else { unreachable!() };
+                got.push(es.iter().map(|e| e.as_int().unwrap() as usize).collect());
+                Ok(true)
+            })
+            .unwrap();
+            assert!(done);
+            let expected: Vec<Vec<usize>> = all
+                .iter()
+                .filter(|s| {
+                    s.len() >= min_c
+                        && s.len() <= max_c
+                        && req.iter().all(|r| s.contains(r))
+                        && s.iter().all(|x| req.contains(x) || opt.contains(x))
+                })
+                .cloned()
+                .collect();
+            assert_eq!(got, expected, "req={req:?} opt={opt:?} card={min_c}..={max_c}");
+        }
     }
 }

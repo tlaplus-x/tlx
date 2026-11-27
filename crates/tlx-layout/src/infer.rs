@@ -313,10 +313,25 @@ fn grow_len(n: usize) -> usize {
 fn set_headroom(elem: Shape, max_card: usize, in_elem: bool) -> Shape {
     let mut m = grow_len(max_card);
     if let Some(n) = elem.cardinality() {
-        let n = usize::try_from(n).unwrap_or(usize::MAX);
-        m = m.min(n).max(max_card);
-        if !in_elem && crate::layout::bitset_universe(&elem).is_some() {
-            m = n.max(max_card);
+        let n_usize = usize::try_from(n).unwrap_or(usize::MAX);
+        m = m.min(n_usize).max(max_card);
+        if crate::layout::bitset_universe(&elem).is_some() {
+            if !in_elem {
+                m = n_usize.max(max_card);
+            } else if n <= 62 {
+                // When the full powerset (2^n) fits in the same 64-bit bitset
+                // word count as the capped subset universe (within
+                // MAX_BITSET_UNIVERSE), widening max_card to n costs zero extra
+                // words and enables direct bitmask ranking (`word_ranked_set`)
+                // for nested bitsets.
+                let full_card = 1u64 << n;
+                if full_card <= crate::shape::MAX_BITSET_UNIVERSE {
+                    let cur_card = set_shape(elem.clone(), m).cardinality().unwrap_or(u64::MAX);
+                    if full_card.div_ceil(64) <= cur_card.div_ceil(64) && full_card <= cur_card.saturating_mul(2) {
+                        m = n_usize.max(max_card);
+                    }
+                }
+            }
         }
     }
     set_shape(elem, m)
@@ -1080,5 +1095,35 @@ mod tests {
         // widened shape holds both types: the run continues, not wrongly.
         let w = widen_repeated(s, &rec(&[("tx", int(1)), ("type", mv("S_c"))]), &hints, 0);
         assert_eq!(names(&field(&w, "type")), ["S_c", "T_a", "T_b"]);
+    }
+
+    /// A nested bitset whose full powerset (`2^n`) fits in the same 64-bit
+    /// word count as its capped universe (e.g. pairs from 5 atoms: 31 -> 32,
+    /// both 1 word) widens `max_card` to `n` so compiled code can rank inner
+    /// sets directly by bitmask, while larger universes stay capped.
+    #[test]
+    fn nested_small_bitset_widens_to_full_powerset_in_same_word_count() {
+        let hints5 = Hints { atoms: ["n1", "n2", "n3", "n4", "n5"].into_iter().map(mv).collect(), ..Hints::default() };
+        let pair = Value::set_enum(vec![mv("n1"), mv("n2")]).unwrap();
+        let edges = Value::set_enum(vec![pair]).unwrap();
+        let mut o = Observer::new(1);
+        o.observe(&[edges]);
+        let finalized = &o.finalize(&hints5)[0];
+        let Shape::Set { elem, .. } = finalized else { panic!("expected outer set: {finalized:?}") };
+        let Shape::Set { max_card, .. } = &**elem else { panic!("expected inner set: {elem:?}") };
+        assert_eq!(*max_card, 5);
+        assert_eq!(elem.cardinality(), Some(32));
+
+        // Large element universe (12 atoms, max_card 2 -> 4): 2^12 = 4096 needs
+        // 64 words vs 13 words for capped universe, so it must NOT widen to 12.
+        let hints12 = Hints { atoms: (1..=12).map(|i| mv(&format!("a{i}"))).collect(), ..Hints::default() };
+        let pair12 = Value::set_enum(vec![mv("a1"), mv("a2")]).unwrap();
+        let edges12 = Value::set_enum(vec![pair12]).unwrap();
+        let mut o12 = Observer::new(1);
+        o12.observe(&[edges12]);
+        let finalized12 = &o12.finalize(&hints12)[0];
+        let Shape::Set { elem: elem12, .. } = finalized12 else { panic!("expected outer set") };
+        let Shape::Set { max_card: max_card12, .. } = &**elem12 else { panic!("expected inner set") };
+        assert_eq!(*max_card12, 4);
     }
 }

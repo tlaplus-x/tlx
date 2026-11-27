@@ -20,6 +20,7 @@ pub mod natives;
 pub mod random;
 mod seqfilter;
 pub mod strings;
+mod subsetfilter;
 
 pub use error::EvalError;
 pub use interp::{HoldMark, Interp, RunStats, SavedRegisters, SimConfig, SpecInfo};
