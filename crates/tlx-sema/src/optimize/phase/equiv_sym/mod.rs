@@ -297,6 +297,40 @@ pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option
     Some((groups, all_keys))
 }
 
+/// Partition an exact finite atom set into complete symmetric-group indices and
+/// key-free fixed atoms. Fails closed (`None`) if any symmetric group overlaps
+/// partially or if an uncovered moved key remains.
+pub(in crate::optimize::phase) fn classify_key_set(
+    keys: &BTreeSet<Atom>,
+    groups: &[GroupInfo],
+    all_keys: &BTreeSet<Arc<str>>,
+) -> Option<(Vec<usize>, Vec<Atom>)> {
+    let mut sym_groups = Vec::new();
+    let mut covered_keys: BTreeSet<Arc<str>> = BTreeSet::new();
+    for (gi, g) in groups.iter().enumerate() {
+        let present = g.keys.iter().filter(|k| keys.contains(&Atom::Model((*k).clone()))).count();
+        if present == g.keys.len() {
+            sym_groups.push(gi);
+            covered_keys.extend(g.keys.iter().cloned());
+        } else if present != 0 {
+            return None;
+        }
+    }
+    let mut fixed_keys = Vec::new();
+    for k in keys {
+        if let Atom::Model(m) = k {
+            if covered_keys.contains(m) {
+                continue;
+            }
+            if all_keys.contains(m) {
+                return None;
+            }
+        }
+        fixed_keys.push(k.clone());
+    }
+    Some((sym_groups, fixed_keys))
+}
+
 pub(in crate::optimize::phase) fn collect_const_bindings<'a>(
     program: &Program,
     cfg: &'a Config,

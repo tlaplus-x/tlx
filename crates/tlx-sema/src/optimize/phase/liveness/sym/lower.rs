@@ -7,9 +7,9 @@ use std::sync::Arc;
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 
 use super::super::super::{
-    binding,
+    binding, collect_unchanged_excluding,
     domain::Atom,
-    equiv_sym::{fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo, GroupMask},
+    equiv_sym::{classify_key_set, fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo, GroupMask},
     mentions_local, sym_totality, variable, Branch, CheckSpec, OpenCert,
 };
 use super::super::{ActionRead, Analysis, Control, ObsContext, ObsSink, Slot};
@@ -54,28 +54,13 @@ pub(super) fn emit_composed(
             (false, vec![dummy_id], 0u16, "Sum.inl ⟨0, by decide⟩".to_string())
         }
         Some(ks) => {
+            let (sym_groups, fixed_atoms) = classify_key_set(ks, groups, all_keys)?;
             let mut mask: GroupMask = 0;
-            let mut covered_keys: BTreeSet<Arc<str>> = BTreeSet::new();
-            for (gi, g) in groups.iter().enumerate() {
-                let present = g.keys.iter().filter(|k| ks.contains(&Atom::Model((*k).clone()))).count();
-                if present == g.keys.len() {
-                    mask |= 1u16 << gi;
-                    covered_keys.extend(g.keys.iter().cloned());
-                } else if present != 0 {
-                    // Key domain partially overlaps a symmetric group — cannot compose.
-                    return None;
-                }
+            for &gi in &sym_groups {
+                mask |= 1u16 << gi;
             }
-            let mut fixed_ids = Vec::new();
-            for k in ks {
-                if let Atom::Model(m) = k {
-                    if covered_keys.contains(m) {
-                        continue;
-                    }
-                    if all_keys.contains(m) {
-                        return None;
-                    }
-                }
+            let mut fixed_ids = Vec::with_capacity(fixed_atoms.len());
+            for k in &fixed_atoms {
                 let ak = AtomKey::from_key_free_atom(k, all_keys)?;
                 fixed_ids.push(ctx.atom_id_of(ak));
             }
@@ -85,7 +70,7 @@ pub(super) fn emit_composed(
             let default_key = if !fixed_ids.is_empty() {
                 "Sum.inl ⟨0, by decide⟩".to_string()
             } else {
-                let first_g = (0..groups.len()).find(|gi| (mask & (1u16 << gi)) != 0)?;
+                let first_g = *sym_groups.first()?;
                 format!("Sum.inr ⟨⟨⟨{first_g}, by decide⟩, ⟨0, by decide⟩⟩, by decide⟩")
             };
             (true, fixed_ids, mask, default_key)
@@ -422,7 +407,7 @@ fn lower_step_cases(
                         return None;
                     }
                     let mut retained = Vec::new();
-                    collect_retained_unchanged(a, &args[0], &mut retained)?;
+                    collect_unchanged_excluding(&args[0], &mut |v| a.is_control_or_projected_var(v), &mut retained)?;
                     for v_expr in retained {
                         let frame = Expr::new(ExprKind::Builtin { op: B::Unchanged, args: vec![v_expr] }, term.span);
                         guard_forms.push(ctx.lower_form(&frame, true)?);
@@ -464,24 +449,6 @@ fn lower_step_cases(
         out.push(case_res?);
     }
     Some(out)
-}
-
-fn collect_retained_unchanged(a: &Analysis<'_>, e: &Expr, out: &mut Vec<Expr>) -> Option<()> {
-    match &*e.kind {
-        ExprKind::Var(v) => {
-            if !a.is_control_or_projected_var(*v) {
-                out.push(e.clone());
-            }
-            Some(())
-        }
-        ExprKind::Tuple(es) => {
-            for x in es {
-                collect_retained_unchanged(a, x, out)?;
-            }
-            Some(())
-        }
-        _ => None,
-    }
 }
 
 /// Record actor/global slot reads and replace `ProvedMembership` subexpressions

@@ -726,6 +726,10 @@ impl<'a> TotalityChecker<'a> {
                     let old_at = except_old_at_shape(base, &cur, path, in_prime, env, ui == 0);
                     let mut rhs_env = env.clone();
                     rhs_env.at_shape = Some(old_at);
+                    rhs_env.at_is_threshold_counter = !in_prime
+                        && !self.threshold_counters.is_empty()
+                        && matches!(&*base.kind, ExprKind::Var(v) if self.threshold_counters.contains(v))
+                        && matches!(path.as_slice(), [ExceptKey::Index(ixs)] if ixs.len() == 1);
                     let val = self.check_expr(rhs, allow_prime, in_prime, &rhs_env, steps)?;
                     cur = apply_except_shape(&cur, path, &val);
                 }
@@ -1030,8 +1034,12 @@ impl<'a> TotalityChecker<'a> {
                     max_dom: Some(card),
                 })
             }
-            // Strict checked 32-bit signed arithmetic across all modes.
-            (B::Plus, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_add),
+            // Strict checked 32-bit signed arithmetic across all modes, plus
+            // scoped mathematical Nat counter increments when certifying
+            // threshold-counter/symmetry compositions.
+            (B::Plus, [a, b]) => self
+                .check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_add)
+                .or_else(|| self.check_threshold_counter_add(a, b, allow_prime, in_prime, env, steps)),
             (B::Minus, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_sub),
             (B::Mul, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_mul),
             (B::Div, [a, b]) => self.check_arith_bin((a, b), allow_prime, in_prime, env, steps, arith_div_pos),
@@ -1113,6 +1121,50 @@ impl<'a> TotalityChecker<'a> {
             _ => other,
         };
         self.check_expr(stamp, allow_prime, in_prime, env, steps).is_some_and(|s| is_int_shape(&s))
+    }
+
+    /// Scoped strictly to certified threshold-counter/symmetry compositions:
+    /// accepts `counter + d` / `d + counter` where `counter` is a proven
+    /// mathematical Nat counter variable (or its map lookup / `@`) and `d` is
+    /// a non-negative bounded integer constant. Returns `Shape::Int(None)` so
+    /// the unbounded result cannot feed back into checked 32-bit arithmetic.
+    fn check_threshold_counter_add(
+        &self,
+        a: &Expr,
+        b: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<Shape> {
+        if self.threshold_counters.is_empty() || in_prime {
+            return None;
+        }
+        let is_counter_read = |e: &Expr| -> bool {
+            match &*e.kind {
+                ExprKind::Var(v) => self.threshold_counters.contains(v),
+                ExprKind::At => env.at_is_threshold_counter,
+                ExprKind::FnApp { func, args } if args.len() == 1 => {
+                    matches!(&*func.kind, ExprKind::Var(v) if self.threshold_counters.contains(v))
+                }
+                _ => false,
+            }
+        };
+        for (ctr, delta) in [(a, b), (b, a)] {
+            if !is_counter_read(ctr) {
+                continue;
+            }
+            let Shape::Int(Some((lo, hi))) = self.check_expr(delta, allow_prime, in_prime, env, steps)? else {
+                continue;
+            };
+            if lo < 0 || hi > i32::MAX / 2 {
+                continue;
+            }
+            if self.check_expr(ctr, allow_prime, in_prime, env, steps).is_some_and(|s| is_int_shape(&s)) {
+                return Some(Shape::Int(None));
+            }
+        }
+        None
     }
 
     fn check_arith_bin(

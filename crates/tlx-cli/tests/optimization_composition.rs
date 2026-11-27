@@ -994,3 +994,418 @@ BusyMarked == (\E a \in Actors : r[a].mode = "busy") => (\E a \in Actors : marke
         }
     }
 }
+
+#[test]
+fn threshold_sym_scalar_and_map_counters_compose_across_all_tiers() {
+    let spec = r#"---- MODULE ThreshSym ----
+EXTENDS Naturals
+CONSTANT Actor
+VARIABLES phase, step, retries, failures
+Init == /\ phase = "idle"
+        /\ step = 0
+        /\ retries = 0
+        /\ failures = [a \in Actor |-> 0]
+Start == /\ phase = "idle"
+         /\ phase' = "busy"
+         /\ UNCHANGED <<step, retries, failures>>
+Retry == /\ phase = "busy"
+         /\ step < 5
+         /\ step' = step + 1
+         /\ retries' = retries + 1
+         /\ phase' = IF retries >= 1 THEN "escalated" ELSE "busy"
+         /\ UNCHANGED failures
+Fail == \E a \in Actor :
+          /\ phase \in {"busy", "escalated"}
+          /\ step < 5
+          /\ step' = step + 1
+          /\ failures' = [failures EXCEPT ![a] = @ + 1]
+          /\ phase' = IF failures[a] >= 1 THEN "degraded" ELSE phase
+          /\ UNCHANGED retries
+Tick == \E a \in Actor :
+          /\ phase = "degraded"
+          /\ step < 5
+          /\ step' = step + 1
+          /\ failures' = [failures EXCEPT ![a] = @ + 1]
+          /\ UNCHANGED <<phase, retries>>
+Reset == /\ phase' = "idle"
+         /\ retries' = 0
+         /\ failures' = [a \in Actor |-> 0]
+         /\ UNCHANGED step
+Next == Start \/ Retry \/ Fail \/ Tick \/ Reset
+TypeOK == /\ phase \in {"idle", "busy", "escalated", "degraded"}
+          /\ step \in Nat
+          /\ retries \in Nat
+          /\ failures \in [Actor -> Nat]
+EscCheck == (phase = "escalated") => (retries >= 2)
+DegCheck == (phase = "degraded") => (\E a \in Actor : failures[a] >= 2)
+StateLimit == step <= 5
+ActLimit == phase' \in {"idle", "busy", "escalated", "degraded"}
+ActPropOk == [][ phase' \in {"idle", "busy", "escalated", "degraded"} ]_<<phase, step>>
+====
+"#;
+    for (mode, extra_cfg) in
+        [("unconstrained", ""), ("constrained", "CONSTRAINT StateLimit\nACTION_CONSTRAINT ActLimit\nPROPERTY ActPropOk\n")]
+    {
+        let cfg = format!(
+            "INIT Init\nNEXT Next\nCONSTANT Actor = {{a1, a2, a3}}\nINVARIANTS\n  TypeOK\n  EscCheck\n  DegCheck\n{extra_cfg}CHECK_DEADLOCK TRUE\n"
+        );
+        let dir = tlx_testkit::TempDir::with_spec(&format!("thresh-sym-{mode}"), spec, &cfg);
+
+        let proj_only = tlx_testkit::tlx_default!()
+            .check("ThreshSym.tla")
+            .args(["-interp", "-workers", "1", "-optimize", "-noautosymmetry"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(proj_only.code, 0, "{mode} proj-only: {}", proj_only.text());
+        let proj_distinct = parse_distinct(&proj_only.stdout);
+
+        let sym_only = tlx_testkit::tlx_default!()
+            .check("ThreshSym.tla")
+            .args(["-interp", "-workers", "1"])
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(sym_only.code, 0, "{mode} sym-only: {}", sym_only.text());
+        let sym_distinct = parse_distinct(&sym_only.stdout);
+
+        for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+            let proof_dir = dir.join(format!("proofs-{idx}"));
+            let cache_dir = dir.join(format!("cache-{idx}"));
+            let run = tlx_testkit::tlx_default!()
+                .check("ThreshSym.tla")
+                .args(["-workers", "1", "-optimize", "-maxmem", "32"])
+                .args(*args)
+                .envs(env.iter().copied())
+                .env("TLX_PARANOID", "1")
+                .env("TLX_SYMMETRY_PARANOID", "1")
+                .env("TLX_PROOF_DIR", &proof_dir)
+                .env("TLX_CACHE", &cache_dir)
+                .dir(&dir)
+                .timeout(Duration::from_secs(120))
+                .run();
+            assert_eq!(run.code, 0, "{mode}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("threshold-counter-projection"), "{mode}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("composed with symmetry Permutations(Actor)"), "{mode}/{tier}: {}", run.text());
+            assert!(run.stdout.contains("threshold-counter/equivariant-symmetry composition certificate"), "{mode}/{tier}: {}", run.text());
+            let composed = parse_distinct(&run.stdout);
+            assert!(
+                composed < proj_distinct && composed < sym_distinct,
+                "{mode}/{tier}: expected composed {composed} < min(proj={proj_distinct}, sym={sym_distinct})"
+            );
+            let lean = read_single_lean(&proof_dir);
+            for expected in [
+                "namespace TlxOptimization.GeneratedThresholdSymmetry",
+                "theorem threshold_certificate",
+                "theorem symmetry_certificate",
+                "theorem certificate",
+                "theorem orbit_key_equivalent",
+            ] {
+                assert!(lean.contains(expected), "{mode}/{tier}: missing `{expected}`");
+            }
+            if mode == "constrained" {
+                for expected in [
+                    "theorem threshold_constrained_certificate",
+                    "theorem symmetry_constrained_certificate",
+                    "theorem constrained_certificate",
+                ] {
+                    assert!(lean.contains(expected), "{mode}/{tier}: missing `{expected}`");
+                }
+            }
+            assert!(!lean.contains("sorry"), "{mode}/{tier}");
+        }
+    }
+}
+
+#[test]
+fn threshold_sym_preserves_uncapped_safety_action_and_deadlock_traces() {
+    let cex_spec = r#"---- MODULE ThreshSymCex ----
+EXTENDS Naturals
+CONSTANT Actor
+VARIABLES pos, fails
+Init == pos = 0 /\ fails = [a \in Actor |-> 0]
+Step == \E a \in Actor :
+          /\ pos < 4
+          /\ pos' = pos + 1
+          /\ fails' = [fails EXCEPT ![a] = @ + 1]
+Linger == \E a \in Actor :
+            /\ pos < 4
+            /\ pos' = pos + 1
+            /\ fails' = [fails EXCEPT ![a] = @ + 4]
+Next == Step \/ Linger
+TypeOK == pos \in 0..4 /\ fails \in [Actor -> Nat]
+Guard == \A a \in Actor : (fails[a] < 2) \/ (fails[a] >= 2)
+NotFour == pos # 4
+ActBad == [][ pos' < 4 ]_pos
+====
+"#;
+    let cex_cfg = "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2}\nINVARIANTS\n  TypeOK\n  Guard\n  NotFour\nCHECK_DEADLOCK FALSE\n";
+    let cex_dir = tlx_testkit::TempDir::with_spec("thresh-sym-cex", cex_spec, cex_cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("ThreshSymCex.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", cex_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", cex_dir.join(format!("cache-{idx}")))
+            .dir(&cex_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 12, "cex/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actor)"), "cex/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Invariant NotFour is violated"), "cex/{tier}: {}", run.text());
+        assert!(
+            run.stdout.contains(" :> 4") || run.stdout.contains(" :> 5") || run.stdout.contains(" :> 8") || run.stdout.contains(" :> 16"),
+            "cex/{tier} must reconstruct un-capped concrete counter value:\n{}",
+            run.text()
+        );
+    }
+
+    let act_bad_cfg =
+        "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2}\nINVARIANTS\n  TypeOK\n  Guard\nPROPERTY ActBad\nCHECK_DEADLOCK FALSE\n";
+    let act_dir = tlx_testkit::TempDir::with_spec("thresh-sym-act-bad", cex_spec, act_bad_cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("ThreshSymCex.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", act_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", act_dir.join(format!("cache-{idx}")))
+            .dir(&act_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 13, "act-bad/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actor)"), "act-bad/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Action property ActBad is violated."), "act-bad/{tier}: {}", run.text());
+    }
+
+    let dl_cfg = "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2}\nINVARIANTS\n  TypeOK\n  Guard\nCHECK_DEADLOCK TRUE\n";
+    let dl_dir = tlx_testkit::TempDir::with_spec("thresh-sym-dl", cex_spec, dl_cfg);
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let run = tlx_testkit::tlx_default!()
+            .check("ThreshSymCex.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", dl_dir.join(format!("proofs-{idx}")))
+            .env("TLX_CACHE", dl_dir.join(format!("cache-{idx}")))
+            .dir(&dl_dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 11, "dl/{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actor)"), "dl/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Deadlock reached"), "dl/{tier}: {}", run.text());
+        assert!(run.stdout.contains("pos = 4"), "dl/{tier}: {}", run.text());
+    }
+}
+
+#[test]
+fn uncomposable_threshold_projection_does_not_displace_stronger_certified_symmetry() {
+    let thresh_choose_spec = r#"---- MODULE UncomposableThresh ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLES st, cnt
+Init == st = [a \in Actors |-> 0] /\ cnt = 0
+Flip(a) == /\ (CHOOSE x \in Actors : x = a) = a
+           /\ st' = [st EXCEPT ![a] = 1 - @]
+           /\ cnt' = IF cnt < 3 THEN cnt + 1 ELSE 3
+Next == \E a \in Actors : Flip(a)
+Inv == st \in [Actors -> {0, 1}] /\ cnt \in Nat /\ (cnt < 2 \/ cnt >= 2)
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2, a3, a4}\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let t_dir = tlx_testkit::TempDir::with_spec("uncomposable-thresh-vs-sym", thresh_choose_spec, cfg);
+    let t_sym = tlx_testkit::tlx_default!()
+        .check("UncomposableThresh.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&t_dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(t_sym.code, 0, "t-sym: {}", t_sym.text());
+    assert!(t_sym.stdout.contains("symmetry Permutations(Actors)"), "t-sym: {}", t_sym.text());
+    let t_sym_distinct = parse_distinct(&t_sym.stdout);
+
+    let t_opt = tlx_testkit::tlx_default!()
+        .check("UncomposableThresh.tla")
+        .args(["-interp", "-workers", "1", "-optimize"])
+        .env("TLX_PARANOID", "1")
+        .env("TLX_SYMMETRY_PARANOID", "1")
+        .dir(&t_dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(t_opt.code, 0, "t-opt: {}", t_opt.text());
+    let t_opt_distinct = parse_distinct(&t_opt.stdout);
+    assert!(
+        t_opt_distinct <= t_sym_distinct,
+        "uncomposable threshold projection must not regress past certified symmetry ({t_opt_distinct} > {t_sym_distinct}):\n{}",
+        t_opt.text()
+    );
+    assert!(t_opt.stdout.contains("symmetry Permutations(Actors)"), "t-opt: {}", t_opt.text());
+}
+
+#[test]
+fn overlapping_except_at_declines_threshold_sym_certificate_and_preserves_violation() {
+    let overlap_thresh = r#"---- MODULE OverlapThresh ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLES phase, marked, retries
+Init == phase = "idle" /\ marked = [a \in Actors |-> FALSE] /\ retries = 0
+Step == \E a, b \in Actors :
+          /\ phase = "idle"
+          /\ phase' = "busy"
+          /\ marked' = [marked EXCEPT ![a] = TRUE, ![b] = ~@]
+          /\ retries' = retries + 1
+Tick == /\ phase = "busy"
+        /\ retries' = retries + 1
+        /\ UNCHANGED <<phase, marked>>
+Reset == /\ phase = "busy"
+         /\ retries >= 2
+         /\ phase' = "idle"
+         /\ retries' = 0
+         /\ marked' = [a \in Actors |-> FALSE]
+Next == Step \/ Tick \/ Reset
+TypeOK == phase \in {"idle", "busy"} /\ marked \in [Actors -> BOOLEAN] /\ retries \in Nat
+BusyMarked == (phase = "busy") => (\E a \in Actors : marked[a])
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANTS\n  TypeOK\n  BusyMarked\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("overlap-except-thresh", overlap_thresh, cfg);
+    for (idx, (tier, args, env)) in [ALL_TIERS[0], ALL_TIERS[2]].iter().enumerate() {
+        let proof_dir = dir.join(format!("proofs-{idx}"));
+        let cache_dir = dir.join(format!("cache-{idx}"));
+        let run = tlx_testkit::tlx_default!()
+            .check("OverlapThresh.tla")
+            .args(["-workers", "1", "-optimize"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &proof_dir)
+            .env("TLX_CACHE", &cache_dir)
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 12, "thresh/{tier}: {}", run.text());
+        assert!(run.stdout.contains("Invariant BusyMarked is violated"), "thresh/{tier}: {}", run.text());
+        for entry in std::fs::read_dir(&proof_dir).unwrap() {
+            let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+            assert!(
+                !lean.contains("namespace TlxOptimization.GeneratedThresholdSymmetry"),
+                "thresh/{tier}: overlapping EXCEPT @ must not emit GeneratedThresholdSymmetry"
+            );
+        }
+    }
+
+    let overlap_counter = r#"---- MODULE OverlapCounter ----
+EXTENDS Naturals
+CONSTANT Actors
+VARIABLES step, fails
+Init == step = 0 /\ fails = [a \in Actors |-> 0]
+Bump == \E a, b \in Actors :
+          /\ step < 3
+          /\ step' = step + 1
+          /\ fails' = [fails EXCEPT ![a] = @ + 1, ![b] = @ + 1]
+Next == Bump
+TypeOK == step \in 0..3 /\ fails \in [Actors -> Nat]
+Guard == \A a \in Actors : (fails[a] < 2) \/ (fails[a] >= 2)
+NotTwoInOneStep == (step = 1) => (\A a \in Actors : fails[a] < 2)
+====
+"#;
+    let c_cfg =
+        "INIT Init\nNEXT Next\nCONSTANT Actors = {a1, a2}\nINVARIANTS\n  TypeOK\n  Guard\n  NotTwoInOneStep\nCHECK_DEADLOCK FALSE\n";
+    let c_dir = tlx_testkit::TempDir::with_spec("overlap-except-counter", overlap_counter, c_cfg);
+    let c_proof = c_dir.join("proofs");
+    let c_run = tlx_testkit::tlx_default!()
+        .check("OverlapCounter.tla")
+        .args(["-interp", "-workers", "1", "-optimize"])
+        .env("TLX_PARANOID", "1")
+        .env("TLX_SYMMETRY_PARANOID", "1")
+        .env("TLX_PROOF_DIR", &c_proof)
+        .dir(&c_dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(c_run.code, 12, "counter: {}", c_run.text());
+    assert!(c_run.stdout.contains("Invariant NotTwoInOneStep is violated"), "counter: {}", c_run.text());
+    for entry in std::fs::read_dir(&c_proof).unwrap() {
+        let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+        assert!(
+            !lean.contains("namespace TlxOptimization.GeneratedThresholdSymmetry"),
+            "counter: overlapping EXCEPT @ on counter map must decline GeneratedThresholdSymmetry"
+        );
+    }
+}
+
+#[test]
+fn threshold_sym_mixed_fixed_and_sym_counter_map_composes() {
+    let spec = r#"---- MODULE ThreshSymMixed ----
+EXTENDS Naturals
+CONSTANT Actor
+VARIABLES step, counts
+Keys == Actor \cup {"master"}
+Init == step = 0 /\ counts = [k \in Keys |-> 0]
+Bump == \E k \in Keys :
+          /\ step < 5
+          /\ step' = step + 1
+          /\ counts' = [counts EXCEPT ![k] = @ + 1]
+Next == Bump
+TypeOK == step \in 0..5 /\ counts \in [Keys -> Nat]
+Guard == (\A a \in Actor : counts[a] < 2 \/ counts[a] >= 2) /\ (counts["master"] < 2 \/ counts["master"] >= 2)
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2, a3}\nINVARIANTS\n  TypeOK\n  Guard\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("thresh-sym-mixed", spec, cfg);
+    let proj_only = tlx_testkit::tlx_default!()
+        .check("ThreshSymMixed.tla")
+        .args(["-interp", "-workers", "1", "-optimize", "-noautosymmetry"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(proj_only.code, 0, "proj-only: {}", proj_only.text());
+    let proj_distinct = parse_distinct(&proj_only.stdout);
+
+    let sym_only = tlx_testkit::tlx_default!()
+        .check("ThreshSymMixed.tla")
+        .args(["-interp", "-workers", "1"])
+        .dir(&dir)
+        .timeout(Duration::from_secs(60))
+        .run();
+    assert_eq!(sym_only.code, 0, "sym-only: {}", sym_only.text());
+    let sym_distinct = parse_distinct(&sym_only.stdout);
+
+    for (idx, (tier, args, env)) in ALL_TIERS.iter().enumerate() {
+        let proof_dir = dir.join(format!("proofs-{idx}"));
+        let cache_dir = dir.join(format!("cache-{idx}"));
+        let run = tlx_testkit::tlx_default!()
+            .check("ThreshSymMixed.tla")
+            .args(["-workers", "1", "-optimize", "-maxmem", "32"])
+            .args(*args)
+            .envs(env.iter().copied())
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .env("TLX_PROOF_DIR", &proof_dir)
+            .env("TLX_CACHE", &cache_dir)
+            .dir(&dir)
+            .timeout(Duration::from_secs(120))
+            .run();
+        assert_eq!(run.code, 0, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("composed with symmetry Permutations(Actor)"), "{tier}: {}", run.text());
+        let composed = parse_distinct(&run.stdout);
+        assert!(
+            composed < proj_distinct && composed < sym_distinct,
+            "{tier}: expected composed {composed} < min(proj={proj_distinct}, sym={sym_distinct})"
+        );
+        let lean = read_single_lean(&proof_dir);
+        assert!(lean.contains("namespace TlxOptimization.GeneratedThresholdSymmetry"), "{tier}");
+        assert!(lean.contains("SlotEntry.fixedKey"), "{tier}: expected fixedKey slot entry");
+        assert!(lean.contains("SlotEntry.symGroup"), "{tier}: expected symGroup slot entry");
+        assert!(!lean.contains("sorry"), "{tier}");
+    }
+}

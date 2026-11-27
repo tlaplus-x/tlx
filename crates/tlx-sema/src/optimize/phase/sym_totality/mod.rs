@@ -136,6 +136,8 @@ pub(crate) struct CheckEnv {
     var_overrides: HashMap<(VarId, bool), Shape>,
     fn_app_overrides: HashMap<(VarId, bool, Vec<PlaceKey>), Shape>,
     at_shape: Option<Shape>,
+    /// True inside an `EXCEPT ![idx] = rhs` update on a certified threshold counter map.
+    at_is_threshold_counter: bool,
     /// Definitely-bound variables along the current action/init path:
     /// `Some((false, set))` during `Init`, `Some((true, set))` during `Next`, `None` otherwise.
     bound_vars: Option<(bool, BTreeSet<VarId>)>,
@@ -460,6 +462,9 @@ pub(crate) struct TotalityChecker<'a> {
     /// Scoped strictly to certified relative-age clock projections: permits
     /// `(stamp + d) cmp clock` comparisons on the proven mathematical clock variable.
     age_clock: Option<VarId>,
+    /// Scoped strictly to certified threshold-counter/symmetry compositions:
+    /// permits non-negative constant increments on proven mathematical Nat counters.
+    threshold_counters: BTreeSet<VarId>,
 }
 
 /// True if `cfg` contains any definition override (`Def = v`, `Def <- Other`, or module-scoped
@@ -768,9 +773,14 @@ impl<'a> TotalityChecker<'a> {
             allow_choose_folds,
             allow_unbounded_seq_len: false,
             age_clock: None,
+            threshold_counters: BTreeSet::new(),
         };
         checker.var_shapes = checker.infer_var_shapes(init_norm, next_norm);
         checker
+    }
+
+    pub(crate) fn set_threshold_counters(&mut self, counters: BTreeSet<VarId>) {
+        self.threshold_counters = counters;
     }
 
     /// Check complete observations, constraints, action predicates, value-position expressions

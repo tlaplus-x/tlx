@@ -12,11 +12,14 @@ use tlx_front::cfg::Config;
 
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit, Program};
 
-use super::{required_cap, CounterKind, CounterSpec};
+use super::{
+    required_cap,
+    shape::{self, MapSeedShape, MapTransferShape, SeedShape, SlotUpdate},
+    CounterKind, CounterSpec,
+};
 use crate::optimize::phase::{
-    atom_nat, binding,
+    binding, collect_unchanged_excluding,
     domain::{Atom, Domains},
-    expr_structurally_eq,
     normalize::opaque_recursive_def_vars,
     ordinary_unchanged, variable, Branch, CheckSpec, OpenCert,
 };
@@ -328,12 +331,9 @@ impl Emitter<'_> {
         Some(out)
     }
 
-    fn with_map_ctor_slot<T>(&mut self, bounds: &[Bound], slot_key: &Atom, f: impl FnOnce(&mut Self, LocalId) -> Option<T>) -> Option<T> {
-        let [bound] = bounds else { return None };
-        let BoundVars::Many(ids) = &bound.vars else { return None };
-        let [local] = ids.as_slice() else { return None };
-        self.scope.push((*local, slot_key.clone()));
-        let res = f(self, *local);
+    fn with_map_ctor_slot<T>(&mut self, local: LocalId, slot_key: &Atom, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        self.scope.push((local, slot_key.clone()));
+        let res = f(self);
         self.scope.pop();
         res
     }
@@ -363,29 +363,27 @@ impl Emitter<'_> {
 
     fn lower_scalar_init(&mut self, rhs: &Expr) -> Option<String> {
         self.tick(1)?;
-        if let Some(n) = atom_nat(self.domains, rhs) {
-            return Some(n.to_string());
+        match shape::seed_shape(self.domains, rhs)? {
+            SeedShape::Const(n) => Some(n.to_string()),
+            SeedShape::Ite { cond, then, els } => {
+                let c = self.atom(cond, false)?;
+                let t = self.lower_scalar_init(then)?;
+                let f = self.lower_scalar_init(els)?;
+                Some(format!("(if ({c}) then {t} else {f})"))
+            }
         }
-        if let ExprKind::If { cond, then, els } = &*rhs.kind {
-            let c = self.atom(cond, false)?;
-            let t = self.lower_scalar_init(then)?;
-            let f = self.lower_scalar_init(els)?;
-            return Some(format!("(if ({c}) then {t} else {f})"));
-        }
-        None
     }
 
     fn lower_map_init(&mut self, slot_key: &Atom, rhs: &Expr) -> Option<String> {
         self.tick(1)?;
-        match &*rhs.kind {
-            ExprKind::FnConstruct { bounds, body } => self.with_map_ctor_slot(bounds, slot_key, |this, _| this.lower_scalar_init(body)),
-            ExprKind::If { cond, then, els } => {
+        match shape::map_seed_shape(rhs)? {
+            MapSeedShape::FnConstruct { local, body, .. } => self.with_map_ctor_slot(local, slot_key, |this| this.lower_scalar_init(body)),
+            MapSeedShape::Ite { cond, then, els } => {
                 let c = self.atom(cond, false)?;
                 let t = self.lower_map_init(slot_key, then)?;
                 let f = self.lower_map_init(slot_key, els)?;
                 Some(format!("(if ({c}) then {t} else {f})"))
             }
-            _ => None,
         }
     }
 
@@ -399,7 +397,7 @@ impl Emitter<'_> {
             if let ExprKind::Builtin { op: B::Unchanged, args } = &*term.kind {
                 if args.len() == 1 && ordinary_unchanged(&args[0]) {
                     let mut retained = Vec::new();
-                    self.collect_retained_unchanged(&args[0], &mut retained)?;
+                    collect_unchanged_excluding(&args[0], &mut |v| self.counters.contains_key(&v), &mut retained)?;
                     for v_expr in retained {
                         let frame = Expr::new(ExprKind::Builtin { op: B::Unchanged, args: vec![v_expr] }, term.span);
                         guards.push(format!("(Test.pure ({}))", self.atom(&frame, false)?));
@@ -424,69 +422,33 @@ impl Emitter<'_> {
         Some((fold_test(guards, "conj", "True"), transfers))
     }
 
-    fn collect_retained_unchanged(&self, e: &Expr, out: &mut Vec<Expr>) -> Option<()> {
-        match &*e.kind {
-            ExprKind::Var(v) => {
-                if !self.counters.contains_key(v) {
-                    out.push(e.clone());
-                }
-                Some(())
-            }
-            ExprKind::Tuple(es) => {
-                for x in es {
-                    self.collect_retained_unchanged(x, out)?;
-                }
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
     fn lower_scalar_transfer(&mut self, var: VarId, rhs: &Expr) -> Option<String> {
         self.tick(1)?;
-        if variable(rhs, false) == Some(var) {
-            return Some("Transfer.keep".into());
-        }
-        if let Some(r) = atom_nat(self.domains, rhs) {
-            return Some(format!("(Transfer.reset {r})"));
-        }
-        match &*rhs.kind {
-            ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-                for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                    if variable(lhs, false) == Some(var) {
-                        if let Some(d) = atom_nat(self.domains, delta_e) {
-                            return Some(format!("(Transfer.add {d})"));
-                        }
-                    }
-                }
-                None
-            }
-            ExprKind::If { cond, then, els } => {
+        match shape::scalar_update(self.domains, var, rhs)? {
+            SlotUpdate::Keep => Some("Transfer.keep".into()),
+            SlotUpdate::Reset(r) => Some(format!("(Transfer.reset {r})")),
+            SlotUpdate::Add(d) => Some(format!("(Transfer.add {d})")),
+            SlotUpdate::Ite { cond, then, els } => {
                 let c = self.test(cond, false)?;
                 let t = self.lower_scalar_transfer(var, then)?;
                 let f = self.lower_scalar_transfer(var, els)?;
                 self.tick(c.len() + t.len() + f.len())?;
                 Some(format!("(Transfer.ite {c} {t} {f})"))
             }
-            _ => None,
         }
     }
 
     fn lower_map_transfer(&mut self, var: VarId, slot_key: &Atom, rhs: &Expr) -> Option<String> {
         self.tick(1)?;
-        if variable(rhs, false) == Some(var) {
-            return Some("Transfer.keep".into());
-        }
-        match &*rhs.kind {
-            ExprKind::FnConstruct { bounds, body } => self.with_map_ctor_slot(bounds, slot_key, |this, local| {
+        match shape::map_transfer_shape(var, rhs)? {
+            MapTransferShape::Keep => Some("Transfer.keep".into()),
+            MapTransferShape::FnConstruct { local, body, .. } => self.with_map_ctor_slot(local, slot_key, |this| {
                 let idx = Expr::new(ExprKind::Local(local), body.span);
                 this.lower_map_slot_transfer(var, &idx, body)
             }),
-            ExprKind::Except { base, updates } if variable(base, false) == Some(var) => {
+            MapTransferShape::Except(updates) => {
                 let mut result = "Transfer.keep".to_owned();
-                for (path, val) in updates {
-                    let [ExceptKey::Index(indices)] = path.as_slice() else { return None };
-                    let [idx] = indices.as_slice() else { return None };
+                for (idx, val) in updates {
                     if let Some(known) = self.resolve_known_atom(idx) {
                         if known == *slot_key {
                             result = self.lower_map_slot_transfer(var, idx, val)?;
@@ -500,46 +462,29 @@ impl Emitter<'_> {
                 }
                 Some(result)
             }
-            ExprKind::If { cond, then, els } => {
+            MapTransferShape::Ite { cond, then, els } => {
                 let c = self.test(cond, false)?;
                 let t = self.lower_map_transfer(var, slot_key, then)?;
                 let f = self.lower_map_transfer(var, slot_key, els)?;
                 self.tick(c.len() + t.len() + f.len())?;
                 Some(format!("(Transfer.ite {c} {t} {f})"))
             }
-            _ => None,
         }
     }
 
     fn lower_map_slot_transfer(&mut self, var: VarId, idx: &Expr, val: &Expr) -> Option<String> {
         self.tick(1)?;
-        if matches!(&*val.kind, ExprKind::FnApp { func, args } if args.len() == 1 && variable(func, false) == Some(var) && expr_structurally_eq(&args[0], idx))
-        {
-            return Some("Transfer.keep".into());
-        }
-        if let Some(r) = atom_nat(self.domains, val) {
-            return Some(format!("(Transfer.reset {r})"));
-        }
-        match &*val.kind {
-            ExprKind::Builtin { op: B::Plus, args } if args.len() == 2 => {
-                for (lhs, delta_e) in [(&args[0], &args[1]), (&args[1], &args[0])] {
-                    if matches!(&*lhs.kind, ExprKind::FnApp { func, args } if args.len() == 1 && variable(func, false) == Some(var) && expr_structurally_eq(&args[0], idx))
-                    {
-                        if let Some(d) = atom_nat(self.domains, delta_e) {
-                            return Some(format!("(Transfer.add {d})"));
-                        }
-                    }
-                }
-                None
-            }
-            ExprKind::If { cond, then, els } => {
+        match shape::map_slot_update(self.domains, var, idx, val)? {
+            SlotUpdate::Keep => Some("Transfer.keep".into()),
+            SlotUpdate::Reset(r) => Some(format!("(Transfer.reset {r})")),
+            SlotUpdate::Add(d) => Some(format!("(Transfer.add {d})")),
+            SlotUpdate::Ite { cond, then, els } => {
                 let c = self.test(cond, false)?;
                 let t = self.lower_map_slot_transfer(var, idx, then)?;
                 let f = self.lower_map_slot_transfer(var, idx, els)?;
                 self.tick(c.len() + t.len() + f.len())?;
                 Some(format!("(Transfer.ite {c} {t} {f})"))
             }
-            _ => None,
         }
     }
 

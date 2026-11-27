@@ -32,6 +32,7 @@ SUPPORTED_NAMESPACES = (
     "GeneratedErasedEquivSymmetry",
     "GeneratedThresholdCounter",
     "GeneratedFieldSymmetry",
+    "GeneratedThresholdSymmetry",
 )
 # Representative tracked specifications covering every supported generated
 # certificate namespace when check_generated.py is invoked without explicit files.
@@ -67,6 +68,22 @@ DEFAULT_CASES = (
         "check",
         "proofs/field/ActionChecks.tla",
         "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTANT Actors = {a1, a2, a3}\nCONSTANT Rounds = 2\nCONSTANT Values = {0, 1}\nCHECK_DEADLOCK FALSE\n",
+        ("-interp", "-optimize"),
+        (0,),
+    ),
+    (
+        "GeneratedThresholdSymmetry",
+        "check",
+        "proofs/counter/ThresholdProtocol.tla",
+        "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2, a3}\nINVARIANTS\n  TypeOK\n  EscalatedImpliesRetries\n  DegradedImpliesFailure\nCHECK_DEADLOCK TRUE\n",
+        ("-interp", "-optimize"),
+        (0,),
+    ),
+    (
+        "GeneratedThresholdSymmetry",
+        "check",
+        "proofs/counter/ThresholdProtocol.tla",
+        "INIT Init\nNEXT Next\nCONSTANT Actor = {a1, a2, a3}\nINVARIANTS\n  TypeOK\n  EscalatedImpliesRetries\n  DegradedImpliesFailure\nCONSTRAINT TypeOK\nCHECK_DEADLOCK TRUE\n",
         ("-interp", "-optimize"),
         (0,),
     ),
@@ -221,7 +238,7 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
     if namespace in {
         "GeneratedSymmetry", "GeneratedErasedSymmetry", "GeneratedEquivSymmetry",
-        "GeneratedErasedEquivSymmetry", "GeneratedFieldSymmetry",
+        "GeneratedErasedEquivSymmetry", "GeneratedFieldSymmetry", "GeneratedThresholdSymmetry",
     }:
         theorems |= {"orbit_key_equivalent"}
     if namespace == "GeneratedChooseSymmetry":
@@ -230,6 +247,8 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
         theorems |= {"erasure_certificate"}
     if namespace == "GeneratedFieldSymmetry":
         theorems |= {"field_certificate", "symmetry_certificate"}
+    if namespace == "GeneratedThresholdSymmetry":
+        theorems |= {"threshold_certificate", "symmetry_certificate"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_select:
         theorems |= {"select_concrete", "select_reduced"}
     if namespace in {"GeneratedAge", "GeneratedAgeHistory"} and has_bind:
@@ -246,6 +265,8 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
         }
         if namespace == "GeneratedFieldSymmetry":
             theorems |= {"field_constrained_certificate", "symmetry_constrained_certificate"}
+        if namespace == "GeneratedThresholdSymmetry":
+            theorems |= {"threshold_constrained_certificate", "symmetry_constrained_certificate"}
     if has_erasure_constrained:
         theorems |= {"erasure_constrained_certificate"}
     if has_const_declared:
@@ -385,6 +406,14 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                 ("next q r := ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "next q r := False ∧ ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "discarded quotient successors"),
                 ("initial q := ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "initial q := False ∧ ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "discarded quotient initialization"),
             ] if namespace == "GeneratedFieldSymmetry" else [
+                ("| .le, t => t + 1", "| .le, t => t", "off-by-one cap on <= comparison"),
+                ("| .add d => min (a i + d) (cap i)", "| .add d => min (a i) (cap i)", "dropped increment in reduced transfer"),
+                ("(m.guard a.1 b.1 w).eval a.2", "(m.guard a.1 b.1 w).eval (fun _ => 0)", "discarded threshold guard feedback"),
+                ("| .key k => .key (p.toFun k)", "| .key k => .key k", "failed to rename keys"),
+                ("fun i => n (m.permSlot p.inverse i)", "fun i => n i", "failed to permute symmetric counter slots"),
+                ("next q r := ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "next q r := False ∧ ∃ a b, oq.symProject a = q ∧ oq.system.toSystem.next a b ∧ oq.symProject b = r", "discarded quotient successors"),
+                ("initial q := ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "initial q := False ∧ ∃ a, oq.system.toSystem.initial a ∧ oq.symProject a = q", "discarded quotient initialization"),
+            ] if namespace == "GeneratedThresholdSymmetry" else [
                 ("(phase m.seed s.1.val, s.2)", "(false, s.2)", "forgot the initial anchor"),
                 ("t.1 = (s.1 && decide (m.delta w = 0))", "t.1 = s.1", "failed to advance the reduced phase"),
             ])
@@ -456,7 +485,17 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     "observed dead field in a dead phase",
                 )
 
-            if namespace == "GeneratedFieldSymmetry":
+            if namespace == "GeneratedThresholdSymmetry":
+                sym_slot_match = re.search(r"(?m)^  \| (\d+) => some \(", gen_block)
+                if sym_slot_match is not None:
+                    slot_idx = sym_slot_match.group(1)
+                    add_gen_decl_mutation(
+                        rf"^(def cap \(k : Fin SlotCount\) : Nat :=\n  match k\.val with\n(?:  \| [^\n]*\n)*?  \| {slot_idx} => )(\d+)$",
+                        lambda m: f"{m.group(1)}{int(m.group(2)) + 1}",
+                        "asymmetric per-key counter cap",
+                    )
+
+            if namespace in {"GeneratedFieldSymmetry", "GeneratedThresholdSymmetry"}:
                 add_gen_decl_mutation(
                     r"^def intermediate := \(model sem\)\.intermediate$",
                     lambda _: "def intermediate := { (model sem).intermediate with next := fun _ _ => False }",
