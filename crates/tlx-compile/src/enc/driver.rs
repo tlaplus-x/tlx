@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tlx_layout::decisions::{in_slot, note_for, summary, Slot};
+use tlx_layout::permute::AtomOrbits;
 use tlx_layout::store::StoreRef;
 
 use tlx_eval::model::State;
@@ -639,7 +640,7 @@ impl Speculation {
                     return true;
                 }
                 let old = self.shapes[var].clone();
-                self.shapes[var] = in_slot(slot, || widen_repeated(&old, &v, &self.hints, self.misses[var] - 1));
+                self.shapes[var] = in_slot(slot, || atom_orbits(base).close(&widen_repeated(&old, &v, &self.hints, self.misses[var] - 1)));
                 if tlx_layout::decisions::on() {
                     let what = format!("miss {} (value {v}): {} -> {}", self.misses[var], summary(&old), summary(&self.shapes[var]));
                     note_for(slot, what);
@@ -657,7 +658,9 @@ impl Speculation {
                 stats::add_count("restarts (layout miss)", 1);
                 self.def_misses[i] += 1;
                 let slot = Slot::Def(self.def_shapes[i].0 .0);
-                let w = in_slot(slot, || widen_repeated(&self.def_shapes[i].1, &v, &self.hints, self.def_misses[i] - 1));
+                let w = in_slot(slot, || {
+                    atom_orbits(base).close(&widen_repeated(&self.def_shapes[i].1, &v, &self.hints, self.def_misses[i] - 1))
+                });
                 note_for(slot, format!("miss {} (value {v}): {} -> {}", self.def_misses[i], summary(&self.def_shapes[i].1), summary(&w)));
                 if last || has_dyn(&w) {
                     note_for(slot, "not materialized any more (last restart, or Dyn parts)".to_string());
@@ -921,8 +924,9 @@ fn speculate(
     let t0 = Instant::now();
     let budget =
         PrerunBudget { states: settings.prerun_states, time: settings.prerun_time, walk_depth, settle: settings.prerun_settle, workers };
+    let orbits = atom_orbits(base);
     let layout = |p: Prerun| {
-        let (shapes, defs, _) = layouts(base, &cands, p);
+        let (shapes, defs, _) = layouts(base, &cands, p, &orbits);
         (shapes, defs)
     };
     let pre = prerun_shapes(base, budget, hints, &cands, &layout, search).map_err(SpeculationError::Effects)?;
@@ -949,7 +953,7 @@ fn speculate(
     match pre {
         Ok(Prerun { report: Some(r), .. }) => Err(SpeculationError::Search(Box::new(r))),
         Ok(p) => {
-            let (shapes, defs, notes) = layouts(base, &cands, p);
+            let (shapes, defs, notes) = layouts(base, &cands, p, &orbits);
             notes.into_iter().for_each(log);
             Ok((shapes, defs))
         }
@@ -963,11 +967,28 @@ fn speculate(
     }
 }
 
+fn atom_orbits(base: &InterpModel) -> AtomOrbits {
+    match base.symmetry_factors() {
+        Some(factors) => AtomOrbits::from_factors(&factors),
+        None => AtomOrbits::from_group(base.symmetry_maps()),
+    }
+}
+
 /// The shapes of the variables and of the materialized definitions (among
 /// the candidates `cands`) from pre-run result `p`.
-fn layouts(base: &InterpModel, cands: &[DefId], p: Prerun) -> (Vec<Shape>, Vec<(DefId, Shape)>, Vec<String>) {
-    let defs: Vec<(DefId, Shape)> = cands.iter().zip(p.defs).filter_map(|(d, s)| s.map(|s| (*d, s))).collect();
-    with_bounds(base, p.shapes, defs, p.bounded)
+fn layouts(base: &InterpModel, cands: &[DefId], p: Prerun, orbits: &AtomOrbits) -> (Vec<Shape>, Vec<(DefId, Shape)>, Vec<String>) {
+    let view = super::speculate::view_def(base);
+    let defs = cands
+        .iter()
+        .zip(p.defs)
+        .filter_map(|(&d, observed)| {
+            let shape = orbits.close(&observed?);
+            (!has_dyn(&shape) || (view == Some(d) && super::speculate::view_allows_dyn(base, d, &shape))).then_some((d, shape))
+        })
+        .collect();
+    let shapes = p.shapes.iter().map(|s| orbits.close(s)).collect();
+    let bounded = p.bounded.iter().map(|(v, s)| (*v, orbits.close(s))).collect();
+    with_bounds(base, shapes, defs, bounded)
 }
 
 /// The unified shapes of the variables and definitions, with those of the
@@ -995,7 +1016,7 @@ fn with_bounds(
         let mut trial = cur.clone();
         trial[var] = r;
         let t = unified(&trial);
-        if t.2 <= best.2 {
+        if t.2 <= best.2 && best.0.iter().zip(&t.0).all(|(old, new)| !has_dyn(new) || has_dyn(old)) {
             if t.2 < best.2 {
                 notes.push(format!("type invariant bounds {}: {} -> {} state words", base.ip.prog.vars[var].name, best.2, t.2));
             }
@@ -1017,6 +1038,68 @@ fn def_name(base: &InterpModel, d: DefId) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_server_orbit_uses_one_compiled_layout() {
+        let src = tlx_testkit::module(
+            "Orbit",
+            r"EXTENDS TLC
+CONSTANT Server
+VARIABLE msg
+Symmetry == Permutations(Server)
+Init == \E s \in Server : msg = [dest |-> s, sent |-> FALSE]
+Next == \E s \in Server : msg' = [dest |-> s, sent |-> TRUE]",
+        );
+        let cfg = "CONSTANT Server = {s1, s2, s3, s4}\nSYMMETRY Symmetry\nINIT Init\nNEXT Next\n";
+        let base = Arc::new(tlx_testkit::spec::load(&src, cfg));
+        let settings = Settings { prerun_states: 1, paranoid: true, ..Settings::global().clone() };
+        // Isolate the observations from static constant hints that can already
+        // cover all four servers in this small fixture.
+        let (shapes, defs) = speculate(&base, &Hints::default(), &settings, 0, 1, None).ok().unwrap();
+        let model = EncModel::new(base.clone(), Arc::new(Layout::new(shapes)), defs, &settings);
+        assert!(model.notes.iter().any(|n| n == "symmetry: permuting encodings"), "{:?}", model.notes);
+        let opts = Options { workers: 1, ..Options::default() };
+        let reference = tlx_runtime::explore(&*base, &opts);
+        let compiled = tlx_runtime::explore(&model, &opts);
+        assert!(matches!(reference.outcome, Outcome::Ok));
+        assert!(matches!(compiled.outcome, Outcome::Ok), "{:?}", compiled.outcome);
+        assert_eq!(reference.stats.distinct, 2);
+        assert_eq!((compiled.stats.generated, compiled.stats.distinct), (reference.stats.generated, reference.stats.distinct));
+    }
+
+    #[test]
+    fn orbit_closure_rechecks_materialization_and_bounds() {
+        use tlx_layout::shape::{map_shape, FcnWitness};
+        use tlx_value::{Sym, Value};
+
+        let src = tlx_testkit::module("Orbit", "VARIABLE x\nV == <<x, x = x>>\nInit == x = TRUE\nNext == x' = x");
+        let base = tlx_testkit::spec::load(&src, "VIEW V\nINIT Init\nNEXT Next\n");
+        let view = super::super::speculate::view_def(&base).unwrap();
+        let mut servers = ["s1", "s2", "s3", "s4"].map(Sym::new);
+        servers.sort();
+        let orbits = AtomOrbits::from_factors(&[&servers]);
+        let atoms = Shape::Atom(servers[..3].iter().copied().map(Value::ModelValue).collect());
+        let key = Shape::Tuple(vec![atoms, Shape::Int { lo: 1, hi: 1200 }].into());
+        let map = map_shape(key, Shape::Bool, FcnWitness::Enumerated);
+        assert!(matches!(map, Shape::Map { .. }));
+        assert_eq!(orbits.close(&map), Shape::Dyn);
+        let candidate = |def| Prerun {
+            shapes: vec![Shape::Bool],
+            defs: vec![Some(def)],
+            states: 1,
+            settled: false,
+            report: None,
+            bounded: vec![(0, map.clone())],
+        };
+        let tuple = |x, y| Shape::Tuple(vec![x, y].into());
+        let (vars, defs, _) = layouts(&base, &[view], candidate(tuple(Shape::Bool, map.clone())), &orbits);
+        assert_eq!(vars, vec![Shape::Bool]);
+        assert!(defs.is_empty());
+        let (_, defs, _) = layouts(&base, &[view], candidate(tuple(map.clone(), Shape::Bool)), &orbits);
+        assert_eq!(defs, vec![(view, tuple(Shape::Dyn, Shape::Bool))]);
+        let base = tlx_testkit::spec::load(&src, "INIT Init\nNEXT Next\n");
+        assert!(layouts(&base, &[view], candidate(map.clone()), &orbits).1.is_empty());
+    }
 
     /// A checkpoint of an older speculation version is refused before its
     /// `Dyn` interner table is loaded; one of this version restores

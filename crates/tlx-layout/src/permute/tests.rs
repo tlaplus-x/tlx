@@ -270,3 +270,44 @@ fn apply_orbit_dyn_does_not_intern_candidates() {
     }
     assert_eq!(probe_count(), 1, "apply_orbit_unchecked on Dyn must not intern losing candidates");
 }
+
+#[test]
+fn orbit_closure_in_nested_map_preserves_fixed_atoms_and_separate_factors() {
+    let mut servers = ["s1", "s2", "s3", "s4"].map(Sym::new);
+    let mut clients = ["c1", "c2"].map(Sym::new);
+    servers.sort();
+    clients.sort();
+    let factors = [&servers[..], &clients[..]];
+    let shape = |server, client| {
+        let record = |name, field| Shape::Record(vec![(Sym::new(name), field)].into());
+        let key = record("dest", server).join(&record("sender", client));
+        crate::shape::map_shape(key, crate::shape::set_shape(atoms(&["c1", "fixed"]), 2), FcnWitness::Enumerated)
+    };
+    let observed = shape(atoms(&["s1", "s2", "s3"]), atoms(&["c1"]));
+    let group = FactorGroupSpec::new(&factors);
+    assert!(FactorPlan::compile(&observed, &group).is_none());
+    let closed = AtomOrbits::from_factors(&factors).close(&observed);
+    let Shape::Map { key, range, .. } = &closed else { panic!("expected map") };
+    let Shape::Map { key: expected, .. } = shape(atoms(&["s1", "s2", "s3", "s4"]), atoms(&["c1", "c2"])) else { unreachable!() };
+    assert_eq!(key, &expected);
+    assert_eq!(**range, crate::shape::set_shape(atoms(&["c1", "c2", "fixed"]), 2));
+    assert!(FactorPlan::compile(&closed, &group).is_some());
+}
+
+#[test]
+fn explicit_cyclic_orbit_closes_only_intersecting_universes() {
+    let cycle = ["a", "b", "c"].map(Sym::new);
+    let maps: Vec<std::collections::HashMap<_, _>> =
+        [1, 2].map(|step| (0..3).map(|i| (cycle[i], Value::ModelValue(cycle[(i + step) % 3]))).collect()).into();
+    let orbits = AtomOrbits::from_group(&maps);
+    let closed = orbits.close(&atoms(&["b", "fixed"]));
+    assert_eq!(closed, atoms(&["a", "b", "c", "fixed"]));
+    assert_eq!(orbits.close(&atoms(&["fixed"])), atoms(&["fixed"]));
+    for map in maps {
+        let perm: AtomPerm = Arc::new(move |v| match v {
+            Value::ModelValue(s) => map.get(s).unwrap_or(v).clone(),
+            _ => v.clone(),
+        });
+        check_all(&closed, &perm);
+    }
+}
