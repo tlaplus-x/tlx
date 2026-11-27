@@ -117,7 +117,8 @@ slots, without forming a `u64` reference before initialization. Fresh-output
 ordering tests cover these paths under targeted Miri.
 
 Trusted host decoding is additionally audited in `tlx-compile/src/exec/fast/`,
-`enc/{model,mixed}.rs`, `enc/model/{checks,fingerprint,view,symmetry}.rs`,
+`enc/{model,mixed}.rs`,
+`enc/model/{checks,exec,fingerprint,tier,view,symmetry}.rs`,
 `enc/model/symmetry/{order,branch,tests}.rs`, and `tlx-testkit/src/diff.rs`:
 unsafe calls use the matching layout/program and encoder-produced state,
 constant or region words, synchronized when crossing threads. Generated projection orbits
@@ -216,10 +217,12 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-compile/src/enc/model/checks.rs` | reviewed | Paranoid decoding of encoder-produced states, preserving published Dyn handle and matching layout contracts. |
 | `crates/tlx-compile/src/enc/model/fingerprint.rs` | reviewed | Trusted decoding and permutation of encoded states for VIEW and SYMMETRY fingerprints (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/codec.rs` | reviewed | Trusted encoded state decoding, widening transcode and validated queue codec boundaries (encoded-state contract below). |
+| `crates/tlx-compile/src/enc/model/exec.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/symmetry.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/symmetry/branch.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/symmetry/order.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/symmetry/tests.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
+| `crates/tlx-compile/src/enc/model/tier.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model/view.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/model.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
 | `crates/tlx-compile/src/enc/native.rs` | reviewed | Trusted encoded state, native/JIT entry points and reviewed fixtures (rows 17-22). |
