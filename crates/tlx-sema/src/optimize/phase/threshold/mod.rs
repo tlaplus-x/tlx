@@ -17,10 +17,11 @@ use tlx_front::cfg::Config;
 use crate::{builtins::Builtin as B, hir::*, visit, Program};
 
 use super::{
-    binding, binding_with_index, branches_with_if,
+    atom_nat, binding, binding_with_index, branches_with_if,
     domain::{compatible, Atom, Domain, Domains, Locals},
+    expr_structurally_eq,
     normalize::{opaque_recursive_def_vars, Normalizer},
-    variable, Branch, CheckSpec, FieldProjection,
+    ordinary_unchanged, variable, Branch, CheckSpec, FieldProjection,
 };
 
 const MAX_CAP: i128 = (i32::MAX as i128) - 1;
@@ -273,14 +274,6 @@ fn build_view(program: &Program, counters: &[CounterSpec], span: Span) -> Expr {
     Expr::new(ExprKind::Tuple(values), span)
 }
 
-pub(super) fn ordinary_unchanged(e: &Expr) -> bool {
-    match &*e.kind {
-        ExprKind::Var(_) => true,
-        ExprKind::Tuple(es) => es.iter().all(ordinary_unchanged),
-        _ => false,
-    }
-}
-
 pub(super) fn required_cap(op: B, thresh: i128, reversed: bool) -> Option<i128> {
     let norm_op = if reversed {
         match op {
@@ -302,11 +295,6 @@ pub(super) fn required_cap(op: B, thresh: i128, reversed: bool) -> Option<i128> 
         _ => return None,
     };
     (req <= MAX_CAP).then_some(req)
-}
-
-pub(super) fn atom_nat(domains: &Domains, e: &Expr) -> Option<i128> {
-    let Atom::Num(n) = domains.atom_value(e)? else { return None };
-    (0..=i128::from(i32::MAX)).contains(&n).then_some(n)
 }
 
 pub(super) fn is_index_in_domain(domains: &Domains, idx: &Expr, keys: &BTreeSet<Atom>, locals: &Locals) -> bool {
@@ -882,28 +870,6 @@ impl Checker<'_> {
             }
             _ => false,
         }
-    }
-}
-
-pub(super) fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
-    match (&*a.kind, &*b.kind) {
-        (ExprKind::Var(x), ExprKind::Var(y)) => x == y,
-        (ExprKind::Local(x), ExprKind::Local(y)) => x == y,
-        (ExprKind::Const(x), ExprKind::Const(y)) => x == y,
-        (ExprKind::Num(x), ExprKind::Num(y)) => x == y,
-        (ExprKind::Str(x), ExprKind::Str(y)) => x == y,
-        (ExprKind::Bool(x), ExprKind::Bool(y)) => x == y,
-        (ExprKind::Tuple(xs), ExprKind::Tuple(ys)) | (ExprKind::SetEnum(xs), ExprKind::SetEnum(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| expr_structurally_eq(x, y))
-        }
-        (ExprKind::Field { record: r1, field: f1 }, ExprKind::Field { record: r2, field: f2 }) => f1 == f2 && expr_structurally_eq(r1, r2),
-        (ExprKind::FnApp { func: f1, args: a1 }, ExprKind::FnApp { func: f2, args: a2 }) => {
-            a1.len() == a2.len() && expr_structurally_eq(f1, f2) && a1.iter().zip(a2).all(|(x, y)| expr_structurally_eq(x, y))
-        }
-        (ExprKind::Builtin { op: o1, args: a1 }, ExprKind::Builtin { op: o2, args: a2 }) => {
-            o1 == o2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_structurally_eq(x, y))
-        }
-        _ => false,
     }
 }
 

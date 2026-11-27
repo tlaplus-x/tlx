@@ -19,7 +19,7 @@ use super::{
     binding, branches,
     domain::{compatible, Domain, Domains, Locals},
     normalize::Normalizer,
-    unchanged, variable, Branch, FieldProjection,
+    ordinary_unchanged, unchanged, variable, Branch, FieldProjection,
 };
 
 /// Prove a finite summary for one history, retaining concrete execution and
@@ -277,13 +277,5 @@ fn interval_end(e: &Expr) -> Option<&Expr> {
     match &*e.kind {
         ExprKind::Builtin { op: B::DotDot, args } if args.len() == 2 && matches!(&*args[0].kind, ExprKind::Num(1)) => Some(&args[1]),
         _ => None,
-    }
-}
-
-fn ordinary_unchanged(e: &Expr) -> bool {
-    match &*e.kind {
-        ExprKind::Var(_) => true,
-        ExprKind::Tuple(es) => es.iter().all(ordinary_unchanged),
-        _ => false,
     }
 }

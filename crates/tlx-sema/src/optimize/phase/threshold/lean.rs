@@ -12,12 +12,13 @@ use tlx_front::cfg::Config;
 
 use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit, Program};
 
-use super::{atom_nat, expr_structurally_eq, ordinary_unchanged, required_cap, CounterKind, CounterSpec};
+use super::{required_cap, CounterKind, CounterSpec};
 use crate::optimize::phase::{
-    binding,
+    atom_nat, binding,
     domain::{Atom, Domains},
+    expr_structurally_eq,
     normalize::opaque_recursive_def_vars,
-    variable, Branch, CheckSpec, OpenCert,
+    ordinary_unchanged, variable, Branch, CheckSpec, OpenCert,
 };
 
 #[derive(Clone, Debug)]

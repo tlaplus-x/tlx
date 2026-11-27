@@ -1,5 +1,6 @@
 //! Finite filters and quantified deadline observations. Filter predicates stay
 //! explicit in Lean; only consumers of their exact selected sets are leaves.
+use super::super::super::max_local;
 use super::{fold, Emitter};
 use crate::{builtins::Builtin as B, hir::*, visit};
 
@@ -87,16 +88,11 @@ impl Emitter<'_, '_> {
     }
 
     pub(super) fn filtered_consumer(&mut self, e: &Expr, observation: bool) -> Option<String> {
-        // No hole is introduced under a binder. Above all referenced locals
-        // (including enumerated scopes), these IDs cannot capture source uses.
-        fn max_local(e: &Expr, max: &mut u32) {
-            if let ExprKind::Local(l) = &*e.kind {
-                *max = (*max).max(l.0);
-            }
-            visit::children(e, &mut |child| max_local(child, max));
-        }
+        // No hole is introduced under a binder. Above all referenced and
+        // declared locals (including enumerated scopes), these IDs cannot
+        // capture source uses.
         let mut local = self.scope.iter().map(|(l, _)| l.0).max().unwrap_or(0);
-        max_local(e, &mut local);
+        local = local.max(max_local(e));
         let mut next_local = local.checked_add(1)?;
         let mut inputs = Inputs::default();
         let masked = self.mask_filters(e, observation, &mut next_local, &mut inputs)?;

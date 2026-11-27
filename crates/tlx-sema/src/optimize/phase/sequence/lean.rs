@@ -1,5 +1,5 @@
 //! Lower the actual length-only slice, retaining its branch choices and events.
-use super::super::max_local;
+use super::super::{max_local, mentions_vars};
 use std::fmt::Write;
 
 use super::super::{binding, variable, Branch};
@@ -155,12 +155,7 @@ impl Emitter<'_> {
     }
 
     fn mentions(&self, e: &Expr) -> bool {
-        if matches!(&*e.kind, ExprKind::Var(v) if self.vars.contains(v)) {
-            return true;
-        }
-        let mut found = false;
-        visit::children(e, &mut |e| found |= self.mentions(e));
-        found
+        mentions_vars(e, self.vars)
     }
 
     fn mask(&self, e: &Expr, lengths: bool, next: &mut u32, holes: &mut Vec<(LocalId, usize)>) -> Option<Expr> {

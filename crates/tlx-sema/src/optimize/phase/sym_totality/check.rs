@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::super::ordinary_unchanged;
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, Shape, TotalityChecker, MAX_I32_U32};
 use crate::{builtins::Builtin as B, hir::*};
@@ -158,7 +159,7 @@ impl<'a> TotalityChecker<'a> {
                 true
             }
             ExprKind::Builtin { op: B::Unchanged, args } if allow_prime && args.len() == 1 => {
-                if is_var_frame(&args[0]) {
+                if ordinary_unchanged(&args[0]) {
                     let mut frame_vars = BTreeSet::new();
                     collect_var_frame(&args[0], &mut frame_vars);
                     if frame_vars.iter().all(|v| !bound_targets.contains(v)) {

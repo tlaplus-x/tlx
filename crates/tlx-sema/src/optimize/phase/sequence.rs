@@ -11,7 +11,7 @@ use super::{
     binding, branches,
     domain::{Domain, Domains},
     normalize::Normalizer,
-    unchanged, variable, Branch, FieldProjection,
+    ordinary_unchanged, unchanged, variable, Branch, FieldProjection,
 };
 
 /// Prove a length-only key for top-level sequences. All observations must be
@@ -108,18 +108,10 @@ impl Proof<'_> {
         b.terms.iter().all(|e| match &*e.kind {
             ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 && variable(&args[0], primed) == Some(self.v) => true,
             ExprKind::Builtin { op: B::Unchanged, args } if primed && args.len() == 1 && unchanged(&args[0], self.v) == 1 => {
-                Self::unchanged(&args[0])
+                ordinary_unchanged(&args[0])
             }
             _ => self.read(e),
         })
-    }
-
-    fn unchanged(e: &Expr) -> bool {
-        match &*e.kind {
-            ExprKind::Var(_) => true,
-            ExprKind::Tuple(es) => es.iter().all(Self::unchanged),
-            _ => false,
-        }
     }
 
     // Transfers preserve length equivalence. Appended expressions are still

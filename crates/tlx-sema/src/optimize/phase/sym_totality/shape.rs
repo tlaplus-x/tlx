@@ -832,14 +832,6 @@ pub(super) fn shape_is_exact_cup_scalar(s: &Shape) -> bool {
     }
 }
 
-pub(super) fn is_var_frame(e: &Expr) -> bool {
-    match &*e.kind {
-        ExprKind::Var(_) => true,
-        ExprKind::Tuple(es) => es.iter().all(is_var_frame),
-        _ => false,
-    }
-}
-
 pub(super) fn collect_var_frame(e: &Expr, out: &mut BTreeSet<VarId>) {
     match &*e.kind {
         ExprKind::Var(v) => {

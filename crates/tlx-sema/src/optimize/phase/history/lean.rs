@@ -6,9 +6,9 @@ mod feedback;
 
 use std::{fmt::Write, sync::Arc};
 
-use super::super::{binding, unchanged, variable, Branch};
+use super::super::{binding, mentions_var, unchanged, variable, Branch};
 use super::{interval_end, one_local};
-use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
+use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal};
 
 pub(super) fn emit(
     var: VarId,
@@ -142,12 +142,7 @@ impl<'a> Emitter<'a> {
     }
 
     pub(in super::super) fn independent(&self, e: &Expr) -> bool {
-        if matches!(&*e.kind, ExprKind::Var(v) if *v == self.var) {
-            return false;
-        }
-        let mut valid = true;
-        visit::children(e, &mut |e| valid &= self.independent(e));
-        valid
+        !mentions_var(e, self.var)
     }
 
     fn atom(&mut self, e: &Expr) -> Option<usize> {

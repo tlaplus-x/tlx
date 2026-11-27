@@ -1,7 +1,8 @@
 //! Connected rule-model certificates. Unsupported applications are refused;
 //! independent HIR leaves cannot access the forgotten allocation magnitude.
+use super::super::mentions_var;
 use super::{binding, syntax, variable, Branch, Family, OrderedPlan};
-use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal, visit};
+use crate::{builtins::Builtin as B, hir::*, optimize::lean::literal};
 use std::fmt::Write;
 
 pub(super) fn emit(
@@ -119,12 +120,7 @@ struct Emitter {
 }
 impl Emitter {
     fn independent(&self, e: &Expr) -> bool {
-        if matches!(&*e.kind, ExprKind::Var(v) if *v == self.frontier) {
-            return false;
-        }
-        let mut valid = true;
-        visit::children(e, &mut |child| valid &= self.independent(child));
-        valid
+        !mentions_var(e, self.frontier)
     }
 
     fn branch(&mut self, branch: &Branch, primed: bool) -> Option<String> {
