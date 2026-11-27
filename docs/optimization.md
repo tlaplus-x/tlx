@@ -58,9 +58,26 @@ negative mutation checks are explicit.
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, `FieldSymCertificate.lean`, and `ThresholdSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure, phase-dependent field masking, or in-place threshold-counter saturation composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure, phase-dependent fields, or threshold counters and the corresponding symmetry certificate matches the exact installed `VIEW` |
 | Counter export and cleanup pipeline | `PipelineCertificate.lean`: closed natural-number transition IR, inductive singleton/interval domains, and multi-pass composition | Enabled in `tlx optimize` |
 
-State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and pure zero-arity
-`CONSTANT C <- Def` substitutions are covered across all certified checking projections and
-automatic symmetry families via connected `ConstrainedCertificate` proofs. `ACTION_CONSTRAINT`
+State `CONSTRAINT` predicates, implied-init `PROPERTY` conjuncts, and `.cfg` substitutions are
+covered across all certified checking projections and automatic symmetry families via connected
+`ConstrainedCertificate` proofs. Besides pure zero-arity `CONSTANT C <- Def`, a certified lowering
+applies the pure, non-recursive, arity-preserving **definition overrides** the runtime applies:
+`Def <- OtherDef` (including builtin definitions such as `Nat <- BoundedNat`), parameterized
+`CONSTANT C(_, ...) <- Def`, and chains `A <- B <- C` (resolved to the terminal definition, cycles
+refused). The opaque recursive dependency walk used by the projection rules follows the same
+redirects, so an override cannot hide a live variable. Each applied use site is recorded as a
+`defSubstApplied` expansion and located at its own occurrence in the syntactic HIR of the
+normalized model formula that the certificate lowers (`defSubstModelHIR`, with
+`defSubstModelPrefix`/`Suffix`). Lean checks the declared-vs-applied equality
+(`def_subst_bindings_match`) and the exact `++` decomposition by `rfl`
+(`def_subst_model_slice_<i>`); the concrete system is guarded by their conjunction
+(`before := if overrideGuard then <model> else <empty>`) and `override_consistent` discharges the
+guard, so `certificate` and the generated `certificate_with_overrides` theorem consume the override
+records rather than sitting next to them. A declared expansion that the lowering did not apply, one
+that does not occur in the normalized model, or a recursive replacement target refuses
+certification. Value overrides
+(`Def = value`), module-scoped overrides, impure or recursive replacements, and arity changes
+remain outside the certified subset. `ACTION_CONSTRAINT`
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
 `ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `FieldSymCertificate`,
@@ -73,8 +90,9 @@ as globally observed so its value survives at both endpoints. `Ordered`, `Nested
 retained core state, refusing any read of a projected allocation magnitude, rank pattern,
 live-version table, or projected counter. `Length`, `History`, `Age`, and
 `AgeHistory` still fail closed when action constraints or action properties are present.
-Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and configuration operator or
-builtin overrides (e.g., `Nat <- NatOverride`) remain outside the certified checking subset.
+Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = value` overrides, and
+module-scoped/cyclic/impure/arity-changing `<-` overrides remain outside the certified checking
+subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
 projection. (A declared `SYMMETRY` may still be enlarged in the default mode by certified
 automatic symmetry; see [reductions.md](reductions.md) section 2.6.)

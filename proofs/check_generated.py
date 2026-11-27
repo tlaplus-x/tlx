@@ -61,6 +61,16 @@ DEFAULT_CASES = (
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedLive", "check", "proofs/ordered/LiveVersions.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedErasedSymmetry", "check", "proofs/symmetry/Erased.tla", None, ("-interp", "-optimize"), (0,)),
+    ("GeneratedErasure", "check", "proofs/symmetry/Override.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
+    (
+        "GeneratedErasure",
+        "check",
+        "proofs/symmetry/Override.tla",
+        "CONSTANTS Proc = {p1, p2, p3}\n          B <- Le\n          Ok <- Bound\n          Nat <- SmallNat\n"
+        "INIT Init\nNEXT Next\nCONSTRAINT Inv\nCHECK_DEADLOCK FALSE\n",
+        ("-interp", "-optimize", "-noautosymmetry"),
+        (0,),
+    ),
     ("GeneratedErasedEquivSymmetry", "check", "proofs/symmetry/ErasedMultiKey.tla", None, ("-interp", "-optimize"), (0,)),
     ("GeneratedThresholdCounter", "check", "proofs/counter/ThresholdProtocol.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),
     ("GeneratedFieldSymmetry", "check", "proofs/field/ActionChecks.tla", None, ("-interp", "-optimize"), (0,)),
@@ -235,6 +245,14 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
     has_const_expanded = has_decl_line(gen_block, "def constSubstExpanded (i : Fin ConstSubstCount) : String :=")
     if has_const_declared != has_const_expanded:
         raise RuntimeError(f"{path}: mismatched constSubstDeclared/constSubstExpanded declarations")
+    has_def_declared = has_decl_line(gen_block, "def defSubstDeclared (i : Fin DefSubstCount) : String :=")
+    has_def_canonical = has_decl_line(gen_block, "def defSubstAppliedCanonical (i : Fin DefSubstCount) : String :=")
+    has_def_applied = has_decl_line(gen_block, "def defSubstApplied (i : Fin DefSubstCount) : String :=")
+    has_def_model = has_decl_line(gen_block, "def defSubstModelHIR (i : Fin DefSubstCount) : String :=")
+    has_def_prefix = has_decl_line(gen_block, "def defSubstModelPrefix (i : Fin DefSubstCount) : String :=")
+    has_def_suffix = has_decl_line(gen_block, "def defSubstModelSuffix (i : Fin DefSubstCount) : String :=")
+    if len({has_def_declared, has_def_canonical, has_def_applied, has_def_model, has_def_prefix, has_def_suffix}) != 1:
+        raise RuntimeError(f"{path}: mismatched definition-override tables")
 
     theorems = THEOREMS | ({"runtime_key_equivalent"} if namespace in {"GeneratedOrdered", "GeneratedNested", "GeneratedLive"} else set())
     if namespace in {
@@ -274,6 +292,12 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
         theorems |= {"const_subst_bindings_match", "const_subst_sound"}
         if is_constrained:
             theorems |= {"const_subst_constrained_sound"}
+    if has_def_applied:
+        count = int(re.search(r"abbrev DefSubstCount : Nat := (\d+)", gen_block)[1])
+        if count == 0:
+            raise RuntimeError(f"{path}: empty override obligation")
+        theorems |= {f"def_subst_model_slice_{i}" for i in range(count)}
+        theorems |= {"def_subst_bindings_match", "certificate_with_overrides"}
 
     axioms = check_positive(lean, path, namespace, theorems, lean_pool) if run_positive else None
     mutated_sources = []
@@ -521,11 +545,15 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     lambda _: "def after := { (model sem).reduced with initial := fun _ => False }",
                     "discarded live-version initialization",
                 )
-            add_gen_decl_mutation(
-                after_pat,
-                lambda _: "def after := { (model sem).reduced with safe := fun _ => True }",
-                "changed reduced observation",
-            )
+            if not is_constrained:
+                # A constrained certificate's obligations run through
+                # `constrainedAfter`; the uncoupled `after` record may be unused
+                # there, so the mutation would be inert rather than rejected.
+                add_gen_decl_mutation(
+                    after_pat,
+                    lambda _: "def after := { (model sem).reduced with safe := fun _ => True }",
+                    "changed reduced observation",
+                )
             if is_constrained:
                 constrained_pat = r"^def constrainedAfter := \(model sem\)\.constrainedReduced$"
                 for field_expr, label in (
@@ -550,6 +578,20 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                     lambda _: '  (hModel : sys (fun _ => eval "") = before sem) :',
                     "disconnected constant substitution model expansion",
                 )
+            if has_def_applied:
+                for fn, label in (
+                    ("defSubstDeclared", "mismatched declared override expansion"),
+                    ("defSubstAppliedCanonical", "mismatched canonical applied expansion"),
+                    ("defSubstApplied", "mismatched applied override expansion"),
+                    ("defSubstModelHIR", "mismatched model formula record"),
+                    ("defSubstModelPrefix", "mismatched model formula prefix"),
+                    ("defSubstModelSuffix", "mismatched model formula suffix"),
+                ):
+                    add_gen_decl_mutation(
+                        rf'^(def {fn} \(i : Fin DefSubstCount\) : String :=\n(?:  .*\n)*?  *if i\.val = 0 then )"((?:[^"\\]|\\.)*)"( else "")$',
+                        lambda m: f'{m.group(1)}"{m.group(2)}_mismatch"{m.group(3)}',
+                        label,
+                    )
 
     return namespace, theorems, axioms, mutated_sources
 
@@ -710,6 +752,8 @@ def generate_default_certificates(tlx, workdir):
     missing = set(SUPPORTED_NAMESPACES) - covered
     if missing:
         raise RuntimeError(f"default certificate suite does not cover namespaces: {sorted(missing)}")
+    if not any("def defSubstApplied" in cert.read_text() for cert in generated):
+        raise RuntimeError("default certificate suite does not exercise a .cfg override obligation")
     return generated
 
 

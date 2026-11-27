@@ -249,13 +249,20 @@ fn observations_and_temporal_checks_keep_the_full_graph() {
         (format!("{CFG}ACTION_CONSTRAINT ActionBound\n"), 0),
         (format!("{CFG}VIEW Observed\n"), 0),
         (format!("{CFG}PROPERTY Live\n"), 13),
-        (format!("{CFG}CONSTANT Flip <- Idle\n"), 0),
     ] {
         let dir = tlx_testkit::TempDir::with_spec("projection-observations", PROJECTION_SPEC, &cfg);
         let run = tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp", "-noautosymmetry"]).dir(&dir).run();
         assert_eq!(run.code, expected, "{}", run.text());
         assert!(!run.stdout.contains("unobserved-state-projection"), "{}", run.text());
     }
+    // A pure, arity-preserving `.cfg` definition override permits a certified
+    // projection: `Flip <- Idle` is applied by the lowering, and the unobserved
+    // `tag` is erased.
+    let dir = tlx_testkit::TempDir::with_spec("projection-override", PROJECTION_SPEC, &format!("{CFG}CONSTANT Flip <- Idle\n"));
+    let run = tlx_testkit::tlx_default!().check("Counter.tla").args(["-optimize", "-interp", "-noautosymmetry"]).dir(&dir).run();
+    assert_eq!(run.code, 0, "{}", run.text());
+    assert!(run.stdout.contains("unobserved-state-projection (tag;"), "{}", run.text());
+
     // Checking only `TagInv` observes `tag` while leaving `x` unobserved with total
     // arithmetic update `x' = 1 - x`, so `x` is erased and `TagInv` still fails concretely.
     let dir = tlx_testkit::TempDir::with_spec("projection-tag-only", PROJECTION_SPEC, &CFG.replace("INVARIANT Inv", "INVARIANT TagInv"));
@@ -317,5 +324,74 @@ Inv == x \in {0, 1}
                 run.text()
             );
         }
+    }
+}
+
+#[test]
+fn override_hidden_live_counter_is_not_projected() {
+    // `OK <- Bound` makes the recursive helper read `x`, but the helper is kept
+    // opaque by the threshold rule. The override must be resolved in the opaque
+    // dependency walk, or the projection forgets `x` and misses the violation.
+    let tla = r#"---- MODULE HiddenCounter ----
+EXTENDS Naturals
+VARIABLE x
+OK == TRUE
+Bound == x < 5
+RECURSIVE Help(_)
+Help(n) == IF n = 0 THEN OK ELSE Help(n - 1)
+Init == x = 0
+Next == x' = x + 1
+Inv == Help(0)
+====
+"#;
+    let cfg = "CONSTANT OK <- Bound\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("override-hidden-counter", tla, cfg);
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let run = tlx_testkit::tlx_default!()
+            .check("HiddenCounter.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 12, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("Invariant Inv is violated"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("6 distinct states found"), "{tier}: {}", run.text());
+        assert!(!run.stdout.contains("threshold-counter-projection"), "{tier}: {}", run.text());
+    }
+}
+
+#[test]
+fn fn_fold_override_is_not_bypassed() {
+    // `Sum` is a recursive function-like operator; `Sum <- BadSum` must be
+    // applied by the fold path too, or the projection forgets `tag` and misses
+    // the invariant violation at tag = 5.
+    let tla = r#"---- MODULE FnFoldHide ----
+EXTENDS Naturals
+VARIABLE x, tag
+RECURSIVE Sum(_)
+Sum(S) == IF S = {} THEN 0 ELSE LET e == CHOOSE y \in S : TRUE IN 1 + Sum(S \ {e})
+BadSum(S) == tag
+Init == x = 0 /\ tag = 0
+Next == x' = 1 - x /\ tag' = IF tag < 5 THEN tag + 1 ELSE 5
+Inv == Sum({1}) < 5
+====
+"#;
+    let cfg = "CONSTANT Sum <- BadSum\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("fn-fold-override", tla, cfg);
+    for (tier, args, env) in tlx_testkit::cli::TIERS {
+        let run = tlx_testkit::tlx_default!()
+            .check("FnFoldHide.tla")
+            .args(args)
+            .args(["-optimize", "-noautosymmetry"])
+            .envs(env.iter().copied())
+            .dir(&dir)
+            .timeout(Duration::from_secs(60))
+            .run();
+        assert_eq!(run.code, 12, "{tier}: {}", run.text());
+        assert!(run.stdout.contains("Invariant Inv is violated"), "{tier}: {}", run.text());
+        assert!(run.stdout.contains("6 distinct states found"), "{tier}: {}", run.text());
+        assert!(!run.stdout.contains("unobserved-state-projection (tag;"), "{tier}: {}", run.text());
     }
 }

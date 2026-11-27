@@ -39,9 +39,11 @@ impl InterpModel {
         let cfg = &self.ip.cfg;
         tlx_sema::optimize::cfg_constants_supported(&self.ip.prog, cfg)
             && cfg.constants.iter().all(|b| match b {
-                ConstBinding::Value { name, module: None, .. } | ConstBinding::Subst { name, module: None, .. } => {
-                    self.ip.root_def(name).is_none()
-                }
+                // `Def = value` still needs a value-override certificate.
+                ConstBinding::Value { name, module: None, .. } => self.ip.root_def(name).is_none(),
+                // Pure definition and parameterized-constant substitutions are
+                // resolved and certified by `cfg_constants_supported`.
+                ConstBinding::Subst { module: None, .. } => true,
                 _ => false,
             })
     }

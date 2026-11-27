@@ -188,3 +188,33 @@ variables, unsupported symmetry shapes and other projection kinds refuse
 composition. Existing user VIEW/SYMMETRY declarations retain the TLC path. Source
 lowering, domain/totality inference (`sym_totality`), independent semantic leaves,
 group closure and runtime projection/canonicalization remain trusted.
+
+## `.cfg` definition overrides
+
+[Override.tla](Override.tla) ([Override.cfg](Override.cfg)) is an unchanged wrapper
+model whose configuration replaces the pure operators `Ok <- Bound` and
+`B <- Le` plus the builtin definition `Nat <- SmallNat`. The certified lowering
+follows the replacement bodies (the shadowed `Ok == v < 2` would stop at 2; the
+configured `Bound == v <= 2` reaches 3), so `-tlc` and `-optimize` agree on 145
+generated / 64 distinct states while `tag` is erased, and automatic symmetry reduces
+the same model to 46 / 20.
+
+Every applied use site is recorded as a `defSubstApplied` expansion, located in the
+syntactic HIR of the normalized model formula that the certificate lowers
+(`defSubstModel` with a `defSubstModelPrefix`/`Suffix` split), and checked by Lean
+with a `++` decomposition (`def_subst_model_slice_<i>`). The generated
+`certificate_with_overrides` theorem conjoins those decompositions with the ordinary
+and constrained certificates, so the override connection is part of the certified
+result. A declaration that the lowering did not apply, or an expansion that does not
+occur in the normalized model, refuses certification; value, module-scoped, cyclic,
+impure and arity-changing overrides stay refused.
+
+```sh
+./target/release/tlx check proofs/symmetry/Override.tla -config proofs/symmetry/Override.cfg -tlc
+./target/release/tlx check proofs/symmetry/Override.tla -config proofs/symmetry/Override.cfg -optimize -noautosymmetry
+./target/release/tlx check proofs/symmetry/Override.tla -config proofs/symmetry/Override.cfg
+```
+
+`python3 proofs/check_generated.py --lean lean --tlx target/release/tlx --negative`
+audits the override tables and requires mutations of the applied expansion, the model
+formula record, and its prefix/suffix to be rejected by Lean.

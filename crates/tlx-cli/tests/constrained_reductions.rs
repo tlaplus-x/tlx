@@ -602,7 +602,7 @@ Limit == \A i \in {0} : (2147483647 + Len(s)) >= 0
 }
 
 #[test]
-fn refuses_impure_const_subst_and_builtin_override_across_all_tiers() {
+fn refuses_impure_subst_and_certifies_pure_builtin_override_across_all_tiers() {
     let effect_subst_tla = r#"---- MODULE UnusedEffectSubstCli ----
 EXTENDS Naturals, TLC
 CONSTANT C
@@ -646,23 +646,31 @@ CONSTANT Nodes
 VARIABLE state
 SmallNat == 0..2
 Init == state = [n \in Nodes |-> 0]
-Next == \E n \in Nodes : state' = [state EXCEPT ![n] = 1 - @]
-Inv == \A n \in Nodes : state[n] \in Nat
+Next == \E n \in Nodes : state[n] \in Nat /\ state' = [state EXCEPT ![n] = 1 - @]
+Inv == \A n \in Nodes : state[n] \in 0..2
 ====
 "#;
-    assert_refused_across_all_tiers(
-        "refusal-override",
+    // A pure, arity-preserving definition override of a builtin (`Nat <- SmallNat`,
+    // as PaxosStore configures) is what the runtime redirects, so automatic
+    // symmetry now certifies it on every tier and records the override obligation.
+    let dir = tlx_testkit::TempDir::with_spec(
+        "accept-pure-override",
         override_tla,
         "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Nat <- SmallNat\nINVARIANT Inv\n",
-        "RefusalOverride.tla",
-        RefusalExpectation {
-            extra_args: &[],
-            expected_code: 0,
-            expected_diag: None,
-            forbidden_opt: "Optimizations: symmetry",
-            expect_rule_algebra_record: false,
-        },
     );
+    for tr in run_all_tiers(&dir, "RefusalOverride.tla", &[], true) {
+        let tier = &tr.tier;
+        assert_eq!(tr.run.code, 0, "{tier}: {}", tr.run.text());
+        assert!(tr.run.stdout.contains("Optimizations: symmetry"), "{tier}: {}", tr.run.text());
+        let mut found = false;
+        if let Ok(entries) = std::fs::read_dir(&tr.proof_dir) {
+            for entry in entries {
+                let lean = std::fs::read_to_string(entry.unwrap().path().join("Optimization.lean")).unwrap();
+                found |= lean.contains("def_subst_model_slice");
+            }
+        }
+        assert!(found, "{tier}: override obligation missing in the generated certificate");
+    }
 }
 
 const ACT_FIELD_TLA: &str = r#"---- MODULE ActField ----

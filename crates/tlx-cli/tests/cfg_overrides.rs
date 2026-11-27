@@ -233,3 +233,56 @@ INVARIANT Inv
         assert!(stdout.contains("Invariant Inv is violated"), "mode {extra:?}: stdout={stdout}");
     }
 }
+
+#[test]
+fn pure_operator_override_certifies_optimize_and_symmetry() {
+    let tla = r#"---- MODULE OverrideCertify ----
+EXTENDS Naturals
+CONSTANT Nodes, Limit
+VARIABLE state, tag
+Ok(n) == state[n] < Limit
+Bound(n) == state[n] < Limit + 1
+Init == state = [n \in Nodes |-> 0] /\ tag = 0
+Next == \E n \in Nodes : Ok(n) /\ state' = [state EXCEPT ![n] = state[n] + 1] /\ tag' = tag
+Inv == \A n \in Nodes : state[n] <= Limit + 1
+====
+"#;
+    let cfg = "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Limit = 2\n  Ok <- Bound\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::new("override-certify");
+    let tla_path = dir.write("OverrideCertify.tla", tla);
+    dir.write("OverrideCertify.cfg", cfg);
+
+    let mut counts = Vec::new();
+    for (tier, args) in
+        [("baseline", &["-tlc", "-interp"][..]), ("interp", &["-interp", "-optimize"][..]), ("compiled", &["-compile", "-optimize"][..])]
+    {
+        let mut cmd = tlx_testkit::tlx_default!();
+        cmd.check(&tla_path)
+            .args(args)
+            .env("TLX_PROOF_DIR", dir.join(format!("proofs-{tier}")))
+            .env("TLX_PARANOID", "1")
+            .dir(&dir)
+            .timeout(std::time::Duration::from_secs(60));
+        let out = cmd.run();
+        assert_eq!(out.code, 0, "{tier}: {}", out.text());
+        let line = out.stdout.lines().find(|l| l.contains(" distinct states found")).unwrap_or_default().to_string();
+        counts.push((tier, line));
+        let cert = std::fs::read_dir(dir.join(format!("proofs-{tier}")))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path().join("Optimization.lean")).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tier != "baseline" {
+            assert!(cert.contains("def_subst_model_slice"), "{tier}: override obligation missing");
+        }
+    }
+    let distinct = |tier: &str| {
+        let line = &counts.iter().find(|(t, _)| *t == tier).unwrap().1;
+        line.split(" distinct states found").next().unwrap().rsplit(' ').next().unwrap().parse::<u64>().unwrap()
+    };
+    let base = distinct("baseline");
+    assert_eq!(distinct("interp"), base, "interp -optimize changed the distinct count: {counts:?}");
+    assert_eq!(distinct("compiled"), base, "compiled -optimize changed the distinct count: {counts:?}");
+}

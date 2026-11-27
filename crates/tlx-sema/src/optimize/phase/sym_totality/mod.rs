@@ -479,14 +479,24 @@ pub(crate) fn cfg_overrides_or_tables(program: &Program, cfg: &Config) -> bool {
 
 /// Iteratively verify that `root_def` is transitively pure through all called
 /// definitions, `LET` bindings, operator arguments, and referenced substituted
-/// constants, with cycle handling and a bounded work budget.
-fn def_is_pure(program: &Program, cfg: &Config, root_def: DefId, budget: &mut usize) -> bool {
+/// constants, with cycle handling and a bounded work budget. `redirect` is the
+/// `.cfg` definition-override map: an overridden operator is checked through
+/// the body that actually replaces it, so a pure wrapper cannot hide an
+/// effectful definition that runs in its place.
+pub(in crate::optimize::phase) fn def_is_pure(
+    program: &Program,
+    cfg: &Config,
+    redirect: &HashMap<DefId, DefId>,
+    root_def: DefId,
+    budget: &mut usize,
+) -> bool {
     use crate::builtins::Effect;
     let mut visited_defs = BTreeSet::new();
     let mut visited_consts = BTreeSet::new();
     let mut stack: Vec<Expr> = Vec::new();
 
     let push_def = |did: DefId, visited_defs: &mut BTreeSet<DefId>, stack: &mut Vec<Expr>| -> bool {
+        let did = *redirect.get(&did).unwrap_or(&did);
         let d = &program.defs[did.idx()];
         if let Some(op) = d.builtin {
             return op.metadata().effect == Effect::Pure;
@@ -537,17 +547,21 @@ fn def_is_pure(program: &Program, cfg: &Config, root_def: DefId, budget: &mut us
                     }
                 }
                 OpRef::Const(c) => {
+                    let arity = program.consts[c.idx()].arity;
                     let name = &program.consts[c.idx()].name;
                     let Some(target) = cfg.last_constant_subst(name) else {
                         return false;
                     };
                     if visited_consts.insert(*c) {
-                        match program.lookup_resolved_root(target) {
-                            Some(RootSymbol::Def(d)) => {
+                        match super::resolve_override_name(program, target) {
+                            // A parameterized `CONSTANT C(...) <- G` accepts only a
+                            // definition of exactly that arity.
+                            Some(super::ConstSubstTarget::Def(d)) if program.defs[d.idx()].params.len() == arity => {
                                 if !push_def(d, &mut visited_defs, &mut stack) {
                                     return false;
                                 }
                             }
+                            Some(super::ConstSubstTarget::PureBuiltin(..) | super::ConstSubstTarget::Const(_)) if arity == 0 => {}
                             _ => return false,
                         }
                     }
@@ -588,11 +602,14 @@ fn def_is_pure(program: &Program, cfg: &Config, root_def: DefId, budget: &mut us
 }
 
 /// True iff every constant binding in `cfg` is either an unqualified value binding on a
-/// non-override constant or an unqualified zero-arity `CONSTANT C <- target` substitution
-/// targeting a pure, non-`LET` zero-arity root definition or zero-arity constant.
+/// non-override constant, an unqualified zero-arity `CONSTANT C <- target` substitution
+/// targeting a pure, non-`LET` zero-arity root definition or zero-arity constant, or a
+/// pure, non-recursive, arity-preserving definition override (`F <- G`,
+/// `CONSTANT C(...) <- G`) that [`cfg_def_redirects`] resolved.
 pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
     let any_non_let_def =
         |target: &str| program.defs.iter().enumerate().any(|(i, d)| &*d.name == target && !program.def_is_let(DefId(i as u32)));
+    let Some(redirect) = super::const_subst::cfg_def_redirects(program, cfg) else { return false };
     let mut purity_budget = MAX_SUBST_WORK;
     cfg.constants.iter().all(|b| match b {
         ConstBinding::Value { name, module, .. } => {
@@ -607,17 +624,32 @@ pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
             if module.is_some() {
                 return false;
             }
-            let valid_lhs = match program.lookup_resolved_root(name) {
-                Some(RootSymbol::Const(cid)) => program.consts[cid.idx()].arity == 0,
+            match program.lookup_resolved_root(name) {
+                Some(RootSymbol::Const(cid)) if program.consts[cid.idx()].arity == 0 => {
+                    match super::resolve_const_subst_name(program, op) {
+                        Some(super::ConstSubstTarget::PureBuiltin(_, _) | super::ConstSubstTarget::Const(_)) => true,
+                        Some(super::ConstSubstTarget::Def(did)) => def_is_pure(program, cfg, &redirect.defs, did, &mut purity_budget),
+                        None => false,
+                    }
+                }
+                // `CONSTANT C(...) <- G`: an operator-valued constant replaced by
+                // a definition of the same arity.
+                Some(RootSymbol::Const(cid)) => {
+                    let arity = program.consts[cid.idx()].arity;
+                    match super::resolve_override_name(program, op) {
+                        Some(super::ConstSubstTarget::Def(did)) if program.defs[did.idx()].params.len() == arity => {
+                            def_is_pure(program, cfg, &redirect.defs, did, &mut purity_budget)
+                        }
+                        _ => false,
+                    }
+                }
+                // `F <- G` on a root definition: arity and purity were checked
+                // while resolving the redirect map.
+                Some(RootSymbol::Def(lhs)) => redirect
+                    .defs
+                    .get(&lhs)
+                    .is_some_and(|&target| program.defs[target.idx()].params.len() == program.defs[lhs.idx()].params.len()),
                 _ => false,
-            };
-            if !valid_lhs {
-                return false;
-            }
-            match super::resolve_const_subst_name(program, op) {
-                Some(super::ConstSubstTarget::PureBuiltin(_, _) | super::ConstSubstTarget::Const(_)) => true,
-                Some(super::ConstSubstTarget::Def(did)) => def_is_pure(program, cfg, did, &mut purity_budget),
-                None => false,
             }
         }
         ConstBinding::OpValue { .. } => false,

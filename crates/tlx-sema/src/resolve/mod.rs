@@ -947,6 +947,28 @@ impl Program {
         ds
     }
 
+    /// [`Program::def_copies`] for a definition whose copies are already
+    /// resolved: the definitions a `.cfg` override of `d` replaces, without
+    /// queueing work on the resolver. Returns `None` when a copy is still
+    /// unresolved, so a caller that analyses or certifies the override fails
+    /// closed instead of inspecting a stale body.
+    pub fn resolved_def_copies(&self, d: DefId) -> Option<Vec<DefId>> {
+        if self.def_is_let(d) || self.entry_of.contains_key(&d) {
+            return Some(vec![d]);
+        }
+        let (module, name) = (self.def_src[d.idx()].module, self.defs[d.idx()].name.clone());
+        let ds: Vec<DefId> = (0..self.defs.len())
+            .map(|i| DefId(i as u32))
+            .filter(|&c| {
+                self.def_src[c.idx()].module == module
+                    && self.defs[c.idx()].name == name
+                    && !self.def_is_let(c)
+                    && !self.entry_of.contains_key(&c)
+            })
+            .collect();
+        ds.iter().all(|&c| !matches!(self.defs[c.idx()].kind, crate::hir::DefKind::Pending)).then_some(ds)
+    }
+
     /// The entry definitions (see `entry_def`) and the definition each one
     /// stands for, in id order.
     pub fn entry_defs(&self) -> Vec<(DefId, DefId)> {
