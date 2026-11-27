@@ -42,6 +42,45 @@ fn store_round_trip() {
 }
 
 #[test]
+fn a_store_created_during_the_removal_of_the_last_one_waits() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// Clears the pause, also if the test fails.
+    struct NoPause;
+    impl Drop for NoPause {
+        fn drop(&mut self) {
+            DROP_PAUSE_US.store(0, Ordering::SeqCst);
+        }
+    }
+
+    let scratch = tlx_testkit::TempDir::new("io-recreate");
+    let dir = scratch.child_path("spill");
+    let spill = spill_in(&dir);
+    let store = spill.store("blocks").unwrap();
+    let sp = spill.clone();
+    let (started, wait) = std::sync::mpsc::channel();
+    let _no_pause = NoPause;
+    DROP_PAUSE_US.store(100_000, Ordering::SeqCst);
+    let dropper = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        drop(store);
+    });
+    wait.recv().unwrap();
+    // (The last store's drop is now removing the directory. A store created
+    // meanwhile must wait for the removal: it would otherwise find this
+    // process's own lock file still flocked, or create the directory only
+    // to have the removal take it back.)
+    std::thread::sleep(Duration::from_millis(20));
+    let next = sp.store("blocks").expect("a store created while the previous directory is removed");
+    drop(next);
+    dropper.join().unwrap();
+    assert!(spill.error().is_none());
+    assert!(spill.dir().is_none());
+    assert!(!dir.exists());
+}
+
+#[test]
 fn panic_removes_owned_spill_resources() {
     let scratch = tlx_testkit::TempDir::new("io-panic");
     let parent = scratch.path().to_path_buf();

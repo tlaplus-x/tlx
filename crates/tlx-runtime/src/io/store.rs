@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use super::{disk_reserve, disk_space, fs_info, Ctx, Dir, IoError};
+use super::{disk_reserve, disk_space, fs_info, Ctx, DirLease, IoError};
 
 /// The unit of checksums: every page of a block has one.
 pub const PAGE: usize = 4096;
@@ -160,8 +160,9 @@ pub struct BlockStore {
     /// `ctx.phys_used` for this store.
     phys_live: AtomicU64,
     ctx: Arc<Ctx>,
-    /// (Keeps the directory while the store exists.)
-    _dir: Arc<Dir>,
+    /// (Keeps the directory while the store exists; gives it back when
+    /// the store is the last user.)
+    _dir: DirLease,
 }
 
 impl BlockStore {
@@ -172,7 +173,7 @@ impl BlockStore {
 
     /// A new file at `path`; with `nocache`, written and read past the page
     /// cache where the system allows (macOS).
-    pub(super) fn create(path: PathBuf, dir: Arc<Dir>, ctx: Arc<Ctx>, nocache: bool) -> Result<BlockStore, IoError> {
+    pub(super) fn create(path: PathBuf, dir: DirLease, ctx: Arc<Ctx>, nocache: bool) -> Result<BlockStore, IoError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
