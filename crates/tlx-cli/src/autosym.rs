@@ -244,10 +244,12 @@ struct Precertified {
 }
 
 /// Apply the proven symmetry of `an` to `model` when it is allowed: the
-/// safety search only (no temporal properties), no declared SYMMETRY, no
-/// VIEW, and no builtin whose output or result depends on the states
-/// explored. Before it is applied, a bounded check of the group runs as a
-/// cross-check of the proof; a witness is an internal error (exit 101).
+/// safety search only (no temporal properties), no VIEW, and no builtin whose
+/// output or result depends on the states explored. A declared `.cfg`
+/// `SYMMETRY` is enlarged when the proven candidates extend it
+/// (`apply_augmented`); otherwise no automatic group is applied. Before an
+/// automatic group is installed, a bounded check of it runs as a cross-check
+/// of the proof; a witness is an internal error (exit 101).
 fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Option<Precertified>) -> Result<Option<Applied>, ExitCode> {
     let forced = tlx_base::knobs::Env::process().string_or_default("TLX_AUTOSYM_FORCE");
     let forced: Vec<&str> = forced.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
@@ -256,6 +258,13 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
         return Ok(None);
     }
     an.force(&forced);
+    if model.ip.cfg.symmetry.is_some() {
+        if let Some(why) = not_applicable_with(model, an, true) {
+            note(&format!("not applied: {why}"));
+            return Ok(None);
+        }
+        return apply_augmented(model, an);
+    }
     if let Some(why) = not_applicable(model, an) {
         note(&format!("not applied: {why}"));
         return Ok(None);
@@ -380,6 +389,144 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
     }
     model.record_symmetry_certificate(certificate);
     Ok(Some(Applied { group: text }))
+}
+
+/// In the default mode, enlarge a declared `.cfg` `SYMMETRY` with additional
+/// automatically proven groups. The declared group must factor as a disjoint
+/// product of full symmetric groups; every added candidate must be a proven
+/// full group disjoint from it, and the combined product must stay within the
+/// certificate emitters' bounds. One connected Lean certificate covers the
+/// whole combined product; without it the declared group stays untouched
+/// (fail closed).
+fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<Applied>, ExitCode> {
+    let declared_factors: Vec<Vec<tlx_value::Sym>> = match model.symmetry_factors() {
+        Some(factors) => factors.into_iter().map(<[tlx_value::Sym]>::to_vec).collect(),
+        None => {
+            note("not applied: the declared SYMMETRY is not a disjoint product of full symmetric groups");
+            return Ok(None);
+        }
+    };
+    let declared_order = declared_factors.iter().fold(1u128, |o, f| o.saturating_mul(order_of(f.len())));
+    if declared_order > MAX_ORDER {
+        note(&format!("not applied: the declared SYMMETRY product has order {declared_order}, above the certificate bound {MAX_ORDER}"));
+        return Ok(None);
+    }
+    let declared_atoms: std::collections::HashSet<tlx_value::Sym> = declared_factors.iter().flatten().copied().collect();
+    let declared_names: Vec<(Vec<String>, String)> =
+        declared_factors.iter().map(|keys| (key_names(keys), declared_factor_text(an, keys))).collect();
+    // Proven full candidates whose elements the declared group does not move.
+    let mut extra: Vec<&autosym::SetResult> = an
+        .proven()
+        .filter(|s| {
+            s.full()
+                && s.candidate.elems.len() <= MAX_KEYS
+                && (2..=MAX_ORDER).contains(&s.group_order())
+                && s.candidate.elems.iter().all(|e| matches!(e, tlx_value::Value::ModelValue(m) if !declared_atoms.contains(m)))
+        })
+        .collect();
+    if extra.is_empty() {
+        note("not applied: no proven symmetry group is disjoint from the declared SYMMETRY");
+        return Ok(None);
+    }
+    // Prefer the largest groups, in cfg order on ties, while the combined
+    // product stays disjoint and within the emitters' bounds.
+    let at = |s: &&autosym::SetResult| an.sets.iter().position(|x| std::ptr::eq(x, *s)).unwrap_or(usize::MAX);
+    extra.sort_by(|a, b| b.group_order().cmp(&a.group_order()).then_with(|| at(a).cmp(&at(b))));
+    let mut used = declared_atoms;
+    let mut chosen: Vec<&autosym::SetResult> = Vec::new();
+    let mut order = declared_order;
+    for s in extra {
+        let keys = candidate_keys(s);
+        let next_order = order.saturating_mul(s.group_order());
+        if declared_factors.len() + chosen.len() + 1 > AUTOSYM_MAX_GROUPS || next_order > MAX_ORDER || keys.iter().any(|m| used.contains(m))
+        {
+            continue;
+        }
+        order = next_order;
+        used.extend(keys);
+        chosen.push(s);
+    }
+    if chosen.is_empty() {
+        note("not applied: no proven symmetry group fits the combined group bounds");
+        return Ok(None);
+    }
+    let mut combined_names: Vec<Vec<String>> = declared_names.iter().map(|(names, _)| names.clone()).collect();
+    let mut text: Vec<String> = declared_names.into_iter().map(|(_, t)| t).collect();
+    let mut factors = declared_factors;
+    for s in &chosen {
+        let keys = candidate_keys(s);
+        combined_names.push(key_names(&keys));
+        text.extend(s.group_text());
+        factors.push(keys);
+    }
+    let Some(certificate) = model.augmented_symmetry_certificate(&combined_names) else {
+        note("not applied: no connected Lean certificate for the declared SYMMETRY superset");
+        return Ok(None);
+    };
+    let added_text = chosen.iter().filter_map(|s| s.group_text()).collect::<Vec<_>>().join(" x ");
+    let extra_gens: Vec<_> = chosen.iter().flat_map(|s| s.generators()).collect();
+    let bounds = Bounds { time: Some(CROSS_CHECK_TIME), ..Bounds::default() };
+    let t0 = Instant::now();
+    let check = symcheck::check_perms(model, extra_gens.clone(), &bounds);
+    stats::phase("auto symmetry cross-check", t0.elapsed());
+    match check {
+        Ok(r) => {
+            if let Some(w) = r.witness {
+                out::error(
+                    code::GENERAL,
+                    &format!(
+                        "Internal error: the symmetry {added_text} that tlx added to the declared SYMMETRY does not hold ({}; permutation {}). Run with -noautosymmetry.",
+                        w.part,
+                        w.permutation
+                    ),
+                );
+                return Err(ExitCode::from(101));
+            }
+        }
+        Err(e) => {
+            note(&format!("not applied: cross-check failed ({})", e.message));
+            return Ok(None);
+        }
+    }
+    if let Err(e) = model.install_augmented_symmetry(factors, extra_gens, certificate) {
+        note(&format!("not applied: {}", e.message));
+        return Ok(None);
+    }
+    Ok(Some(Applied { group: text.join(" x ") }))
+}
+
+/// `n!`, saturating (a full symmetric group over `n` model values).
+fn order_of(n: usize) -> u128 {
+    (1..=n as u128).fold(1u128, |a, k| a.saturating_mul(k))
+}
+
+/// The model values of a proven candidate, in cfg order.
+fn candidate_keys(s: &autosym::SetResult) -> Vec<tlx_value::Sym> {
+    s.candidate
+        .elems
+        .iter()
+        .filter_map(|e| match e {
+            tlx_value::Value::ModelValue(m) => Some(*m),
+            _ => None,
+        })
+        .collect()
+}
+
+fn key_names(keys: &[tlx_value::Sym]) -> Vec<String> {
+    keys.iter().map(|m| m.as_str().to_owned()).collect()
+}
+
+/// TLA+ text of a factor of the declared group: the cfg constant that names
+/// the same model values when there is one, the explicit set otherwise.
+fn declared_factor_text(an: &Analysis, keys: &[tlx_value::Sym]) -> String {
+    let named = an.sets.iter().find(|s| {
+        s.candidate.elems.len() == keys.len()
+            && s.candidate.elems.iter().all(|e| matches!(e, tlx_value::Value::ModelValue(m) if keys.contains(m)))
+    });
+    match named {
+        Some(s) => format!("Permutations({})", s.candidate.name),
+        None => format!("Permutations({{{}}})", keys.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")),
+    }
 }
 
 #[derive(Clone)]
@@ -833,7 +980,14 @@ fn json_string(s: &str) -> String {
 
 /// Why no symmetry is applied to `model` at all, if so.
 fn not_applicable(model: &InterpModel, an: &Analysis) -> Option<String> {
-    if !model.symmetry_maps().is_empty() || model.ip.cfg.symmetry.is_some() {
+    not_applicable_with(model, an, false)
+}
+
+/// Like [`not_applicable`]; `allow_declared` permits a declared `.cfg`
+/// `SYMMETRY` when the caller certifies a superset of it instead of keeping
+/// the declaration verbatim.
+fn not_applicable_with(model: &InterpModel, an: &Analysis, allow_declared: bool) -> Option<String> {
+    if !allow_declared && (!model.symmetry_maps().is_empty() || model.ip.cfg.symmetry.is_some()) {
         return Some("the cfg declares a SYMMETRY".into());
     }
     if model.has_view() && !model.has_automatic_projection() {

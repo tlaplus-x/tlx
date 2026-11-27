@@ -427,12 +427,19 @@ impl InterpModel {
     }
 
     fn symmetry_cert_next(&self) -> Option<Expr> {
+        self.symmetry_cert_next_with(false)
+    }
+
+    /// The next-state relation a symmetry certificate covers. `declared`
+    /// permits a group installed from the cfg's `SYMMETRY` declaration: the
+    /// caller certifies the combined product that includes the declared one
+    /// (`augmented_symmetry_certificate`).
+    fn symmetry_cert_next_with(&self, declared: bool) -> Option<Expr> {
         let cfg = &self.ip.cfg;
         if !self.live.is_empty()
             || (self.has_view() && !self.state_projection)
             || self.ordered_projection.is_some()
-            || !self.group.is_empty()
-            || cfg.symmetry.is_some()
+            || (!declared && (!self.group.is_empty() || cfg.symmetry.is_some()))
             || !self.possible.is_empty()
             || !self.postconditions.is_empty()
             || self.alias.is_some()
@@ -463,6 +470,26 @@ impl InterpModel {
         } else {
             tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups)
         }
+    }
+
+    /// Certify `combined` — the declared `.cfg` `SYMMETRY` factors plus extra
+    /// disjoint full symmetric groups — as one connected product. Fails closed
+    /// unless the declared group factors into full symmetric groups and every
+    /// one of those factors appears verbatim in `combined`, so the certificate
+    /// covers the group actually installed. This does not install it.
+    pub fn augmented_symmetry_certificate(&self, combined: &[Vec<String>]) -> Option<String> {
+        if self.state_projection || self.ip.cfg.symmetry.is_none() {
+            return None;
+        }
+        let declared: Vec<Vec<String>> =
+            self.symmetry_factors()?.into_iter().map(|keys| keys.iter().map(|m| m.as_str().to_owned()).collect()).collect();
+        if !declared.iter().all(|factor| combined.contains(factor)) {
+            return None;
+        }
+        let next = self.symmetry_cert_next_with(true)?;
+        let init_props = self.init_prop_exprs();
+        let spec = self.check_spec(&init_props);
+        tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, combined)
     }
 
     /// Certify a disjoint product of full key permutation groups via the
@@ -613,6 +640,46 @@ Inv == /\ clock \in Nat /\ records \in [{1} -> [created: Nat, payload: {"x"}] \c
         let (rule, _) = m.project_state().unwrap();
         assert_eq!(rule, "relative-age-projection");
         assert!(m.projection_certificate().unwrap().contains("GeneratedAgeHistory"));
+    }
+
+    const DECLARED: &str = r#"---- MODULE Declared ----
+EXTENDS TLC, Naturals, FiniteSets
+CONSTANTS TxId, Key
+VARIABLES tx, key
+Init == tx = [t \in TxId |-> 0] /\ key = [k \in Key |-> 0]
+Next == \/ \E t \in TxId : tx[t] < 1 /\ tx' = [tx EXCEPT ![t] = 1] /\ UNCHANGED key
+        \/ \E k \in Key : key[k] < 1 /\ key' = [key EXCEPT ![k] = 1] /\ UNCHANGED tx
+Inv == \A t \in TxId : tx[t] <= 1 /\ \A k \in Key : key[k] <= 1
+Syn == Permutations(TxId)
+====
+"#;
+
+    #[test]
+    fn an_augmented_certificate_must_cover_the_declared_factors() {
+        let cfg =
+            "CONSTANTS\n  TxId = {t1, t2}\n  Key = {k1, k2}\nSYMMETRY Syn\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+        let dir = tlx_testkit::TempDir::with_spec("declared-augment", DECLARED, cfg);
+        let p = Program::load(&dir.join("Declared.tla"), &[]).unwrap();
+        let ip = Interp::new(p, tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
+        let m = InterpModel::new(ip).unwrap();
+        let declared: Vec<Vec<String>> = m
+            .symmetry_factors()
+            .expect("the declared group factors")
+            .into_iter()
+            .map(|keys| keys.iter().map(|k| k.as_str().to_owned()).collect())
+            .collect();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].len(), 2);
+        let mut combined = declared.clone();
+        combined.push(vec!["k1".to_owned(), "k2".to_owned()]);
+        assert!(m.augmented_symmetry_certificate(&combined).is_some());
+        // The certificate must cover every declared factor: dropping one is refused.
+        assert!(m.augmented_symmetry_certificate(&combined[1..]).is_none());
+        // Without a declared SYMMETRY the certificate is refused outright.
+        let plain = "INIT Init\nNEXT Next\nINVARIANT Inv\nCONSTANTS TxId = {t1, t2} Key = {k1, k2}\n";
+        let p = Program::load(&dir.join("Declared.tla"), &[]).unwrap();
+        let ip = Interp::new(p, tlx_front::cfg::parse_cfg(plain).unwrap()).unwrap();
+        assert!(InterpModel::new(ip).unwrap().augmented_symmetry_certificate(&combined[1..]).is_none());
     }
 
     #[test]

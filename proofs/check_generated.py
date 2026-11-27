@@ -55,6 +55,7 @@ DEFAULT_CASES = (
     ("GeneratedSymmetry", "check", "proofs/symmetry/Keyed.tla", None, ("-interp",), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/KeyedSeven.tla", None, ("-interp",), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/ProductLarge.tla", None, ("-interp",), (0,)),
+    ("GeneratedSymmetry", "check", "proofs/symmetry/DeclaredProduct.tla", None, ("-interp",), (0,)),
     ("GeneratedEquivSymmetry", "check", "proofs/symmetry/KeyValMaps.tla", None, ("-interp",), (0,)),
     ("GeneratedChooseSymmetry", "check", "proofs/symmetry/ChooseSym.tla", None, ("-interp",), (0,)),
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),

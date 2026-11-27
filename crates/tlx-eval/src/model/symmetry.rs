@@ -443,6 +443,12 @@ impl Group {
         Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull).unwrap()
     }
 
+    /// Build a group from disjoint full symmetric-group factors, for a
+    /// certified reduction that enlarges a declared `SYMMETRY`.
+    pub(in crate::model) fn from_factor_sets(factors: Vec<Vec<Sym>>) -> EResult<Group> {
+        Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull)
+    }
+
     fn from_factors_with_fallback(factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> EResult<Group> {
         if factors.is_empty() {
             return Ok(Group::default());

@@ -217,7 +217,10 @@ that application:
    records, bounded sequences/tuples, set comprehensions, `KSubset`, `IsInjective`), or
    choice-irrelevant `CHOOSE` (`ChooseSymCertificate`: unique-witness `CHOOSE`, projected
    uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer
-   set-sum folds).
+   set-sum folds). A declared `.cfg` `SYMMETRY` that already factors into such groups may be
+   enlarged by the same analysis in the default mode, provided one connected certificate
+   covers the whole combined product; `-tlc` and `-noautosymmetry` use the declaration verbatim
+   ([details](docs/reductions.md)).
 2. **Opt-in state projections (`-optimize`).** Installs a certified `VIEW` key while keeping
    concrete states and transitions intact for counterexample replay; each certificate proves
    initialization, successor correspondence, observations, counterexample lifting and deadlock
@@ -251,7 +254,8 @@ Every implemented reduction family has connected rule-IR certificates for its en
 Broader age/history combinations, dynamic allocation containers, identifier-containing version
 payloads and other symmetry combinations remain unavailable without connected certificates.
 Unsupported candidates stay unapplied; another certified rule may still apply. Explicit user
-`VIEW` and `SYMMETRY` declarations retain their TLC behavior.
+`VIEW` declarations retain their TLC behavior; a declared `SYMMETRY` is used verbatim under
+`-tlc` and `-noautosymmetry` and enlarged only under a connected certificate otherwise.
 See [the coverage inventory](docs/optimization.md#proof-coverage).
 
 Optimized checking and certified automatic symmetry always write standalone Lean

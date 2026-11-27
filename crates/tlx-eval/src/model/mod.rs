@@ -174,12 +174,13 @@ pub struct InterpModel {
     /// The order in which TLC prints the variables (computed when first
     /// needed).
     var_order: std::sync::OnceLock<Vec<usize>>,
-    /// A symmetry tlx applies on its own (`apply_symmetry`), checked at
-    /// sampled expanded states under `TLX_SYMMETRY_PARANOID`.
+    /// A symmetry tlx applies on its own (`apply_symmetry`, or the extra
+    /// factors of `install_augmented_symmetry`), checked at sampled expanded
+    /// states under `TLX_SYMMETRY_PARANOID`.
     claim: Option<Arc<Claim>>,
 }
 
-/// A symmetry applied without a declaration, and how often it is checked.
+/// A symmetry applied by tlx on its own, and how often it is checked.
 struct Claim {
     /// The unreduced model.
     plain: InterpModel,
@@ -612,6 +613,33 @@ impl InterpModel {
         Ok(())
     }
 
+    /// Install a certified superset of the declared `.cfg` `SYMMETRY`: the
+    /// disjoint product of full symmetric groups `factors` (which must contain
+    /// every declared factor) and the connected certificate that covers it.
+    /// `extra_gens` are the generators the certificate adds; under
+    /// `TLX_SYMMETRY_PARANOID=N` one expanded state in N is checked against
+    /// them, as in `apply_symmetry`.
+    pub fn install_augmented_symmetry(
+        &mut self,
+        factors: Vec<Vec<Sym>>,
+        extra_gens: Vec<std::collections::HashMap<Sym, Value>>,
+        certificate: String,
+    ) -> EResult<()> {
+        if self.ip.cfg.symmetry.is_none() {
+            return Err(EvalError::new("install_augmented_symmetry requires a declared SYMMETRY"));
+        }
+        let every = tlx_base::knobs::Env::process().opt_num("TLX_SYMMETRY_PARANOID").ok().flatten();
+        let claim = every.filter(|n| *n > 0).map(|every| {
+            let plain = InterpModel { claim: None, ..self.with_fp_mode(FpMode::Plain) };
+            Arc::new(Claim { plain, gens: extra_gens, every, seen: Default::default() })
+        });
+        self.group = symmetry::Group::from_factor_sets(factors)?;
+        self.record_symmetry_certificate(certificate);
+        self.claim = claim;
+        self.fp_mode = FpMode::Reduced;
+        Ok(())
+    }
+
     /// Whether the state being expanded is to be checked against the
     /// symmetry `apply_symmetry` applied (`TLX_SYMMETRY_PARANOID`).
     #[inline]
@@ -639,7 +667,7 @@ impl InterpModel {
                 None => String::new(),
             };
             panic!(
-                "TLX_SYMMETRY_PARANOID: the symmetry applied without a declaration does not hold: {} under the permutation {perm} at state s\n{}\np(s):\n{}{edge}",
+                "TLX_SYMMETRY_PARANOID: the symmetry applied by tlx does not hold: {} under the permutation {perm} at state s\n{}\np(s):\n{}{edge}",
                 d.part,
                 c.plain.render(s),
                 c.plain.render(&d.image)

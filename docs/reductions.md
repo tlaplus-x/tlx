@@ -138,10 +138,11 @@ the same certified group, but it does not use encoded words.
 
 Application happens once, after the model is built and before the search, and only in the default
 mode. Under `-tlc` the analysis runs for its suggestion and nothing is applied, so `-tlc` output is
-unchanged except for that line. A group is not applied when the specification has a declared
-`SYMMETRY`, a user `VIEW`, temporal properties, a state-dependent effect, or an incomplete analysis —
-each reason is reported under `-stats`. Connected certificate coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init
-`PROPERTY`, `[][A]_sub` action `PROPERTY` conjuncts, and pure zero-arity `CONSTANT C <- Def`
+unchanged except for that line. An inferred group is not applied over a user `VIEW`, temporal
+properties, a state-dependent effect, or an incomplete analysis — each reason is reported under
+`-stats`. A declared `.cfg` `SYMMETRY` is handled separately (§2.6). Connected certificate
+coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init `PROPERTY`,
+`[][A]_sub` action `PROPERTY` conjuncts, and pure zero-arity `CONSTANT C <- Def`
 substitutions (emitting `ConstrainedCertificate` theorems when any constrained check is active),
 while excluding temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, operator or
 builtin overrides, and unsupported key operations. Certified unobserved-variable
@@ -185,6 +186,25 @@ by `symcheck`), and offline execution of the `lean` kernel (`tlx check` persists
 owns the shared Lean specification and trust boundary, and
 [certified automatic symmetry](optimization.md#certified-keyed-symmetry) details the lowered symmetry
 rule IRs.
+
+### 2.6 Declared `SYMMETRY` supersets
+
+A `.cfg` `SYMMETRY` declaration is the user's assertion, and tlx keeps it verbatim under `-tlc` and
+`-noautosymmetry`. In the default mode it is also a starting point: when the declared group is already
+a disjoint product of full symmetric groups `S_{n_1} x ... x S_{n_k}` over model values, tlx runs the
+same candidate analysis (§2.1–2.3) and may add proven full groups whose elements the declaration does
+not move. The enlarged product must stay within the certificate bounds (two to seven model values per
+factor, at most `AUTOSYM_MAX_GROUPS` factors and total order at most 5,040), and one connected
+certificate must cover the **whole** combined product — the declared factors included, not just the
+added ones. Only then is the group installed; the `Optimizations:` line names the enlarged product.
+
+Every failure fails closed and leaves the declared group intact, without an error: a declaration that
+does not factor into full symmetric groups (for example a cyclic or custom subgroup), a declared
+product above the certificate bounds, no disjoint proven candidate, or no connected certificate for
+the combined product (for instance because the configuration uses `ALIAS`, `_POSSIBLE`,
+`POSTCONDITION`, or an unsupported operation). The reason is recorded under `-stats`. The bounded
+20 ms generator cross-check (§2.3) covers the added generators; a witness is an internal error
+(exit 101).
 
 ## 3. The labelling contract
 

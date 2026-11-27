@@ -10,6 +10,7 @@ mod common;
 mod age_projection;
 mod atom_type_widening;
 mod autosym;
+mod autosym_augment;
 mod bitset_card;
 mod bundled_modules;
 mod call_semantics;
@@ -72,6 +73,7 @@ fn all_test_files_registered() {
         "archive_elision",
         "atom_type_widening",
         "autosym",
+        "autosym_augment",
         "bitset_card",
         "bundled_modules",
         "call_semantics",
