@@ -64,12 +64,13 @@ Inv == owner \in Proc
         "must reject .cfg value override of anonymous INSTANCE operator"
     );
 
-    // Subst override of an operator imported via anonymous INSTANCE.
+    // A pure substitution of an operator imported via anonymous INSTANCE is
+    // what the runtime applies (`bind_cfg` looks it up in root scope), so the
+    // certified lowering follows the replacement and records the obligation.
     let cfg_subst = parse_cfg("CONSTANT Proc = {p1, p2}\nCONSTANT Flag <- BadFlag\nINIT Init\nNEXT Next\nINVARIANT Inv\n").unwrap();
-    assert!(
-        symmetry_certificate(&prog, &cfg_subst, &init, &next, std::slice::from_ref(&inv), &[vec!["p1".into(), "p2".into()]]).is_none(),
-        "must reject .cfg subst override of anonymous INSTANCE operator"
-    );
+    let cert = symmetry_certificate(&prog, &cfg_subst, &init, &next, std::slice::from_ref(&inv), &[vec!["p1".into(), "p2".into()]])
+        .expect("pure anonymous-INSTANCE substitution must certify the applied replacement");
+    assert!(cert.contains("def_subst_model_slice"), "override obligation missing");
 }
 
 #[test]
@@ -245,4 +246,98 @@ Next == UNCHANGED x
     // INVARIANT naming a 0-ary constant substituted by a 0-ary def -> allowed.
     let cfg = parse_cfg("CONSTANT C <- Ok\nINIT Init\nNEXT Next\nINVARIANT C\n").unwrap();
     assert_eq!(prog.check_cfg_defs(&cfg), None);
+}
+
+fn cert_for(prog: &Program, cfg_src: &str, inv_name: &str) -> Option<String> {
+    let cfg = parse_cfg(cfg_src).unwrap();
+    let init = root_call_prog(prog, "Init");
+    let next = root_call_prog(prog, "Next");
+    let inv = root_call_prog(prog, inv_name);
+    symmetry_certificate(prog, &cfg, &init, &next, std::slice::from_ref(&inv), &[vec!["p1".into(), "p2".into()]])
+}
+
+fn root_call_prog(prog: &Program, name: &str) -> Expr {
+    let Some(RootSymbol::Def(id)) = prog.lookup_resolved_root(name) else {
+        panic!("missing root def {name}");
+    };
+    Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, prog.defs[id.idx()].span)
+}
+
+#[test]
+fn certifies_pure_operator_and_parameterized_constant_overrides() {
+    let tla = r#"---- MODULE OverrideCert ----
+EXTENDS Naturals
+CONSTANTS Proc, F(_, _)
+Same(a, b) == a = b
+VARIABLE owner
+Init == owner \in Proc
+Next == \E p \in Proc : F(owner, p) /\ owner' = p
+Inv == owner \in Proc
+====
+"#;
+    let prog = load_spec(&[("OverrideCert.tla", tla)], "OverrideCert.tla");
+    // `F(owner, p)` replaced by a pure definition: the lowering must follow the
+    // configured body and record the higher-arity obligation.
+    let cert = cert_for(&prog, "CONSTANT Proc = {p1, p2}\nCONSTANT F <- Same\nINIT Init\nNEXT Next\nINVARIANT Inv\n", "Inv")
+        .expect("parameterized constant substitution must certify");
+    assert!(cert.contains("def_subst_model_slice"), "{cert}");
+    assert!(cert.contains("defSubstApplied"), "{cert}");
+    assert!(cert.contains("certificate_with_overrides"), "{cert}");
+
+    // A definition override on a root operator certifies the replacement body.
+    let prog = load_spec(&[("OverrideCert.tla", tla)], "OverrideCert.tla");
+    let cert = cert_for(&prog, "CONSTANT Proc = {p1, p2}\nCONSTANT Same <- F\nINIT Init\nNEXT Next\nINVARIANT Inv\n", "Inv");
+    // `Same <- F` has matching arity; `F` itself is a parameterized constant,
+    // so this binding names no root definition and stays unbound/refused.
+    assert!(cert.is_none(), "binding a parameterized-constant name as a definition must be refused");
+}
+
+#[test]
+fn operator_override_chain_resolves_to_terminal_replacement() {
+    let tla = r#"---- MODULE OverrideChain ----
+EXTENDS Naturals
+CONSTANT Proc
+A == FALSE
+B == TRUE
+C == TRUE
+VARIABLE owner
+Init == owner \in Proc
+Next == owner' \in Proc /\ A
+Inv == owner \in Proc
+====
+"#;
+    let prog = load_spec(&[("OverrideChain.tla", tla)], "OverrideChain.tla");
+    // A -> B -> C; the lowering must use C, not A's or B's body. `A = 3` still
+    // holds because `A` is replaced by `C == 3`; a wrong chain would make it false
+    // but certification here only checks the connected obligation.
+    assert!(
+        cert_for(&prog, "CONSTANT Proc = {p1, p2}\nINIT Init\nNEXT Next\nINVARIANT Inv\n", "Inv").is_some(),
+        "baseline without override must certify"
+    );
+    let cfg = parse_cfg("CONSTANT Proc = {p1, p2}\nCONSTANT A <- C\nINIT Init\nNEXT Next\nINVARIANT Inv\n").unwrap();
+    assert!(tlx_sema::optimize::cfg_constants_supported(&prog, &cfg), "cfg gate must accept the pure override");
+    let cert = cert_for(&prog, "CONSTANT Proc = {p1, p2}\nCONSTANT A <- C\nINIT Init\nNEXT Next\nINVARIANT Inv\n", "Inv")
+        .expect("terminal replacement must certify");
+    assert!(cert.contains("def_subst_model_slice"), "{cert}");
+}
+
+#[test]
+fn refuses_recursive_override_target() {
+    let tla = r#"---- MODULE RecursiveOverrideTarget ----
+EXTENDS Naturals
+VARIABLE x, y
+Orig(n) == TRUE
+RECURSIVE RecY(_)
+RecY(n) == IF n = 0 THEN y < 5 ELSE RecY(n - 1)
+Init == x = 0 /\ y = 0
+Next == x' = x /\ y' = IF y < 5 THEN y + 1 ELSE 5
+Inv == Orig(0) /\ x >= 0
+====
+"#;
+    let prog = load_spec(&[("RecursiveOverrideTarget.tla", tla)], "RecursiveOverrideTarget.tla");
+    let cfg = parse_cfg("INIT Init\nNEXT Next\nCONSTANT Orig <- RecY\nINVARIANT Inv\n").unwrap();
+    assert!(
+        !tlx_sema::optimize::cfg_constants_supported(&prog, &cfg),
+        "a recursive replacement target must be outside the certified subset"
+    );
 }

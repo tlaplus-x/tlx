@@ -925,7 +925,7 @@ fn state_constraints_certify_and_sequence_projection_still_refuses_action_checks
 }
 
 #[test]
-fn refuses_builtin_override_and_impure_unused_const_subst() {
+fn certifies_pure_builtin_override_and_refuses_impure_or_mismatched_substs() {
     let override_tla = r#"---- MODULE OverrideRefuse ----
 EXTENDS Naturals
 CONSTANT Nodes
@@ -936,10 +936,13 @@ Next == \E n \in Nodes : state' = [state EXCEPT ![n] = 1 - @]
 Inv == \A n \in Nodes : state[n] \in Nat
 ====
 "#;
+    // A builtin definition replaced by a pure, arity-preserving root definition
+    // (PaxosStore's `Nat <- tlx_Nat2`) is a legitimate override: the runtime
+    // redirects it, so the certified lowering follows the replacement.
     let (p, cfg) =
         load("OverrideRefuse", override_tla, "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Nat <- SmallNat\nINVARIANT Inv\n");
-    assert!(!cfg_constants_supported(&p, &cfg));
-    assert!(symmetry_certificate_with_spec(
+    assert!(cfg_constants_supported(&p, &cfg));
+    let cert = symmetry_certificate_with_spec(
         &p,
         &cfg,
         &def_expr(&p, "Init"),
@@ -947,7 +950,58 @@ Inv == \A n \in Nodes : state[n] \in Nat
         CheckSpec::invariants_only(&[def_expr(&p, "Inv")]),
         &[vec!["n1".into(), "n2".into()]],
     )
-    .is_none());
+    .expect("pure builtin override must certify");
+    assert!(cert.contains("Certificate"), "connected certificate missing");
+
+    // Impure, recursive, arity-mismatched, and module-scoped overrides stay refused.
+    let impure_tla = r#"---- MODULE ImpureOverride ----
+EXTENDS Naturals, TLC
+CONSTANT Nodes
+VARIABLE state
+Noisy == PrintT("override")
+Init == state = [n \in Nodes |-> 0]
+Next == \E n \in Nodes : Noisy /\ state' = [state EXCEPT ![n] = 1 - @]
+Inv == \A n \in Nodes : state[n] \in Nat
+====
+"#;
+    let (p, cfg) =
+        load("ImpureOverride", impure_tla, "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Noisy <- PrintT\nINVARIANT Inv\n");
+    assert!(!cfg_constants_supported(&p, &cfg), "effectful replacement must be refused");
+
+    let rec_tla = r#"---- MODULE RecursiveOverride ----
+EXTENDS Naturals
+CONSTANT Nodes
+VARIABLE state
+Left == 1
+Right == 2
+Init == state = [n \in Nodes |-> 0]
+Next == \E n \in Nodes : Left = 1 /\ state' = [state EXCEPT ![n] = 1 - @]
+Inv == \A n \in Nodes : state[n] \in 0..2
+====
+"#;
+    let (p, cfg) = load(
+        "RecursiveOverride",
+        rec_tla,
+        "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Left <- Right\n  Right <- Left\nINVARIANT Inv\n",
+    );
+    assert!(!cfg_constants_supported(&p, &cfg), "cyclic redirect chain must be refused");
+
+    let arity_tla = r#"---- MODULE ArityOverride ----
+EXTENDS Naturals
+CONSTANT Nodes
+VARIABLE state
+One(a) == a
+Two(a, b) == a
+Init == state = [n \in Nodes |-> 0]
+Next == \E n \in Nodes : One(n) = n /\ state' = [state EXCEPT ![n] = 1 - @]
+Inv == \A n \in Nodes : state[n] \in Nat
+====
+"#;
+    let (p, cfg) = load("ArityOverride", arity_tla, "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  One <- Two\nINVARIANT Inv\n");
+    assert!(!cfg_constants_supported(&p, &cfg), "arity-changing override must be refused");
+    let (p, cfg) =
+        load("ArityOverride", arity_tla, "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  One <- [Naturals]Two\nINVARIANT Inv\n");
+    assert!(!cfg_constants_supported(&p, &cfg), "module-scoped override must be refused");
 
     let effect_tla = r#"---- MODULE UnusedEffectSubst ----
 EXTENDS Naturals, TLC
@@ -1552,4 +1606,40 @@ fn verify_all_constrained_certificate_families_with_lean_negative() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     eprint!("{stdout}{stderr}");
     assert!(out.status.success(), "check_generated.py --negative failed ({}):\n{stdout}{stderr}", out.status);
+}
+
+#[test]
+fn override_obligation_is_emitted_for_constrained_projections() {
+    let tla = r#"---- MODULE ConstrainedOverride ----
+EXTENDS Naturals
+CONSTANT Nodes
+VARIABLE state, tag
+Ok(n) == state[n] < 2
+Bound(n) == state[n] <= 2
+Init == state = [n \in Nodes |-> 0] /\ tag = 0
+Next == \E n \in Nodes : Ok(n) /\ state' = [state EXCEPT ![n] = state[n] + 1] /\ tag' = tag
+Inv == \A n \in Nodes : state[n] <= 2
+StateBound == \A n \in Nodes : state[n] <= 2
+====
+"#;
+    let (program, cfg) = load(
+        "ConstrainedOverride",
+        tla,
+        "INIT Init\nNEXT Next\nCONSTANTS\n  Nodes = {n1, n2}\n  Ok <- Bound\nINVARIANT Inv\nCONSTRAINT StateBound\nCHECK_DEADLOCK FALSE\n",
+    );
+    assert!(cfg_constants_supported(&program, &cfg));
+    let cert = unobserved_projection_with_spec(
+        &program,
+        &cfg,
+        &def_expr(&program, "Init"),
+        &def_expr(&program, "Next"),
+        CheckSpec { invariants: &[def_expr(&program, "Inv")], constraints: &[def_expr(&program, "StateBound")], ..CheckSpec::default() },
+    )
+    .expect("constrained override projection must certify")
+    .certificate
+    .expect("certificate");
+    assert!(cert.contains("def_subst_model_slice_0"), "model slice missing");
+    assert!(cert.contains("def_subst_bindings_match"), "declared/applied binding missing");
+    assert!(cert.contains("certificate_with_overrides"), "combined certificate missing");
+    assert!(cert.contains("defSubstModelHIR"), "model HIR record missing");
 }

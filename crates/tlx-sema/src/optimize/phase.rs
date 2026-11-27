@@ -3,7 +3,7 @@
 //!
 //! The module root keeps the projection entry points and re-exports the
 //! supporting items its children import from `super`: check specifications and
-//! retained views (`spec`), `.cfg` constant substitutions (`const_subst`), Lean
+//! retained views (`spec`), `.cfg` substitutions and definition-override redirects (`const_subst`), Lean
 //! certificate bodies and symmetry dispatch (`cert`), disjunctive branch
 //! splitting (`branch`), and shared structural HIR walkers (`hir_util`).
 
@@ -43,6 +43,7 @@ pub use sequence::{sequence_length_projection, sequence_length_projection_with_s
 pub use spec::{CheckSpec, FieldProjection, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
 pub use sym_totality::cfg_constants_supported;
+
 pub use threshold::{threshold_counter_projection, threshold_counter_projection_with_spec};
 
 // Supporting items the `phase` submodules import from `super`.
@@ -52,8 +53,9 @@ pub(in crate::optimize::phase) use branch::{
 };
 pub(in crate::optimize::phase) use cert::OpenCert;
 pub(in crate::optimize::phase) use const_subst::{
-    attach_const_subst_obligation, canonical_expr_repr, resolve_const_subst_chain, resolve_const_subst_name, resolve_const_subst_target,
-    ConstSubstTarget,
+    attach_const_subst_obligation, canonical_expr_repr, cfg_def_redirects, resolve_const_subst_chain, resolve_const_subst_name,
+    resolve_const_subst_target, resolve_override_name, syntactic_expr_repr, AppliedOverride, CfgRedirects, ConstSubstTarget,
+    OverrideObligations,
 };
 pub(in crate::optimize::phase) use hir_util::{
     atom_nat, collect_unchanged_excluding, expr_alpha_eq, expr_alpha_eq_with_locals, expr_structurally_eq, max_local, mentions_local,

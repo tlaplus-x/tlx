@@ -21,7 +21,7 @@
 mod folds;
 mod helpers;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use tlx_front::cfg::Config;
 
@@ -63,6 +63,16 @@ pub struct SymNormalizer<'a> {
     pub(super) stack: Vec<DefId>,
     const_stack: Vec<ConstId>,
     expanded_substs: BTreeMap<ConstId, String>,
+    /// `.cfg` definition overrides the runtime applies; `None` when the
+    /// configuration has an override this analysis cannot certify, in which
+    /// case lowering an operator definition fails closed.
+    redirect: Option<super::CfgRedirects>,
+    /// Definition and parameterized-constant overrides actually lowered, with
+    /// the argument tuple each use site applied.
+    expanded_overrides: Vec<super::AppliedOverride>,
+    override_keys: HashSet<(String, Vec<String>)>,
+    model_hirs: Vec<String>,
+    saw_override: bool,
     remaining: usize,
     pub(crate) local: u32,
     at_stack: Vec<(Expr, bool)>,
@@ -106,6 +116,11 @@ impl<'a> SymNormalizer<'a> {
             stack: Vec::new(),
             const_stack: Vec::new(),
             expanded_substs: BTreeMap::new(),
+            redirect: cfg.and_then(|cfg| super::cfg_def_redirects(program, cfg)),
+            expanded_overrides: Vec::new(),
+            override_keys: HashSet::new(),
+            model_hirs: Vec::new(),
+            saw_override: false,
             remaining,
             local: program.locals.len() as u32,
             at_stack: Vec::new(),
@@ -120,19 +135,63 @@ impl<'a> SymNormalizer<'a> {
     /// Normalize a root expression. Returns `None` on unsupported constructs or
     /// budget/depth exhaustion.
     pub fn normalize(&mut self, e: &Expr) -> Option<Expr> {
-        self.expand(e, &HashMap::new(), &HashMap::new(), None, None, 0)
+        let result = self.expand(e, &HashMap::new(), &HashMap::new(), None, None, 0)?;
+        if self.saw_override {
+            self.model_hirs.push(super::syntactic_expr_repr(self.program, &result)?);
+        }
+        Some(result)
     }
 
     pub(in crate::optimize::phase) fn attach_const_subst(&self, cert: super::OpenCert) -> Option<String> {
         let cfg = self.cfg?;
-        super::attach_const_subst_obligation(self.program, cfg, &self.expanded_substs, |cid| self.expand_declared_const_subst(cid), cert)
+        super::attach_const_subst_obligation(
+            self.program,
+            cfg,
+            &self.expanded_substs,
+            &super::OverrideObligations { applied: &self.expanded_overrides, model_hirs: &self.model_hirs },
+            |cid| self.expand_declared_const_subst(cid),
+            |name, args| self.expand_declared_override(name, args),
+            cert,
+        )
+    }
+
+    /// Re-derive an applied `.cfg` override from the configuration alone, for
+    /// the certificate's binding obligation.
+    fn expand_declared_override(&self, name: &str, args: &[Expr]) -> Option<String> {
+        let cfg = self.cfg?;
+        let target = cfg.last_constant_subst(name)?;
+        let super::ConstSubstTarget::Def(target) = super::resolve_override_name(self.program, target)? else { return None };
+        let mut fresh = Self::with_mode(self.program, self.cfg, self.mode);
+        let span = self.program.defs[target.idx()].span;
+        let expanded = fresh.apply_def(target, args, &HashMap::new(), &HashMap::new(), None, None, span, 1)?;
+        super::canonical_expr_repr(self.program, &expanded)
+    }
+
+    fn builtin_override(&self, op: B) -> Option<(DefId, DefId)> {
+        self.redirect.as_ref()?.builtins.get(&op).copied()
+    }
+
+    /// Record one applied override use site, deduplicated by the replaced name
+    /// and canonical argument tuple.
+    fn record_override(&mut self, name: String, target: String, args: &[Expr], result: &Expr) -> Option<()> {
+        let key = (name.clone(), args.iter().map(|a| super::canonical_expr_repr(self.program, a)).collect::<Option<Vec<_>>>()?);
+        if self.override_keys.insert(key) {
+            let applied = super::canonical_expr_repr(self.program, result)?;
+            let applied_syntax = super::syntactic_expr_repr(self.program, result)?;
+            self.expanded_overrides.push(super::AppliedOverride { name, target, args: args.to_vec(), applied, applied_syntax });
+        }
+        self.saw_override = true;
+        Some(())
     }
 
     pub(in crate::optimize::phase) fn expand_declared_const_subst(&self, c: ConstId) -> Option<String> {
         let cfg = self.cfg?;
         let (seen, terminal) = super::resolve_const_subst_chain(self.program, cfg, c)?;
         let resolved = match terminal {
-            super::ConstSubstTarget::PureBuiltin(op, span) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            super::ConstSubstTarget::PureBuiltin(op, span) => {
+                let mut fresh = Self::with_mode(self.program, self.cfg, self.mode);
+                fresh.expand_apply(OpRef::Builtin(op), &[], &HashMap::new(), &HashMap::new(), None, None, span, 1)?
+            }
             super::ConstSubstTarget::Const(other) => Expr::new(ExprKind::Const(other), Span::default()),
             super::ConstSubstTarget::Def(id) => {
                 let d = &self.program.defs[id.idx()];
@@ -240,16 +299,6 @@ impl<'a> SymNormalizer<'a> {
         Some(out)
     }
 
-    fn const_subst_def(&self, c: ConstId) -> Option<DefId> {
-        let cfg = self.cfg?;
-        let name = &*self.program.consts[c.idx()].name;
-        let target = cfg.last_constant_subst(name)?;
-        match self.program.lookup_resolved_root(target)? {
-            RootSymbol::Def(id) if !self.program.def_is_let(id) => Some(id),
-            _ => None,
-        }
-    }
-
     pub(super) fn eval_op_arg(
         &self,
         arg: &Expr,
@@ -327,7 +376,11 @@ impl<'a> SymNormalizer<'a> {
                             return None;
                         }
                         let res = match super::resolve_const_subst_target(self.program, cfg, *c)? {
-                            super::ConstSubstTarget::PureBuiltin(op, _) => Expr::new(ExprKind::Builtin { op, args: vec![] }, e.span),
+                            super::ConstSubstTarget::PureBuiltin(op, span) => {
+                                // A substituted builtin may itself be replaced by a
+                                // definition override (`C <- Nat`, `Nat <- ...`).
+                                self.expand_apply(OpRef::Builtin(op), &[], env, op_env, cur_except, lex_at, span, depth + 1)?
+                            }
                             super::ConstSubstTarget::Def(def_id) => {
                                 self.const_stack.push(*c);
                                 let res =
@@ -384,6 +437,16 @@ impl<'a> SymNormalizer<'a> {
             }
             ExprKind::Apply { op, args } => {
                 return self.expand_apply(*op, args, env, op_env, cur_except, lex_at, e.span, depth + 1);
+            }
+            ExprKind::Builtin { op, args } if self.builtin_override(*op).is_some() => {
+                let expanded: Vec<_> =
+                    args.iter().map(|a| self.expand(a, env, op_env, cur_except, lex_at, depth + 1)).collect::<Option<_>>()?;
+                let (lhs, target) = self.builtin_override(*op)?;
+                let result = self.apply_def(target, &expanded, env, op_env, cur_except, lex_at, e.span, depth + 1)?;
+                let name = self.program.defs[lhs.idx()].name.to_string();
+                let target_name = self.program.defs[target.idx()].name.to_string();
+                self.record_override(name, target_name, &expanded, &result)?;
+                return Some(result);
             }
             ExprKind::Builtin { op, args } if self.mode == NormMode::Equiv => {
                 return self.apply_builtin(*op, args, env, op_env, cur_except, lex_at, e.span, depth);
@@ -474,10 +537,17 @@ impl<'a> SymNormalizer<'a> {
                     if let [target_raw] = args.as_slice() {
                         if let ExprKind::Apply { op: OpRef::Def(sum_id), args: fargs } = &*func.kind {
                             if fargs.is_empty() {
-                                if let Some(folded) =
-                                    self.try_expand_fn_fold(*sum_id, target_raw, env, op_env, cur_except, lex_at, e.span, depth)
-                                {
-                                    return folded;
+                                // A `.cfg` override replaces this definition; the
+                                // fold recognizer only knows the shadowed body, so
+                                // let the call flow through `apply_def`, which
+                                // applies and records the configured replacement.
+                                let overridden = self.redirect.as_ref().is_some_and(|r| r.defs.contains_key(sum_id));
+                                if !overridden {
+                                    if let Some(folded) =
+                                        self.try_expand_fn_fold(*sum_id, target_raw, env, op_env, cur_except, lex_at, e.span, depth)
+                                    {
+                                        return folded;
+                                    }
                                 }
                             }
                         }
@@ -617,11 +687,35 @@ impl<'a> SymNormalizer<'a> {
         depth: usize,
     ) -> Option<Expr> {
         match op {
-            OpRef::Builtin(b) => self.apply_builtin(b, args, env, op_env, cur_except, lex_at, span, depth),
+            OpRef::Builtin(b) => {
+                if let Some((lhs, target)) = self.builtin_override(b) {
+                    let expanded_args =
+                        args.iter().map(|a| self.expand(a, env, op_env, cur_except, lex_at, depth + 1)).collect::<Option<Vec<_>>>()?;
+                    let result = self.apply_def(target, args, env, op_env, cur_except, lex_at, span, depth)?;
+                    let name = self.program.defs[lhs.idx()].name.to_string();
+                    let target_name = self.program.defs[target.idx()].name.to_string();
+                    self.record_override(name, target_name, &expanded_args, &result)?;
+                    return Some(result);
+                }
+                self.apply_builtin(b, args, env, op_env, cur_except, lex_at, span, depth)
+            }
             OpRef::Def(id) => self.apply_def(id, args, env, op_env, cur_except, lex_at, span, depth),
             OpRef::Const(c) => {
-                let def_id = self.const_subst_def(c)?;
-                self.apply_def(def_id, args, env, op_env, cur_except, lex_at, span, depth).map(block_non_target)
+                let arity = self.program.consts[c.idx()].arity;
+                let name = self.program.consts[c.idx()].name.to_string();
+                let target_name = self.cfg?.last_constant_subst(&name)?.to_string();
+                let super::ConstSubstTarget::Def(def_id) = super::resolve_override_name(self.program, &target_name)? else {
+                    return None;
+                };
+                if self.program.defs[def_id.idx()].params.len() != arity {
+                    return None;
+                }
+                let expanded_args =
+                    args.iter().map(|a| self.expand(a, env, op_env, cur_except, lex_at, depth + 1)).collect::<Option<Vec<_>>>()?;
+                let result = self.apply_def(def_id, args, env, op_env, cur_except, lex_at, span, depth).map(block_non_target)?;
+                let target_name = self.program.defs[def_id.idx()].name.to_string();
+                self.record_override(name, target_name, &expanded_args, &result)?;
+                Some(result)
             }
             OpRef::Param(p) => match op_env.get(&p)?.clone() {
                 OpBinding::Ref(inner) => self.expand_apply(inner, args, env, op_env, cur_except, lex_at, span, depth).map(block_non_target),
@@ -765,6 +859,21 @@ impl<'a> SymNormalizer<'a> {
         span: Span,
         depth: usize,
     ) -> Option<Expr> {
+        if self.cfg.is_some() {
+            let redirect = self.redirect.as_ref()?;
+            if let Some(&target) = redirect.defs.get(&id) {
+                // Expand the actual arguments in the caller's context once for
+                // the certificate's override obligation; the call itself binds
+                // the raw arguments below.
+                let expanded_args =
+                    args.iter().map(|a| self.expand(a, env, op_env, cur_except, lex_at, depth + 1)).collect::<Option<Vec<_>>>()?;
+                let result = self.apply_def(target, args, env, op_env, cur_except, lex_at, span, depth)?;
+                let name = self.program.defs[id.idx()].name.to_string();
+                let target_name = self.program.defs[target.idx()].name.to_string();
+                self.record_override(name, target_name, &expanded_args, &result)?;
+                return Some(result);
+            }
+        }
         if matches!(self.mode, NormMode::Choose | NormMode::Equiv) && args.is_empty() {
             if let Some(val) = self.let_vals.get(&id) {
                 return Some(val.clone());
@@ -772,6 +881,11 @@ impl<'a> SymNormalizer<'a> {
         }
         let d = &self.program.defs[id.idx()];
         if let Some(op) = d.builtin {
+            // A builtin operator replaced through this definition: the
+            // replacement body runs at every use of the operator.
+            if let Some((_, replacement)) = self.builtin_override(op) {
+                return self.apply_def(replacement, args, env, op_env, cur_except, lex_at, span, depth);
+            }
             return self.apply_builtin(op, args, env, op_env, cur_except, lex_at, span, depth);
         }
         if self.stack.contains(&id) || d.params.len() != args.len() {

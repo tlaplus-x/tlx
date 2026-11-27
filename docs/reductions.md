@@ -142,10 +142,18 @@ unchanged except for that line. An inferred group is not applied over a user `VI
 properties, a state-dependent effect, or an incomplete analysis — each reason is reported under
 `-stats`. A declared `.cfg` `SYMMETRY` is handled separately (§2.6). Connected certificate
 coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init `PROPERTY`,
-`[][A]_sub` action `PROPERTY` conjuncts, and pure zero-arity `CONSTANT C <- Def`
-substitutions (emitting `ConstrainedCertificate` theorems when any constrained check is active),
-while excluding temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, operator or
-builtin overrides, and unsupported key operations. Certified unobserved-variable
+`[][A]_sub` action `PROPERTY` conjuncts, and `.cfg` substitutions (emitting
+`ConstrainedCertificate` theorems when any constrained check is active), while excluding
+temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = value` overrides, and
+module-scoped/cyclic/recursive/impure/arity-changing `<-` overrides. A pure, non-recursive,
+arity-preserving definition override (`Timeout <- MCTimeout`, a parameterized
+`CONSTANT C(_, _) <- Def`, a chain, or a builtin definition) is applied by the certified lowering;
+every applied use site is recorded and located at its own occurrence inside the syntactic HIR of
+the normalized model formula (`defSubstModelHIR`); `def_subst_bindings_match` checks the declared
+expansion, the `rfl`-checked slices prove the decomposition, and the concrete system is guarded by
+their conjunction so `certificate`/`certificate_with_overrides` consume it. Recursive replacement
+targets and composed constrained emitters refuse overrides rather than emit an unguarded
+certificate. Certified unobserved-variable
 erasure can compose with certified automatic keyed symmetry (including disjoint products of full
 keyed groups) through `ErasedKeyedCertificate`
 ([optimization.md](optimization.md#composing-projection-with-symmetry)); other projections stay

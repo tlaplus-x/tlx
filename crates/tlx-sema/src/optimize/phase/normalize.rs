@@ -17,6 +17,18 @@ pub(super) struct Normalizer<'a> {
     stack: Vec<DefId>,
     const_stack: Vec<ConstId>,
     expanded_substs: BTreeMap<ConstId, String>,
+    /// `.cfg` definition and builtin overrides the runtime would apply; `None`
+    /// when the configuration has an override this analysis cannot certify, in
+    /// which case lowering any operator definition fails closed.
+    redirect: Option<super::CfgRedirects>,
+    /// Definition and parameterized-constant overrides actually lowered, with
+    /// the argument tuple each use site applied.
+    expanded_overrides: Vec<super::AppliedOverride>,
+    override_keys: HashSet<(String, Vec<String>)>,
+    /// Syntactic HIR of each normalized formula once an override was applied;
+    /// the override connection theorems are stated against these formulas.
+    model_hirs: Vec<String>,
+    saw_override: bool,
     remaining: usize,
     local: u32,
     at_stack: Vec<(Expr, bool)>,
@@ -36,6 +48,11 @@ impl<'a> Normalizer<'a> {
             stack: Vec::new(),
             const_stack: Vec::new(),
             expanded_substs: BTreeMap::new(),
+            redirect: super::cfg_def_redirects(program, cfg),
+            expanded_overrides: Vec::new(),
+            override_keys: HashSet::new(),
+            model_hirs: Vec::new(),
+            saw_override: false,
             remaining: 100_000,
             local: program.locals.len() as u32,
             at_stack: Vec::new(),
@@ -54,6 +71,10 @@ impl<'a> Normalizer<'a> {
 
     pub fn opaque_vars_cache_mut(&mut self) -> &mut HashMap<DefId, Option<BTreeSet<VarId>>> {
         &mut self.opaque_vars_cache
+    }
+
+    fn builtin_override(&self, op: B) -> Option<(DefId, DefId)> {
+        self.redirect.as_ref()?.builtins.get(&op).copied()
     }
 
     fn is_recursive_def(&mut self, target: DefId) -> bool {
@@ -94,15 +115,34 @@ impl<'a> Normalizer<'a> {
             self.program,
             self.cfg,
             &self.expanded_substs,
+            &super::OverrideObligations { applied: &self.expanded_overrides, model_hirs: &self.model_hirs },
             |cid| Self::expand_declared_const_subst(self.program, self.cfg, cid),
+            |name, args| Self::expand_declared_override(self.program, self.cfg, name, args),
             cert,
         )
+    }
+
+    /// Re-derive a `.cfg` definition override from the configuration alone: the
+    /// configured replacement body applied to `args`, canonicalized the same way
+    /// the lowering records it.
+    fn expand_declared_override(program: &'a Program, cfg: &'a Config, name: &str, args: &[Expr]) -> Option<String> {
+        let target = cfg.last_constant_subst(name)?;
+        let super::ConstSubstTarget::Def(target) = super::resolve_override_name(program, target)? else { return None };
+        let mut fresh = Self::with_config(program, cfg);
+        let expanded = fresh.apply_def(target, args, &HashMap::new(), 1)?;
+        super::canonical_expr_repr(program, &expanded)
     }
 
     pub fn expand_declared_const_subst(program: &'a Program, cfg: &'a Config, c: ConstId) -> Option<String> {
         let (seen, terminal) = super::resolve_const_subst_chain(program, cfg, c)?;
         let resolved = match terminal {
-            ConstSubstTarget::PureBuiltin(op, span) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            ConstSubstTarget::PureBuiltin(op, span) => {
+                let mut fresh = Self::with_config(program, cfg);
+                match fresh.builtin_override(op) {
+                    Some((_, target)) => fresh.apply_def(target, &[], &HashMap::new(), 1)?,
+                    None => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+                }
+            }
             ConstSubstTarget::Const(other) => Expr::new(ExprKind::Const(other), Span::default()),
             ConstSubstTarget::Def(id) => {
                 let body = Self::def_body(&program.defs[id.idx()])?;
@@ -129,7 +169,11 @@ impl<'a> Normalizer<'a> {
     }
 
     pub fn root(&mut self, e: &Expr) -> Option<Expr> {
-        self.expand(e, &HashMap::new(), None, 0)
+        let result = self.expand(e, &HashMap::new(), None, 0)?;
+        if self.saw_override {
+            self.model_hirs.push(super::syntactic_expr_repr(self.program, &result)?);
+        }
+        Some(result)
     }
 
     fn bind(&mut self, vars: &BoundVars, env: &mut HashMap<LocalId, Expr>, span: Span) -> BoundVars {
@@ -168,7 +212,10 @@ impl<'a> Normalizer<'a> {
             return None;
         }
         let res = match super::resolve_const_subst_target(self.program, self.cfg, c)? {
-            ConstSubstTarget::PureBuiltin(op, _) => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            ConstSubstTarget::PureBuiltin(op, span) => match self.builtin_override(op) {
+                Some((_, target)) => self.apply_def(target, &[], env, depth + 1)?,
+                None => Expr::new(ExprKind::Builtin { op, args: vec![] }, span),
+            },
             ConstSubstTarget::Def(id) => {
                 if self.stack.contains(&id) {
                     return None;
@@ -189,6 +236,70 @@ impl<'a> Normalizer<'a> {
             }
         };
         self.record_const_subst(c, &res).then_some(res)
+    }
+
+    /// Lower a call of `id` after applying the `.cfg` definition overrides the
+    /// runtime applies. A redirected call is expanded from the configured
+    /// replacement body and recorded for the certificate's override obligation;
+    /// a configuration with an uncertifiable override fails closed.
+    fn apply_def(&mut self, id: DefId, args: &[Expr], env: &HashMap<LocalId, Expr>, depth: usize) -> Option<Expr> {
+        let redirect = self.redirect.as_ref()?;
+        let target = *redirect.defs.get(&id).unwrap_or(&id);
+        let d = &self.program.defs[target.idx()];
+        if let Some(op) = d.builtin {
+            // A builtin operator replaced through this definition: the
+            // replacement body runs at every use of the operator.
+            if let Some((_, replacement)) = self.builtin_override(op) {
+                return self.apply_def(replacement, args, env, depth);
+            }
+            return Some(Expr::new(ExprKind::Builtin { op, args: args.to_vec() }, d.span));
+        }
+        if d.params.len() != args.len() {
+            return None;
+        }
+        if self.allow_opaque_recursive && self.is_recursive_def(target) {
+            // Only keep a recursive call opaque when `id` and every
+            // transitively reachable definition are pure and lexically closed
+            // (no free enclosing locals or `@` captures).
+            opaque_recursive_def_vars(self.program, self.cfg, target, &mut self.opaque_vars_cache)?;
+            return Some(Expr::new(ExprKind::Apply { op: OpRef::Def(target), args: args.to_vec() }, d.span));
+        }
+        if self.stack.contains(&target) {
+            return None;
+        }
+        if self.program.is_strict_call_def(target) && !strict_call_preserves_args(self.program, d) {
+            return None;
+        }
+        // TLA+ parameters are by name. Substitution keeps each actual read in
+        // the callee's control context; expansion above still refuses effectful
+        // actuals.
+        let mut scope = env.clone();
+        scope.extend(d.params.iter().copied().zip(args.iter().cloned()));
+        let body = Self::def_body(d)?;
+        let def_at = self.let_at.get(&target).copied().unwrap_or(None);
+        self.stack.push(target);
+        let result = self.expand(&body, &scope, def_at, depth + 1);
+        self.stack.pop();
+        let result = result?;
+        if target != id {
+            let name = self.program.defs[id.idx()].name.to_string();
+            let target_name = self.program.defs[target.idx()].name.to_string();
+            self.record_override(name, target_name, args, &result)?;
+        }
+        Some(result)
+    }
+
+    /// Record one applied override use site, deduplicated by the replaced name
+    /// and canonical argument tuple.
+    fn record_override(&mut self, name: String, target: String, args: &[Expr], result: &Expr) -> Option<()> {
+        let key = (name.clone(), args.iter().map(|a| super::canonical_expr_repr(self.program, a)).collect::<Option<Vec<_>>>()?);
+        if self.override_keys.insert(key) {
+            let applied = super::canonical_expr_repr(self.program, result)?;
+            let applied_syntax = super::syntactic_expr_repr(self.program, result)?;
+            self.expanded_overrides.push(super::AppliedOverride { name, target, args: args.to_vec(), applied, applied_syntax });
+        }
+        self.saw_override = true;
+        Some(())
     }
 
     fn expand(&mut self, e: &Expr, env: &HashMap<LocalId, Expr>, lex_at: Option<usize>, depth: usize) -> Option<Expr> {
@@ -221,48 +332,48 @@ impl<'a> Normalizer<'a> {
                 return res;
             }
             ExprKind::Apply { op, args } => {
-                let args: Vec<_> = args.iter().map(|a| self.expand(a, env, lex_at, depth + 1)).collect::<Option<_>>()?;
+                let expanded: Vec<_> = args.iter().map(|a| self.expand(a, env, lex_at, depth + 1)).collect::<Option<_>>()?;
                 match op {
-                    OpRef::Builtin(op) => ExprKind::Builtin { op: *op, args },
-                    OpRef::Def(id) => {
-                        let d = &self.program.defs[id.idx()];
-                        if let Some(op) = d.builtin {
-                            ExprKind::Builtin { op, args }
-                        } else {
-                            if d.params.len() != args.len() {
-                                return None;
-                            }
-                            if self.allow_opaque_recursive && self.is_recursive_def(*id) {
-                                // Only keep a recursive call opaque when `id` and every
-                                // transitively reachable definition are pure and lexically
-                                // closed (no free enclosing locals or `@` captures).
-                                opaque_recursive_def_vars(self.program, self.cfg, *id, &mut self.opaque_vars_cache)?;
-                                return Some(Expr::new(ExprKind::Apply { op: OpRef::Def(*id), args }, e.span));
-                            }
-                            if self.stack.contains(id) {
-                                return None;
-                            }
-                            if self.program.is_strict_call_def(*id) && !strict_call_preserves_args(self.program, d) {
-                                return None;
-                            }
-                            // TLA+ parameters are by name. Substitution keeps
-                            // each actual read in the callee's control context;
-                            // expansion above still refuses effectful actuals.
-                            let mut scope = env.clone();
-                            scope.extend(d.params.iter().copied().zip(args));
-                            let body = Self::def_body(d)?;
-                            let def_at = self.let_at.get(id).copied().unwrap_or(None);
-                            self.stack.push(*id);
-                            let result = self.expand(&body, &scope, def_at, depth + 1);
-                            self.stack.pop();
-                            return result;
+                    OpRef::Builtin(op) => {
+                        if let Some((lhs, target)) = self.builtin_override(*op) {
+                            let result = self.apply_def(target, &expanded, env, depth + 1)?;
+                            let name = self.program.defs[lhs.idx()].name.to_string();
+                            let target_name = self.program.defs[target.idx()].name.to_string();
+                            self.record_override(name, target_name, &expanded, &result)?;
+                            return Some(result);
                         }
+                        ExprKind::Builtin { op: *op, args: expanded }
                     }
-                    OpRef::Const(_) | OpRef::Param(_) => return None,
+                    OpRef::Def(id) => return self.apply_def(*id, &expanded, env, depth + 1),
+                    OpRef::Const(c) => {
+                        let arity = self.program.consts[c.idx()].arity;
+                        let name = self.program.consts[c.idx()].name.to_string();
+                        let target = self.cfg.last_constant_subst(&name)?;
+                        let super::ConstSubstTarget::Def(target) = super::resolve_override_name(self.program, target)? else {
+                            return None;
+                        };
+                        if self.program.defs[target.idx()].params.len() != arity {
+                            return None;
+                        }
+                        let result = self.apply_def(target, &expanded, env, depth + 1)?;
+                        let target_name = self.program.defs[target.idx()].name.to_string();
+                        self.record_override(name, target_name, &expanded, &result)?;
+                        return Some(result);
+                    }
+                    OpRef::Param(_) => return None,
                 }
             }
             ExprKind::InstVar { subst, .. } if self.expand_inst_var && !self.in_enabled => {
                 return self.expand(subst, env, lex_at, depth + 1);
+            }
+            ExprKind::Builtin { op, args } if self.builtin_override(*op).is_some() => {
+                let expanded: Vec<_> = args.iter().map(|a| self.expand(a, env, lex_at, depth + 1)).collect::<Option<_>>()?;
+                let (lhs, target) = self.builtin_override(*op)?;
+                let result = self.apply_def(target, &expanded, env, depth + 1)?;
+                let name = self.program.defs[lhs.idx()].name.to_string();
+                let target_name = self.program.defs[target.idx()].name.to_string();
+                self.record_override(name, target_name, &expanded, &result)?;
+                return Some(result);
             }
             ExprKind::Builtin { op: crate::builtins::Builtin::Enabled, args } if self.expand_inst_var => {
                 let prev = self.in_enabled;
@@ -398,10 +509,15 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
     if let Some(cached) = cache.get(&root) {
         return cached.clone();
     }
+    // A `.cfg` override changes the body that runs at a use site, so the
+    // dependency walk must see the replacement's reads; otherwise an opaque
+    // recursive helper can hide a live variable from the reduction rules.
+    let redirect = super::cfg_def_redirects(program, cfg)?;
 
     struct Ctx<'a> {
         program: &'a Program,
         cfg: &'a Config,
+        redirect: &'a super::CfgRedirects,
         visited_defs: HashSet<DefId>,
         visited_consts: HashSet<ConstId>,
         let_scopes: HashMap<DefId, (HashSet<LocalId>, bool)>,
@@ -426,8 +542,12 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
         }
 
         fn enqueue_def(&mut self, id: DefId) -> bool {
+            let id = *self.redirect.defs.get(&id).unwrap_or(&id);
             let d = &self.program.defs[id.idx()];
             if let Some(b) = d.builtin {
+                if let Some((_, replacement)) = self.redirect.builtins.get(&b) {
+                    return self.enqueue_def(*replacement);
+                }
                 return Self::is_allowed_builtin(b);
             }
             if self.visited_defs.insert(id) {
@@ -468,11 +588,15 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
                                 ConstSubstTarget::Def(did) => {
                                     let d = &self.program.defs[did.idx()];
                                     if let Some(b) = d.builtin {
-                                        if !Self::is_allowed_builtin(b) {
+                                        if let Some((_, replacement)) = self.redirect.builtins.get(&b) {
+                                            if !self.enqueue_def(*replacement) {
+                                                return false;
+                                            }
+                                        } else if !Self::is_allowed_builtin(b) {
                                             return false;
                                         }
-                                    } else if self.visited_defs.insert(did) {
-                                        self.stack.push((did, HashSet::new(), false));
+                                    } else if !self.enqueue_def(did) {
+                                        return false;
                                     }
                                 }
                             }
@@ -488,11 +612,20 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
                 | ExprKind::BoxAction { .. }
                 | ExprKind::AngleAction { .. }
                 | ExprKind::Fairness { .. } => false,
-                ExprKind::Builtin { op, args } => Self::is_allowed_builtin(*op) && args.iter().all(|a| self.walk(a, scope, in_except)),
+                ExprKind::Builtin { op, args } => {
+                    let ok = match self.redirect.builtins.get(op) {
+                        Some((_, replacement)) => self.enqueue_def(*replacement),
+                        None => Self::is_allowed_builtin(*op),
+                    };
+                    ok && args.iter().all(|a| self.walk(a, scope, in_except))
+                }
                 ExprKind::Apply { op, args } => {
                     let ok = match op {
                         OpRef::Def(id) => self.enqueue_def(*id),
-                        OpRef::Builtin(b) => Self::is_allowed_builtin(*b),
+                        OpRef::Builtin(b) => match self.redirect.builtins.get(b) {
+                            Some((_, replacement)) => self.enqueue_def(*replacement),
+                            None => Self::is_allowed_builtin(*b),
+                        },
                         OpRef::Const(_) | OpRef::Param(_) => false,
                     };
                     ok && args.iter().all(|a| self.walk(a, scope, in_except))
@@ -563,6 +696,7 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
     let mut ctx = Ctx {
         program,
         cfg,
+        redirect: &redirect,
         visited_defs: HashSet::from([root]),
         visited_consts: HashSet::new(),
         let_scopes: HashMap::new(),
