@@ -87,6 +87,10 @@
   "valid",
   ""
  ],
+ "90c6cf749bd8be090051": [
+  "valid",
+  ""
+ ],
  "a39c6d49b61c3e9900cb": [
   "invalid",
   "TLC: {'result': 'liveness failure'} (expected {'result': 'success'})"
@@ -115,6 +119,10 @@
   "valid",
   ""
  ],
+ "dc195af5c827470c14df": [
+  "valid",
+  ""
+ ],
  "e1ff2d06d5d1527f3dc7": [
   "valid",
   ""
@@ -140,6 +148,10 @@
   ""
  ],
  "ff4bbc5ddd9e2bb404bf": [
+  "valid",
+  ""
+ ],
+ "ffca6b6dc01385f5b4f0": [
   "valid",
   ""
  ]

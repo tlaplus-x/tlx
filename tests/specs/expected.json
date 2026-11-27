@@ -3013,6 +3013,65 @@
   "result": "safety failure",
   "violated": "Inv"
  },
+ "TP1": {
+  "depth": 7,
+  "distinct": 27,
+  "exit": 13,
+  "generated": 55,
+  "result": "liveness failure",
+  "trace_random": true,
+  "violated": "TemporalInvariantProbe"
+ },
+ "TP2": {
+  "depth": 7,
+  "distinct": 27,
+  "exit": 13,
+  "generated": 55,
+  "result": "liveness failure",
+  "trace_random": true,
+  "violated": "TemporalInvariant"
+ },
+ "TP3": {
+  "depth": 7,
+  "distinct": 36,
+  "exit": 13,
+  "generated": 109,
+  "result": "liveness failure",
+  "trace_random": true,
+  "violated": "CommitPointEventuallyPropagatesProbe"
+ },
+ "TP4": {
+  "depth": 2,
+  "distinct": 2,
+  "exit": 13,
+  "generated": 2,
+  "result": "liveness failure",
+  "violated": "Termination"
+ },
+ "TP5": {
+  "depth": null,
+  "distinct": null,
+  "exit": 13,
+  "generated": null,
+  "result": "init property failure",
+  "violated": "RInit"
+ },
+ "TP6": {
+  "depth": 2,
+  "distinct": 2,
+  "exit": 13,
+  "generated": 2,
+  "result": "property failure",
+  "violated": "line 12, col 19 to line 12, col 32 of module TPRefAbs"
+ },
+ "TP7": {
+  "depth": 2,
+  "distinct": 2,
+  "exit": 13,
+  "generated": 2,
+  "result": "liveness failure",
+  "violated": "Refines"
+ },
  "TSFCfgOps": {
   "depth": 1,
   "distinct": 1,
