@@ -56,10 +56,20 @@ before they become a new baseline.
 
 ## Enumeration resource limits
 
-CarTalkPuzzle Model_3 and SpanTreeTest5Nodes no longer fail immediately on cardinality overflow,
-but both reached the 600-second warm-up limit with no timed samples in the
-[post-fix validation](research/post-fix-validation.md). Their large enumerations still
-need optimization or a documented larger resource bound; neither is a completed timing.
+`SpanTreeTest5Nodes` no longer fails immediately on cardinality overflow, but reached the
+600-second warm-up limit with no timed samples in the
+[post-fix validation](research/post-fix-validation.md); its large `Init` enumeration still needs
+optimization or a documented larger resource bound.
+
+`CarTalkPuzzle/CarTalkPuzzle.toolbox/Model_3/MC` (`N = 121`, `P = 5`, `[1..5 -> 1..121]` =
+25,937,424,601 functions) previously hit the 600-second warm-up limit in the same validation pass
+(and timed out in TLC at 14,400 s / 1 worker and 1,800 s / 16 workers). After extending
+`seqfilter` (bounded recursive unfolding, constant `LET`/`CHOOSE`, integer interval pruning with
+binary range splitting, and small constant-domain quantifier unrolling) together with interpreter
+bound caching, zero-allocation disjoint-intersection checks, and borrowed constant memo lookups,
+local single-worker `test-release` verification now completes with the expected solution
+`{<<1, 3, 9, 27, 81>>}` (0 states, 52.6 MiB peak RSS); repeated cloud benchmark samples remain
+open.
 
 ## Measurement quality and high-speedup validation
 

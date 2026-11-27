@@ -220,3 +220,139 @@ Next == x' = [n \\in Nat |-> n] /\\ ((UNCHANGED x) \\cdot (x' = [n \\in Nat |-> 
     let outcome_lazy = run_model("ComposeLazyConflict", body_lazy, cfg).unwrap();
     assert!(matches!(outcome_lazy, Outcome::Error(_)), "expected Error, got {outcome_lazy:?}");
 }
+
+#[test]
+fn seq_filter_recursive_sum_and_monotone_interval_pruning() {
+    // Exercises bounded recursive unfolding (`Sum` with `LET`/`CHOOSE`/`\`),
+    // `ConstVal::Def` cfg substitution (`N <- const_N`), constant-domain
+    // quantifier unrolling, and integer interval binary splitting on a
+    // CarTalkPuzzle-shaped comprehension (`40^4 = 2.56M` base functions).
+    let body = "\
+EXTENDS Integers, FiniteSets
+CONSTANTS N, P
+const_N == 40
+const_P == 4
+RECURSIVE Sum(_, _)
+Sum(f, S) == IF S = {} THEN 0
+             ELSE LET x == CHOOSE x \\in S : TRUE
+                  IN  f[x] + Sum(f, S \\ {x})
+Break == {B \\in [1..P -> 1..N] :
+            Sum(B, 1..P) = N
+            /\\ \\A i \\in 1..P : \\A j \\in (i + 1)..P : B[i] =< B[j]}
+IsRep(w, B, S, T) == S \\cap T = {} /\\ w + Sum(B, S) = Sum(B, T)
+IsSol(B) == \\A w \\in 1..N : \\E S, T \\in SUBSET (1..P) : IsRep(w, B, S, T)
+AllSol == {B \\in Break : IsSol(B)}
+VARIABLE ok
+Init == ok = (AllSol = {<<1, 3, 9, 27>>})
+Next == UNCHANGED ok
+Inv == ok
+";
+    let cfg = "CONSTANT N <- const_N\nCONSTANT P <- const_P\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let outcome = run_model("SeqFilterRecursiveSum", body, cfg).unwrap();
+    assert!(matches!(outcome, Outcome::Ok), "expected Ok, got {outcome:?}");
+}
+
+#[test]
+fn seq_filter_preserves_left_to_right_errors_and_overflow_fallback() {
+    let cfg = "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n";
+    for (name, expr) in [
+        ("AndLeftErr", "{s \\in [1..2 -> 1..3] : (s[1] = \"a\") /\\ FALSE}"),
+        ("OrLeftErr", "{s \\in [1..2 -> 1..3] : (s[1] = \"a\") \\/ TRUE}"),
+        ("QuantLeftErr", "{s \\in [1..2 -> 1..3] : \\A i \\in 1..2 : IF i = 1 THEN (s[1] = \"a\") ELSE FALSE}"),
+        ("IntOverflow", "{s \\in [1..2 -> 1..3] : 2147483647 + s[1] > 0}"),
+        ("IntRangeInNonInt", "{s \\in [1..2 -> 1..3] : s[1] \\in {\"a\"}}"),
+        // Singleton Boolean-wrapper reductions must still enforce Boolean type checks.
+        ("AndSingletonNonBool", "{s \\in [1..2 -> 1..3] : (s[1] /\\ TRUE) = 1}"),
+        ("OrSingletonNonBool", "{s \\in [1..2 -> 1..3] : (s[1] \\/ FALSE) = 1}"),
+        ("ImpliesSingletonNonBool", "{s \\in [1..2 -> 1..3] : (TRUE => s[1]) = 1}"),
+        ("ForallSingletonNonBool", "{s \\in [1..2 -> 1..3] : (\\A i \\in {1} : s[1]) = 1}"),
+        ("ExistsSingletonNonBool", "{s \\in [1..2 -> 1..3] : (\\E i \\in 1..2 : IF i = 1 THEN FALSE ELSE s[1]) = 1}"),
+        // Multi-variable unrolling must match TLC's first-variable-fastest order.
+        (
+            "QuantMultiOrderErr",
+            "{s \\in [1..2 -> 1..2] : \\A i \\in 1..2, j \\in 1..2 : IF i = 1 /\\ j = 2 THEN FALSE ELSE IF i = 2 /\\ j = 1 THEN (s[1] = \"a\") ELSE TRUE}",
+        ),
+    ] {
+        let body = format!("EXTENDS Integers\nVARIABLE x\nInit == x = {expr}\nNext == UNCHANGED x\n");
+        let outcome = run_model(name, &body, cfg).unwrap();
+        assert!(matches!(outcome, Outcome::Error(_)), "{name}: expected Error, got {outcome:?}");
+    }
+}
+
+#[test]
+fn cap_empty_fast_path_and_two_var_binding_preserve_order_and_errors() {
+    let body = "\
+EXTENDS Integers, Sequences, TLC
+VARIABLE ok
+CheckPairOrder ==
+  /\\ (\\A x, y \\in SUBSET (1..3) :
+        ((x \\cap y = {}) <=> ({e \\in x : e \\in y} = {}))
+        /\\ ((x \\cap y # {}) <=> ({e \\in x : e \\in y} # {}))
+        /\\ (({} = x \\cap y) <=> ({e \\in x : e \\in y} = {})))
+  /\\ TLCSet(1, <<>>)
+  /\\ (\\A a \\in 1..2, b \\in 3..4 : TLCSet(1, Append(TLCGet(1), <<a, b>>)))
+  /\\ TLCGet(1) = << <<1, 3>>, <<2, 3>>, <<1, 4>>, <<2, 4>> >>
+IgnoreFirst(a, b) == b = 1
+CheckDefer ==
+  LET x == 1 \\div 0
+      y == 1
+  IN  IgnoreFirst(x, y)
+Init == ok = (CheckPairOrder /\\ CheckDefer)
+Next == UNCHANGED ok
+Inv == ok
+";
+    let cfg = "INIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let outcome = run_model("CapEmptyAndPair", body, cfg).unwrap();
+    assert!(matches!(outcome, Outcome::Ok), "expected Ok, got {outcome:?}");
+
+    // Incompatible element types and non-set operands with a non-empty set must still error.
+    let err_cfg = "INIT Init\nNEXT Next\nCHECK_DEADLOCK FALSE\n";
+    for (name, expr) in
+        [("CapTypeErr", "{1} \\cap {\"a\"} = {}"), ("CapNonSetLhs", "1 \\cap {1} = {}"), ("CapNonSetRhs", "{1} \\cap 1 = {}")]
+    {
+        let err_body = format!("EXTENDS Integers\nVARIABLE x\nInit == x = ({expr})\nNext == UNCHANGED x\n");
+        let outcome = run_model(name, &err_body, err_cfg).unwrap();
+        assert!(matches!(outcome, Outcome::Error(_)), "{name}: expected Error, got {outcome:?}");
+    }
+}
+
+#[test]
+fn inline_call_does_not_duplicate_temporal_or_assume_lambda_thunks() {
+    // Temporal operator parameters are bound as unmemoized `Binding::Thunk` in
+    // `liveness.rs`; inlining `Same(p)` must fall back when `p` is not a `Val`.
+    let body = "\
+EXTENDS Integers, TLC
+VARIABLE x
+Same(a) == a = a
+Bump == IF TLCSet(1, TLCGet(1) + 1) THEN TLCGet(1) ELSE 0
+App(F(_), v) == F(v)
+ASSUME TLCSet(1, 0) /\\ App(LAMBDA p : Same(p), Bump)
+Prop(p) == <>(Same(p))
+Init == x = 0
+Next == UNCHANGED x
+Spec == Init /\\ [][Next]_x
+P == Prop(x + Bump)
+";
+    let cfg = "SPECIFICATION Spec\nPROPERTY P\n";
+    let model = build_model("TemporalThunkInline", body, cfg).unwrap();
+    model.check_assumes().unwrap();
+    let s = [Value::Int(0)];
+    let bits = model.live.state_bits(&model.ip, &s, 1, &[]).unwrap();
+    assert_eq!(bits, [1], "Bump must be evaluated once per Same(p) call, not twice");
+}
+
+#[test]
+fn cached_small_subset_bound_still_respects_split_actions_limit() {
+    let body = "\
+EXTENDS Integers
+VARIABLE x
+Init == x = {} /\\ (\\E s \\in SUBSET (1..10) : s = {})
+Next == \\E S, T \\in SUBSET (1..10) : x' = S \\cup T
+";
+    let cfg = "INIT Init\nNEXT Next\n";
+    let model = build_model("SubsetSplitLimit", body, cfg).unwrap();
+    // |SUBSET (1..10)| = 1024 <= MAX_CACHED, so `bound_elems` caches it, yet
+    // 1024 * 1024 = 1_048_576 > DEFAULT_MAX_SET_SIZE (1_000_000): action
+    // splitting must keep the action unsplit instead of OOMing.
+    assert_eq!(model.actions().len(), 1, "expected 1 unsplit action when product exceeds maxSetSize");
+}

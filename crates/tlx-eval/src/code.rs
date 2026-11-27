@@ -65,6 +65,12 @@ enum Node {
     /// An application of a user-defined operator without operator
     /// parameters (`Interp::call_def_with_args`).
     Call(Box<Call>),
+    /// A small, pure, straight-line call with local arguments: executes
+    /// `inlined` when every argument local is currently bound to
+    /// `Binding::Val`, falling back to `fallback` (`exec_call`) otherwise so
+    /// by-name thunks and deferred errors from any tier keep exact evaluation
+    /// count and semantics.
+    InlineCall(Box<InlineCall>),
     /// A strict binary built-in (`is_plain2`) without a cfg override.
     Bin(B, Box<[Code; 2]>),
     /// `x \in {e1, ...}` (true) / `x \notin {e1, ...}`: the element's and the
@@ -108,6 +114,13 @@ enum Node {
     Except(Box<Code>, Box<[(Box<[Key]>, Code)]>),
     /// Evaluated by the tree-walker.
     Tree(Expr),
+}
+
+/// `Node::InlineCall`: guarded inlining for a small pure call with local args.
+struct InlineCall {
+    locals: Box<[LocalId]>,
+    inlined: Code,
+    fallback: Call,
 }
 
 /// `Node::Call`: what `call_def_with_args` decides from the definition.
@@ -174,21 +187,22 @@ impl Interp {
     }
 
     fn compile(&self, e: &Expr) -> Code {
-        self.compile_in(e, true)
+        self.compile_in(e, true, true)
     }
 
     /// The code of `e`; with `hoist`, its largest closed constant
-    /// subexpressions are hoisted (`Node::Hoist`).
-    fn compile_in(&self, e: &Expr, hoist: bool) -> Code {
+    /// subexpressions are hoisted (`Node::Hoist`); with `inline`, small pure
+    /// calls with local arguments may be inlined once.
+    fn compile_in(&self, e: &Expr, hoist: bool, inline: bool) -> Code {
         if hoist && hoistable(e) && self.closed(e, &mut Vec::new()) {
-            let inner = self.compile_in(e, false);
+            let inner = self.compile_in(e, false, inline);
             if matches!(inner.node, Node::Lit(_) | Node::Shared(..)) {
                 return inner;
             }
             let slot = self.hoist_slot();
             return Code { node: Node::Hoist(Box::new(inner), slot, AtomicBool::new(false)), span: e.span };
         }
-        let codes = |es: &[Expr]| es.iter().map(|x| self.compile_in(x, hoist)).collect::<Box<[Code]>>();
+        let codes = |es: &[Expr]| es.iter().map(|x| self.compile_in(x, hoist, inline)).collect::<Box<[Code]>>();
         let unchanged = |op: B| op.java_only_name().is_none() && self.builtin_override(op).is_none();
         let node = match &*e.kind {
             ExprKind::Num(n) if *n <= i32::MAX as i128 => Node::Lit(Value::Int(*n as i64)),
@@ -199,10 +213,10 @@ impl Interp {
             ExprKind::At => Node::Local(AT),
             ExprKind::Const(c) => Node::Const(*c),
             ExprKind::Apply { op: OpRef::Def(d), args } if args.is_empty() => self.compile_call0(*d),
-            ExprKind::Apply { op: OpRef::Def(d), args } => self.compile_call(*d, args, hoist),
+            ExprKind::Apply { op: OpRef::Def(d), args } => self.compile_call(*d, args, hoist, inline),
             ExprKind::Apply { op, args } => Node::Apply(*op, args.clone()),
             ExprKind::Builtin { op: B::Not, args } if args.len() == 1 && unchanged(B::Not) => {
-                Node::Not(Box::new(self.compile_in(&args[0], hoist)))
+                Node::Not(Box::new(self.compile_in(&args[0], hoist, inline)))
             }
             ExprKind::Builtin { op: op @ (B::In | B::NotIn), args }
                 if args.len() == 2 && unchanged(*op) && matches!(&*args[1].kind, ExprKind::SetEnum(es) if !es.is_empty()) =>
@@ -211,37 +225,39 @@ impl Interp {
                 let elems = codes(es);
                 if literals(&elems).is_some() {
                     // (A literal set: built once, `Node::Bin`.)
-                    Node::Bin(*op, Box::new([self.compile_in(&args[0], hoist), self.compile_in(&args[1], hoist)]))
+                    Node::Bin(*op, Box::new([self.compile_in(&args[0], hoist, inline), self.compile_in(&args[1], hoist, inline)]))
                 } else {
-                    Node::InEnum(*op == B::In, Box::new(self.compile_in(&args[0], hoist)), elems)
+                    Node::InEnum(*op == B::In, Box::new(self.compile_in(&args[0], hoist, inline)), elems)
                 }
             }
             ExprKind::Builtin { op: op @ (B::Cup | B::SetMinus), args }
                 if args.len() == 2 && unchanged(*op) && matches!(&*args[1].kind, ExprKind::SetEnum(es) if es.len() == 1) =>
             {
                 let ExprKind::SetEnum(es) = &*args[1].kind else { unreachable!() };
-                Node::SetOne(*op, Box::new([self.compile_in(&args[0], hoist), self.compile_in(&es[0], hoist)]))
+                Node::SetOne(*op, Box::new([self.compile_in(&args[0], hoist, inline), self.compile_in(&es[0], hoist, inline)]))
             }
             ExprKind::Builtin { op, args } if args.len() == 2 && is_plain2(*op) && unchanged(*op) => {
-                Node::Bin(*op, Box::new([self.compile_in(&args[0], hoist), self.compile_in(&args[1], hoist)]))
+                Node::Bin(*op, Box::new([self.compile_in(&args[0], hoist, inline), self.compile_in(&args[1], hoist, inline)]))
             }
             ExprKind::Builtin { op, args } if args.len() == 1 && is_plain1(*op) && unchanged(*op) => {
-                Node::Un(*op, Box::new(self.compile_in(&args[0], hoist)))
+                Node::Un(*op, Box::new(self.compile_in(&args[0], hoist, inline)))
             }
             ExprKind::Builtin { op, args } => Node::Builtin(*op, args.clone()),
             ExprKind::And(es) => Node::And(codes(es)),
             ExprKind::Or(es) => Node::Or(codes(es)),
             ExprKind::Quant { kind, bounds, body } => {
-                Node::Quant(*kind == QuantKind::Exists, bounds.clone(), Box::new(self.compile_in(body, hoist)))
+                Node::Quant(*kind == QuantKind::Exists, bounds.clone(), Box::new(self.compile_in(body, hoist, inline)))
             }
-            ExprKind::If { cond, then, els } => {
-                Node::If(Box::new([self.compile_in(cond, hoist), self.compile_in(then, hoist), self.compile_in(els, hoist)]))
-            }
+            ExprKind::If { cond, then, els } => Node::If(Box::new([
+                self.compile_in(cond, hoist, inline),
+                self.compile_in(then, hoist, inline),
+                self.compile_in(els, hoist, inline),
+            ])),
             ExprKind::Case { arms, other } => Node::Case(
-                arms.iter().map(|(g, v)| (self.compile_in(g, hoist), self.compile_in(v, hoist))).collect(),
-                other.as_ref().map(|o| Box::new(self.compile_in(o, hoist))),
+                arms.iter().map(|(g, v)| (self.compile_in(g, hoist, inline), self.compile_in(v, hoist, inline))).collect(),
+                other.as_ref().map(|o| Box::new(self.compile_in(o, hoist, inline))),
             ),
-            ExprKind::Let { defs, body } => Node::Let(defs.clone().into(), Box::new(self.compile_in(body, hoist))),
+            ExprKind::Let { defs, body } => Node::Let(defs.clone().into(), Box::new(self.compile_in(body, hoist, inline))),
             ExprKind::SetEnum(es) => {
                 let cs = codes(es);
                 match literals(&cs).map(Value::set_literal) {
@@ -256,23 +272,30 @@ impl Interp {
                     None => Node::Tuple(cs),
                 }
             }
-            ExprKind::Record(fs) => Node::Record(fs.iter().map(|(n, x)| (self.syms.get(n), self.compile_in(x, hoist))).collect()),
-            ExprKind::FnApp { func, args } => Node::FnApp(Box::new(self.compile_in(func, hoist)), codes(args)),
-            ExprKind::Field { record, field } => Node::Field(Box::new(self.compile_in(record, hoist)), self.syms.get(field)),
-            ExprKind::SetFilter { bound, pred } => {
-                Node::SetFilter(Box::new((bound.clone(), self.compile_in(&bound.set, hoist), pred.clone(), self.compile_in(pred, hoist))))
-            }
-            ExprKind::SetMap { expr, bounds } => Node::SetMap(bounds.clone(), Box::new(self.compile_in(expr, hoist))),
+            ExprKind::Record(fs) => Node::Record(fs.iter().map(|(n, x)| (self.syms.get(n), self.compile_in(x, hoist, inline))).collect()),
+            ExprKind::FnApp { func, args } => Node::FnApp(Box::new(self.compile_in(func, hoist, inline)), codes(args)),
+            ExprKind::Field { record, field } => Node::Field(Box::new(self.compile_in(record, hoist, inline)), self.syms.get(field)),
+            ExprKind::SetFilter { bound, pred } => Node::SetFilter(Box::new((
+                bound.clone(),
+                self.compile_in(&bound.set, hoist, inline),
+                pred.clone(),
+                self.compile_in(pred, hoist, inline),
+            ))),
+            ExprKind::SetMap { expr, bounds } => Node::SetMap(bounds.clone(), Box::new(self.compile_in(expr, hoist, inline))),
             ExprKind::FnConstruct { bounds, body } => {
-                Node::FnConstruct(Box::new((bounds.clone(), body.clone(), self.compile_in(body, hoist))))
+                Node::FnConstruct(Box::new((bounds.clone(), body.clone(), self.compile_in(body, hoist, inline))))
             }
             ExprKind::Choose { vars, set: Some(set), body } => {
-                Node::Choose(Box::new((vars.clone(), self.compile_in(set, hoist), self.compile_in(body, hoist))))
+                Node::Choose(Box::new((vars.clone(), self.compile_in(set, hoist, inline), self.compile_in(body, hoist, inline))))
             }
-            ExprKind::FnSet { domain, range } => Node::FnSet(Box::new([self.compile_in(domain, hoist), self.compile_in(range, hoist)])),
-            ExprKind::RecordSet(fs) => Node::RecordSet(fs.iter().map(|(n, x)| (self.syms.get(n), self.compile_in(x, hoist))).collect()),
+            ExprKind::FnSet { domain, range } => {
+                Node::FnSet(Box::new([self.compile_in(domain, hoist, inline), self.compile_in(range, hoist, inline)]))
+            }
+            ExprKind::RecordSet(fs) => {
+                Node::RecordSet(fs.iter().map(|(n, x)| (self.syms.get(n), self.compile_in(x, hoist, inline))).collect())
+            }
             ExprKind::Except { base, updates } => Node::Except(
-                Box::new(self.compile_in(base, hoist)),
+                Box::new(self.compile_in(base, hoist, inline)),
                 updates
                     .iter()
                     .map(|(keys, val)| {
@@ -283,7 +306,7 @@ impl Interp {
                                 ExceptKey::Index(ix) => Key::Index(codes(ix)),
                             })
                             .collect();
-                        (keys, self.compile_in(val, hoist))
+                        (keys, self.compile_in(val, hoist, inline))
                     })
                     .collect(),
             ),
@@ -311,7 +334,7 @@ impl Interp {
 
     /// An application of definition `d` to `args` (non-empty): what
     /// `Interp::apply` decides from the definition alone.
-    fn compile_call(&self, d: DefId, args: &[Expr], hoist: bool) -> Node {
+    fn compile_call(&self, d: DefId, args: &[Expr], hoist: bool, inline: bool) -> Node {
         let apply = || Node::Apply(OpRef::Def(d), args.to_vec());
         if self.def_value.get(&d).is_some() {
             return apply();
@@ -325,25 +348,67 @@ impl Interp {
         {
             return apply();
         }
-        Node::Call(Box::new(Call {
+        let call = Call {
             d: t,
             params: def.params.clone().into(),
             exprs: args.to_vec(),
-            args: args.iter().map(|a| self.compile_in(a, hoist)).collect(),
+            args: args.iter().map(|a| self.compile_in(a, hoist, inline)).collect(),
             recursive: self.is_recursive(t),
             memo: self.def_memo[t.idx()],
             by_name: self.def_by_name[t.idx()],
             defer_errors: self.def_defer_errors[t.idx()],
             let_def: self.prog.def_is_let(t),
-        }))
+        };
+        if inline {
+            if let Some((locals, inlined)) = self.try_inline_call(t, def, args, hoist) {
+                return Node::InlineCall(Box::new(InlineCall { locals, inlined, fallback: call }));
+            }
+        }
+        Node::Call(Box::new(call))
+    }
+
+    /// Build the guarded inlined body for a small, pure, straight-line
+    /// operator call whose actual arguments are all locals (`ExprKind::Local`).
+    /// Runtime execution enters `inlined` only when every local in `locals`
+    /// resolves to `Binding::Val`, preserving exact call-by-name / thunk
+    /// evaluation counts across interpreter, liveness, and compiled fallbacks.
+    fn try_inline_call(&self, t: DefId, def: &tlx_sema::hir::Def, args: &[Expr], hoist: bool) -> Option<(Box<[LocalId]>, Code)> {
+        const MAX_INLINE_NODES: usize = 24;
+        if self.def_value.get(&t).is_some()
+            || self.is_recursive(t)
+            || self.prog.def_is_let(t)
+            || self.def_by_name[t.idx()]
+            || self.def_effectful[t.idx()]
+            || !self.def_defer_errors[t.idx()]
+        {
+            return None;
+        }
+        let mut locals = Vec::with_capacity(args.len());
+        for a in args {
+            let ExprKind::Local(l) = &*a.kind else { return None };
+            if !locals.contains(l) {
+                locals.push(*l);
+            }
+        }
+        let DefKind::Op(body) = &def.kind else { return None };
+        let mut budget = MAX_INLINE_NODES;
+        if !inlineable_body(body, &mut budget) {
+            return None;
+        }
+        let map: std::collections::HashMap<LocalId, Expr> = def.params.iter().copied().zip(args.iter().cloned()).collect();
+        let mut expanded = body.clone();
+        tlx_sema::visit::subst_locals(&mut expanded, &map);
+        Some((locals.into_boxed_slice(), self.compile_in(&expanded, hoist, false)))
     }
 
     /// `Node::Call` (`call_def_with_args`).
     #[inline(never)]
     fn exec_call(self: &Arc<Self>, c: &Call, env: &Env, cx: &Ctx, span: Span) -> EResult<Value> {
         let _depth = if c.recursive { Some(crate::depth::Guard::enter(span)?) } else { None };
-        if c.memo && cx.s0.is_none() && cx.s1.is_none() {
-            return self.call_def_memo(c.d, &c.exprs, env, cx, span);
+        if c.memo && cx.s0.is_none() && cx.s1.is_none() && !crate::memo::is_disabled(self.uid, c.d) {
+            debug_assert_eq!(c.params.len(), c.args.len());
+            debug_assert_eq!(c.params.len(), c.exprs.len());
+            return self.call_def_memo_with(c.d, cx, span, |i| self.exec_cow(&c.args[i], env, cx), |i| self.bind_by_name(&c.exprs[i], env));
         }
         // (`by_name(cx)`.)
         if c.by_name && !cx.init {
@@ -528,6 +593,13 @@ impl Interp {
             // (`call_def` of the definition.)
             Node::StateDef(d) if !cx.keep_lazy => self.call_def_cached(*d, env, cx, c.span),
             Node::Call(call) => self.exec_call(call, env, cx, c.span),
+            Node::InlineCall(ic) => {
+                if ic.locals.iter().all(|l| matches!(env.lookup(*l), Some(Binding::Val(_)))) {
+                    self.exec(&ic.inlined, env, cx)
+                } else {
+                    self.exec_call(&ic.fallback, env, cx, c.span)
+                }
+            }
             Node::Bin(op, ab) => self.exec_bin(*op, ab, env, cx),
             Node::FnApp(f, args) => Ok(self.exec_fn_app(f, args, env, cx)?.into_owned()),
             Node::Field(r, field) => Ok(self.exec_field(r, *field, env, cx)?.into_owned()),
@@ -564,6 +636,13 @@ impl Interp {
             Node::ConstDef(d) => self.call_def_cached(*d, env, cx, c.span)?,
             Node::Apply(op, args) => self.apply(*op, args, env, cx, c.span)?,
             Node::Call(call) => self.exec_call(call, env, cx, c.span)?,
+            Node::InlineCall(ic) => {
+                if ic.locals.iter().all(|l| matches!(env.lookup(*l), Some(Binding::Val(_)))) {
+                    self.exec(&ic.inlined, env, cx)?
+                } else {
+                    self.exec_call(&ic.fallback, env, cx, c.span)?
+                }
+            }
             Node::Bin(op, ab) => self.exec_bin(*op, ab, env, cx)?,
             Node::Un(op, a) => builtin1(*op, &*self.exec_cow(a, env, cx)?)?,
             Node::Builtin(op, args) => self.builtin(*op, args, env, cx, c.span)?,
@@ -843,6 +922,14 @@ impl Interp {
                 Ok(false)
             }
             Node::Quant(exists, bounds, body) => self.exec_quant(*exists, bounds, body, env, cx),
+            Node::InlineCall(ic) => {
+                if ic.locals.iter().all(|l| matches!(env.lookup(*l), Some(Binding::Val(_)))) {
+                    self.exec_bool(&ic.inlined, env, cx)
+                } else {
+                    let v = self.exec_call(&ic.fallback, env, cx, c.span)?;
+                    as_bool(&v, c.span)
+                }
+            }
             Node::Bin(op, ab) if is_compare2(*op) => self.exec_compare(*op, ab, env, cx),
             Node::InEnum(is_in, x, es) => Ok(self.exec_in_enum(x, es, env, cx)? == *is_in),
             _ => {
@@ -855,6 +942,17 @@ impl Interp {
     /// A comparison (`Node::Bin` with `is_compare2`).
     #[inline(never)]
     fn exec_compare(self: &Arc<Self>, op: B, ab: &[Code; 2], env: &Env, cx: &Ctx) -> EResult<bool> {
+        if matches!(op, B::Eq | B::Neq) {
+            if let Some(cap) = empty_cap_operands(&ab[0], &ab[1]) {
+                let s = self.exec_cow(&cap[0], env, cx)?;
+                let t = self.exec_cow(&cap[1], env, cx)?;
+                if let Some(disjoint) = sets_disjoint_fast(&s, &t) {
+                    return Ok(if op == B::Eq { disjoint } else { !disjoint });
+                }
+                let inter = self.builtin2(B::Cap, &s, &t)?;
+                return compare2(op, &inter, &Value::Set(Arc::from([])));
+            }
+        }
         let a = self.exec_cow(&ab[0], env, cx)?;
         let b = self.exec_cow(&ab[1], env, cx)?;
         if let (Value::Int(x), Value::Int(y)) = (&*a, &*b) {
@@ -1078,4 +1176,71 @@ fn literals(cs: &[Code]) -> Option<Vec<Value>> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether `e` is a small, straight-line expression safe to inline via
+/// `subst_locals` (no `Let` whose separate def bodies are not rewritten, and
+/// no binders whose bound-set pointers could interact with `closed_bounds`).
+fn inlineable_body(e: &Expr, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let allowed = matches!(
+        &*e.kind,
+        ExprKind::Num(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Local(_)
+            | ExprKind::Const(_)
+            | ExprKind::Var(_)
+            | ExprKind::And(_)
+            | ExprKind::Or(_)
+            | ExprKind::If { .. }
+            | ExprKind::Builtin { .. }
+            | ExprKind::FnApp { .. }
+            | ExprKind::Field { .. }
+            | ExprKind::SetEnum(_)
+            | ExprKind::Tuple(_)
+            | ExprKind::Record(_)
+            | ExprKind::Apply { op: OpRef::Def(_) | OpRef::Builtin(_) | OpRef::Const(_), .. }
+    );
+    if !allowed {
+        return false;
+    }
+    let mut ok = true;
+    tlx_sema::visit::children(e, &mut |c| ok = ok && inlineable_body(c, budget));
+    ok
+}
+
+/// If `a = b` (or `a # b`) compares `x \cap y` against `{}`, return `&[x, y]`.
+fn empty_cap_operands<'a>(a: &'a Code, b: &'a Code) -> Option<&'a [Code; 2]> {
+    let is_empty_set = |c: &Code| matches!(&c.node, Node::Lit(Value::Set(es)) | Node::Shared(Value::Set(es), _) if es.is_empty());
+    match (&a.node, &b.node) {
+        (Node::Bin(B::Cap, xy), _) if is_empty_set(b) => Some(xy),
+        (_, Node::Bin(B::Cap, xy)) if is_empty_set(a) => Some(xy),
+        _ => None,
+    }
+}
+
+/// Fast allocation-free `s \cap t = {}` check for materialized `Value::Set`s
+/// that cannot error on element comparison (empty sets, or sorted integer sets).
+fn sets_disjoint_fast(s: &Value, t: &Value) -> Option<bool> {
+    let (Value::Set(a), Value::Set(b)) = (s, t) else { return None };
+    if a.is_empty() || b.is_empty() {
+        return Some(true);
+    }
+    if !a.iter().all(|v| matches!(v, Value::Int(_))) || !b.iter().all(|v| matches!(v, Value::Int(_))) {
+        return None;
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (Value::Int(x), Value::Int(y)) = (&a[i], &b[j]) else { unreachable!() };
+        match x.cmp(y) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return Some(false),
+        }
+    }
+    Some(true)
 }

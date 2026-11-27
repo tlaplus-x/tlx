@@ -223,3 +223,33 @@ Inv == I!Ok
     let out = cmd.run();
     assert_eq!(out.code, 0, "{}", out.text());
 }
+
+#[test]
+fn inline_call_does_not_duplicate_compiled_deferred_thunk() {
+    let dir = TempDir::new("cli-inline-deferred-thunk");
+    dir.write(
+        "DeferredThunkInline.tla",
+        &tlx_testkit::module(
+            "DeferredThunkInline",
+            "\
+EXTENDS Integers, TLC
+VARIABLE x
+Same(a) == a = a
+Bump == IF TLCSet(1, TLCGet(1) + 1) THEN TLCGet(1) ELSE 0
+Bar(p) == Same(p)
+Init == x = 0 /\\ TLCSet(1, 0)
+Next == UNCHANGED x
+Inv == Bar(<<Bump, 1>>)
+",
+        ),
+    );
+    dir.write("DeferredThunkInline.cfg", "INIT Init\nNEXT Next\nINVARIANT Inv\n");
+    for (mode, args, envs) in
+        [("interp", vec!["-interp"], vec![]), ("compile", vec!["-compile"], vec![("TLX_PRERUN_REUSE", "0"), ("TLX_PARANOID", "1")])]
+    {
+        let mut cmd = tlx_testkit::tlx!();
+        cmd.check("DeferredThunkInline.tla").cfg("DeferredThunkInline.cfg").dir(dir.path()).args(&args).envs(envs.iter().copied());
+        let out = cmd.run();
+        assert_eq!(out.code, 0, "mode={mode}\n{}", out.text());
+    }
+}
