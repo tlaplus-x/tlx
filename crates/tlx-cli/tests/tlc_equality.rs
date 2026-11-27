@@ -253,3 +253,42 @@ Inv == Bar(<<Bump, 1>>)
         assert_eq!(out.code, 0, "mode={mode}\n{}", out.text());
     }
 }
+
+#[test]
+fn filtered_powerset_of_powerset_runs_natively_and_matches_interp() {
+    let dir = TempDir::new("cli-subset-filter-5nodes");
+    dir.write(
+        "SubsetEdges.tla",
+        &tlx_testkit::module(
+            "SubsetEdges",
+            "\
+EXTENDS Integers, FiniteSets
+CONSTANTS Nodes
+VARIABLES Edges, seen
+Nbrs(n) == {m \\in Nodes : {m, n} \\in Edges}
+Init ==
+    /\\ Edges \\in {E \\in SUBSET (SUBSET Nodes) : \\A e \\in E : Cardinality(e) = 2}
+    /\\ seen = {}
+Next ==
+    /\\ seen = {}
+    /\\ seen' = {n \\in Nodes : Nbrs(n) /= {}}
+    /\\ UNCHANGED Edges
+Inv == \\A e \\in Edges : (e \\subseteq Nodes) /\\ (Cardinality(e) = 2)
+",
+        ),
+    );
+    dir.write("SubsetEdges.cfg", "CONSTANTS\n  Nodes = {n1, n2, n3, n4, n5}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n");
+    for (mode, args, envs) in [
+        ("interp", vec!["-interp", "-tlc"], vec![]),
+        ("compile", vec!["-compile", "-tlc"], vec![("TLX_PRERUN_REUSE", "0"), ("TLX_PARANOID", "1")]),
+    ] {
+        let mut cmd = tlx_testkit::tlx!();
+        cmd.check("SubsetEdges.tla").cfg("SubsetEdges.cfg").dir(dir.path()).args(&args).envs(envs.iter().copied());
+        let out = cmd.run();
+        assert_eq!(out.code, 0, "mode={mode}\n{}", out.text());
+        assert!(out.text().contains("2047 distinct states found"), "mode={mode}\n{}", out.text());
+        if mode == "compile" {
+            assert!(out.text().contains("0 boxed, 0 interpreter"), "expected fully native lowering:\n{}", out.text());
+        }
+    }
+}

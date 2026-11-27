@@ -14,6 +14,7 @@ use crate::error::{EResult, EvalError};
 use crate::eval::{fn_domain, Ctx};
 use crate::interp::Interp;
 use crate::seqfilter::SeqPred;
+use crate::subsetfilter::SubsetPred;
 
 /// Owned snapshot of an evaluation context.
 #[derive(Clone)]
@@ -242,6 +243,9 @@ struct FilterSet {
     /// The predicate compiled for sets of sequences, if it can be decided
     /// on prefixes (`seqfilter`).
     seq_pred: OnceLock<Option<SeqPred>>,
+    /// The predicate compiled for powersets, if leading conjuncts can prune
+    /// the subset domain (`subsetfilter`).
+    subset_pred: OnceLock<Option<SubsetPred>>,
 }
 
 /// The elements of a `FilterSet`'s base set, with its sets of sequences
@@ -259,6 +263,26 @@ impl ops::SeqsVisitor for SeqVisitor<'_> {
 
     fn seqs(&mut self, n: usize, range: &[Value]) -> tlx_value::Result<Option<bool>> {
         self.pred.filter(n, range, self.visit)
+    }
+}
+
+/// The elements of a `FilterSet`'s base set, with its powersets pruned by
+/// leading subset constraints (`SubsetPred::filter`).
+struct FilterSubsetVisitor<'a> {
+    ip: &'a Arc<Interp>,
+    env: &'a Env,
+    cx: &'a Ctx<'a>,
+    pred: &'a SubsetPred,
+    visit: &'a mut dyn FnMut(Value, Option<bool>) -> tlx_value::Result<bool>,
+}
+
+impl ops::SubsetVisitor for FilterSubsetVisitor<'_> {
+    fn elem(&mut self, v: Value) -> tlx_value::Result<bool> {
+        (self.visit)(v, None)
+    }
+
+    fn subsets(&mut self, base: &ops::SubsetBase<'_>) -> tlx_value::Result<Option<bool>> {
+        self.pred.filter(self.ip, self.env, self.cx, base, self.visit)
     }
 }
 
@@ -352,9 +376,37 @@ impl CustomSet for FilterSet {
                 Ok(true)
             }
         };
-        let done = match self.seq_pred.get_or_init(|| SeqPred::compile(&self.ip, &self.vars, &self.pred, &self.env)) {
-            Some(pred) => ops::for_each_enumerated_seqs(&self.base, &mut SeqVisitor { pred, visit: &mut visit })?,
-            None => ops::for_each_enumerated(&self.base, &mut |x| visit(x, None))?,
+        let cx = self.snap.ctx();
+        let done = match &self.base {
+            Value::LazySet(l) if matches!(**l, LazySet::Subset(_)) => {
+                match self.subset_pred.get_or_init(|| SubsetPred::compile(&self.ip, &self.vars, &self.pred, &self.env)) {
+                    Some(pred) => ops::for_each_enumerated_subsets(
+                        &self.base,
+                        &mut FilterSubsetVisitor { ip: &self.ip, env: &self.env, cx: &cx, pred, visit: &mut visit },
+                    )?,
+                    None => ops::for_each_enumerated(&self.base, &mut |x| visit(x, None))?,
+                }
+            }
+            Value::LazySet(l) if matches!(**l, LazySet::FcnSet(..)) => {
+                match self.seq_pred.get_or_init(|| SeqPred::compile(&self.ip, &self.vars, &self.pred, &self.env)) {
+                    Some(pred) => ops::for_each_enumerated_seqs(&self.base, &mut SeqVisitor { pred, visit: &mut visit })?,
+                    None => ops::for_each_enumerated(&self.base, &mut |x| visit(x, None))?,
+                }
+            }
+            Value::LazySet(l) if matches!(**l, LazySet::Union(_)) => {
+                if let Some(pred) = self.seq_pred.get_or_init(|| SeqPred::compile(&self.ip, &self.vars, &self.pred, &self.env)) {
+                    ops::for_each_enumerated_seqs(&self.base, &mut SeqVisitor { pred, visit: &mut visit })?
+                } else if let Some(pred) = self.subset_pred.get_or_init(|| SubsetPred::compile(&self.ip, &self.vars, &self.pred, &self.env))
+                {
+                    ops::for_each_enumerated_subsets(
+                        &self.base,
+                        &mut FilterSubsetVisitor { ip: &self.ip, env: &self.env, cx: &cx, pred, visit: &mut visit },
+                    )?
+                } else {
+                    ops::for_each_enumerated(&self.base, &mut |x| visit(x, None))?
+                }
+            }
+            _ => ops::for_each_enumerated(&self.base, &mut |x| visit(x, None))?,
         };
         if done {
             if let Some(k) = kept {
@@ -377,6 +429,7 @@ pub(crate) fn lazy_filter(ip: &Arc<Interp>, vars: &BoundVars, base: Value, pred:
         snap: Snap::of(cx),
         memo: OnceLock::new(),
         seq_pred: OnceLock::new(),
+        subset_pred: OnceLock::new(),
     };
     Value::LazySet(Arc::new(LazySet::Custom(Box::new(s))))
 }

@@ -370,6 +370,44 @@ impl Interp {
         ok
     }
 
+    /// Whether `e`, in `env`, is deterministic and free of side effects,
+    /// higher-order operator parameters, and action/temporal constructs.
+    /// Unlike `is_constant_in`, state variables are permitted (for a fixed
+    /// evaluation snapshot `Ctx`).
+    pub(crate) fn is_effect_free_in(&self, e: &Expr, env: &crate::env::Env) -> bool {
+        // Only inspect calls whose implementation is known here. User
+        // operators and LET bodies can force captured lazy values, including
+        // cached constants, or invoke higher-order parameters.
+        let builtin = |op| self.builtin_override(op).is_none() && constant_level_builtin(op);
+        let here = match &*e.kind {
+            ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => {
+                !self.has_def_value(*d) && self.redirect_def(*d) == *d && self.prog.defs[d.idx()].builtin.is_some_and(builtin)
+            }
+            ExprKind::Const(c) => matches!(self.consts[c.idx()], Some(ConstVal::Value(_))),
+            ExprKind::Apply { op: OpRef::Const(_), .. } | ExprKind::OpArg(OpRef::Const(_)) | ExprKind::Let { .. } => false,
+            ExprKind::Local(id) => match env.lookup(*id) {
+                None | Some(crate::env::Binding::Val(_)) => true,
+                Some(b) => match b.by_name(&self.prog) {
+                    Some((a, aenv)) => self.is_effect_free_in(a, aenv),
+                    None => false,
+                },
+            },
+            ExprKind::Apply { op: OpRef::Param(_), .. }
+            | ExprKind::OpArg(OpRef::Param(_))
+            | ExprKind::BoxAction { .. }
+            | ExprKind::AngleAction { .. }
+            | ExprKind::Fairness { .. }
+            | ExprKind::TemporalQuant { .. } => false,
+            ExprKind::Builtin { op, .. } | ExprKind::Apply { op: OpRef::Builtin(op), .. } | ExprKind::OpArg(OpRef::Builtin(op)) => {
+                builtin(*op)
+            }
+            _ => true,
+        };
+        let mut ok = here;
+        tlx_sema::visit::children(e, &mut |c| ok = ok && self.is_effect_free_in(c, env));
+        ok
+    }
+
     /// A deterministic state argument can retain its unprimed value while
     /// keeping its expression for a later prime. Be conservative about
     /// higher-order calls and LET definitions with captured bindings.
