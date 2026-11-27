@@ -676,6 +676,9 @@ impl Interp {
         if has_stream {
             return self.for_each_stream_slot(&slots, env, f);
         }
+        if let [(_, Some(l0), BoundElems::Elems(e0)), (_, Some(l1), BoundElems::Elems(e1))] = slots.as_slice() {
+            return for_each_pair(*l0, e0, *l1, e1, env, f);
+        }
         let mut idx = vec![0usize; slots.len()];
         loop {
             let mut env2 = env.clone();
@@ -718,11 +721,15 @@ impl Interp {
         let mut has_stream = false;
         let mut total: usize = 1;
         for b in bounds {
-            let card = match self.bound_elems(&b.set, env, &Ctx::NONE).ok()? {
+            // Check the evaluated set directly via `bound_elems_of` (bypassing
+            // `bound_elems`'s small-SUBSET cache) so `SUBSET`/`kSubset` bounds
+            // always set `has_stream` and remain subject to `total > limit`.
+            let v = self.eval_cow(&b.set, env, &Ctx::NONE).ok()?;
+            let card = match self.bound_elems_of(&v, &b.set).ok()? {
                 BoundElems::Elems(e) => e.len(),
-                BoundElems::Stream(v) => {
+                BoundElems::Stream(sv) => {
                     has_stream = true;
-                    usize::try_from(ops::cardinality(&v).ok()?).ok()?
+                    usize::try_from(ops::cardinality(&sv).ok()?).ok()?
                 }
             };
             let slots = match &b.vars {
@@ -830,12 +837,26 @@ impl Interp {
         }
         let v = self.eval(set, env, cx)?;
         let elems = self.bound_elems_of(&v, set)?;
-        if let BoundElems::Elems(e) = &elems {
-            match e {
-                Elems::Shared(es, _) if es.len() <= MAX_CACHED => local::put(self.uid, slot, Value::Tuple(es.clone())),
-                Elems::Interval(lo, end) => local::put(self.uid, slot, Value::Interval(*lo, *end - 1)),
-                _ => {}
+        match &elems {
+            BoundElems::Elems(Elems::Shared(es, _)) if es.len() <= MAX_CACHED => {
+                local::put(self.uid, slot, Value::Tuple(es.clone()));
             }
+            BoundElems::Elems(Elems::Interval(lo, end)) => {
+                local::put(self.uid, slot, Value::Interval(*lo, *end - 1));
+            }
+            // Small closed `SUBSET S` / `kSubset(k, S)` domains (already in
+            // normalized order and exempt from `-maxSetSize`): cache once per
+            // thread instead of re-allocating every subset on each quantifier
+            // evaluation. Fall back to streaming on any enumeration error so
+            // error timing is unchanged.
+            BoundElems::Stream(sv) if ops::size_if_known(sv).is_some_and(|sz| sz <= MAX_CACHED as i64) => {
+                if let Ok(vec) = ops::enumerate_normalized(sv) {
+                    let es: Arc<[Value]> = Arc::from(vec);
+                    local::put(self.uid, slot, Value::Tuple(es.clone()));
+                    return Ok(BoundElems::Elems(Elems::Shared(es, 0)));
+                }
+            }
+            _ => {}
         }
         Ok(elems)
     }
@@ -1200,7 +1221,7 @@ impl Interp {
     /// in action contexts.
     fn call_def_with_args(self: &Arc<Self>, d: DefId, args: &[Expr], env: &Env, cx: &Ctx, span: Span) -> EResult<Value> {
         let _depth = self.depth_guard(d, span)?;
-        if self.def_memo[d.idx()] && cx.s0.is_none() && cx.s1.is_none() {
+        if self.def_memo[d.idx()] && cx.s0.is_none() && cx.s1.is_none() && !crate::memo::is_disabled(self.uid, d) {
             return self.call_def_memo(d, args, env, cx, span);
         }
         let lazy = by_name(cx) && self.def_by_name[d.idx()];
@@ -1210,37 +1231,18 @@ impl Interp {
     }
 
     /// `call_def_with_args` of a `def_memo` definition in a constant
-    /// context: the arguments are bound as `bind_params` binds them, and
-    /// when they are all values the application is memoized (`memo`).
-    pub(crate) fn call_def_memo(self: &Arc<Self>, d: DefId, args: &[Expr], env: &Env, cx: &Ctx, span: Span) -> EResult<Value> {
-        let defer_errors = self.def_defer_errors[d.idx()];
-        let mut vals = Vec::with_capacity(args.len());
-        let mut all_vals = true;
-        let mut err = None;
-        let env2 = Env::default().bind_all(self.prog.defs[d.idx()].params.iter().zip(args).map_while(|(p, a)| {
-            let b = match self.eval(a, env, cx) {
-                Ok(v) => {
-                    vals.push(v.clone());
-                    Binding::Val(v)
-                }
-                Err(e) if defer_errors && !crate::depth::is_depth_error(&e) => {
-                    all_vals = false;
-                    self.bind_by_name(a, env)
-                }
-                Err(e) => {
-                    err = Some(e);
-                    return None;
-                }
-            };
-            Some((*p, b))
-        }));
-        if let Some(e) = err {
-            return Err(e);
-        }
-        if !all_vals || !crate::memo::keyable(&vals) {
-            return self.def_body(d, &env2, cx, span);
-        }
-        crate::memo::get_or_eval(self.uid, d, cx.keep_lazy, vals, || self.def_body(d, &env2, cx, span))
+    /// context: evaluates the arguments once and avoids building the call
+    /// `Env` on cache hits.
+    pub(crate) fn call_def_memo<'a>(
+        self: &'a Arc<Self>,
+        d: DefId,
+        args: &'a [Expr],
+        env: &'a Env,
+        cx: &Ctx<'a>,
+        span: Span,
+    ) -> EResult<Value> {
+        debug_assert_eq!(self.prog.defs[d.idx()].params.len(), args.len());
+        self.call_def_memo_with(d, cx, span, |i| self.eval_cow(&args[i], env, cx), |i| self.bind_by_name(&args[i], env))
     }
 
     /// Apply an operator value to argument expressions.
@@ -1397,6 +1399,41 @@ impl Interp {
             }
             DefKind::Fn { bounds, body } => self.fn_construct(bounds, body, env, cx),
             DefKind::Pending => Err(EvalError::at(format!("definition {} could not be resolved", self.prog.defs[d.idx()].name), span)),
+        }
+    }
+}
+
+/// Two non-empty single-variable slots (`\E x, y \in D`): updates both
+/// bindings in place via `rebind_head` (first variable `l0` varies fastest,
+/// matching TLC's `ContextEnumerator`).
+fn for_each_pair(l0: LocalId, e0: &Elems, l1: LocalId, e1: &Elems, env: &Env, f: &mut dyn FnMut(&Env) -> EResult<bool>) -> EResult<bool> {
+    let mut env1 = env.bind_val(l1, e1.get(0));
+    let mut i1 = 0;
+    loop {
+        {
+            let mut env2 = env1.bind_val(l0, e0.get(0));
+            let mut i0 = 0;
+            loop {
+                if !f(&env2)? {
+                    return Ok(false);
+                }
+                i0 += 1;
+                if i0 >= e0.len() {
+                    break;
+                }
+                let x = e0.get(i0);
+                if let Err(x) = env2.rebind_head(x) {
+                    env2 = env1.bind_val(l0, x);
+                }
+            }
+        }
+        i1 += 1;
+        if i1 >= e1.len() {
+            return Ok(true);
+        }
+        let y = e1.get(i1);
+        if let Err(y) = env1.rebind_head(y) {
+            env1 = env.bind_val(l1, y);
         }
     }
 }
