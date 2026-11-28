@@ -55,6 +55,14 @@ impl Levels {
             cost: Mutex::new(CostEstimate::new(n)),
         }
     }
+
+    /// Mark the search finished before workers start (e.g., an error during
+    /// `init`/`resume`/`recover` or a pre-search observer stop) so every worker
+    /// exits `run_levels` uniformly without touching barriers or an unstarted
+    /// `Order`.
+    pub(super) fn mark_done(&self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
 }
 
 /// A reusable barrier for the workers of the level-synchronous search.
@@ -298,6 +306,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
             self.retire(task);
             n += 1;
         }
+        self.release_expand_order();
         if let Some(e) = self.local.take_io_error() {
             // (A spilled segment could not be read back.)
             shared.fail(super::Outcome::Io(e.0), super::tracelog::NO_PARENT);
@@ -313,8 +322,10 @@ impl<M: Model> WorkerState<'_, '_, M> {
 /// blocks), then meet at the barrier before any starts level k + 1. Each
 /// submits its tasks of level k + 1 before the barrier; the barrier leader
 /// makes them the current level (`Frontier::install`) before it releases the
-/// others, so that one barrier per level suffices (two when choosing
-/// representatives in BFS order). Under oversubscription each barrier costs
+/// others, so that one barrier per level suffices (three when choosing
+/// representatives in BFS order, releasing `NewClasses` / parent `Positions`
+/// after expansion and `Order::best` after candidate filtering before
+/// allocating next-level tables). Under oversubscription each barrier costs
 /// about a scheduling quantum of the slowest worker to be scheduled again.
 ///
 /// Narrow levels, too small to be worth that synchronization, are expanded by
@@ -329,6 +340,9 @@ impl<M: Model> WorkerState<'_, '_, M> {
 pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
     let shared = w.shared;
     let levels = &shared.levels;
+    if levels.done.load(Ordering::SeqCst) {
+        return;
+    }
     for level in 0usize.. {
         let solo = levels.solo.load(Ordering::SeqCst);
         if solo == NO_SOLO {
@@ -336,11 +350,22 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             let n = w.expand_level(true);
             levels.busy_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::SeqCst);
             levels.expanded.fetch_add(n, Ordering::SeqCst);
-            if shared.order.is_some() {
+            if let Some(order) = &shared.order {
                 // Choosing the representatives in BFS order: once every
-                // worker has offered its candidates (see `order`).
+                // worker has offered its candidates (see `order`), release
+                // expansion-only metadata, filter kept candidates against
+                // `Order::best`, release `Order::best` shards, and only then
+                // allocate next-level tables and resolve kept states.
                 w.leave_safepoints();
                 barrier_wait_then(shared, w.me, || {
+                    order.release_after_expand(!shared.retention.on || shared.retention.off());
+                });
+                if levels.barrier.is_broken() {
+                    return;
+                }
+                w.filter_candidates();
+                barrier_wait_then(shared, w.me, || {
+                    order.clear_best();
                     if shared.store_gc.is_some() {
                         shared.safepoint.join_all(shared.slots.len());
                     }
@@ -351,7 +376,7 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
                 if shared.store_gc.is_some() {
                     w.joined_safepoints();
                 }
-                w.resolve();
+                w.resolve_kept();
             }
         } else if solo == w.me {
             let mut cost = levels.cost.lock();
@@ -362,7 +387,15 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             let mut since_mark = 0;
             loop {
                 since_mark += w.expand_level(false);
-                w.resolve();
+                if let Some(order) = &shared.order {
+                    // Peer workers remain parked at the outer level barrier on
+                    // solo levels, so run the release/filter/resolve stages
+                    // sequentially without calling `levels.barrier`.
+                    order.release_after_expand(!shared.retention.on || shared.retention.off());
+                    w.filter_candidates();
+                    order.clear_best();
+                    w.resolve_kept();
+                }
                 let width = w.local.next_len();
                 let end = width == 0 || shared.control().stopped();
                 if since_mark >= SOLO_SAMPLE || end {

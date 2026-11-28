@@ -236,8 +236,12 @@ pub(super) fn workers<'m, M: Model>(
         // before the workers allocate theirs.
         crate::mem::purge();
     }
-    // The first level, expanded by all workers.
+    // The first level, expanded by all workers (unless init/resume/recover
+    // or a pre-search observer already stopped the search).
     seed.advance();
+    if shared.control().stopped() {
+        shared.levels.mark_done();
+    }
     let monitor_done = tlx_base::par::Done::new();
     // Existing shard IDs remain stable when the worker count changes.
     shared.history.lock().prepare(init_logs, nworkers, shared.live_atoms, opts.queue.seg_bytes);

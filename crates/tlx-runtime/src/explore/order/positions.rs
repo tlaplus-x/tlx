@@ -315,10 +315,6 @@ pub struct Positions {
 }
 
 impl Positions {
-    pub(super) fn empty() -> Positions {
-        Positions { tables: Vec::new(), first: Box::new([]), len: 0, charge: Charge::default() }
-    }
-
     pub(super) fn from_parts(tables: Vec<Option<Arc<Table>>>, first: Box<[u64]>, len: u64) -> Positions {
         Positions { tables, first, len, charge: Charge::default() }
     }

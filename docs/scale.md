@@ -95,9 +95,18 @@ Details that matter:
   and offers its segments to the disk every 1024 states, as expanding does. The interpreter keeps the state
   objects. The gauge tracks reserved capacities as they grow, including candidate metadata, encoded buffers
   and codec scratch, the sharded best-key tables, BFS positions/counts (until their last reader releases them),
-  and resolve indices, ranks and output tables. Clearing a buffer keeps it charged; under pressure workers
-  shrink empty candidate buffers at level boundaries and release best-key table capacity after resolving a
-  level. In-place unstable sorting allocates no additional sort workspace. Interpreted states' heap data is
+  and resolve indices, ranks and output tables. To avoid stacking previous-level and next-level metadata across
+  level boundaries, workers drop their parent-level `Positions` and `NewClasses` references as soon as
+  expansion finishes and `Order` releases `NewClasses` (plus parent-level `Positions` whenever layout-miss
+  resume archiving is inactive) before resolution begins; resolution then runs in two phases separated by a
+  barrier on parallel levels (sequentially on solo narrow levels), first filtering each worker's candidates
+  against `Order::best`, next releasing every `Order::best` shard's backing table, and only then allocating
+  sort indices, ranks, and next-level `Table`s while decoding and enqueuing kept representatives. At level
+  advance, old `Positions` (when kept for layout-miss resume) and `Counts` are released before next-level
+  `Positions`, `Counts`, and `NewClasses` are allocated. Clearing a worker's candidate buffers keeps their
+  capacity charged in normal mode; under pressure workers shrink `CandBuf` right after candidate filtering and
+  shrink empty candidate buffers at level boundaries. In-place unstable sorting allocates no additional sort
+  workspace. Interpreted states' heap data is
   covered by RSS. (Historical baseline before metadata compaction on MultiPaxos_MC with 8 workers: the widest
   level, 4M states of 335 words, took about 40 GiB as objects, beyond the default budget, and about 1.1 GiB
   encoded. With `-maxmem 400M` the candidates still peaked at 1.5 GB, and a 16-worker run in a control

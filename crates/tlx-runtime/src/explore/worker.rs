@@ -1027,7 +1027,7 @@ fn run_worker_in<'s, 'm, M: Model>(
         active: true,
         safepoint_every: shared.safepoint_every,
         expanded: 0,
-        order: shared.order.as_ref().map(|o| OrderLocal::new(o, shared.model.caps().codec(), shared.opts.queue.seg_bytes)),
+        order: shared.order.as_ref().map(|_| OrderLocal::new(shared.model.caps().codec(), shared.opts.queue.seg_bytes)),
         checked_outside: Vec::new(),
         path: None,
         roots_deposited: false,

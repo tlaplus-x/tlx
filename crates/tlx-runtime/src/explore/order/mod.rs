@@ -205,14 +205,16 @@ impl BestShard {
         }
     }
 
-    fn clear(&mut self, shrinking: bool) {
-        self.packed.clear();
-        if shrinking {
-            self.packed.shrink_to_fit();
-            self.overflow = None;
-        } else if let Some(ov) = &mut self.overflow {
-            ov.clear();
-        }
+    #[inline]
+    fn is_empty_and_unallocated(&self) -> bool {
+        self.packed.capacity() == 0 && self.overflow.is_none()
+    }
+
+    /// Drop the shard's backing hash table and overflow side table immediately
+    /// so `Order::best` does not overlap with `resolve_kept`'s next-level tables.
+    fn clear(&mut self) {
+        self.packed = FpMap::default();
+        self.overflow = None;
     }
 
     fn bytes(&self) -> usize {
@@ -224,13 +226,15 @@ impl BestShard {
 pub(super) struct Order {
     /// The classes new at the level being expanded: the least key offered.
     best: Box<[Padded<Mutex<BestShard>>]>,
-    /// A filter on the classes new at the level being expanded.
-    new: Mutex<Arc<NewClasses>>,
-    /// The positions of the states of the level being expanded.
-    current: Mutex<Arc<Positions>>,
+    /// A filter on the classes new at the level being expanded (`None` once
+    /// `release_after_expand` drops it before `resolve`).
+    new: Mutex<Option<Arc<NewClasses>>>,
+    /// The positions of the states of the level being expanded (`None` once
+    /// `release_after_expand(true)` drops them on non-resumable runs).
+    current: Mutex<Option<Arc<Positions>>>,
     /// Per state of the level being expanded (by position), the number of
     /// its successors kept.
-    counts: Mutex<Arc<Counts>>,
+    counts: Mutex<Option<Arc<Counts>>>,
     /// Per worker, its table of the states of the next level.
     next: Mutex<Vec<Option<Arc<Table>>>>,
     /// The memory of the candidates buffered by the workers (bytes, and
@@ -255,9 +259,9 @@ impl Order {
         );
         Order {
             best: (0..SHARDS).map(|_| Padded(Mutex::new(BestShard::default()))).collect(),
-            new: Mutex::new(Arc::new(NewClasses::new(0, &gauge))),
-            current: Mutex::new(Arc::new(Positions::empty())),
-            counts: Mutex::new(Counts::zeros(0, &gauge)),
+            new: Mutex::new(None),
+            current: Mutex::new(None),
+            counts: Mutex::new(None),
             next: Mutex::new(vec![None; workers]),
             cand_bytes: gauge,
             best_parts: (0..SHARDS).map(|_| Part::default()).collect(),
@@ -296,14 +300,39 @@ impl Order {
     /// workers start).
     pub(super) fn start(&self, positions: Arc<Positions>) {
         positions.account(&self.cand_bytes);
-        *self.counts.lock() = Counts::zeros(positions.len, &self.cand_bytes);
-        *self.new.lock() = Arc::new(NewClasses::new(positions.len, &self.cand_bytes));
-        *self.current.lock() = positions;
+        *self.counts.lock() = Some(Counts::zeros(positions.len, &self.cand_bytes));
+        *self.new.lock() = Some(Arc::new(NewClasses::new(positions.len, &self.cand_bytes)));
+        *self.current.lock() = Some(positions);
     }
 
     /// The positions of the states of the level being expanded.
     pub(super) fn current(&self) -> Arc<Positions> {
-        self.current.lock().clone()
+        self.current.lock().clone().expect("level positions active")
+    }
+
+    /// Release expansion-only shared metadata (`NewClasses`, and parent-level
+    /// `Positions` when `release_current` is true because layout-miss resume
+    /// archiving is inactive) once every worker has finished expanding the
+    /// level.
+    pub(super) fn release_after_expand(&self, release_current: bool) {
+        *self.new.lock() = None;
+        if release_current {
+            *self.current.lock() = None;
+        }
+    }
+
+    /// Release every `Order::best` shard's backing table and zero its gauge
+    /// charge once all workers have finished `filter_candidates`, before
+    /// `resolve_kept` allocates next-level tables. Idempotent.
+    pub(super) fn clear_best(&self) {
+        for (i, b) in self.best.iter().enumerate() {
+            let mut b = b.lock();
+            if b.is_empty_and_unallocated() {
+                continue;
+            }
+            b.clear();
+            self.best_parts[i].set(&self.cand_bytes, 0);
+        }
     }
 
     /// The packed least key offered for class `fp` at this level.
@@ -321,20 +350,18 @@ impl Order {
     /// Make the next level (resolved by every worker) the current one:
     /// called by a single worker, the others waiting.
     pub(super) fn advance(&self) {
+        // Drop old `current` (if kept for layout-miss resume) and old `counts`
+        // before allocating next-level `first`, `Counts`, and `NewClasses`.
+        *self.current.lock() = None;
         let mut counts = self.counts.lock();
-        let (first, len) = counts.prefix_sums();
+        let (first, len) = counts.take().map_or_else(|| (Box::from([]), 0), |c| c.prefix_sums());
         let tables = std::mem::replace(&mut *self.next.lock(), vec![None; self.workers]);
         let positions = Arc::new(Positions::from_parts(tables, first, len));
         positions.account(&self.cand_bytes);
-        *self.current.lock() = positions;
-        *counts = Counts::zeros(len, &self.cand_bytes);
-        *self.new.lock() = Arc::new(NewClasses::new(len, &self.cand_bytes));
-        let shrinking = self.shrinking();
-        for (i, b) in self.best.iter().enumerate() {
-            let mut b = b.lock();
-            b.clear(shrinking);
-            self.best_parts[i].set(&self.cand_bytes, b.bytes());
-        }
+        *self.current.lock() = Some(positions);
+        *counts = Some(Counts::zeros(len, &self.cand_bytes));
+        *self.new.lock() = Some(Arc::new(NewClasses::new(len, &self.cand_bytes)));
+        self.clear_best();
     }
 }
 
@@ -575,34 +602,44 @@ fn rank_and_count_kept(
 
 /// A worker's part of the choice of representatives.
 pub(super) struct OrderLocal<'m, S> {
-    /// The positions of the level being expanded and the counts of its
-    /// states' successors kept (see `Order`).
-    positions: Arc<Positions>,
-    counts: Arc<Counts>,
-    /// The filter on the classes new at the level (see `Order::new`).
-    new: Arc<NewClasses>,
+    /// The positions of the level being expanded (`Some` only while expanding),
+    /// and the counts of its states' successors kept (`Some` from `order_level`
+    /// until `resolve_kept` consumes them).
+    positions: Option<Arc<Positions>>,
+    counts: Option<Arc<Counts>>,
+    /// The filter on the classes new at the level (`Some` only while expanding).
+    new: Option<Arc<NewClasses>>,
     /// The position of the state being expanded.
     pos: u64,
     /// The candidates buffered at this level, in the order they were offered.
     cands: CandBuf,
     /// Their states.
     store: CandStore<'m, S>,
-    charge: Charge,
+    /// Separate charges for `cands` and `store` so `filter_candidates` can
+    /// update `cands` while `store` is deposited in `Shared::gc_roots`.
+    cands_charge: Charge,
+    store_charge: Charge,
 }
 
 impl<'m, S> OrderLocal<'m, S> {
     /// The part of a worker, its candidates' states encoded by `codec` (if
     /// any) in segments of `seg_bytes`.
-    pub(super) fn new(order: &Order, codec: Option<&'m dyn StateCodec<S>>, seg_bytes: usize) -> OrderLocal<'m, S> {
+    pub(super) fn new(codec: Option<&'m dyn StateCodec<S>>, seg_bytes: usize) -> OrderLocal<'m, S> {
         OrderLocal {
-            positions: order.current(),
-            counts: order.counts.lock().clone(),
-            new: order.new.lock().clone(),
+            positions: None,
+            counts: None,
+            new: None,
             pos: 0,
             cands: CandBuf::default(),
             store: CandStore::new(codec, seg_bytes),
-            charge: Charge::default(),
+            cands_charge: Charge::default(),
+            store_charge: Charge::default(),
         }
+    }
+
+    fn account(&self, gauge: &Arc<Gauge>) {
+        self.cands_charge.set(gauge, self.cands.bytes());
+        self.store_charge.set(gauge, self.store.bytes());
     }
 
     pub(super) fn take_store(&mut self) -> CandStore<'m, S> {
@@ -615,17 +652,26 @@ impl<'m, S> OrderLocal<'m, S> {
 }
 
 impl<M: Model> WorkerState<'_, '_, M> {
-    /// Before expanding a level: its positions.
+    /// Before expanding a level: latch its positions, counts, and new-class filter.
     pub(super) fn order_level(&mut self) {
         if let (Some(o), Some(order)) = (&mut self.order, &self.shared.order) {
-            o.positions = order.current();
-            o.counts = order.counts.lock().clone();
-            o.new = order.new.lock().clone();
+            o.positions = Some(order.current());
+            o.counts = Some(order.counts.lock().clone().expect("level counts active"));
+            o.new = Some(order.new.lock().clone().expect("level new-classes active"));
             if order.shrinking() {
                 o.cands.shrink_to_fit();
                 o.store.shrink();
             }
-            o.charge.set(&order.cand_bytes, cand_bytes(o));
+            o.account(&order.cand_bytes);
+        }
+    }
+
+    /// Right after expanding a level: release this worker's handles to
+    /// parent-level `Positions` and `NewClasses` before `resolve`.
+    pub(super) fn release_expand_order(&mut self) {
+        if let Some(o) = &mut self.order {
+            o.positions = None;
+            o.new = None;
         }
     }
 
@@ -638,7 +684,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
             return;
         }
         let r = o.store.spill(&self.shared.opts.spill);
-        o.charge.set(&order.cand_bytes, cand_bytes(o));
+        o.store_charge.set(&order.cand_bytes, o.store.bytes());
         if let Err(e) = r {
             self.shared.fail(Outcome::Io(e.0), NO_PARENT);
         }
@@ -648,7 +694,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
     #[inline]
     pub(super) fn order_task(&mut self, task: &Task<M::State>) {
         if let Some(o) = &mut self.order {
-            o.pos = o.positions.pos(task.log);
+            o.pos = o.positions.as_ref().expect("level positions active").pos(task.log);
         }
     }
 
@@ -671,9 +717,10 @@ impl<M: Model> WorkerState<'_, '_, M> {
         let key = (o.pos, idx);
         let packed_key = pack_key(key);
         let seen = &shared.seen;
+        let new = o.new.as_ref().expect("level new-classes active");
         // A class found at an earlier level, told without writing shared
         // memory (see `NewClasses`; the disk tier is asked by `insert` only).
-        if !seen.spilling() && seen.contains(fp) && !o.new.may_hold(fp) {
+        if !seen.spilling() && seen.contains(fp) && !new.may_hold(fp) {
             return Ok(());
         }
         let high = || shared.control().request(SP_GROW);
@@ -690,7 +737,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
                 }
                 break less;
             }
-            o.new.mark(fp);
+            new.mark(fp);
             match if STATS { stats::fp_insert(seen, self.me, fp, high) } else { seen.insert_by(self.me, fp, &mut 0, high) } {
                 Ok(true) => {
                     let capacity = best.packed.capacity();
@@ -718,29 +765,49 @@ impl<M: Model> WorkerState<'_, '_, M> {
             }
         };
         if keep {
-            let before = cand_bytes(o);
+            let before_store = o.store.bytes();
+            let before_cands = o.cands.bytes();
             let at = o.store.push(t, fp, Meta { parent: task.log, depth: task.depth + 1, action });
             o.cands.push(key, at, fp);
-            let bytes = cand_bytes(o);
-            if bytes != before {
-                o.charge.set(&order.cand_bytes, bytes);
+            let after_store = o.store.bytes();
+            if after_store != before_store {
+                o.store_charge.set(&order.cand_bytes, after_store);
+            }
+            let after_cands = o.cands.bytes();
+            if after_cands != before_cands {
+                o.cands_charge.set(&order.cand_bytes, after_cands);
             }
         }
         Ok(())
     }
 
-    /// After every worker has expanded the level: keep the candidates that
-    /// represent their classes, in BFS order: log, count (outdegrees,
-    /// depth, coverage), check and queue them. A failure stops the search.
-    pub(super) fn resolve(&mut self) {
+    /// Phase 1 of representative resolution (after every worker has expanded the
+    /// level): retain only candidates whose key still matches `Order::best`.
+    /// This is the sole read of `Order::best`, so `Order::clear_best()` can
+    /// release all shards before `resolve_kept()` allocates next-level tables.
+    pub(super) fn filter_candidates(&mut self) {
+        let (Some(o), Some(order)) = (&mut self.order, &self.shared.order) else { return };
+        o.cands.retain_best(order);
+        if order.shrinking() {
+            let before = o.cands.bytes();
+            o.cands.shrink_to_fit();
+            stats::add_count("representative buffer bytes reclaimed", before.saturating_sub(o.cands.bytes()) as u64);
+        }
+        o.cands_charge.set(&order.cand_bytes, o.cands.bytes());
+    }
+
+    /// Phase 2 of representative resolution (after `Order::clear_best()` has
+    /// released `Order::best`): rank the kept candidates in BFS order, log,
+    /// count (outdegrees, depth, coverage), check and queue them, and install
+    /// this worker's next-level position `Table`. A failure stops the search.
+    pub(super) fn resolve_kept(&mut self) {
         let shared = self.shared;
         let (Some(o), Some(order)) = (&mut self.order, &shared.order) else { return };
-        o.charge.set(&order.cand_bytes, cand_bytes(o));
+        o.account(&order.cand_bytes);
         // (Both are put back below, their buffers kept for the next level.)
         let mut cands = std::mem::take(&mut o.cands);
-        let counts = o.counts.clone();
+        let counts = o.counts.take().expect("level counts active");
         let mut store = std::mem::replace(&mut o.store, CandStore::new(None, 0));
-        cands.retain_best(order);
         // The successors kept per parent: their ranks, counts, and the
         // outdegrees of the parents (counted as 0 when expanded). The
         // candidates are visited by key (as by one worker); their states,
@@ -748,6 +815,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
         // take part.
         let scratch = Charge::default();
         let (ranks, wide_table) = rank_and_count_kept(&cands, &counts, &mut self.outdegree, &order.cand_bytes, &scratch);
+        drop(counts);
         let model = shared.model;
         let start = self.shard.log.len();
         let mut entries = TableEntries::with_capacity(cands.len(), wide_table);
@@ -850,6 +918,8 @@ impl<M: Model> WorkerState<'_, '_, M> {
                 self.local.spill();
             }
         }
+        drop(ranks);
+        drop(scratch);
         store.clear();
         cands.clear();
         if order.shrinking() {
@@ -861,17 +931,12 @@ impl<M: Model> WorkerState<'_, '_, M> {
         if let Some(o) = &mut self.order {
             o.cands = cands;
             o.store = store;
-            o.charge.set(&order.cand_bytes, cand_bytes(o));
+            o.account(&order.cand_bytes);
         }
         let table = Arc::new(Table::new(start, entries, table_charge));
         table.account(&order.cand_bytes);
         order.next.lock()[self.me] = Some(table);
     }
-}
-
-/// The memory of a worker's candidates (bytes, for the memory budget).
-fn cand_bytes<S>(o: &OrderLocal<'_, S>) -> usize {
-    o.cands.bytes() + o.store.bytes()
 }
 
 #[cfg(test)]
