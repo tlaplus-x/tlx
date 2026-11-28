@@ -577,7 +577,7 @@ impl InterpModel {
             return None;
         }
         let declared: Vec<Vec<String>> =
-            self.symmetry_factors()?.into_iter().map(|keys| keys.iter().map(|m| m.as_str().to_owned()).collect()).collect();
+            self.symmetry_factors()?.into_iter().map(|keys| keys.iter().map(|m| m.sym().as_str().to_owned()).collect()).collect();
         if !declared.iter().all(|factor| combined.contains(factor)) {
             return None;
         }
@@ -767,7 +767,7 @@ Syn == Permutations(TxId)
             .symmetry_factors()
             .expect("the declared group factors")
             .into_iter()
-            .map(|keys| keys.iter().map(|k| k.as_str().to_owned()).collect())
+            .map(|keys| keys.iter().map(|k| k.sym().as_str().to_owned()).collect())
             .collect();
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].len(), 2);

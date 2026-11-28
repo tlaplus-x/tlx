@@ -1077,7 +1077,7 @@ Next == \E s \in Server : msg' = [dest |-> s, sent |-> TRUE]",
         let view = super::super::speculate::view_def(&base).unwrap();
         let mut servers = ["s1", "s2", "s3", "s4"].map(Sym::new);
         servers.sort();
-        let orbits = AtomOrbits::from_factors(&[&servers]);
+        let orbits = AtomOrbits::from_factors(&[&servers.map(tlx_value::SymAtom::Model)]);
         let atoms = Shape::Atom(servers[..3].iter().copied().map(Value::ModelValue).collect());
         let key = Shape::Tuple(vec![atoms, Shape::Int { lo: 1, hi: 1200 }].into());
         let map = map_shape(key, Shape::Bool, FcnWitness::Enumerated);

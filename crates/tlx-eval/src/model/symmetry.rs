@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 
 use tlx_base::partition::{Partition, INLINE_KEYS};
 use tlx_value::order::{cmp_tlc, try_total_cmp};
-use tlx_value::{ops, Sym, Value};
+use tlx_value::{ops, Sym, SymAtom, Value};
 
 use crate::error::{EResult, EvalError};
 
@@ -32,7 +32,7 @@ use refine::{
 
 /// A permutation of model values: maps each moved model value to its image
 /// (fixed points are left out).
-pub(super) type Perm = HashMap<Sym, Value>;
+pub(super) type Perm = HashMap<SymAtom, Value>;
 
 /// Largest group order for which `InterpModel::symmetry_maps()` materializes
 /// explicit `Perm` maps on demand (for `tlx-compile`). Larger disjoint products
@@ -66,28 +66,30 @@ impl CmpMode {
 /// A permutation in a form fast to apply: the moved model values (by
 /// symbol id) and their images.
 #[derive(Clone)]
-pub(super) struct FastPerm(pub(super) Vec<(u32, Value)>);
+pub(super) struct FastPerm(pub(super) Vec<(u64, Value)>);
 
 impl FastPerm {
     pub(super) fn new(p: &Perm) -> FastPerm {
-        FastPerm(p.iter().map(|(k, v)| (k.id(), v.clone())).collect())
+        FastPerm(p.iter().map(|(k, v)| (k.compact_key(), v.clone())).collect())
     }
 
     #[inline]
-    fn get(&self, m: Sym) -> Option<&Value> {
-        let id = m.id();
+    fn get(&self, m: SymAtom) -> Option<&Value> {
+        let id = m.compact_key();
         self.0.iter().find(|(k, _)| *k == id).map(|(_, v)| v)
     }
 
     /// The images of the model values `support` (symbol ids) into `out`,
     /// for telling apart the permutations that act differently on them;
     /// false if one is not a model value.
-    fn images(&self, support: &[u32], out: &mut Vec<u32>) -> bool {
+    fn images(&self, support: &[u64], out: &mut Vec<u64>) -> bool {
         out.clear();
         for &id in support {
             out.push(match self.0.iter().find(|(k, _)| *k == id) {
-                Some((_, Value::ModelValue(m))) => m.id(),
-                Some(_) => return false,
+                Some((_, image)) => match SymAtom::from_value(image) {
+                    Some(atom) => atom.compact_key(),
+                    None => return false,
+                },
                 None => id,
             });
         }
@@ -150,7 +152,7 @@ impl<'a> PermMap<'a> {
     }
 
     #[inline]
-    fn get(self, m: Sym) -> Option<&'a Value> {
+    fn get(self, m: SymAtom) -> Option<&'a Value> {
         match self {
             PermMap::Id => None,
             PermMap::Fast(p) => p.get(m),
@@ -189,7 +191,10 @@ fn cmp_images_mode(mode: CmpMode, p: PermMap, a: &Value, q: PermMap, b: &Value) 
     }
     let scalar = |v: &Value| matches!(v, Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..));
     match (a, b) {
-        (Value::ModelValue(m), Value::ModelValue(n)) => mode.cmp(mv_image(p, *m, a), mv_image(q, *n, b)),
+        (Value::ModelValue(m), Value::ModelValue(n)) => {
+            mode.cmp(atom_image(p, SymAtom::Model(*m), a), atom_image(q, SymAtom::Model(*n), b))
+        }
+        (Value::Str(m), Value::Str(n)) => mode.cmp(atom_image(p, SymAtom::Str(*m), a), atom_image(q, SymAtom::Str(*n), b)),
         _ if scalar(a) && scalar(b) => mode.cmp(a, b),
         (Value::Tuple(t), Value::Tuple(u)) => {
             if t.len() != u.len() {
@@ -269,7 +274,7 @@ fn cmp_seq<'v, 'p>(
     Ok(Ordering::Equal)
 }
 
-fn mv_image<'v>(p: PermMap<'v>, m: Sym, v: &'v Value) -> &'v Value {
+fn atom_image<'v>(p: PermMap<'v>, m: SymAtom, v: &'v Value) -> &'v Value {
     p.get(m).unwrap_or(v)
 }
 
@@ -348,14 +353,14 @@ impl ImageOrder {
         }
         for i in 0..n {
             let j = match key(i) {
-                Value::ModelValue(m) => match p.get(*m) {
+                v @ (Value::ModelValue(_) | Value::Str(_)) => match p.get(SymAtom::from_value(v).unwrap()) {
                     None => i,
                     Some(img) => match (0..n).find(|&j| key(j) == img) {
                         Some(j) => j,
                         None => return Some(ImageOrder { src: [0; MAX_KEYS], known: 0, used: 0 }),
                     },
                 },
-                Value::Bool(_) | Value::Int(_) | Value::Str(_) => i,
+                Value::Bool(_) | Value::Int(_) => i,
                 _ => return Some(ImageOrder { src: [0; MAX_KEYS], known: 0, used: 0 }),
             };
             o.src[j] = i as u8;
@@ -410,7 +415,7 @@ enum GroupKind {
     Factorized(FactorizedGroup),
     Explicit {
         perms: Vec<FastPerm>,
-        moved: Vec<u32>,
+        moved: Vec<u64>,
         raw: Vec<Perm>,
     },
 }
@@ -440,16 +445,17 @@ impl Group {
 
     #[cfg(test)]
     fn from_factors(factors: Vec<Vec<Sym>>) -> Group {
+        let factors = factors.into_iter().map(|keys| keys.into_iter().map(SymAtom::Model).collect()).collect();
         Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull).unwrap()
     }
 
     /// Build a group from disjoint full symmetric-group factors, for a
     /// certified reduction that enlarges a declared `SYMMETRY`.
-    pub(in crate::model) fn from_factor_sets(factors: Vec<Vec<Sym>>) -> EResult<Group> {
+    pub(in crate::model) fn from_factor_sets(factors: Vec<Vec<SymAtom>>) -> EResult<Group> {
         Self::from_factors_with_fallback(factors, FallbackOrder::DisjointFull)
     }
 
-    fn from_factors_with_fallback(factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> EResult<Group> {
+    fn from_factors_with_fallback(factors: Vec<Vec<SymAtom>>, fallback: FallbackOrder) -> EResult<Group> {
         if factors.is_empty() {
             return Ok(Group::default());
         }
@@ -481,7 +487,7 @@ impl Group {
             return Group::default();
         }
         let perms: Vec<FastPerm> = raw.iter().map(FastPerm::new).collect();
-        let mut moved: Vec<u32> = perms.iter().flat_map(|p| p.0.iter().map(|(k, _)| *k)).collect();
+        let mut moved: Vec<u64> = perms.iter().flat_map(|p| p.0.iter().map(|(k, _)| *k)).collect();
         moved.sort_unstable();
         moved.dedup();
         Group { kind: GroupKind::Explicit { perms, moved, raw }, maps: Arc::new(OnceLock::new()), id: Self::next_id() }
@@ -492,7 +498,7 @@ impl Group {
     }
 
     /// The model values moved by at least one element of this group.
-    pub(super) fn moved_syms(&self) -> HashSet<Sym> {
+    pub(super) fn moved_syms(&self) -> HashSet<SymAtom> {
         match &self.kind {
             GroupKind::Empty => HashSet::new(),
             GroupKind::Factorized(fg) => fg.factors.iter().flat_map(|f| f.keys.iter().copied()).collect(),
@@ -500,9 +506,9 @@ impl Group {
         }
     }
 
-    /// Read-only per-factor sorted `Sym` slices when this group is a disjoint
+    /// Read-only per-factor sorted atom slices when this group is a disjoint
     /// product of full symmetric groups `S_{n_1} x ... x S_{n_k}`.
-    pub(super) fn symmetry_factors(&self) -> Option<Vec<&[Sym]>> {
+    pub(super) fn symmetry_factors(&self) -> Option<Vec<&[SymAtom]>> {
         match &self.kind {
             GroupKind::Factorized(fg) => Some(fg.factors.iter().map(|f| f.keys.as_slice()).collect()),
             _ => None,
@@ -601,7 +607,7 @@ impl Group {
                 let mut sv = StateVals::Given(vals);
                 let dedup = !collect_support(moved, &mut sv, order, &mut support);
                 let mut key = Vec::new();
-                let mut seen: Vec<Vec<u32>> = Vec::new();
+                let mut seen: Vec<Vec<u64>> = Vec::new();
                 'perm: for (pi, p) in perms.iter().enumerate() {
                     if dedup && p.images(&support, &mut key) {
                         if key == support || seen.contains(&key) {
@@ -753,7 +759,7 @@ impl Group {
     fn choose_explicit(
         &self,
         perms: &[FastPerm],
-        moved: &[u32],
+        moved: &[u64],
         vals: &mut StateVals,
         order: &[usize],
         cache_bags: bool,
@@ -833,8 +839,9 @@ fn collect_factor_support(
 ) -> bool {
     fn walk(v: &Value, fg: &FactorizedGroup, out: &mut Vec<(usize, u16)>, obs_per_factor: &mut [usize]) -> bool {
         match v {
-            Value::ModelValue(m) => {
-                if let Some((g, k)) = fg.lookup(*m) {
+            Value::ModelValue(_) | Value::Str(_) => {
+                let m = SymAtom::from_value(v).unwrap();
+                if let Some((g, k)) = fg.lookup(m) {
                     let entry = (fg.factors[g].offset + k, k as u16);
                     if !out.contains(&entry) {
                         out.push(entry);
@@ -847,7 +854,7 @@ fn collect_factor_support(
             Value::Record(fs) => fs.iter().any(|(_, e)| walk(e, fg, out, obs_per_factor)),
             Value::Fcn(ps, _) => ps.iter().any(|(k, e)| walk(k, fg, out, obs_per_factor) || walk(e, fg, out, obs_per_factor)),
             Value::LazySet(_) | Value::LazyFcn(_) => true,
-            Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+            Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         }
     }
     order.iter().any(|&i| walk(vals.get(i), fg, out, obs_per_factor))
@@ -921,11 +928,12 @@ fn choose_factorized_lazy_ordered(fg: &FactorizedGroup, vals: &mut StateVals, or
     Ok(best_img)
 }
 
-fn collect_support(moved: &[u32], vals: &mut StateVals, order: &[usize], out: &mut Vec<u32>) -> bool {
-    fn walk(v: &Value, moved: &[u32], out: &mut Vec<u32>) -> bool {
+fn collect_support(moved: &[u64], vals: &mut StateVals, order: &[usize], out: &mut Vec<u64>) -> bool {
+    fn walk(v: &Value, moved: &[u64], out: &mut Vec<u64>) -> bool {
         match v {
-            Value::ModelValue(m) => {
-                let id = m.id();
+            Value::ModelValue(_) | Value::Str(_) => {
+                let m = SymAtom::from_value(v).unwrap();
+                let id = m.compact_key();
                 if moved.binary_search(&id).is_ok() && !out.contains(&id) {
                     out.push(id);
                 }
@@ -935,7 +943,7 @@ fn collect_support(moved: &[u32], vals: &mut StateVals, order: &[usize], out: &m
             Value::Record(fs) => fs.iter().any(|(_, e)| walk(e, moved, out)),
             Value::Fcn(ps, _) => ps.iter().any(|(k, e)| walk(k, moved, out) || walk(e, moved, out)),
             Value::LazySet(_) | Value::LazyFcn(_) => true,
-            Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+            Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         }
     }
     order.iter().any(|&i| walk(vals.get(i), moved, out))
@@ -1117,9 +1125,9 @@ fn retained_bytes(v: &Value, cap: usize) -> usize {
 
 #[derive(Default)]
 struct LeastBuf {
-    support: Vec<u32>,
-    key: Vec<u32>,
-    seen: Vec<Vec<u32>>,
+    support: Vec<u64>,
+    key: Vec<u64>,
+    seen: Vec<Vec<u64>>,
     orders: Vec<Option<ImageOrder>>,
     bags: BagCache,
     factor: FactorScratch,
@@ -1147,7 +1155,7 @@ fn perm_of(f: &Value) -> EResult<Perm> {
         };
         let img = ops::apply(f, &k)?;
         if img != k {
-            m.insert(sym, img);
+            m.insert(SymAtom::Model(sym), img);
         }
     }
     Ok(m)
@@ -1155,14 +1163,11 @@ fn perm_of(f: &Value) -> EResult<Perm> {
 
 fn compose(p: &Perm, q: &Perm) -> Perm {
     let mut r = HashMap::new();
-    let keys: HashSet<Sym> = p.keys().chain(q.keys()).copied().collect();
+    let keys: HashSet<SymAtom> = p.keys().chain(q.keys()).copied().collect();
     for k in keys {
-        let mid = q.get(&k).cloned().unwrap_or(Value::ModelValue(k));
-        let img = match &mid {
-            Value::ModelValue(m) => p.get(m).cloned().unwrap_or(mid.clone()),
-            _ => mid.clone(),
-        };
-        if img != Value::ModelValue(k) {
+        let mid = q.get(&k).cloned().unwrap_or(k.to_value());
+        let img = SymAtom::from_value(&mid).and_then(|atom| p.get(&atom)).cloned().unwrap_or(mid);
+        if img != k.to_value() {
             r.insert(k, img);
         }
     }

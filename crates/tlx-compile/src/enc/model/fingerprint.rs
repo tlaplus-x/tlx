@@ -771,13 +771,15 @@ impl EncModel {
                 }
                 // SAFETY: valid words from the matching encoder/program, with published Dyn handles.
                 let got = unsafe { self.layout.decode_state_unchecked(&buf) };
-                let want: Vec<Value> =
-                    vals.iter().map(|v| tlx_value::ops::permute(v, &|m| fsym.fg.map_sym(m, &gen_img).cloned()).expect("permute")).collect();
+                let want: Vec<Value> = vals
+                    .iter()
+                    .map(|v| tlx_value::ops::permute(v, &|m| fsym.fg.map_atom(m, &gen_img).cloned()).expect("permute"))
+                    .collect();
                 if got != want {
                     mismatch(format_args!(
                         "SYMMETRY (factorized): generator swap ({}, {}) on\n{}\ndecodes to\n{}\ninstead of\n{}",
-                        factor.keys[k].as_str(),
-                        factor.keys[k + 1].as_str(),
+                        factor.keys[k].to_value(),
+                        factor.keys[k + 1].to_value(),
                         state_list(&self.base, std::slice::from_ref(&vals)),
                         state_list(&self.base, &[got]),
                         state_list(&self.base, &[want])
@@ -788,8 +790,8 @@ impl EncModel {
                     if gen_fp != expected_fp {
                         mismatch(format_args!(
                             "SYMMETRY (factorized): orbit_fp not invariant under generator swap ({}, {}) on\n{}\noriginal fp: {expected_fp:#018x}\nswapped fp:  {gen_fp:#018x}",
-                            factor.keys[k].as_str(),
-                            factor.keys[k + 1].as_str(),
+                            factor.keys[k].to_value(),
+                            factor.keys[k + 1].to_value(),
                             state_list(&self.base, std::slice::from_ref(&vals))
                         ));
                     }

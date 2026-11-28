@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use tlx_base::partition::FactorLayout;
-use tlx_value::{Sym, Value};
+use tlx_value::{SymAtom, Value};
 
 use super::explicit::sort_elems;
 use crate::dynval;
@@ -16,10 +16,10 @@ use crate::shape::{binom, FcnWitness};
 use crate::Shape;
 
 /// One full symmetric-group factor `Sym(K_g)` over `keys` sorted strictly
-/// ascending in TLC order (`Sym::cmp`).
+/// ascending in TLC order (`SymAtom::cmp`).
 #[derive(Clone, Debug)]
 pub struct FactorDesc {
-    pub keys: Box<[Sym]>,
+    pub keys: Box<[SymAtom]>,
     /// Pre-built `Value::ModelValue(k)` matching `keys` for zero-alloc lookup.
     pub values: Box<[Value]>,
     /// Start offset of this factor in flat per-key target-index tables (`img`).
@@ -32,16 +32,16 @@ pub struct FactorDesc {
 #[derive(Clone, Debug)]
 pub struct FactorGroupSpec {
     pub factors: Box<[FactorDesc]>,
-    /// Sorted by `sym.id()`: `(sym_id, factor_idx, key_idx)`.
-    key_index: Box<[(u32, u16, u16)]>,
-    min_id: u32,
-    max_id: u32,
+    /// Sorted by `sym.compact_key()`: `(sym_id, factor_idx, key_idx)`.
+    key_index: Box<[(u64, u16, u16)]>,
+    min_id: u64,
+    max_id: u64,
     pub total_keys: usize,
 }
 
 impl FactorGroupSpec {
-    /// Build a factorized group descriptor from per-factor sorted `Sym` slices.
-    pub fn new(raw_factors: &[&[Sym]]) -> Self {
+    /// Build a factorized group descriptor from per-factor sorted `SymAtom` slices.
+    pub fn new(raw_factors: &[&[SymAtom]]) -> Self {
         let mut factors = Vec::with_capacity(raw_factors.len());
         let mut key_index = Vec::new();
         let mut offset = 0usize;
@@ -49,21 +49,21 @@ impl FactorGroupSpec {
             debug_assert!(keys.len() >= 2);
             debug_assert!(keys.windows(2).all(|w| w[0] < w[1]));
             for (k, &s) in keys.iter().enumerate() {
-                key_index.push((s.id(), g as u16, k as u16));
+                key_index.push((s.compact_key(), g as u16, k as u16));
             }
-            let values: Box<[Value]> = keys.iter().copied().map(Value::ModelValue).collect();
+            let values: Box<[Value]> = keys.iter().copied().map(SymAtom::to_value).collect();
             factors.push(FactorDesc { keys: keys.into(), values, offset });
             offset += keys.len();
         }
         key_index.sort_unstable_by_key(|&(id, _, _)| id);
-        let min_id = key_index.first().map_or(u32::MAX, |&(id, _, _)| id);
+        let min_id = key_index.first().map_or(u64::MAX, |&(id, _, _)| id);
         let max_id = key_index.last().map_or(0, |&(id, _, _)| id);
         Self { factors: factors.into(), key_index: key_index.into(), min_id, max_id, total_keys: offset }
     }
 
     #[inline]
-    pub fn lookup(&self, m: Sym) -> Option<(usize, usize)> {
-        let id = m.id();
+    pub fn lookup(&self, m: SymAtom) -> Option<(usize, usize)> {
+        let id = m.compact_key();
         if id < self.min_id || id > self.max_id {
             return None;
         }
@@ -103,7 +103,7 @@ impl FactorGroupSpec {
     /// Image of model value `m` under flat image table `img`, or `None` when
     /// fixed (for `tlx_value::ops::permute_shared`).
     #[inline]
-    pub fn map_sym(&self, m: Sym, img: &[u16]) -> Option<&Value> {
+    pub fn map_atom(&self, m: SymAtom, img: &[u16]) -> Option<&Value> {
         let (g, k) = self.lookup(m)?;
         let f = &self.factors[g];
         let t = img[f.offset + k] as usize;
@@ -154,8 +154,8 @@ impl AtomTable {
         let mut key_to_code = vec![u64::MAX; fg.total_keys];
         let mut counts = vec![0usize; fg.factors.len()];
         for (code, v) in u.iter().enumerate() {
-            if let Value::ModelValue(m) = v {
-                if let Some((g, k)) = fg.lookup(*m) {
+            if let Some(m) = SymAtom::from_value(v) {
+                if let Some((g, k)) = fg.lookup(m) {
                     code_to_key[code] = Some((g as u16, k as u16));
                     key_to_code[fg.factors[g].offset + k] = code as u64;
                     counts[g] += 1;
@@ -257,7 +257,7 @@ impl DomMap {
             }
             DomMap::ValueDom(dom) => {
                 let v = &dom[slot];
-                match tlx_value::ops::permute_shared(v, &|m| fg.map_sym(m, img).cloned()) {
+                match tlx_value::ops::permute_shared(v, &|m| fg.map_atom(m, img).cloned()) {
                     Ok(Some(p)) => dom.iter().position(|d| d.exact_eq(&p)).expect("closed domain"),
                     _ => slot,
                 }
@@ -315,7 +315,7 @@ impl DomMap {
                 gen_img[off + k] = (k + 1) as u16;
                 gen_img[off + k + 1] = k as u16;
                 for d in dom {
-                    let pk = tlx_value::ops::permute_shared(d, &|m| fg.map_sym(m, &gen_img).cloned()).ok()?;
+                    let pk = tlx_value::ops::permute_shared(d, &|m| fg.map_atom(m, &gen_img).cloned()).ok()?;
                     if let Some(pk) = pk {
                         if !dom.iter().any(|x| x.exact_eq(&pk)) {
                             return None;
@@ -1095,12 +1095,12 @@ impl FactorPlan {
                 FactorPlan::Dyn => {
                     let v = if TRUSTED { dynval::lookup_unchecked(src[0]) } else { dynval::lookup(src[0]) };
                     if ORBIT_CANON {
-                        dst[0] = match tlx_value::ops::permute_shared(&v, &|m| fg.map_sym(m, img).cloned()) {
+                        dst[0] = match tlx_value::ops::permute_shared(&v, &|m| fg.map_atom(m, img).cloned()) {
                             Ok(Some(p)) => orbit_dyn_digest(&p),
                             _ => orbit_dyn_digest(&v),
                         };
                     } else {
-                        dst[0] = match tlx_value::ops::permute_shared(&v, &|m| fg.map_sym(m, img).cloned()) {
+                        dst[0] = match tlx_value::ops::permute_shared(&v, &|m| fg.map_atom(m, img).cloned()) {
                             Ok(Some(p)) => dynval::intern_exact(&p),
                             _ => src[0],
                         };
@@ -1108,7 +1108,7 @@ impl FactorPlan {
                 }
                 FactorPlan::Ref(store) => {
                     let v = if TRUSTED { store.thaw(src[0]) } else { store.try_thaw(src[0]).expect("valid value store handle") };
-                    match tlx_value::ops::permute_shared(&v, &|m| fg.map_sym(m, img).cloned()) {
+                    match tlx_value::ops::permute_shared(&v, &|m| fg.map_atom(m, img).cloned()) {
                         Ok(Some(p)) => {
                             dst[0] = if ORBIT_CANON {
                                 crate::store::digest_of_value(&p).unwrap_or_else(|_| store.digest(src[0]))
@@ -1205,8 +1205,8 @@ fn compile_factor_product(parts: &[&Shape], fg: &FactorGroupSpec, n: usize) -> O
 
 fn value_has_moved(v: &Value, fg: &FactorGroupSpec) -> bool {
     match v {
-        Value::ModelValue(m) => fg.lookup(*m).is_some(),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+        Value::ModelValue(_) | Value::Str(_) => fg.lookup(SymAtom::from_value(v).unwrap()).is_some(),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| value_has_moved(e, fg)),
         Value::Record(fs) => fs.iter().any(|(_, e)| value_has_moved(e, fg)),
         Value::Fcn(ps, _) => ps.iter().any(|(k, e)| value_has_moved(k, fg) || value_has_moved(e, fg)),
@@ -1216,12 +1216,12 @@ fn value_has_moved(v: &Value, fg: &FactorGroupSpec) -> bool {
 
 fn for_each_moved_in_value(v: &Value, fg: &FactorGroupSpec, f: &mut impl FnMut(usize, usize)) {
     match v {
-        Value::ModelValue(m) => {
-            if let Some((g, k)) = fg.lookup(*m) {
+        Value::ModelValue(_) | Value::Str(_) => {
+            if let Some((g, k)) = fg.lookup(SymAtom::from_value(v).unwrap()) {
                 f(g, k);
             }
         }
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => {}
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => {}
         Value::Set(es) | Value::Tuple(es) => {
             for e in es.iter() {
                 for_each_moved_in_value(e, fg, f);

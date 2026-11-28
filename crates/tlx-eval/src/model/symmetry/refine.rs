@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use tlx_base::partition::Partition;
 use tlx_value::order::{self_comparison_is_inert, try_total_cmp};
-use tlx_value::{Sym, Value};
+use tlx_value::{Sym, SymAtom, Value};
 
 use crate::error::EResult;
 
@@ -41,8 +41,8 @@ pub(super) enum DetOutcome<'a> {
 /// may contain one).
 pub(super) fn has_any_moved_atom(v: &Value, fg: &FactorizedGroup) -> bool {
     match v {
-        Value::ModelValue(m) => fg.lookup(*m).is_some(),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+        Value::ModelValue(_) | Value::Str(_) => fg.lookup(SymAtom::from_value(v).unwrap()).is_some(),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| has_any_moved_atom(e, fg)),
         Value::Record(fs) => fs.iter().any(|(_, e)| has_any_moved_atom(e, fg)),
         Value::Fcn(ps, _) => ps.iter().any(|(k, e)| has_any_moved_atom(k, fg) || has_any_moved_atom(e, fg)),
@@ -341,8 +341,8 @@ pub(super) fn is_orbit_cmp_safe(v: &Value, fg: &FactorizedGroup) -> bool {
 /// `part` (or a lazy value that may contain one).
 fn has_unpinned_atom(v: &Value, fg: &FactorizedGroup, part: &Partition) -> bool {
     match v {
-        Value::ModelValue(m) => fg.lookup(*m).is_some_and(|(g, k)| !part.is_pinned(fg, g, k)),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+        Value::ModelValue(_) | Value::Str(_) => fg.lookup(SymAtom::from_value(v).unwrap()).is_some_and(|(g, k)| !part.is_pinned(fg, g, k)),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| has_unpinned_atom(e, fg, part)),
         Value::Record(fs) => fs.iter().any(|(_, e)| has_unpinned_atom(e, fg, part)),
         Value::Fcn(ps, _) => ps.iter().any(|(k, e)| has_unpinned_atom(k, fg, part) || has_unpinned_atom(e, fg, part)),
@@ -355,15 +355,15 @@ fn has_unpinned_atom(v: &Value, fg: &FactorizedGroup, part: &Partition) -> bool 
 fn collect_unpinned_atoms(v: &Value, fg: &FactorizedGroup, part: &Partition, out: &mut Vec<(usize, usize)>) {
     fn walk(v: &Value, fg: &FactorizedGroup, part: &Partition, out: &mut Vec<(usize, usize)>) -> bool {
         match v {
-            Value::ModelValue(m) => {
-                if let Some((g, k)) = fg.lookup(*m) {
+            Value::ModelValue(_) | Value::Str(_) => {
+                if let Some((g, k)) = fg.lookup(SymAtom::from_value(v).unwrap()) {
                     if !part.is_pinned(fg, g, k) && !out.contains(&(g, k)) {
                         out.push((g, k));
                     }
                 }
                 false
             }
-            Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+            Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
             Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| walk(e, fg, part, out)),
             Value::Record(fs) => fs.iter().any(|(_, e)| walk(e, fg, part, out)),
             Value::Fcn(ps, _) => ps.iter().any(|(k, e)| walk(k, fg, part, out) || walk(e, fg, part, out)),
@@ -386,8 +386,10 @@ fn collect_unpinned_atoms(v: &Value, fg: &FactorizedGroup, part: &Partition, out
 /// Whether `v` contains any unpinned atom of factor `target_g` (or a lazy value).
 fn has_unpinned_in_factor(v: &Value, fg: &FactorizedGroup, part: &Partition, target_g: usize) -> bool {
     match v {
-        Value::ModelValue(m) => fg.lookup(*m).is_some_and(|(g, k)| g == target_g && !part.is_pinned(fg, g, k)),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
+        Value::ModelValue(_) | Value::Str(_) => {
+            fg.lookup(SymAtom::from_value(v).unwrap()).is_some_and(|(g, k)| g == target_g && !part.is_pinned(fg, g, k))
+        }
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
         Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| has_unpinned_in_factor(e, fg, part, target_g)),
         Value::Record(fs) => fs.iter().any(|(_, e)| has_unpinned_in_factor(e, fg, part, target_g)),
         Value::Fcn(ps, _) => {
@@ -410,7 +412,7 @@ fn set_is_rule2_eligible(es: &[Value], fg: &FactorizedGroup, mode: CmpMode) -> b
         match e {
             Value::ModelValue(m) => {
                 let ty = m.model_value_type();
-                if fg.lookup(*m).is_some() && ty.is_some() {
+                if fg.lookup(SymAtom::Model(*m)).is_some() && ty.is_some() {
                     touched_typed_factor = true;
                 }
                 if mode == CmpMode::Tlc {
@@ -460,16 +462,14 @@ fn single_factor_fcn_domain(
     in_dom: &mut Vec<bool>,
     payload_idx: &mut Vec<Option<usize>>,
 ) -> Option<usize> {
-    let (Value::ModelValue(m0), _) = ps.first()? else { return None };
-    let (g, _) = fg.lookup(*m0)?;
+    let (g, _) = fg.lookup(SymAtom::from_value(&ps.first()?.0)?)?;
     let n = fg.factors[g].keys.len();
     in_dom.clear();
     in_dom.resize(n, false);
     payload_idx.clear();
     payload_idx.resize(n, None);
     for (i, (k, _)) in ps.iter().enumerate() {
-        let Value::ModelValue(m) = k else { return None };
-        let (kg, ki) = fg.lookup(*m)?;
+        let (kg, ki) = fg.lookup(SymAtom::from_value(k)?)?;
         if kg != g || in_dom[ki] {
             return None;
         }
@@ -482,20 +482,21 @@ fn single_factor_fcn_domain(
 /// True iff `v1` (with `k1` acting as self-key) and `v2` (with `k2` acting as
 /// self-key) have identical structure, contain no unpinned atom other than
 /// their respective self-key, and contain no lazy values.
-fn same_self_template(fg: &FactorizedGroup, part: &Partition, k1: Sym, v1: &Value, k2: Sym, v2: &Value) -> bool {
+fn same_self_template(fg: &FactorizedGroup, part: &Partition, k1: SymAtom, v1: &Value, k2: SymAtom, v2: &Value) -> bool {
     match (v1, v2) {
-        (Value::ModelValue(m1), Value::ModelValue(m2)) => {
-            if *m1 == k1 && *m2 == k2 {
+        (Value::ModelValue(_), Value::ModelValue(_)) | (Value::Str(_), Value::Str(_)) => {
+            let m1 = SymAtom::from_value(v1).unwrap();
+            let m2 = SymAtom::from_value(v2).unwrap();
+            if m1 == k1 && m2 == k2 {
                 return true;
             }
-            if *m1 == k1 || *m2 == k2 {
+            if m1 == k1 || m2 == k2 {
                 return false;
             }
-            *m1 == *m2 && fg.lookup(*m1).is_none_or(|(g, ki)| part.is_pinned(fg, g, ki))
+            m1 == m2 && fg.lookup(m1).is_none_or(|(g, ki)| part.is_pinned(fg, g, ki))
         }
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Interval(l1, h1), Value::Interval(l2, h2)) => l1 == l2 && h1 == h2,
         (Value::Tuple(a), Value::Tuple(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_self_template(fg, part, k1, x, k2, y))
@@ -572,9 +573,9 @@ pub(super) fn refine_deterministic<'a>(
         return Ok(DetOutcome::Done);
     }
     match v {
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => Ok(DetOutcome::Done),
-        Value::ModelValue(m) => {
-            if let Some((g, k)) = fg.lookup(*m) {
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => Ok(DetOutcome::Done),
+        Value::ModelValue(_) | Value::Str(_) => {
+            if let Some((g, k)) = fg.lookup(SymAtom::from_value(v).unwrap()) {
                 part.pin_smallest(fg, g, k);
             }
             Ok(DetOutcome::Done)
@@ -636,8 +637,8 @@ fn refine_set<'a>(
         scratch.in_set.resize(n, false);
         let mut any = false;
         for e in es {
-            if let Value::ModelValue(m) = e {
-                if let Some((eg, ek)) = fg.lookup(*m) {
+            if let Some(m) = SymAtom::from_value(e) {
+                if let Some((eg, ek)) = fg.lookup(m) {
                     if eg == g {
                         scratch.in_set[ek] = true;
                         any = true;
@@ -940,7 +941,7 @@ pub(super) fn minimize_across_candidates(
             }
             return Ok(cands);
         }
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => return Ok(candidates),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => return Ok(candidates),
         _ => {}
     }
 

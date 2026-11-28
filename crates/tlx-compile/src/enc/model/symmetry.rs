@@ -22,7 +22,7 @@ use tlx_layout::permute::{AtomPerm, DomMap, FactorGroupSpec, FactorPlan, PermPla
 use tlx_layout::Layout;
 use tlx_native::fp_words;
 use tlx_runtime::ModelError;
-use tlx_value::{Sym, Value};
+use tlx_value::{SymAtom, Value};
 
 use branch::choose_factorized_words;
 use order::WordOrder;
@@ -130,10 +130,8 @@ pub(super) fn compile_symmetry(base: &InterpModel, layout: &Layout, notes: &mut 
     let mut group = Vec::with_capacity(maps.len());
     for m in maps {
         let m = m.clone();
-        let perm: AtomPerm = Arc::new(move |v: &Value| match v {
-            Value::ModelValue(s) => m.get(s).cloned().unwrap_or_else(|| v.clone()),
-            _ => v.clone(),
-        });
+        let perm: AtomPerm =
+            Arc::new(move |v: &Value| SymAtom::from_value(v).and_then(|a| m.get(&a)).cloned().unwrap_or_else(|| v.clone()));
         let mut plans = Vec::with_capacity(layout.vars.len());
         for (i, s) in layout.vars.iter().enumerate() {
             match PermPlan::compile(s, &perm) {
@@ -364,13 +362,13 @@ pub(super) fn orbit_fp_explicit(
 /// decoded values (see `orbit_fp_explicit`), avoiding the store allocation of
 /// `PermPlan::Ref`.
 pub(super) struct RefDigests<'a> {
-    maps: &'a [HashMap<Sym, Value>],
+    maps: &'a [HashMap<SymAtom, Value>],
     /// Decoded value of each top-level `Shape::Ref` variable, by variable index.
     vals: Box<[Option<Value>]>,
 }
 
 impl<'a> RefDigests<'a> {
-    pub(super) fn new(layout: &Layout, words: &[u64], maps: &'a [HashMap<Sym, Value>]) -> Self {
+    pub(super) fn new(layout: &Layout, words: &[u64], maps: &'a [HashMap<SymAtom, Value>]) -> Self {
         let vals = layout
             .vars
             .iter()

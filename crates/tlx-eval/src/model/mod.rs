@@ -31,7 +31,7 @@ use tlx_front::cfg::Config;
 use tlx_runtime::{stats, Model, ModelError};
 use tlx_sema::hir::*;
 use tlx_sema::source::EndTrim;
-use tlx_value::{Sym, Value};
+use tlx_value::{Sym, SymAtom, Value};
 
 use crate::enumerate::Action;
 use crate::env::Env;
@@ -571,7 +571,7 @@ impl InterpModel {
 
     /// Read-only per-factor ordered `Sym` slices (`m_{g,0} <_{tlc} ... <_{tlc} m_{g,n_g-1}`)
     /// when `SYMMETRY` is a factorized disjoint symmetric-group product.
-    pub fn symmetry_factors(&self) -> Option<Vec<&[Sym]>> {
+    pub fn symmetry_factors(&self) -> Option<Vec<&[SymAtom]>> {
         self.group.symmetry_factors()
     }
 
@@ -579,7 +579,7 @@ impl InterpModel {
     /// The SYMMETRY group (without the identity): each element maps the
     /// model values it moves to their images (materialized on demand for
     /// factorized groups up to order 720).
-    pub fn symmetry_maps(&self) -> &[std::collections::HashMap<tlx_value::Sym, Value>] {
+    pub fn symmetry_maps(&self) -> &[std::collections::HashMap<SymAtom, Value>] {
         self.group.symmetry_maps()
     }
 
@@ -605,7 +605,7 @@ impl InterpModel {
     /// (`autosym`); the model must not have a declared SYMMETRY. Under
     /// `TLX_SYMMETRY_PARANOID=N` one expanded state in N is checked against
     /// it (`check_symmetry_claim`).
-    pub fn apply_symmetry(&mut self, gens: Vec<std::collections::HashMap<Sym, Value>>) -> EResult<()> {
+    pub fn apply_symmetry(&mut self, gens: Vec<std::collections::HashMap<SymAtom, Value>>) -> EResult<()> {
         assert!(self.group.is_empty(), "apply_symmetry with a declared SYMMETRY");
         let every = tlx_base::knobs::Env::process().opt_num("TLX_SYMMETRY_PARANOID").ok().flatten();
         let claim = every.filter(|n| *n > 0).map(|every| {
@@ -626,8 +626,8 @@ impl InterpModel {
     /// them, as in `apply_symmetry`.
     pub fn install_augmented_symmetry(
         &mut self,
-        factors: Vec<Vec<Sym>>,
-        extra_gens: Vec<std::collections::HashMap<Sym, Value>>,
+        factors: Vec<Vec<SymAtom>>,
+        extra_gens: Vec<std::collections::HashMap<SymAtom, Value>>,
         certificate: String,
     ) -> EResult<()> {
         if self.ip.cfg.symmetry.is_none() {

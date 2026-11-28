@@ -115,7 +115,7 @@ impl PermPlan {
     /// function domain not closed under the permutation).
     pub fn compile(shape: &Shape, perm: &AtomPerm) -> Option<PermPlan> {
         let n = words(shape);
-        let permute_value = |v: &Value| tlx_value::ops::permute(v, &|m| Some(perm(&Value::ModelValue(m)))).ok();
+        let permute_value = |v: &Value| tlx_value::ops::permute(v, &|m| Some(perm(&m.to_value()))).ok();
         Some(match shape {
             Shape::Never | Shape::Bool | Shape::Int { .. } => PermPlan::Copy(n),
             Shape::Atom(u) => {
@@ -370,8 +370,8 @@ impl PermPlan {
                     };
                     // Permuting a normalized value cannot fail in practice; keep
                     // the value if it does.
-                    let image = |m| {
-                        let x = Value::ModelValue(m);
+                    let image = |m: tlx_value::SymAtom| {
+                        let x = m.to_value();
                         let y = perm(&x);
                         (y != x).then_some(y)
                     };
