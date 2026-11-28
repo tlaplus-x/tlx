@@ -191,6 +191,14 @@ their sum (`bcastFolklore/bcastFolklore`: 501,552 states and 10.2M
 graph edges take 58.3 MiB CSR, 76.2 MiB for the largest 655,360-node / 6.48M-edge product, and 239.7 MiB peak
 RSS).
 
+The parts entered from waiting tableau states follow the graph's own BFS (`GraphBfs`): it keeps the states
+those steps enter in discovery order, records where each BFS level begins as one bit per entry (the distances
+are contiguous, so the entries are entered at `1, 2, ...`) instead of a distance per graph state, records only
+the step into each such state, finds its roots through a bitset of the initial states, and marks the states it
+has queued in a pre-sized bitset. It takes at most about 12.25 B per graph state after construction (instead
+of 16 B) and about 16.375 B at its peak (instead of 20 B), on every graph topology: a chain or ring whose BFS
+depth equals its state count costs the same as a shallow expander.
+
 The fingerprints of the graph's states (`8 B` per node) are not needed to build or search the product: only
 the nodes along a counterexample lasso are read, to seed the replay and to check each replayed step. Under
 `-spill always`, and under `-spill auto` when the product would otherwise go over the budget, they are

@@ -521,3 +521,116 @@ fn high_outdegree_product_checks_budget_during_insertion() {
     assert!(res.is_err(), "budget must stop during state 0 fanout");
     assert_eq!(max_seen_nodes, 65_536, "guard must trigger at GUARD_EVERY inserted nodes, not after all {fanout}");
 }
+
+/// The graph BFS of waiting states charges about `12.125 B/state` retained
+/// and `~16.375 B/state` while it is built (down from `16` and `20`), and
+/// keeps its level starts in one bit per entry rather than a `u32` per state.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn waiting_state_graph_bfs_is_compact() {
+    use tlx_live::{check_lasso_csr_stats, CheckStats, Csr};
+    let n = 200_000usize;
+    let g = ring(n as u32);
+    // `[](p => <>q)` has a waiting tableau state, so the graph BFS is built.
+    let prop = always(leads_to(st(0), st(1)));
+    let mut calls: Vec<usize> = Vec::new();
+    let mut stats = CheckStats::default();
+    let c = Csr::from_graph(&g);
+    check_lasso_csr_stats(
+        &c,
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            calls.push(bytes);
+            true
+        },
+        &mut stats,
+    )
+    .expect("fits")
+    .expect("q holds everywhere");
+    assert_eq!(stats.waiting_states, 1);
+    // The construction charge is the only pre-product call near `n` bytes;
+    // the next one is the first product's initial check.
+    let at = calls.iter().position(|&b| b >= 10 * n).expect("graph BFS construction charge");
+    let (peak, retained) = (calls[at], calls[at + 1]);
+    // `bytes_for` keeps the per-state arrays plus the temporary queue and
+    // visited bitset and the initial-state bitset.
+    assert!((16 * n..=33 * n / 2).contains(&peak), "construction charge {peak} for {n} states");
+    // The retained BFS drops the distance array for one bit per entry.
+    assert!((12 * n..=25 * n / 2).contains(&retained), "retained charge {retained} for {n} states");
+    eprintln!("graph BFS: {peak} B construction, {retained} B retained for {n} states");
+}
+
+/// The same bounds at maximum BFS depth through the public budget: a plain
+/// ring's graph BFS has one level per state (`n` levels), yet the level
+/// starts are one bit per `order` entry, so neither the construction charge
+/// (`~16.375 B/state`) nor the retained one (`~12.125 B/state`) grows with
+/// the depth.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn waiting_state_graph_bfs_is_compact_at_maximum_depth() {
+    use tlx_live::{check_lasso_csr_stats, CheckStats, Csr};
+    let n = 200_000u32;
+    // A directed ring with its stuttering steps: the BFS from state 0 needs
+    // `n` levels, one per state.
+    let ring: Vec<(u32, u32, u64)> = (0..n).map(|s| (s, (s + 1) % n, 0)).collect();
+    let g = graph(&[0], &vec![1; n as usize], &ring, true);
+    let prop = always(leads_to(st(0), st(1)));
+    let (mut calls, mut stats) = (Vec::new(), CheckStats::default());
+    check_lasso_csr_stats(
+        &Csr::from_graph(&g),
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            calls.push(bytes);
+            true
+        },
+        &mut stats,
+    )
+    .expect("fits")
+    .expect_err("p is never followed by q");
+    assert_eq!(stats.waiting_states, 1);
+    let n = n as usize;
+    let at = calls.iter().position(|&b| b >= 10 * n).expect("graph BFS construction charge");
+    let (peak, retained) = (calls[at], calls[at + 1]);
+    assert!((16 * n..=33 * n / 2).contains(&peak), "construction charge {peak} for {n} states at depth {n}");
+    assert!((12 * n..=25 * n / 2).contains(&retained), "retained charge {retained} for {n} states at depth {n}");
+    eprintln!("graph BFS at maximum depth: {peak} B construction, {retained} B retained for {n} states");
+}
+
+/// A counterexample whose product nodes are entered from waiting states
+/// reconstructs its prefix along the graph BFS: from a non-initial state and
+/// from an initial state that a step reaches (the roots above it).
+#[test]
+fn waiting_state_prefix_reconstruction_reaches_initial_states() {
+    use tlx_live::{check_lasso_csr_stats, CheckStats, Csr};
+    // A 6-state ring (each state also stutters) checked against
+    // `[](p => <>q)` with `q` false: reaching `p` then staying violates it.
+    let n = 6u32;
+    let ring: Vec<(u32, u32, u64)> = (0..n).map(|s| (s, (s + 1) % n, 0)).collect();
+    let prop = always(leads_to(st(0), st(1)));
+    let run = |init: &[u32], p: &[u32]| {
+        let states: Vec<u64> = (0..n).map(|s| u64::from(p.contains(&s))).collect();
+        let g = graph(init, &states, &ring, true);
+        let mut stats = CheckStats::default();
+        let run = check_lasso_csr_stats(&Csr::from_graph(&g), &prop, &[], 1, &mut |_, _, _| true, &mut stats)
+            .expect("fits")
+            .expect_err("p never followed by q");
+        assert_eq!(stats.waiting_states, 1);
+        assert!(lasso_error(&g, &prop, &[], &run).is_none(), "invalid lasso {run:?}");
+        run
+    };
+    // State 4 is entered from initial state 3, so the cycle starts there and
+    // the prefix is the BFS step into it, not a `[]`-rooted walk.
+    let non_initial = run(&[0, 3], &[3]);
+    assert_eq!(non_initial.prefix, vec![(3, 0)]);
+    assert_eq!(non_initial.cycle, vec![(4, 1)]);
+    // State 0 is initial and is also entered from state 5: the prefix walks
+    // `into` back to the recorded step 3 -> 4 -> 5 -> 0 and stops at the
+    // (non-zero) initial state 3.
+    let entered_initial = run(&[0, 3], &[5]);
+    assert_eq!(entered_initial.prefix, vec![(3, 0), (4, 0), (5, 0)]);
+    assert_eq!(entered_initial.cycle, vec![(0, 1)]);
+}
