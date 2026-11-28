@@ -27,8 +27,9 @@ Core design and architecture:
 - **Parallel state-space exploration.** Level-synchronous workers share an atomic fingerprint
   table, supporting concurrent successor generation and duplicate detection.
 - **Lean-certified state reduction.** Safety runs apply automatic symmetry over interchangeable
-  model-value orbits in default mode and opt-in state projections under `-optimize`, each
-  gated on a compiler-generated Lean certificate while preserving concrete counterexamples.
+  model-value and opaque string scalarset orbits in default mode and opt-in state projections under
+  `-optimize`, each gated on a compiler-generated Lean certificate while preserving concrete
+  counterexamples.
 
 [docs/design.md](docs/design.md), [docs/optimization.md](docs/optimization.md) and
 [docs/reductions.md](docs/reductions.md) explain these mechanisms and the guarded interpreter
@@ -209,12 +210,12 @@ Automatic state reductions require a compiler-generated Lean certificate connect
 that application:
 
 1. **[Automatic symmetry](proofs/symmetry/README.md) (default mode).** Applies disjoint
-   products of full permutation groups (two to seven model values each, total order at most
-   5,040) when backed by a connected Lean certificate across keyed state (`KeyedCertificate`:
-   fixed/mixed maps, scalar or optional key slots, sets of keys, single-key tagged record
-   sets, and fixed records), recursive equivariant finite values (`EquivSymCertificate`:
-   key-valued and nested maps, multi-key
-   records, bounded sequences/tuples, set comprehensions, `KSubset`, `IsInjective`), or
+   products of full permutation groups (two to seven model values or opaque strings each, total
+   order at most 5,040) when backed by a connected Lean certificate across keyed state
+   (`KeyedCertificate`: fixed/mixed maps, scalar or optional key slots, sets of keys, single-key
+   tagged record sets, and fixed records), recursive equivariant finite values
+   (`EquivSymCertificate`: model-value and opaque string scalarsets, key-valued and nested maps,
+   multi-key records, bounded sequences/tuples, set comprehensions, `KSubset`, `IsInjective`), or
    choice-irrelevant `CHOOSE` (`ChooseSymCertificate`: unique-witness `CHOOSE`, projected
    uniform/constant-value `CHOOSE`, and commutative-associative recursive `CHOOSE` integer
    set-sum folds). A declared `.cfg` `SYMMETRY` that already factors into such groups may be

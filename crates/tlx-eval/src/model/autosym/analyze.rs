@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use tlx_sema::builtins::Builtin as B;
 use tlx_sema::hir::*;
-use tlx_value::{Sym, Value};
+use tlx_value::{Sym, SymAtom, Value};
 
 use super::shape::{Mask, Sh, ALL};
 use crate::interp::Interp;
@@ -73,6 +73,7 @@ pub(super) struct Atom {
 enum AtomKey {
     Const(ConstId),
     Def(DefId),
+    StrLit(Sym),
 }
 
 /// An argument of an operator: its shape, and the variable it is (primed
@@ -112,7 +113,9 @@ const MAX_PASSES: usize = 12;
 
 pub(super) struct Analyzer<'a> {
     ip: &'a Arc<Interp>,
-    mask_of: &'a dyn Fn(Sym) -> Mask,
+    mask_of: &'a dyn Fn(SymAtom) -> Mask,
+    /// Bitmask of all analyzed `Value::Str` scalarset candidates.
+    string_mask: Mask,
     /// The shapes of the variables (fixed during a pass).
     pub vars: Vec<Sh>,
     /// The shapes assigned to the variables in this pass.
@@ -128,7 +131,7 @@ pub(super) struct Analyzer<'a> {
     pub effects: Vec<Effect>,
     pub atoms: Vec<Atom>,
     atom_keys: HashSet<AtomKey>,
-    const_defs: HashMap<DefId, Option<Sh>>,
+    const_defs: HashMap<DefId, (Option<Sh>, Mask)>,
     /// The CHOOSE expressions of recursive folds over sets (`fold_chooses`).
     folds: HashSet<usize>,
     steps: usize,
@@ -137,11 +140,12 @@ pub(super) struct Analyzer<'a> {
 }
 
 impl<'a> Analyzer<'a> {
-    pub(super) fn new(ip: &'a Arc<Interp>, mask_of: &'a dyn Fn(Sym) -> Mask) -> Analyzer<'a> {
+    pub(super) fn new(ip: &'a Arc<Interp>, mask_of: &'a dyn Fn(SymAtom) -> Mask, string_mask: Mask) -> Analyzer<'a> {
         let n = ip.prog.vars.len();
         Analyzer {
             ip,
             mask_of,
+            string_mask,
             vars: vec![Sh::default(); n],
             next_vars: vec![Sh::default(); n],
             memo: HashMap::new(),

@@ -15,7 +15,7 @@ fn try_load_with(src: &str, cfg: &str) -> Result<InterpModel, String> {
     Interp::new(prog, cfg).and_then(InterpModel::new).map_err(|e| e.into_message())
 }
 
-const HEAD: &str = "EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC, TLCExt, Bags, SequencesExt, FiniteSetsExt, Functions, Json\nCONSTANTS Proc, Leader\n";
+const HEAD: &str = "EXTENDS Naturals, Integers, Sequences, FiniteSets, TLC, TLCExt, Bags, SequencesExt, FiniteSetsExt, Functions, Json, IOUtils\nCONSTANTS Proc, Leader\n";
 const CFG: &str = "CONSTANTS\n  Proc = {p1, p2, p3}\n  Leader = q\nINIT Init\nNEXT Next\n";
 
 /// Analyze a module with variables, Init and Next given in `body`.
@@ -409,4 +409,210 @@ fn choose_only_rejection_retains_atom_partitioned_choose_verdict() {
         }
         other => panic!("expected partial Proven choose_verdict, got {other:?}"),
     }
+}
+
+// --- opaque String scalarsets ---
+
+#[test]
+fn string_scalarsets_and_seq_ops_are_proven_without_cfg_symmetry_advice() {
+    let cfg = "CONSTANTS\n  Key = {\"k1\", \"k2\", \"k3\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body = "CONSTANT Key\n\
+        VARIABLES q, tag\n\
+        Init == q = <<>> /\\ tag = \"ON_NON_SUBSET\"\n\
+        Next == \\E k \\in Key : /\\ Len(q) < 3 /\\ q' = Append(q, k) \\o <<>>\n\
+        \x20   /\\ (Len(q) > 0 => Head(q) \\in Key /\\ Len(Tail(q)) >= 0 /\\ Len(SubSeq(q, 1, 1)) = 1)\n\
+        \x20   /\\ Len(SelectSeq(q, LAMBDA x : x = k)) <= 3\n\
+        \x20   /\\ tag' \\in {\"New\", \"Started\", \"SYNC\", \"ON_NON_SUBSET\"}\n";
+    let an = analysis_with(body, cfg);
+    let key = an.sets.iter().find(|s| s.candidate.name == "Key").expect("candidate Key");
+    assert!(key.full(), "expected Permutations(Key) to be proven: {:?}", key.verdict);
+    assert_eq!(key.group_order(), 6);
+    assert_eq!(an.group_text(), "Permutations(Key)");
+    // String sets cannot be declared in manual `.cfg` SYMMETRY (`docs/compat.md`).
+    assert!(an.symmetry_definition().is_none(), "Str set must suppress .cfg SYMMETRY paste advice");
+    let suggestion = an.suggestion(Some(true)).expect("suggestion for Str set");
+    assert!(suggestion.ends_with("; to use it, run without -tlc."), "{suggestion}");
+    assert!(!suggestion.contains("SYMMETRY Perms"), "{suggestion}");
+
+    // `<-`-substituted constant definition of a homogeneous String set.
+    let subst_cfg = "CONSTANTS\n  Key <- MCKey\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let subst_body = "CONSTANT Key\n\
+        MCKey == {\"k1\", \"k2\"}\n\
+        VARIABLE x\n\
+        Init == x \\in Key\n\
+        Next == x' \\in Key\n";
+    let an_subst = analysis_with(subst_body, subst_cfg);
+    let key_subst = an_subst.sets.iter().find(|s| s.candidate.name == "Key").expect("substituted Key");
+    assert!(key_subst.full(), "expected <- substituted Str set to be proven: {:?}", key_subst.verdict);
+    assert_eq!(key_subst.group_order(), 2);
+}
+
+#[test]
+fn string_literals_pin_only_matching_str_atoms() {
+    let cfg3 = "CONSTANTS\n  Key = {\"k1\", \"k2\", \"k3\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body = "CONSTANT Key\n\
+        VARIABLE x\n\
+        Init == x \\in Key\n\
+        Next == x' = IF x = \"k1\" THEN x ELSE CHOOSE y \\in Key : y = x\n";
+    let an3 = analysis_with(body, cfg3);
+    match verdict(&an3, "Key") {
+        Verdict::Proven { classes, pinned_by } => {
+            assert_eq!(classes.len(), 1);
+            assert_eq!(classes[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), ["\"k2\"", "\"k3\""]);
+            assert!(pinned_by.iter().any(|p| p.contains("\"k1\"")), "{pinned_by:?}");
+        }
+        v => panic!("expected k1 pinned leaving {{k2, k3}}, got {v:?}"),
+    }
+
+    let cfg2 = "CONSTANTS\n  Key = {\"k1\", \"k2\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let an2 = analysis_with(body, cfg2);
+    assert!(
+        matches!(verdict(&an2, "Key"), Verdict::Pinned { .. }),
+        "2-element set with literal k1 must be Pinned: {:?}",
+        verdict(&an2, "Key")
+    );
+}
+
+#[test]
+fn string_breakers_screen_inspection_synthesis_widening_and_record_fields() {
+    let cfg = "CONSTANTS\n  Key = {\"k1\", \"k2\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let cases: &[(&str, &str)] = &[
+        (
+            "CONSTANT Key\nVARIABLE x\nInit == x \\in Key\nNext == Len(x) = 2 /\\ x' \\in Key\n",
+            "Len",
+        ),
+        (
+            "CONSTANT Key\nVARIABLE x\nInit == x \\in Key\nNext == atoi(x) = 0 /\\ x' \\in Key\n",
+            "atoi",
+        ),
+        (
+            "CONSTANT Key\nVARIABLE x\nInit == x \\in Key\nNext == (x < \"z\") /\\ x' \\in Key\n",
+            "<",
+        ),
+        (
+            "CONSTANT Key\nVARIABLE x\nInit == x \\in Key\nNext == (x[1] = x[1]) /\\ x' \\in Key\n",
+            "string indexing",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = x \\o \"x\"\n",
+            "\\o",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = \"k\" \\o \"1\"\n",
+            "\\o",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ (\\E u : (u \\o <<>>) # <<>>) /\\ y' = y\n",
+            "\\o",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = Tail(\"xk1\")\n",
+            "Tail",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = SubSeq(\"xk1\", 2, 3)\n",
+            "SubSeq",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = ToString(1)\n",
+            "ToString",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, y\nInit == x \\in Key /\\ y = \"\"\nNext == x' \\in Key /\\ y' = ToJson(1)\n",
+            "ToJson",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, r\nInit == x \\in Key /\\ r = [k1 |-> 0]\nNext == x' \\in Key /\\ r' = r\n",
+            "record field",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, r\nInit == x \\in Key /\\ r \\in [k1 : {0, 1}]\nNext == x' \\in Key /\\ r' = r\n",
+            "record field",
+        ),
+        (
+            "CONSTANT Key\nVARIABLES x, r\nInit == x \\in Key /\\ r = [a |-> 0]\nNext == x' \\in Key /\\ r' = [r EXCEPT !.k1 = 0]\n",
+            "record field",
+        ),
+        (
+            "CONSTANT Key\nRecConst == [k1 |-> 0, k2 |-> 1]\nVARIABLES x, r\nInit == x \\in Key /\\ r = RecConst\nNext == x' \\in Key /\\ r' = r\n",
+            "record field",
+        ),
+        (
+            "CONSTANT Key\nVARIABLE x\nInit == x \\in Key\nNext == x' = CHOOSE s \\in STRING : s \\in Key\n",
+            "CHOOSE",
+        ),
+    ];
+    for (body, expected) in cases {
+        let an = analysis_with(body, cfg);
+        match verdict(&an, "Key") {
+            Verdict::Rejected { what, .. } => {
+                assert!(what.contains(expected), "expected breaker {expected:?}, got {what:?}\n{body}");
+            }
+            v => panic!("expected Rejected({expected:?}), got {v:?}\n{body}"),
+        }
+    }
+}
+
+#[test]
+fn same_name_model_value_and_str_candidates_stay_strictly_isolated() {
+    // 1. ModelValue K = {a, b} is NOT pinned by string literal "a".
+    let cfg1 = "CONSTANTS\n  K = {a, b}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body1 = "CONSTANT K\n\
+        VARIABLES x, tag\n\
+        Init == x \\in K /\\ tag = \"a\"\n\
+        Next == x' \\in K /\\ tag' = \"a\"\n";
+    let an1 = analysis_with(body1, cfg1);
+    let k1 = an1.sets.iter().find(|s| s.candidate.name == "K").unwrap();
+    assert!(k1.full(), "literal \"a\" must not pin ModelValue(a): {:?}", k1.verdict);
+
+    // 2. Constant C = {"a", "b", a}: pins ModelValue(a) cleanly on K = {a, b},
+    //    while keeping Str K2 = {"a", "b"} fully symmetric!
+    let cfg2 =
+        "CONSTANTS\n  K = {a, b}\n  K2 = {\"a\", \"b\"}\n  C = {\"a\", \"b\", a}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body2 = "CONSTANTS K, K2, C\n\
+        VARIABLES x, y\n\
+        Init == x \\in K /\\ y \\in K2 /\\ x \\in C /\\ y \\in C\n\
+        Next == x' \\in K /\\ y' \\in K2\n";
+    let an2 = analysis_with(body2, cfg2);
+    assert!(matches!(verdict(&an2, "K"), Verdict::Pinned { .. }), "C must pin ModelValue K: {:?}", verdict(&an2, "K"));
+    let k2 = an2.sets.iter().find(|s| s.candidate.name == "K2").unwrap();
+    assert!(k2.full(), "C must leave Str K2 fully symmetric: {:?}", k2.verdict);
+
+    // 3. Coexistence of K1 = {a, b} and K2 = {"a", "b"}: both proven independently,
+    //    and literal "a" pins only K2 while Leader = a pins only K1.
+    let cfg3 = "CONSTANTS\n  K1 = {a, b}\n  K2 = {\"a\", \"b\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body3 = "CONSTANTS K1, K2\n\
+        VARIABLES x, y\n\
+        Init == x \\in K1 /\\ y \\in K2\n\
+        Next == x' \\in K1 /\\ y' \\in K2\n";
+    let an3 = analysis_with(body3, cfg3);
+    assert!(an3.sets.iter().find(|s| s.candidate.name == "K1").unwrap().full());
+    assert!(an3.sets.iter().find(|s| s.candidate.name == "K2").unwrap().full());
+    assert_eq!(an3.group_order(), 4);
+}
+
+#[test]
+fn tlc_get_config_breaks_str_candidates_but_allows_model_values_and_level() {
+    // `TLCGet("config")` exposes concrete strings and field names, so it must break Str sets
+    // while leaving ModelValue sets unaffected.
+    let cfg = "CONSTANTS\n  Modes = {\"bfs\", \"simulate\"}\n  Proc = {p1, p2, p3}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body = "CONSTANT Modes\n\
+        VARIABLES m, p\n\
+        Init == m \\in Modes /\\ p \\in Proc\n\
+        Next == (m = TLCGet(\"config\").mode \\/ m # TLCGet(\"config\").mode) /\\ m' \\in Modes /\\ p' \\in Proc\n";
+    let an = analysis_with(body, cfg);
+    match verdict(&an, "Modes") {
+        Verdict::Rejected { what, .. } => assert!(what.contains("TLCGet(\"config\")"), "unexpected breaker: {what:?}"),
+        v => panic!("expected TLCGet(\"config\") breaker on Str candidate Modes, got {v:?}"),
+    }
+    assert!(an.sets.iter().find(|s| s.candidate.name == "Proc").unwrap().full());
+
+    // `TLCGet("level")` returns an integer and continues to allow Str candidates.
+    let cfg_level = "CONSTANTS\n  Key = {\"k1\", \"k2\"}\n  Proc = {p1, p2}\n  Leader = q\nINIT Init\nNEXT Next\n";
+    let body_level = "CONSTANT Key\n\
+        VARIABLE k\n\
+        Init == k \\in Key\n\
+        Next == TLCGet(\"level\") < 5 /\\ k' \\in Key\n";
+    let an_level = analysis_with(body_level, cfg_level);
+    assert!(an_level.sets.iter().find(|s| s.candidate.name == "Key").unwrap().full());
 }

@@ -564,13 +564,13 @@ impl InterpModel {
     }
 
     /// Certify a disjoint product of full key permutation groups. This does not install it.
-    pub fn symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
+    pub fn symmetry_certificate(&self, groups: &[tlx_sema::optimize::SymGroup]) -> Option<String> {
         let next = self.symmetry_cert_next()?;
         let cfg = &self.ip.cfg;
         let init_props = self.init_prop_exprs();
         let spec = self.check_spec(&init_props);
         if self.state_projection {
-            tlx_sema::optimize::symmetry_projection_certificate_with_spec(
+            tlx_sema::optimize::symmetry_projection_certificate_with_typed_groups(
                 &self.ip.prog,
                 cfg,
                 &self.init,
@@ -585,9 +585,18 @@ impl InterpModel {
             // certified erasure with the orbit quotient over the exact
             // retained tuple.
             let span = self.view.as_ref()?.span;
-            tlx_sema::optimize::symmetry_view_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups, &retained, span)
+            tlx_sema::optimize::symmetry_view_certificate_with_typed_groups(
+                &self.ip.prog,
+                cfg,
+                &self.init,
+                &next,
+                spec,
+                groups,
+                &retained,
+                span,
+            )
         } else {
-            tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, cfg, &self.init, &next, spec, groups)
+            tlx_sema::optimize::symmetry_certificate_with_typed_groups(&self.ip.prog, cfg, &self.init, &next, spec, groups)
         }
     }
 
@@ -596,25 +605,25 @@ impl InterpModel {
     /// unless the declared group factors into full symmetric groups and every
     /// one of those factors appears verbatim in `combined`, so the certificate
     /// covers the group actually installed. This does not install it.
-    pub fn augmented_symmetry_certificate(&self, combined: &[Vec<String>]) -> Option<String> {
+    pub fn augmented_symmetry_certificate(&self, combined: &[tlx_sema::optimize::SymGroup]) -> Option<String> {
         if self.state_projection || self.has_view() || self.ip.cfg.symmetry.is_none() {
             return None;
         }
-        let declared: Vec<Vec<String>> =
-            self.symmetry_factors()?.into_iter().map(|keys| keys.iter().map(|m| m.sym().as_str().to_owned()).collect()).collect();
+        let declared: Vec<tlx_sema::optimize::SymGroup> =
+            self.symmetry_factors()?.into_iter().map(super::autosym::sym_group_from_atoms).collect::<Option<_>>()?;
         if !declared.iter().all(|factor| combined.contains(factor)) {
             return None;
         }
         let next = self.symmetry_cert_next_with(true)?;
         let init_props = self.init_prop_exprs();
         let spec = self.check_spec(&init_props);
-        tlx_sema::optimize::symmetry_certificate_with_spec(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, combined)
+        tlx_sema::optimize::symmetry_certificate_with_typed_groups(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, combined)
     }
 
     /// Certify a disjoint product of full key permutation groups via the
     /// choice-symmetry certificate (`ChooseSymCertificate`), which proves
     /// `Init` equivariance as well as `CHOOSE` invariance. This does not install it.
-    pub fn choose_symmetry_certificate(&self, groups: &[Vec<String>]) -> Option<String> {
+    pub fn choose_symmetry_certificate(&self, groups: &[tlx_sema::optimize::SymGroup]) -> Option<String> {
         if self.state_projection {
             return None;
         }
@@ -627,7 +636,7 @@ impl InterpModel {
         let next = self.symmetry_cert_next()?;
         let init_props = self.init_prop_exprs();
         let spec = self.check_spec(&init_props);
-        tlx_sema::optimize::choose_symmetry_certificate_with_spec(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, groups)
+        tlx_sema::optimize::choose_symmetry_certificate_with_typed_groups(&self.ip.prog, &self.ip.cfg, &self.init, &next, spec, groups)
     }
 
     /// Retain the proof of the automatic group actually installed by the caller.
@@ -787,16 +796,16 @@ Syn == Permutations(TxId)
         let p = Program::load(&dir.join("Declared.tla"), &[]).unwrap();
         let ip = Interp::new(p, tlx_front::cfg::parse_cfg(cfg).unwrap()).unwrap();
         let m = InterpModel::new(ip).unwrap();
-        let declared: Vec<Vec<String>> = m
+        let declared: Vec<tlx_sema::optimize::SymGroup> = m
             .symmetry_factors()
             .expect("the declared group factors")
             .into_iter()
-            .map(|keys| keys.iter().map(|k| k.sym().as_str().to_owned()).collect())
+            .filter_map(crate::model::autosym::sym_group_from_atoms)
             .collect();
         assert_eq!(declared.len(), 1);
-        assert_eq!(declared[0].len(), 2);
+        assert_eq!(declared[0].keys.len(), 2);
         let mut combined = declared.clone();
-        combined.push(vec!["k1".to_owned(), "k2".to_owned()]);
+        combined.push(tlx_sema::optimize::SymGroup::model(vec!["k1".to_owned(), "k2".to_owned()]));
         assert!(m.augmented_symmetry_certificate(&combined).is_some());
         // The certificate must cover every declared factor: dropping one is refused.
         assert!(m.augmented_symmetry_certificate(&combined[1..]).is_none());
