@@ -277,7 +277,7 @@ Options specific to a script:
 | `fuzz_spec.py` | `--seed N\|rev`, `--count N`, `--start I`, `--minutes M`, `--modes interp,compile,paranoid,w4,recover`, `--shrink N`, `--shrink-minutes M`, `--shrink-known`, `--save`, `--expr N`, `--replay`, `--replay-only [NAME...]`, `--record NAME...`, `--show`, `--keep`, `--out DIR`, `--results-json F --suite S` ([testing.md](testing.md) section 7.1) |
 | `verify.py` | `--fuzz-minutes M` (duration of the `fuzz-campaign` suite); `cloud_verify.py --fuzz-minutes M` forwards it |
 | `tlc.py` | `SPEC.tla [TLC arguments...]` |
-| `cloud_verify.py` | see [cloud-verification.md](cloud-verification.md); launch admission: `--wait-quota MINUTES\|auto`, `--max-account-slots N`, `--cancel`, main-checkout `--grant OWNER --minutes M --slots N --budget-cny X [--reason TEXT]` (`--reason` required above 180 minutes, which name a heavy job); the optional `spot_instance_quota` and `default_share` fields of the cloud config |
+| `cloud_verify.py` | see [cloud-verification.md](cloud-verification.md); launch admission: `--wait-quota MINUTES\|auto`, `--slots N`, `--max-account-slots N`, `--cancel`, coordinator `--grant OWNER --minutes M --slots N --budget-cny X [--reason TEXT]` (`--reason` required above 180 minutes, which name a heavy job), `--coordinator-hub` (authorizes `--grant`/`--budget-override`/`--prune-sg` in a bare-repository worktree pool); the optional `spot_instance_quota` and `default_share` fields of the cloud config |
 
 Scripts that run tlx pass the current environment to tlx unchanged, so developer environment
 variables can be put in front of the command, for example `TLX_PARANOID=1 python3 scripts/spectest.py --extra=-compile`.
