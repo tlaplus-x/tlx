@@ -182,9 +182,12 @@ with several workers (over the budget together, they run one at a time); the nod
 are not built, and only edges that can lie on an accepting cycle are stored. Inside each `Product`, per-node
 automaton state ids (`Ids::zeros(0, max)`) and the graph-edge index behind each retained product edge
 (`gedge`, widened on demand) also use `tlx_live::Ids` (`u8`/`u16`/`u32`), BFS depths are stored as monotone
-`(start_node, dist)` level spans rather than a `u32` per node, and the temporary `(graph node, tableau state)
--> product node` hash map is dropped before `fair_cycle` allocates its Tarjan SCC stack so `Product::bytes`
-charges the larger of the two rather than their sum (`bcastFolklore/bcastFolklore`: 501,552 states and 10.2M
+`(start_node, dist)` level spans rather than a `u32` per node, the temporary `(graph node, tableau state)
+-> product node` map allocates a dense array eagerly only up to `256 KiB` (`2^16` entries) and otherwise
+starts sparse (`FxMap`, zero upfront allocation) and promotes to dense only if it grows to half the dense
+size (`<= 256 MiB`) and the memory budget accepts the transient peak, and the node map is dropped before
+`fair_cycle` allocates its Tarjan SCC stack so `Product::bytes` charges the larger of the two rather than
+their sum (`bcastFolklore/bcastFolklore`: 501,552 states and 10.2M
 graph edges take 58.3 MiB CSR, 76.2 MiB for the largest 655,360-node / 6.48M-edge product, and 239.7 MiB peak
 RSS).
 

@@ -21,7 +21,7 @@ use std::ops::Range;
 
 use self::accepting::Search;
 use self::automaton::{AutInfo, GraphBfs};
-use self::product::{Check, Product};
+use self::product::{Budget, Check, Product};
 use crate::tableau::Automaton;
 use crate::{Bits, CheckStats, Fairness, GraphView, Lasso, Ltl};
 
@@ -165,7 +165,8 @@ pub(crate) fn find_fair_accepting<G: GraphView + Sync>(
     }
     // The parts in turn: the first with a fair accepting cycle.
     for i in 0..units.len() {
-        let found = cx.part(i, within, stats).ok_or(())?;
+        let mut budget = &mut *within;
+        let found = cx.part(i, &mut budget, stats).ok_or(())?;
         if found.is_some() {
             return Ok(found);
         }
@@ -186,12 +187,12 @@ struct PartCx<'a, G: GraphView> {
 
 impl<G: GraphView + Sync> PartCx<'_, G> {
     /// Build and search part `i`: its counterexample, if any; None if
-    /// `within` stopped it.
-    fn part(&self, i: usize, within: &mut Within<'_>, stats: &mut CheckStats) -> Option<Option<Lasso>> {
+    /// `budget` stopped it.
+    fn part<B: Budget + ?Sized>(&self, i: usize, budget: &mut B, stats: &mut CheckStats) -> Option<Option<Lasso>> {
         let t0 = std::time::Instant::now();
         let (c, k) = self.units[i];
         let ck = &self.checks[c];
-        let p = Product::build(self.g, ck, &ck.info.parts[k], self.bfs, Some(within))?;
+        let p = Product::build(self.g, ck, &ck.info.parts[k], self.bfs, budget)?;
         stats.product_nodes += p.st.len();
         stats.product_edges += p.tgt.len();
         stats.build_secs += t0.elapsed().as_secs_f64();
@@ -211,6 +212,45 @@ impl<G: GraphView + Sync> PartCx<'_, G> {
     fn parallel(&self, threads: usize, within: &mut Within<'_>, stats: &mut CheckStats) -> Option<Option<Lasso>> {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Mutex;
+
+        struct ParallelBudget<'a, 'b> {
+            guard: &'a Mutex<(&'a mut Within<'b>, Vec<usize>)>,
+            stopped: &'a AtomicBool,
+            slot: usize,
+        }
+
+        impl Budget for ParallelBudget<'_, '_> {
+            fn check(&mut self, nodes: usize, edges: usize, bytes: usize) -> bool {
+                let mut g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+                g.1[self.slot] = bytes;
+                let total = g.1.iter().copied().fold(0usize, usize::saturating_add);
+                let ok = !self.stopped.load(Ordering::Relaxed) && (g.0)(nodes, edges, total);
+                if !ok {
+                    self.stopped.store(true, Ordering::Relaxed);
+                }
+                ok
+            }
+
+            fn try_peak(&mut self, nodes: usize, edges: usize, peak_bytes: usize, current_bytes: usize) -> bool {
+                let mut g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+                if self.stopped.load(Ordering::Relaxed) {
+                    return false;
+                }
+                g.1[self.slot] = peak_bytes;
+                let total = g.1.iter().copied().fold(0usize, usize::saturating_add);
+                let ok = (g.0)(nodes, edges, total);
+                if !ok {
+                    g.1[self.slot] = current_bytes;
+                }
+                ok
+            }
+
+            fn settle(&mut self, bytes: usize) {
+                let mut g = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+                g.1[self.slot] = bytes;
+            }
+        }
+
         let n = self.units.len();
         let (next, first, stopped) = (AtomicUsize::new(0), AtomicUsize::new(usize::MAX), AtomicBool::new(false));
         let guard = Mutex::new((within, vec![0usize; threads]));
@@ -221,22 +261,13 @@ impl<G: GraphView + Sync> PartCx<'_, G> {
                 let (next, first, stopped, guard, found, totals) = (&next, &first, &stopped, &guard, &found, &totals);
                 scope.spawn(move || {
                     let mut mine = CheckStats::default();
-                    let mut check = |nodes: usize, edges: usize, bytes: usize| {
-                        let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
-                        g.1[t] = bytes;
-                        let total = g.1.iter().sum();
-                        let ok = !stopped.load(Ordering::Relaxed) && (g.0)(nodes, edges, total);
-                        if !ok {
-                            stopped.store(true, Ordering::Relaxed);
-                        }
-                        ok
-                    };
+                    let mut budget = ParallelBudget { guard, stopped, slot: t };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n || i > first.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
                             break;
                         }
-                        match self.part(i, &mut check, &mut mine) {
+                        match self.part(i, &mut budget, &mut mine) {
                             None => break,
                             Some(Some(l)) => {
                                 *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(l);
