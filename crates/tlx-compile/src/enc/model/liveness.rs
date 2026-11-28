@@ -102,6 +102,10 @@ impl EncModel {
 }
 
 impl AtomBits<EState> for EncModel {
+    fn live_input(&self) -> Option<tlx_runtime::liveness::LiveInput<'_>> {
+        self.base.live_input()
+    }
+
     fn state(&self, s: &EState, out: &[&[u64]]) -> Result<Vec<u64>, ModelError> {
         self.check_state_model(s);
         self.live_state_bits(s, out)

@@ -144,6 +144,7 @@ mod tests {
             elapsed: r.elapsed,
             in_init: false,
             live_graph: r.live_graph,
+            live_witness: r.live_witness,
             live_error: None,
             live_atoms_ok: true,
             coverage: Some(Coverage { init_generated: 2, generated: vec![3, 4], distinct: vec![1, 2] }),

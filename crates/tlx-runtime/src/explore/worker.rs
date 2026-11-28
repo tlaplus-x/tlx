@@ -1043,6 +1043,14 @@ fn run_worker_in<'s, 'm, M: Model>(
             if shared.control().stopped() || w.local.next_len() == 0 {
                 break;
             }
+            if let Some(p) = shared.periodic.as_ref().filter(|p| p.due()) {
+                w.publish_history();
+                p.check(shared);
+                w.lease_history();
+                if shared.control().stopped() {
+                    break;
+                }
+            }
             w.local.advance();
             if shared.checkpoint_due() {
                 if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {

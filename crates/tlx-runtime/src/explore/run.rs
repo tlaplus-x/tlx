@@ -146,6 +146,7 @@ pub(super) fn prepare<'m, M: Model>(
         base_outdegree,
         safepoint_every: opts.safepoint_every,
         live_atoms,
+        periodic: live_atoms.filter(|a| observer.is_none() && a.live_input().is_some()).map(|_| super::periodic::Periodic::new()),
         live_pre: Mutex::new(Vec::new()),
         spill_logs: AtomicBool::new(opts.spill.mode() == SpillMode::Always),
         spill_edges: AtomicBool::new(opts.spill.mode() == SpillMode::Always),

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tlx_eval::model::liveness::InterpSearchAtoms;
 use tlx_eval::InterpModel;
-use tlx_runtime::liveness::{LiveInput, LiveResult, STUTTER};
+use tlx_runtime::liveness::{LiveResult, STUTTER};
 use tlx_runtime::mem::RssGuard;
 use tlx_value::Value;
 
@@ -140,18 +140,6 @@ impl<'a, S> TraceView<'a, S> {
     }
 }
 
-/// The temporal properties of `base` and its fairness, for
-/// `tlx_runtime::liveness`.
-fn input(base: &InterpModel) -> LiveInput<'_> {
-    let live = &base.live;
-    LiveInput {
-        props: &live.props,
-        alone: &live.alone,
-        fairness: live.fairness.iter().map(|f| tlx_live::Fairness { strong: f.strong, enabled: f.enabled, taken: f.taken }).collect(),
-        concrete: base.has_view_or_symmetry(),
-    }
-}
-
 /// Check the temporal properties of `m`'s base on its states
 /// (`tlx_runtime::liveness::check`, which see), rendering a counterexample
 /// with `view`.
@@ -178,7 +166,7 @@ pub fn check<T: Tier>(
         tlx_runtime::stats::set("liveness: fairness ENABLED from A's steps", tlx_runtime::stats::Metric::Count(from_steps as u64));
         tlx_runtime::stats::set("liveness: fairness conditions", tlx_runtime::stats::Metric::Count(live.fairness.len() as u64));
     }
-    let r = tlx_runtime::liveness::check(m, &input(base), m, workers, expanded, recorded, guard);
+    let r = tlx_runtime::liveness::check(m, &base.liveness_input(), m, workers, expanded, recorded, guard);
     rendered(base, r, view, true)
 }
 
@@ -191,14 +179,14 @@ pub fn check_trace<T: Tier>(
     succs: &[Vec<(T::State, u32)>],
     view: &TraceView<T::State>,
 ) -> Liveness {
-    let r = tlx_runtime::liveness::check_trace(m, &input(m.base()), m, trace, succs, &|a, b| m.values(a) == m.values(b));
+    let r = tlx_runtime::liveness::check_trace(m, &m.base().liveness_input(), m, trace, succs, &|a, b| m.values(a) == m.values(b));
     rendered(m.base(), r, view, true)
 }
 
 /// The result `r` of checking the properties of `base`, a counterexample
 /// rendered with `view`; `warn`: whether a stuttering one is
 /// warned about (not for a violation found during the search, as TLC).
-fn rendered<S>(base: &InterpModel, r: LiveResult<S>, view: &TraceView<S>, warn: bool) -> Liveness {
+pub(crate) fn rendered<S>(base: &InterpModel, r: LiveResult<S>, view: &TraceView<S>, warn: bool) -> Liveness {
     match r {
         LiveResult::Holds => Liveness::Holds,
         LiveResult::Error(e) => Liveness::Error(e),
@@ -275,13 +263,13 @@ fn render<S>(l: &tlx_runtime::liveness::Lasso<S>, view: &TraceView<S>) -> (Strin
 /// The state atoms of the tableaux TLC builds for the temporal properties
 /// of `base` (`LiveSpec::tableau`).
 pub fn tableau_atoms(base: &InterpModel) -> Vec<u32> {
-    input(base).tableau_atoms()
+    base.liveness_input().tableau_atoms()
 }
 
 /// Whether TLC may report a violation of a temporal property of `base`
 /// during its search, before the end (see `find_error`).
 pub fn reports_early(base: &InterpModel) -> bool {
-    input(base).reports_early()
+    base.liveness_input().reports_early()
 }
 
 /// Search `m` again (with `opts`) evaluating the liveness predicates as
@@ -297,7 +285,7 @@ pub fn find_error<T: Tier>(
     view: &TraceView<T::State>,
 ) -> Option<tlx_runtime::Report<T::State>> {
     let base = m.base();
-    let input = input(base);
+    let input = base.liveness_input();
     let values = |s: &T::State| m.values(s);
     let level = |s: &T::State| m.level(s);
     let atoms = InterpSearchAtoms { base, values: &values, level: &level };

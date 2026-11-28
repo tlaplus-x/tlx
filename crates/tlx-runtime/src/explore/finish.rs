@@ -128,6 +128,7 @@ pub(super) fn finalize<'m, M: Model>(
     }
     // The search's structures (fingerprint set, queues, archive, trace
     // logs) are not needed by liveness: freed before it builds its graph.
+    let live_witness = shared.periodic.as_ref().and_then(|p| p.witness.lock().take());
     drop(shared);
     let (mut outcome, mut live_graph) = (outcome, None);
     if let (Some(atoms), true) = (live_atoms, build_graph) {
@@ -161,6 +162,7 @@ pub(super) fn finalize<'m, M: Model>(
             elapsed: start.elapsed(),
             in_init,
             live_graph,
+            live_witness,
             live_error,
             live_atoms_ok,
             coverage,
@@ -327,6 +329,7 @@ pub(super) fn in_init_failed<'m, M: Model>(run: &Run<'m, M>, e: ModelError) -> R
         elapsed: shared.start.elapsed(),
         in_init: true,
         live_graph: None,
+        live_witness: None,
         live_error: None,
         live_atoms_ok: false,
         coverage,
@@ -372,7 +375,7 @@ fn live_graph_of<'m, M: Model>(
         // (The records are freed as the graph is built, after its arrays
         // are allocated. Only what the graph adds counts against the
         // budget, with at least a quarter of it: `mem::live_limit`.)
-        let (n, e, bytes) = edges::build_bytes(&edges);
+        let (n, e, bytes) = edges::build_bytes(edges.iter());
         let base = crate::mem::live_base();
         let need = base + bytes;
         if need > crate::mem::live_limit(maxmem, base) {

@@ -84,6 +84,7 @@ pub(crate) fn finish_with_trace<T: Tier>(
     let checks = run.sim.is_none() && matches!(r.outcome, Outcome::Ok) && !base.live.is_empty();
     let guard =
         tlx_runtime::mem::RssGuard::new(if checks { run.opts.as_ref().map_or(usize::MAX, |o| o.maxmem) } else { usize::MAX }, recorded);
+    let periodic = r.live_witness.is_some();
     let mut lv = if run.sim.is_none() { liveness(m, &mut r, run, &view, guard) } else { None };
     // TLC evaluates the liveness predicates during its search: an error in
     // one of them stops it where it occurs, maybe before the end of the
@@ -94,7 +95,7 @@ pub(crate) fn finish_with_trace<T: Tier>(
         let early = live::reports_early(base);
         let again = match (&r.outcome, &lv) {
             (Outcome::Ok, Some((live::Liveness::Error(e), _))) => !e.is_store_full(),
-            (Outcome::Ok, Some((live::Liveness::Violated(..), _))) => early,
+            (Outcome::Ok, Some((live::Liveness::Violated(..), _))) => early && !periodic,
             (Outcome::Ok | Outcome::FpSetFull { .. } | Outcome::Io(_), _) => false,
             (Outcome::Error(e), _) if e.is_store_full() => false,
             // A violation: the search found none of these errors where TLC
@@ -262,17 +263,18 @@ pub(crate) fn liveness<T: Tier>(
         return None;
     }
     let st = &r.stats;
+    let space = if r.live_witness.is_some() { "partial" } else { "complete" };
     print_progress(st.depth as u64, st.generated, st.distinct, st.left, None);
     // TLC checks each disjunct of the negated properties (its "branches")
     // on its own copy of the state graph.
     let branches = live_branches(base);
     let text = if branches > 1 {
         format!(
-            "Checking {branches} branches of temporal properties for the complete state space with {} total distinct states",
+            "Checking {branches} branches of temporal properties for the {space} state space with {} total distinct states",
             st.distinct * branches as u64
         )
     } else {
-        format!("Checking temporal properties for the complete state space with {} total distinct states", st.distinct)
+        format!("Checking temporal properties for the {space} state space with {} total distinct states", st.distinct)
     };
     out::info(code::TLC_CHECKING_TEMPORAL_PROPS, &format!("{text} at ({})", out::now()));
     let start = Instant::now();
@@ -284,6 +286,9 @@ pub(crate) fn liveness<T: Tier>(
     // them there, `live_error`.)
     let mut lv = match r.live_error.take() {
         Some(e) => live::Liveness::Error(e),
+        None if r.live_witness.is_some() => {
+            live::rendered(base, r.live_witness.take().unwrap().replay(m, &base.liveness_input()), view, false)
+        }
         None => live::check(m, workers, expanded, view, r.live_graph.take(), guard),
     };
     if matches!(&lv, live::Liveness::Error(e) if e.is_layout_miss()) {
@@ -295,13 +300,9 @@ pub(crate) fn liveness<T: Tier>(
             "layout miss checking temporal properties; checking them with the interpreter",
         );
         let view = live::TraceView::new(base, "Initial predicate".into());
-        let graph = match opts {
-            Some(opts) if !base.has_view_or_symmetry() => Some(interpreted_search(base, opts, workers)),
-            _ => None,
-        };
-        lv = match graph {
-            Some(Err(e)) => live::Liveness::Error(e),
-            graph => live::check(base, workers, expanded, &view, graph.map(|g| g.expect("checked above")), guard),
+        lv = match opts {
+            Some(opts) if !base.has_view_or_symmetry() => interpreted_liveness(base, opts, workers, expanded, &view, guard),
+            _ => live::check(base, workers, expanded, &view, None, guard),
         };
     }
     r.elapsed += start.elapsed();
@@ -312,11 +313,14 @@ pub(crate) fn liveness<T: Tier>(
 /// records (liveness after a compiled model's layout miss): the graph (or
 /// the memory error), or the error of an atom or of the search. The output
 /// of the spec stays suppressed (the first search printed it).
-fn interpreted_search(
+fn interpreted_liveness(
     base: &InterpModel,
     opts: &Options,
     workers: usize,
-) -> Result<Result<tlx_runtime::LiveGraph, String>, tlx_runtime::ModelError> {
+    expanded: usize,
+    view: &live::TraceView<tlx_eval::model::State>,
+    guard: tlx_runtime::mem::RssGuard,
+) -> live::Liveness {
     let printing = !base.ip.print_suppressed();
     base.ip.set_suppress_print(true);
     // (The first search's request to stop would end this one at once.)
@@ -326,11 +330,11 @@ fn interpreted_search(
         &Options { progress: None, coverage: false, coverage_report: None, checkpoint: None, workers, ..opts.clone() },
     );
     base.ip.set_suppress_print(!printing);
-    match (r.live_error, r.live_graph, r.outcome) {
-        (Some(e), _, _) => Err(e),
-        (None, Some(g), Outcome::Ok) => Ok(g),
-        (None, _, Outcome::Error(e)) => Err(e),
-        _ => Err(tlx_runtime::ModelError::new("internal error: the interpreter's search recorded no liveness graph")),
+    match (r.live_error, r.live_witness, r.live_graph, r.outcome) {
+        (Some(e), _, _, _) | (_, _, _, Outcome::Error(e)) => live::Liveness::Error(e),
+        (_, Some(witness), _, Outcome::Ok) => live::rendered(base, witness.replay(base, &base.liveness_input()), view, false),
+        (_, _, graph, Outcome::Ok) => live::check(base, workers, expanded, view, graph, guard),
+        _ => live::Liveness::Error(tlx_runtime::ModelError::new("internal error: the interpreter's search recorded no liveness graph")),
     }
 }
 

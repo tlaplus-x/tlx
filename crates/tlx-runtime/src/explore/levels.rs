@@ -29,6 +29,7 @@ pub(super) struct Levels {
     tasks: [AtomicU64; 2],
     /// Set by the barrier leader: no level follows.
     done: AtomicBool,
+    check_live: AtomicBool,
     /// Set by the barrier leader: the worker that expands the next level
     /// (and the following narrow ones) alone, or `NO_SOLO`.
     solo: AtomicUsize,
@@ -47,6 +48,7 @@ impl Levels {
             barrier: LevelBarrier::new(n),
             tasks: [AtomicU64::new(0), AtomicU64::new(0)],
             done: AtomicBool::new(false),
+            check_live: AtomicBool::new(false),
             solo: AtomicUsize::new(NO_SOLO),
             busy_ns: AtomicU64::new(0),
             expanded: AtomicU64::new(0),
@@ -300,6 +302,9 @@ impl<M: Model> WorkerState<'_, '_, M> {
             // (A spilled segment could not be read back.)
             shared.fail(super::Outcome::Io(e.0), super::tracelog::NO_PARENT);
         }
+        if let Some(p) = &shared.periodic {
+            p.add(n);
+        }
         n
     }
 }
@@ -367,7 +372,7 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
                 }
                 // (A checkpoint due ends the stretch: it is taken at the
                 // barrier, where every worker writes its part.)
-                if end || !cost.solo(width) || shared.checkpoint_wanted() {
+                if end || !cost.solo(width) || shared.checkpoint_wanted() || shared.periodic.as_ref().is_some_and(|p| p.due()) {
                     break;
                 }
                 // (The other workers wait at the barrier.)
@@ -412,12 +417,15 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
             levels.done.store(done, Ordering::SeqCst);
             // (A checkpoint: the workers write their parts below, and join
             // the safepoints after it.)
+            let checkpoint = !done && shared.checkpoint_due();
+            let check_live = !done && !checkpoint && shared.periodic.as_ref().is_some_and(|p| p.due());
+            levels.check_live.store(check_live, Ordering::SeqCst);
             if !done {
-                if shared.checkpoint_due() {
+                if checkpoint {
                     if shared.store_gc.is_some_and(|gc| gc.needs_gc()) {
                         shared.gc_store();
                     }
-                } else {
+                } else if !check_live {
                     // Every worker is active again before any expands a task of
                     // the level, so that a safepoint requested meanwhile is
                     // served by all of them. (The others are waiting here: they
@@ -428,6 +436,21 @@ pub(super) fn run_levels<M: Model>(w: &mut WorkerState<'_, '_, M>) {
         });
         if levels.done.load(Ordering::SeqCst) || levels.barrier.is_broken() {
             return;
+        }
+        if levels.check_live.load(Ordering::SeqCst) {
+            w.publish_history();
+            barrier_wait_then(shared, me, || {
+                shared.periodic.as_ref().unwrap().check(shared);
+                let stopped = shared.control().stopped();
+                levels.done.store(stopped, Ordering::SeqCst);
+                if !stopped {
+                    shared.safepoint.join_all(shared.slots.len());
+                }
+            });
+            w.lease_history();
+            if levels.done.load(Ordering::SeqCst) || levels.barrier.is_broken() {
+                return;
+            }
         }
         if shared.ckpt.as_ref().is_some_and(|c| c.now.load(Ordering::SeqCst)) {
             // A checkpoint between the levels: every worker writes its

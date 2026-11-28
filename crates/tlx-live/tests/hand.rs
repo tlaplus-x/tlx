@@ -47,6 +47,19 @@ fn eventually_holds_under_weak_fairness() {
 }
 
 #[test]
+fn partial_frontier_has_no_fair_stuttering_behavior() {
+    // At 0 the progress action is enabled. Its target has not been expanded.
+    let g = graph(&[0], &[0b10, 0], &[(0, 0, 0), (0, 1, 1)], false);
+    let property = eventually(st(0));
+    let fair = [wf(1, 0)];
+    assert!(tlx_live::check_lasso_csr(&tlx_live::Csr::from_graph(&g), &property, &fair).is_ok());
+    // As soon as the target is expanded and admits stuttering without fairness
+    // obligations, the same property has a real lasso.
+    let closed = graph(&[0], &[0b10, 0], &[(0, 1, 1)], true);
+    violated(&closed, &property, &fair);
+}
+
+#[test]
 fn trivial_properties() {
     let g = eventually_graph();
     holds(&g, &Ltl::True, &[]);

@@ -210,6 +210,7 @@ results or validate a concrete trace for the original specification.
 | `TLX_CLOUD_HOST` | boolean | off | Set by `cloud_verify.py` on the remote host; permits heavy TLC models, concurrent cloud JVMs and cloud benchmark load | Developer | `scripts/tlxlib.py`, `scripts/bench.py` |
 | `TLX_JAVA` | program | `/opt/homebrew/opt/openjdk@21/bin/java` | The java the scripts use to run TLC / SANY | Developer | `scripts/tlc.py` |
 | `TLX_BENCH_MACHINE` | text | none | Appended to the machine description recorded by `bench.py` (after the architecture, CPU model and core count), for example the cloud instance type and price | Developer | `scripts/bench.py` |
+| `TLX_LIVE_CHECK_FIRST` | positive integer (expanded states) | 250000 | First level boundary for periodic recorded-graph liveness checking. Subsequent checks require twice as many expanded states. | Test | `crates/tlx-runtime/src/explore/periodic.rs` |
 | `TLX_LIVE_SCALE` | integer (states) | 200000 | Number of states of the `tlx-live` scale test | Test | `crates/tlx-live/tests/scale.rs` |
 | `TLX_TRACE` | boolean (on when set) | off | The `tlx-sema` resolve test prints the model being processed | Test | `crates/tlx-sema/tests/resolve.rs` |
 | `TLX_RUSTC_SLOTS` | positive integer | optional | Reserved for local build integrations; public build commands use their explicit `-j` limit | Developer | `crates/tlx-base/src/knobs.rs` |

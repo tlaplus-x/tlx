@@ -223,6 +223,7 @@ pub static KNOBS: &[Knob] = &[
         .blank_unset(),
     opt_num("TLX_FP_TABLE_MIN", T, CLI, "a number of slots", "testing: the first fingerprint table has N slots (at least 1024; default 1048576) and grows from there"),
     opt_num("TLX_FP_SPILL_SLOTS", T, CLI, "a number of slots", "testing: with -spill always, the fingerprint table has at most N slots (at least 1024; default 262144) and rotates to disk when full"),
+    Knob::new("TLX_LIVE_CHECK_FIRST", Kind::Num { default: 250_000, min: 1 }, T, "tlx-runtime", "expanded states before the first periodic liveness check").what("a positive integer").meta("N"),
     opt_num("TLX_CHECKPOINT_SECS", T, CLI, "a number of seconds", "testing: a checkpoint every N seconds (with -checkpoint)"),
     opt_num("TLX_CHECKPOINT_STATES", T, CLI, "a number of states", "testing: a checkpoint whenever N more distinct states were found (with -checkpoint)"),
     opt_num("TLX_CHECKPOINT_ABORT", T, CLI, "a number of checkpoints", "testing: end the process right after the N-th checkpoint (exit 134, no cleanup: as if killed)"),

@@ -8,7 +8,8 @@
 
 mod concrete;
 mod expand;
-mod recorded;
+pub(crate) mod recorded;
+pub use recorded::RecordedWitness;
 mod search;
 mod shape;
 mod trace;

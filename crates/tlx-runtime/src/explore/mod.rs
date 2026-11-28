@@ -32,6 +32,7 @@ mod history;
 mod levels;
 mod observer;
 mod order;
+mod periodic;
 mod resume;
 mod run;
 pub mod safepoint;
@@ -283,6 +284,8 @@ pub struct Report<S> {
     /// The failure happened while computing (or checking) the initial
     /// states (TLC then reports no statistics).
     pub in_init: bool,
+    /// A lasso found at a level boundary, ready for replay after search memory is freed.
+    pub live_witness: Option<crate::liveness::RecordedWitness>,
     /// The behavior graph recorded for liveness checking (`Caps::live_atoms`),
     /// if the search explored the whole state space without error; Err: it
     /// does not fit in the memory budget (the message of the liveness
@@ -368,6 +371,7 @@ struct Shared<'m, M: Model> {
     /// A resumed search that records the behavior graph: the states of the
     /// levels before its resume point, whose edges are recorded after the
     /// search (docs/scale.md §8.3).
+    periodic: Option<periodic::Periodic>,
     live_pre: Mutex<Vec<Pre<M::State>>>,
     /// Stages 2 and 3 of memory pressure: workers write the full blocks of
     /// their trace logs (liveness edge logs) to disk.
