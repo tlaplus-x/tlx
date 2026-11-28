@@ -680,6 +680,216 @@ class Track(unittest.TestCase):
         # the run's protocol, so the twin is measured on the same instance.
         a.with_tlc_companion = True
         self.assertIn("--with-tlc-companion", S.remote_args(a, None))
+        # A shard of the suite is one launch's work: the slice travels to the
+        # remote `suite` and names the history file `track` copies back.
+        a.slice = "2/3"
+        self.assertIn("--slice 2/3", S.remote_args(a, None))
+
+    def test_track_refuses_a_bad_slice_before_the_launch(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            S.cmd_track(argparse.Namespace(rev="HEAD", base="none", sizes="all", models="", repeat=3,
+                                           max_minutes=40, setup_minutes=20, provider="tencent",
+                                           instance_type="", inject_slow=[], slice="3/2", dry_run=True))
+        self.assertIn("--slice expects I/N", str(cm.exception))
+
+
+class SuiteMerge(unittest.TestCase):
+    """`suite-merge` joins the `--slice I/N` histories of one suite run: the
+    shards are disjoint, so the merged file is their union, and the verdict is
+    judged again over that union with the thresholds the shards recorded."""
+
+    REV, BASE = "a" * 12, "b" * 12
+
+    def history(self, **over):
+        h = {"suite": True, "commit": self.REV, "date": "2026-11-01 10:00:00", "machine": "m1", "repeat": 3,
+             "sizes": "all", "tla2tools": {"revision": "r1"},
+             "judgement": {"threshold": 0.05, "max_noise": 0.25, "min_delta": 0.05},
+             "runs": {}, "samples": [],
+             "verdict": {"outcome": "PASS", "count_failures": [], "regressions": [], "inconclusive": [], "skipped": []}}
+        h.update(over)
+        return h
+
+    def run_record(self, key, walls=(1.0, 1.01, 1.02), result="success"):
+        return {"tier": "large", "model": key.split(":")[1], "mode": "compile", "workers": 1,
+                "walls": list(walls), "cpu": list(walls), "min": min(walls) if walls else None,
+                "distinct": 5, "result": result, "key": key}
+
+    def merge(self, out, inputs, sets=()):
+        a = argparse.Namespace(out=str(out), inputs=[str(p) for p in inputs], set=list(sets))
+        with contextlib.redirect_stdout(io.StringIO()) as buf, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = S.cmd_suite_merge(a)
+        return code, read(out), buf.getvalue() + err.getvalue()
+
+    def slice(self, directory, name, h):
+        path = os.path.join(directory, name)
+        write(path, json.dumps(h))
+        return path
+
+    def test_merges_runs_base_runs_and_samples(self):
+        k1, k2 = "large:M/a:compile:1w", "large:M/b:compile:1w"
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                date="2026-11-01 10:00:00", slice="1/2",
+                runs={k1: self.run_record(k1)},
+                base={"commit": self.BASE, "runs": {k1: self.run_record(k1)}},
+                samples=[{"model": "M/a", "round": 1}]))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", slice="2/2",
+                runs={k2: self.run_record(k2)},
+                base={"commit": self.BASE, "runs": {k2: self.run_record(k2)}},
+                samples=[{"model": "M/b", "round": 1}]))
+            code, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(out["runs"]), [k1, k2])
+        self.assertEqual(sorted(out["base"]["runs"]), [k1, k2])
+        self.assertEqual([s["model"] for s in out["samples"]], ["M/a", "M/b"])
+        self.assertEqual((out["date"], out["date_end"]), ("2026-11-01 10:00:00", "2026-11-01 11:00:00"))
+        self.assertEqual([s["slice"] for s in out["slices"]], ["1/2", "2/2"])
+        self.assertEqual(out["judgement"], {"threshold": 0.05, "max_noise": 0.25, "min_delta": 0.05})
+        self.assertNotIn("slice", out)
+        self.assertEqual(out["verdict"]["outcome"], "PASS")
+
+    def test_a_regression_in_one_slice_regresses_the_merged_verdict(self):
+        k = "large:M/a:compile:1w"
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                runs={k: self.run_record(k, walls=(2.0, 2.02, 2.04))},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k)}}))
+            code, out, _ = self.merge(os.path.join(d, "merged.json"), [s1])
+        self.assertEqual(code, 1)
+        self.assertEqual(out["verdict"]["outcome"], "REGRESSION")
+        self.assertEqual([r["key"] for r in out["verdict"]["regressions"]], [k])
+
+    def test_a_duplicate_key_keeps_the_stronger_run(self):
+        k = "large:M/a:compile:1w"
+        skipped = self.run_record(k, walls=(), result="skipped")
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(runs={k: self.run_record(k)}))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", runs={k: skipped},
+                verdict={"outcome": "INCONCLUSIVE", "count_failures": [], "regressions": [],
+                         "inconclusive": [], "skipped": [k]}))
+            _, out, err = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(out["runs"][k]["result"], "success")
+        self.assertEqual(out["verdict"]["skipped"], [])
+        self.assertIn("keeping the stronger run", err)
+
+    def test_a_duplicate_ab_key_keeps_one_shard_pair(self):
+        # Each shard measured its own interleaved (new, base) pair on its own
+        # instance. Selecting the two sides independently would pair s2's new
+        # time (10.6) with s1's base time (10.0) and fabricate a REGRESSION.
+        k = "large:M/a:compile:1w"
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                runs={k: self.run_record(k, walls=(10.7, 10.7, 10.7))},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(10.0, 10.0, 10.0))}}))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", runs={k: self.run_record(k, walls=(10.6, 10.6, 10.6))},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(10.8, 10.8, 10.8))}}))
+            code, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual((out["runs"][k]["min"], out["base"]["runs"][k]["min"]), (10.6, 10.8))
+        self.assertEqual(out["verdict"]["outcome"], "PASS")
+        self.assertEqual(code, 0)
+
+    def test_a_count_mismatch_does_not_beat_a_clean_duplicate(self):
+        k = "large:M/a:compile:1w"
+        mismatch = {**self.run_record(k, walls=(1.0, 1.0, 1.0)), "count_problems": ["distinct 5 -> 6"]}
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                runs={k: self.run_record(k, walls=(10.6, 10.6, 10.6))},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(10.0, 10.0, 10.0))}}))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", runs={k: mismatch},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(9.0, 9.0, 9.0))}}))
+            _, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(out["runs"][k]["min"], 10.6)
+        self.assertEqual(out["base"]["runs"][k]["min"], 10.0)
+
+    def test_run_evidence_matches_the_store_order(self):
+        clean = S._suite_run_evidence({"result": "success", "min": 10.6, "date": "d"})
+        # A zero minimum is a measurement, not an unknown: it must not be read
+        # as `float("inf")` by a truthiness test.
+        zero = S._suite_run_evidence({"result": "success", "min": 0.0, "date": "d"})
+        self.assertEqual(zero[0], 2)
+        self.assertGreater(zero, clean)
+        # An expectation mismatch proves no more than no verdict (records.evidence).
+        bad = S._suite_run_evidence({"result": "success", "min": 1.0, "count_problems": ["distinct 5 -> 6"]})
+        self.assertEqual(bad[0], 0)
+        # Two timeouts: the longer measured bound proves more.
+        self.assertGreater(S._suite_run_evidence({"result": "timeout", "min": 20.0}),
+                           S._suite_run_evidence({"result": "timeout", "min": 10.0}))
+
+    def test_a_skipped_stub_does_not_beat_a_real_measurement(self):
+        # A shard that hit `--max-minutes` records a (skipped, skipped) stub
+        # with no samples; a retry shard runs the key and its new side completes
+        # while the base side fails. The empty stub must not win just because
+        # both of its sides are "not an error" (the report's looser `ok_result`).
+        k = "large:M/a:compile:1w"
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                runs={k: self.run_record(k, walls=(), result="skipped")},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(), result="skipped")}},
+                verdict={"outcome": "INCONCLUSIVE", "count_failures": [], "regressions": [],
+                         "inconclusive": [], "skipped": [k]}))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", runs={k: self.run_record(k, walls=(10.0, 10.0, 10.0))},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(), result="unknown")}}))
+            _, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(out["runs"][k]["result"], "success")
+        self.assertEqual(out["base"]["runs"][k]["result"], "unknown")
+        self.assertNotIn(k, out["verdict"]["skipped"])
+
+    def test_a_count_mismatch_pair_still_beats_a_skipped_stub(self):
+        k = "large:M/a:compile:1w"
+        mismatch = {**self.run_record(k, walls=(10.0, 10.0, 10.0)), "count_problems": ["distinct 5 -> 6"]}
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(
+                runs={k: self.run_record(k, walls=(), result="skipped")},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(), result="skipped")}}))
+            s2 = self.slice(d, "s2.json", self.history(
+                date="2026-11-01 11:00:00", runs={k: mismatch},
+                base={"commit": self.BASE, "runs": {k: self.run_record(k, walls=(11.0, 11.0, 11.0))}}))
+            _, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(out["runs"][k]["count_problems"], ["distinct 5 -> 6"])
+        self.assertEqual(out["base"]["runs"][k]["min"], 11.0)
+
+    def test_the_inputs_must_state_one_run_identity(self):
+        cases = {
+            "commit": {"commit": "c" * 12},
+            "machine": {"machine": "m2"},
+            "repeat": {"repeat": 5},
+            "sizes": {"sizes": "small"},
+            "tla2tools": {"tla2tools": {"revision": "r2"}},
+            "different thresholds": {"judgement": {"threshold": 0.2, "max_noise": 0.25, "min_delta": 0.05}},
+            "base revision": {"base": {"commit": "d" * 12, "runs": {}}},
+        }
+        with tempfile.TemporaryDirectory() as d:
+            first = self.slice(d, "s1.json", self.history())
+            for label, over in cases.items():
+                with self.subTest(label):
+                    second = self.slice(d, "s2.json", self.history(**over))
+                    a = argparse.Namespace(out=os.path.join(d, "merged.json"), inputs=[first, second], set=[])
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit):
+                        S.cmd_suite_merge(a)
+
+    def test_spot_launch_identities_of_one_instance_type_merge(self):
+        # Slices are separate spot launches, so their recorded machine strings
+        # name different zones; the hardware (instance type and architecture) is
+        # what has to agree, and the merged header states one deterministically.
+        hard = "x86_64, AMD EPYC 9754 64-Core Processor, 16 cores, tencent SA5.4XLARGE32 (%s, spot 1.0 CNY/h)"
+        with tempfile.TemporaryDirectory() as d:
+            s1 = self.slice(d, "s1.json", self.history(machine=hard % "ap-beijing-3"))
+            s2 = self.slice(d, "s2.json", self.history(machine=hard % "ap-beijing-4"))
+            _, out, _ = self.merge(os.path.join(d, "merged.json"), [s1, s2])
+        self.assertEqual(out["machine"], hard % "ap-beijing-3")
+        self.assertEqual([s["machine"] for s in out["slices"]], [hard % "ap-beijing-3", hard % "ap-beijing-4"])
+
+    def test_set_adds_a_header_field(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self.slice(d, "s1.json", self.history())
+            _, out, _ = self.merge(os.path.join(d, "merged.json"), [first], sets=["instance_type=SA5.4XLARGE32"])
+        self.assertEqual(out["instance_type"], "SA5.4XLARGE32")
 
 
 class TrackReceipt(testkit.GuardedTestCase):
@@ -706,20 +916,35 @@ class TrackReceipt(testkit.GuardedTestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def receipt(self, rev=REV, exit_code=0, bins=(), **over):
+    def namespace(self, base=None, slice_spec=""):
+        """The `track` arguments the tests launch, including the shard `--slice`
+        (`slice_spec` is the `I/N` value, empty for an unsliced run)."""
+        return argparse.Namespace(rev="HEAD", base=self.BASE if base is None else base, sizes="small", models="",
+                                  repeat=3, max_minutes=40, setup_minutes=20, provider="tencent", instance_type="",
+                                  inject_slow=[], dry_run=False, slice=slice_spec)
+
+    def bench_args(self, base=None, slice_spec=""):
+        """The remote `bench.py suite` command `cmd_track` launches, as the
+        receipt records it."""
+        return S.remote_args(self.namespace(base, slice_spec), None if base == "none" else self.BASE)
+
+    def receipt(self, rev=REV, exit_code=0, bins=(), bench=None, **over):
         r = {"provider": "tencent", "rev": rev, "verify_exit": exit_code, "verify_env": {}, "arch": "arm64",
-             "fetched_at": "2026-10-08T00:00:00Z", "phases_s": {}, "bench": ["suite --sizes small"],
+             "fetched_at": "2026-10-08T00:00:00Z", "phases_s": {}, "bench": [self.bench_args()] if bench is None else bench,
              "bench_bins": [{"name": n, "rev": b, "features": ""} for n, b, _ in bins]}
         r.update(over)
         return r
 
-    def suite_history(self, rev=REV, base=BASE, outcome="PASS"):
-        return {"suite": True, "commit": rev, "date": "2026-10-08 10:00:00", "machine": "test machine",
-                "base": {"commit": base} if base else {},
-                "runs": [{"key": "M#compile", "min": 1.0, "walls": [1.0]}],
-                "verdict": {"outcome": outcome, "count_failures": [], "regressions": [], "inconclusive": [], "skipped": []}}
+    def suite_history(self, rev=REV, base=BASE, outcome="PASS", slice_spec=None):
+        h = {"suite": True, "commit": rev, "date": "2026-10-08 10:00:00", "machine": "test machine",
+             "base": {"commit": base} if base else {},
+             "runs": [{"key": "M#compile", "min": 1.0, "walls": [1.0]}],
+             "verdict": {"outcome": outcome, "count_failures": [], "regressions": [], "inconclusive": [], "skipped": []}}
+        if slice_spec is not None:
+            h["slice"] = slice_spec
+        return h
 
-    def result_dir(self, name, receipt, history=None):
+    def result_dir(self, name, receipt, history=None, history_name="history.json"):
         d = os.path.join(self.results, name)
         os.makedirs(d)
         with open(os.path.join(d, "cloud.json"), "w") as f:
@@ -727,14 +952,12 @@ class TrackReceipt(testkit.GuardedTestCase):
         if history is not None:
             hd = os.path.join(d, "bench", "history")
             os.makedirs(hd)
-            with open(os.path.join(hd, "history.json"), "w") as f:
+            with open(os.path.join(hd, history_name), "w") as f:
                 json.dump(history, f)
         return d
 
-    def invoke(self, rc, base=None):
-        a = argparse.Namespace(rev="HEAD", base=self.BASE if base is None else base, sizes="small", models="",
-                               repeat=3, max_minutes=40, setup_minutes=20, provider="tencent", instance_type="",
-                               inject_slow=[], dry_run=False)
+    def invoke(self, rc, base=None, slice_spec=""):
+        a = self.namespace(base, slice_spec)
 
         def fake_git(*args, **kw):
             ref = args[-1]
@@ -817,12 +1040,59 @@ class TrackReceipt(testkit.GuardedTestCase):
         # `--base none`: the run pins no external binary, and its receipt must
         # say so; a receipt that pinned one would authorize a comparison this
         # invocation never asked for.
-        self.result_dir("run-baseline", self.receipt(bins=[]), self.suite_history(base=None))
+        baseline = [self.bench_args(base="none")]
+        self.result_dir("run-baseline", self.receipt(bins=[], bench=baseline), self.suite_history(base=None))
         self.assertEqual(self.invoke(0, base="none")[0], 0)
         self.assertEqual(self.recorded(), ["history.json"])
         self.clear()
-        self.result_dir("run-extra-bin", self.receipt(bins=[("base", self.BASE, "")]), self.suite_history(base=None))
+        self.result_dir("run-extra-bin", self.receipt(bins=[("base", self.BASE, "")], bench=baseline),
+                        self.suite_history(base=None))
         self.assertEqual(self.invoke(0, base="none")[0], 3)
+
+    def test_sequential_slices_are_recorded_from_their_own_receipts(self):
+        # Two shards of one revision are two launches of the same revision, base
+        # and exit status; only the receipt's bench command (its `--slice I/N`)
+        # tells them apart. Before the fix the second shard saw two matching
+        # receipts and exited 3 without recording its history.
+        self.result_dir("run-slice1", self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="1/2")]),
+                        self.suite_history(slice_spec="1/2"), history_name="a-slice1of2.json")
+        code, message = self.invoke(0, slice_spec="1/2")
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.recorded(), ["a-slice1of2.json"])
+        self.result_dir("run-slice2", self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="2/2")]),
+                        self.suite_history(slice_spec="2/2"), history_name="b-slice2of2.json")
+        code, message = self.invoke(0, slice_spec="2/2")
+        self.assertEqual(code, 0, message)
+        self.assertEqual(self.recorded(), ["a-slice1of2.json", "b-slice2of2.json"])
+
+    def test_a_receipt_or_history_of_another_slice_is_refused(self):
+        # A receipt of another shard (its bench command names `1/2`) and a
+        # receipt of the right shard whose history file is the other shard's
+        # both authorize nothing: the requested shard is never guessed from the
+        # only file lying around.
+        self.result_dir("run-other-slice", self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="1/2")]),
+                        self.suite_history(slice_spec="1/2"), history_name="history.json")
+        self.assertEqual(self.invoke(0, slice_spec="2/2")[0], 3)
+        self.assertEqual(self.recorded(), [])
+        self.clear()
+        self.result_dir("run-wrong-history", self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="2/2")]),
+                        self.suite_history(slice_spec="1/2"), history_name="history.json")
+        self.assertEqual(self.invoke(0, slice_spec="2/2")[0], 3)
+        self.assertEqual(self.recorded(), [])
+        # Control: the same receipt with its own shard's history records.
+        self.clear()
+        self.result_dir("run-right-history", self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="2/2")]),
+                        self.suite_history(slice_spec="2/2"), history_name="history.json")
+        self.assertEqual(self.invoke(0, slice_spec="2/2")[0], 0)
+
+    def test_two_receipts_of_the_same_slice_are_refused(self):
+        for name in ("run-a", "run-b"):
+            self.result_dir(name, self.receipt(bins=[("base", self.BASE, "")], bench=[self.bench_args(slice_spec="1/2")]),
+                            self.suite_history(slice_spec="1/2"), history_name="history.json")
+        code, message = self.invoke(0, slice_spec="1/2")
+        self.assertEqual(code, 3)
+        self.assertEqual(self.recorded(), [])
+        self.assertIn("more than one", message)
 
     def test_two_receipts_for_one_invocation_are_refused(self):
         for name in ("run-a", "run-b"):
