@@ -425,6 +425,14 @@ impl Bits {
         }
     }
 
+    /// The memory held on the heap (bytes; `0` when the set fits inline).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match &self.0 {
+            Repr::Inline(_) => 0,
+            Repr::Heap(ws) => ws.len() * 8,
+        }
+    }
+
     /// Sets bit `i` to `v`.
     pub fn set(&mut self, i: u32, v: bool) {
         let word = (i / 64) as usize;

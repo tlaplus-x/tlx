@@ -6,7 +6,7 @@
 use std::collections::hash_map::Entry;
 
 use crate::tableau::Automaton;
-use crate::GraphView;
+use crate::{Bits, GraphView};
 use tlx_base::hash::FxMap;
 
 use super::NONE;
@@ -343,8 +343,6 @@ fn automaton_sccs(aut: &Automaton) -> Vec<u32> {
 /// The graph's BFS from its initial states, for the product nodes of
 /// waiting states (see `AutInfo`).
 pub(super) struct GraphBfs {
-    /// The distance of each state from an initial one (`NONE`: unreachable).
-    pub(super) dist: Vec<u32>,
     /// For each state with a step into it from a reachable state, such a
     /// step from a nearest one: `(source, edge index)` (`NONE` if none).
     /// For a state that is not initial, its BFS tree parent.
@@ -352,62 +350,205 @@ pub(super) struct GraphBfs {
     /// The states with a step into them, by the distance of that step's
     /// source (ascending).
     pub(super) order: Vec<u32>,
+    /// One bit per entry of `order`: set when the entry begins a BFS level,
+    /// so the entries are entered at distances `1, 2, ...` in order (every
+    /// level that discovers a state adds at least one entry). Fixed at
+    /// `0.125 B/state`, whatever the graph's depth.
+    level_start: Vec<u64>,
+    /// The graph's initial states, the roots of the BFS (for
+    /// [`Product::prefix`]).
+    init: Bits,
 }
 
 impl GraphBfs {
     pub(super) fn new<G: GraphView>(g: &G) -> GraphBfs {
         let n = g.num_states();
-        let (mut dist, mut into) = (vec![NONE; n], vec![(NONE, 0); n]);
+        // Pre-sized: `Bits::set` would grow the set word by word.
+        let mut visited = vec![0u64; n.div_ceil(64)];
+        let mut level_start = vec![0u64; n.div_ceil(64)];
+        let mut into = vec![(NONE, 0); n];
         let (mut queue, mut order) = (Vec::with_capacity(n), Vec::with_capacity(n));
         for &s in g.init() {
-            if dist[s as usize] == NONE {
-                dist[s as usize] = 0;
+            let (w, m) = ((s / 64) as usize, 1u64 << (s % 64));
+            if visited[w] & m == 0 {
+                visited[w] |= m;
                 queue.push(s);
             }
         }
-        let mut k = 0;
+        let init = init_bits(g);
+        // The distance of the states being expanded (`cur_dist`) and the
+        // number of queue entries up to the end of their level; the entries
+        // of `order` they add are entered at `cur_dist + 1`.
+        let (mut k, mut cur_dist, mut level_end) = (0, 0u32, queue.len());
+        let mut last_dist = 0u32;
         while k < queue.len() {
+            if k == level_end {
+                cur_dist += 1;
+                level_end = queue.len();
+            }
             let s = queue[k];
             k += 1;
+            let entry_dist = cur_dist + 1;
             for li in 0..g.degree(s) {
                 let t = g.edge(s, li).0;
                 if into[t as usize].0 == NONE {
                     into[t as usize] = (s, li as u32);
+                    if entry_dist != last_dist {
+                        // (A level that discovers a state adds an entry, so
+                        // the distances have no gaps.)
+                        debug_assert_eq!(entry_dist, last_dist + 1, "BFS level adds no order entry");
+                        last_dist = entry_dist;
+                        level_start[order.len() / 64] |= 1 << (order.len() % 64);
+                    }
                     order.push(t);
                 }
-                if dist[t as usize] == NONE {
-                    dist[t as usize] = dist[s as usize] + 1;
+                let (w, m) = ((t / 64) as usize, 1u64 << (t % 64));
+                if visited[w] & m == 0 {
+                    visited[w] |= m;
                     queue.push(t);
                 }
             }
         }
-        GraphBfs { dist, into, order }
+        GraphBfs { into, order, level_start, init }
     }
 
     /// The memory of the BFS of a graph of `n` states (bytes; with its
-    /// queue while it runs).
+    /// temporary queue, visited and level-start bitsets while it runs, and
+    /// its initial-state bitset in the worst case): an upper bound for every
+    /// graph topology.
     pub(super) fn bytes_for(n: usize) -> usize {
-        n * 20
+        let words = n.div_ceil(64) * 8;
+        n * 16 + words * 2 + if n > 64 { words } else { 0 }
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.dist.capacity() * 4 + self.into.capacity() * 8 + self.order.capacity() * 4
+        self.into.capacity() * 8 + self.order.capacity() * 4 + self.level_start.capacity() * 8 + self.init.heap_bytes()
     }
 
-    /// The distance of the product nodes entered from a waiting state at
-    /// graph state `t` (by the step `into[t]`).
+    /// Whether entry `i` of `order` begins a BFS level, i.e. its distance is
+    /// one more than the previous entry's (`1` for entry 0).
     #[inline]
-    pub(super) fn entry_dist(&self, t: u32) -> u32 {
-        self.dist[self.into[t as usize].0 as usize] + 1
+    pub(super) fn starts_level(&self, i: usize) -> bool {
+        self.level_start.get(i / 64).is_some_and(|w| (w >> (i % 64)) & 1 == 1)
     }
+
+    /// Whether `s` is an initial state of the graph: the root above a step
+    /// `into[s]` entered from a waiting state.
+    #[inline]
+    pub(super) fn is_init(&self, s: u32) -> bool {
+        self.init.get(s)
+    }
+}
+
+/// The set of the graph's initial states, pre-sized for its largest one
+/// (inline when they fit one word).
+fn init_bits<G: GraphView>(g: &G) -> Bits {
+    let words = g.init().iter().map(|&s| s as usize / 64 + 1).max().unwrap_or(0);
+    let mut ws = vec![0u64; words];
+    for &s in g.init() {
+        ws[s as usize / 64] |= 1 << (s % 64);
+    }
+    Bits::from_boxed_words(ws.into_boxed_slice())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{sparse_key, NodeMap, DENSE_LIMIT, EAGER_DENSE_LIMIT};
-    use std::collections::HashSet;
+    use super::{sparse_key, GraphBfs, NodeMap, DENSE_LIMIT, EAGER_DENSE_LIMIT, NONE};
+    use crate::{Bits, Graph, GraphView};
+    use std::collections::{HashSet, VecDeque};
     use std::hash::BuildHasher;
     use tlx_base::hash::FxBuildHasher;
+
+    /// The waiting-state BFS keeps a pre-sized visited bitset instead of a
+    /// per-state distance array and records where each level begins as one
+    /// bit per entry of `order`: it takes about `12.125 B/state` (not `16`),
+    /// and its construction peak stays below `16.5 B/state` (not `20`).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn graph_bfs_level_starts_and_bitsets_are_compact() {
+        let n = 100_000u32;
+        let mut g =
+            Graph { init: vec![0, n / 2], state_bits: (0..n).map(|_| Bits::new()).collect(), edges: Vec::with_capacity(n as usize) };
+        // A ring with a 1000-state jump: the BFS has a handful of levels, and
+        // both initial states are entered by a predecessor (each is on the
+        // ring).
+        for s in 0..n {
+            g.edges.push(vec![((s + 1) % n, Bits::new()), ((s + 1000) % n, Bits::new())]);
+        }
+        let bfs = GraphBfs::new(&g);
+
+        // The reference distance of each state, by a plain BFS.
+        let mut dist = vec![NONE; n as usize];
+        let mut queue = VecDeque::new();
+        for &s in g.init() {
+            dist[s as usize] = 0;
+            queue.push_back(s);
+        }
+        while let Some(s) = queue.pop_front() {
+            for li in 0..g.degree(s) {
+                let t = g.edge(s, li).0;
+                if dist[t as usize] == NONE {
+                    dist[t as usize] = dist[s as usize] + 1;
+                    queue.push_back(t);
+                }
+            }
+        }
+
+        // Every state is entered (the ring reaches both initial states from a
+        // predecessor), and the level-start bits give the distance of the
+        // step chain that entered the state.
+        assert_eq!(bfs.order.len(), n as usize);
+        let mut dt = 1;
+        for (i, &t) in bfs.order.iter().enumerate() {
+            if i > 0 && bfs.starts_level(i) {
+                dt += 1;
+            }
+            let (u, _) = bfs.into[t as usize];
+            assert_ne!(u, NONE, "entered state {t} has no step into it");
+            assert_eq!(dt, dist[u as usize] + 1, "entry distance of state {t}");
+        }
+        assert!(bfs.is_init(0) && bfs.is_init(n / 2));
+        assert!(!bfs.is_init(1) && !bfs.is_init(n / 2 + 1));
+
+        let bytes = bfs.bytes();
+        assert!(bytes >= 12 * n as usize && bytes < 13 * n as usize, "{bytes} bytes for {n} states");
+        let peak = GraphBfs::bytes_for(n as usize);
+        assert!(peak >= 16 * n as usize && (peak as f64) < 16.5 * n as f64, "{peak} bytes for {n} states");
+    }
+
+    /// The same bounds at maximum BFS depth: a ring's BFS has one level per
+    /// state (`n` levels), yet the level starts are one bit per `order`
+    /// entry, so the retained size stays about `12.1 B/state` and
+    /// `bytes_for` stays below `16.5 B/state`.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn graph_bfs_is_compact_at_maximum_depth() {
+        let n = 100_000u32;
+        let g = Graph {
+            init: vec![0],
+            state_bits: (0..n).map(|_| Bits::new()).collect(),
+            edges: (0..n).map(|s| vec![((s + 1) % n, Bits::new())]).collect(),
+        };
+        let bfs = GraphBfs::new(&g);
+        // The directed ring enters every state: `1, 2, ..., n - 1`, then `0`
+        // from `n - 1`, at one entry per level.
+        assert_eq!(bfs.order.len(), n as usize);
+        let mut dt = 1;
+        let mut levels = 1usize;
+        for i in 0..bfs.order.len() {
+            if i > 0 && bfs.starts_level(i) {
+                dt += 1;
+                levels += 1;
+            }
+            assert_eq!(dt, i as u32 + 1, "one entry per level at index {i}");
+        }
+        assert_eq!(levels, n as usize, "the ring's BFS depth is its state count");
+
+        let bytes = bfs.bytes();
+        assert!(bytes >= 12 * n as usize && bytes <= 12 * n as usize + n as usize / 4 + 64, "{bytes} bytes for {n} states");
+        let peak = GraphBfs::bytes_for(n as usize);
+        assert!(peak >= 16 * n as usize && (peak as f64) < 16.5 * n as f64, "{peak} bytes for {n} states");
+    }
 
     /// The sparse keys of distinct states spread over a table past 2^26
     /// buckets: 2^20 states of one slot land in about as many 16-bucket

@@ -80,6 +80,15 @@ pub(crate) fn lits_hold(lits: &[(u32, bool)], bits: &Bits) -> bool {
     lits.iter().all(|&(a, pos)| bits.get(a) == pos)
 }
 
+/// The index of the monotone level span of `levels` that holds `i`: `cursor`
+/// advances over the spans (they start in ascending order).
+#[inline]
+fn span_index(levels: &[(u32, u32)], i: usize, cursor: &mut usize) {
+    while levels.get(*cursor + 1).is_some_and(|&(start, _)| i >= start as usize) {
+        *cursor += 1;
+    }
+}
+
 impl<'a, G: GraphView> Product<'a, G> {
     /// The memory of the product (bytes, estimated from its allocations),
     /// with the larger of `map_bytes` and the post-build SCC search buffers
@@ -175,27 +184,27 @@ impl<'a, G: GraphView> Product<'a, G> {
             }
         }
         // The next graph state entered from waiting states (in
-        // `GraphBfs::order`), and the current span in `p.levels`.
+        // `GraphBfs::order`), the current span in `p.levels`, and the
+        // distance of the next entry of `GraphBfs::order` (its levels are
+        // contiguous, so it advances by one at each level start).
         let mut entered = 0;
         let mut lvl = 0;
+        let mut dt = 1;
         let mut v = 0;
         loop {
             let d = if let Some(bfs) = &bfs {
-                while p.levels.get(lvl + 1).is_some_and(|&(start, _)| v >= start as usize) {
-                    lvl += 1;
-                }
+                span_index(&p.levels, v, &mut lvl);
                 // Enter the nodes of the waiting states' steps at the
                 // distance of the next node's successors (with no node left,
                 // at the next such distance), keeping the ids in BFS order.
                 let upto = if v < p.st.len() {
                     p.levels[lvl].1 + 1
                 } else if entered < bfs.order.len() {
-                    bfs.entry_dist(bfs.order[entered])
+                    dt
                 } else {
                     break;
                 };
                 while let Some(&t) = bfs.order.get(entered) {
-                    let dt = bfs.entry_dist(t);
                     if dt > upto {
                         break;
                     }
@@ -205,13 +214,14 @@ impl<'a, G: GraphView> Product<'a, G> {
                             p.add(&mut map, t, q, (FROM_WAITING, 0), dt, budget)?;
                         }
                     }
+                    if entered < bfs.order.len() && bfs.starts_level(entered) {
+                        dt += 1;
+                    }
                 }
                 if v == p.st.len() {
                     continue;
                 }
-                while p.levels.get(lvl + 1).is_some_and(|&(start, _)| v >= start as usize) {
-                    lvl += 1;
-                }
+                span_index(&p.levels, v, &mut lvl);
                 p.levels[lvl].1
             } else {
                 if v == p.st.len() {
@@ -268,7 +278,7 @@ impl<'a, G: GraphView> Product<'a, G> {
                         let (u, li) = bfs.into[s as usize];
                         path.push((u, li));
                         s = u;
-                        if bfs.dist[s as usize] == 0 {
+                        if bfs.is_init(s) {
                             break;
                         }
                     }
