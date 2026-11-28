@@ -104,9 +104,10 @@ def tlcbase_models(a):
         keys = sorted(ms)
     keys = [k for k in keys if a.filter in k]
     if a.slice:
-        i, n = (int(x) for x in a.slice.split("/"))
-        if not 1 <= i <= n:
-            sys.exit(f"--slice expects I/N with 1 <= I <= N, got {a.slice}")
+        try:
+            i, n = bench_budget.parse_slice(a.slice)
+        except ValueError as e:
+            sys.exit(str(e))
         timeout = a.timeout if a.timeout is not None else DEFAULT_TIMEOUT_S
         suite_timeouts = None if a.timeout is not None else _suite_timeouts()
         keys = tlcbase_slices({k: ms[k] for k in keys}, n, timeout, workers_list(a.workers),
@@ -131,16 +132,10 @@ def tlcbase_slices(ms, n, timeout, workers, *, timeouts=None):
     """`ms` ({id: model}) split into `n` lists of about equal estimated time
     (longest first onto the least loaded slice; deterministic), each in id
     order."""
-    slices = [[] for _ in range(n)]
-    load = [0.0] * n
     def est(k):
         t = timeouts.get(k, timeout) if timeouts else timeout
         return tlcbase_estimate(ms[k], t, workers)
-    for k in sorted(ms, key=lambda k: (-est(k), k)):
-        i = min(range(n), key=lambda j: (load[j], j))
-        slices[i].append(k)
-        load[i] += est(k)
-    return [sorted(s) for s in slices]
+    return bench_budget.balance_slices(ms, n, est)
 
 
 

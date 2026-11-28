@@ -35,6 +35,7 @@ from cloud import cloud_common
 import tempdirs
 
 import contextlib, json, math, os, re, shutil, statistics, subprocess, sys, tempfile, time
+from pathlib import Path
 
 from tlxlib import json_update, ROOT, git, geomean
 
@@ -184,32 +185,262 @@ def companion_expect(expect):
     return {"result": expect.get("result"), "source": "unpinned"}
 
 
+# Fallback per-run cost estimates (seconds) used for LPT sharding and
+# shortest-estimated-first scheduling when neither stored tlx records nor TLC
+# timings exist for a model.
+SIZE_FALLBACK_S = {"small": 2.0, "medium": 30.0, "large": 180.0, "huge": 600.0}
+_CANONICAL_MODES = {"compile": "-compile", "interp": "-interp", "tlc": "-tlc", "default": "default"}
+
+
+def _canonical_mode(mode):
+    return _CANONICAL_MODES.get(mode, mode)
+
+
+def _companion_identity(e):
+    """Identity shared by a default-mode run and its unreduced `-tlc` twin."""
+    args = tuple(a for a in (e.get("args") or []) if a != "-tlc")
+    return (e["model"], e["workers"], args, e.get("cgroup_mib"),
+            repr(sorted((e.get("env") or {}).items())))
+
+
+def _is_companion_entry(e):
+    return e["mode"] == "tlc" or (e["mode"] == "compile" and "-tlc" in (e.get("args") or []))
+
+
 def with_companions(es):
     """`es` with each default-mode run followed by its same-instance `-tlc` twin.
 
     The twin repeats the run's model, worker count, timeout, extra arguments,
     environment and memory limit, so both sides are measured under one cache
     policy; it is measured immediately after its reduced run, and it is skipped
-    when the manifest already measures that exact configuration with `-tlc`, or
-    when the default run already asks for `-tlc` through its arguments.
+    when the selection already measures that exact configuration with `mode ==
+    "tlc"` or `mode == "compile"` + `"-tlc"` in `args`, or when the default run
+    already asks for `-tlc` through its arguments.
     """
-    known = {(e["mode"], e["model"], e["workers"], tuple(e.get("args") or []), e.get("cgroup_mib"),
-              repr(sorted((e.get("env") or {}).items()))) for e in es}
+    covered = {_companion_identity(e) for e in es if _is_companion_entry(e)}
     out = []
     for e in es:
         out.append(e)
         mode = COMPANION_MODES.get(e["mode"])
         if mode is None or "-tlc" in (e.get("args") or []):
             continue
-        identity = (mode, e["model"], e["workers"], tuple(e.get("args") or []), e.get("cgroup_mib"),
-                    repr(sorted((e.get("env") or {}).items())))
-        if identity in known:
+        identity = _companion_identity(e)
+        if identity in covered:
             continue
-        known.add(identity)
+        covered.add(identity)
         out.append({**e, "mode": mode,
                     "key": e["key"].replace(f":{e['mode']}:", f":{mode}:", 1),
                     "expect": companion_expect(e["expect"])})
     return out
+
+
+def _cost_indices(records):
+    """Build `(tlx_walls, tlc_walls)` from stored canonical records for scheduling."""
+    from benchmarking.records import COMPLETE
+    tlx_ranked, tlc_ranked = {}, {}
+    for r in records or ():
+        wall = (r.get("metrics") or {}).get("wall_s")
+        if (r.get("counts") or {}).get("result") not in COMPLETE or not wall or wall <= 0:
+            continue
+        rank = (r.get("date") or "", r.get("id") or "")
+        if r.get("tool") == "tlc":
+            key = (r["model"], r["workers"])
+            if key not in tlc_ranked or rank >= tlc_ranked[key][0]:
+                tlc_ranked[key] = (rank, float(wall))
+        elif r.get("tool") == "tlx":
+            key = (r["model"], r["mode"], r["workers"])
+            if key not in tlx_ranked or rank >= tlx_ranked[key][0]:
+                tlx_ranked[key] = (rank, float(wall))
+            c = r.get("configuration") or {}
+            if r.get("mode") == "-compile" and c.get("compatibility") is True and "-tlc" in (c.get("args") or []):
+                twin_k = (r["model"], "-tlc", r["workers"])
+                if twin_k not in tlx_ranked:
+                    tlx_ranked[twin_k] = (rank, float(wall))
+    return ({k: v for k, (_, v) in tlx_ranked.items()},
+            {k: v for k, (_, v) in tlc_ranked.items()})
+
+
+def estimate_entry_cost(entry, *, tlx_walls=None, tlc_walls=None):
+    """Estimated seconds for one suite entry: stored tlx, else TLC, else size fallback."""
+    timeout = float(entry["timeout_s"])
+    model, workers = entry["model"], entry["workers"]
+    mode = _canonical_mode(entry["mode"])
+    if tlx_walls and (w := tlx_walls.get((model, mode, workers))):
+        return min(timeout, float(w))
+    if tlc_walls and (w := tlc_walls.get((model, workers))):
+        return min(timeout, float(w))
+    w1 = (tlc_walls.get((model, 1)) if tlc_walls else None) or entry.get("tlc_1w_s")
+    if w1 and w1 > 0:
+        est = float(w1) if workers == 1 else max(1.0, float(w1) / 4.0)
+        return min(timeout, est)
+    return min(timeout, SIZE_FALLBACK_S.get(entry.get("size"), 60.0))
+
+
+def _group_by_model(es):
+    groups = {}
+    for e in es:
+        groups.setdefault(e["model"], []).append(e)
+    return groups
+
+
+def slice_entries(es, slice_spec, *, records=None):
+    """Return the entries for the `I/N` LPT-balanced model slice.
+
+    All selected runs of a model stay in the same slice so `--with-tlc-companion`
+    same-instance pairing is preserved.
+    """
+    index, total = bench_budget.parse_slice(slice_spec)
+    groups = _group_by_model(es)
+    if not groups:
+        return []
+    tlx_walls, tlc_walls = _cost_indices(records)
+    costs = {mid: sum(estimate_entry_cost(e, tlx_walls=tlx_walls, tlc_walls=tlc_walls) for e in runs)
+             for mid, runs in groups.items()}
+    chosen = bench_budget.balance_slices(list(groups), total, costs.__getitem__)[index - 1]
+    return [e for mid in chosen for e in groups[mid]]
+
+
+def order_entries_shortest_first(es, *, records=None):
+    """Order entries shortest-estimated-first by model, keeping each model's runs grouped."""
+    groups = _group_by_model(es)
+    if not groups:
+        return []
+    tlx_walls, tlc_walls = _cost_indices(records)
+    costs = {mid: sum(estimate_entry_cost(e, tlx_walls=tlx_walls, tlc_walls=tlc_walls) for e in runs)
+             for mid, runs in groups.items()}
+    ordered_models = sorted(groups, key=lambda mid: (costs[mid], mid))
+    return [e for mid in ordered_models for e in groups[mid]]
+
+
+def _same_revision(a, b):
+    """Match exact or unambiguous hex-prefix git revisions without blurring `-dirty`."""
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+    if a == b:
+        return True
+    if a.endswith("-dirty") or b.endswith("-dirty"):
+        return False
+    return min(len(a), len(b)) >= 7 and (a.startswith(b) or b.startswith(a))
+
+
+def _expected_cache(isolate_cache, env=None):
+    """Exact `provenance.cache` dict this suite run will produce for an entry."""
+    if isolate_cache:
+        return {"mode": "fresh-per-model", "initial_state": "empty", "warmup": True}
+    mode = "inherited" if (env or {}).get("TLX_CACHE") or os.environ.get("TLX_CACHE") else "shared-batch"
+    return {"mode": mode, "initial_state": "unknown", "warmup": True}
+
+
+def _planned_twin_key(entry, *, revision, instance_type, instance_arch, digest_val, tlc_version, cache):
+    """The `bench_records.twin_key` this suite invocation will produce for `entry`."""
+    from benchmarking import bench_records
+    probe = {
+        "model": entry["model"],
+        "revision": revision,
+        "instance": {"type": instance_type, "arch": instance_arch},
+        "workers": entry["workers"],
+        "content_digest": digest_val,
+        "tlc_version": tlc_version,
+        "configuration": {
+            "args": list(entry.get("args") or []),
+            "env": entry.get("env") or None,
+            "cgroup_mib": entry.get("cgroup_mib"),
+            "hogs": 0,
+            "variant": None,
+        },
+        "provenance": {"cache": cache},
+    }
+    return bench_records.twin_key(probe)
+
+
+def _record_satisfies_entry(r, entry, *, revision, instance_type, digest_val, isolate_cache=False):
+    """Whether canonical store record `r` satisfies suite `entry`."""
+    from benchmarking import bench_records
+    if not revision or not instance_type or not digest_val:
+        return False
+    if (r.get("tool") != "tlx" or r.get("model") != entry["model"]
+            or r.get("workers") != entry["workers"]
+            or not _same_revision(r.get("revision"), revision)
+            or (r.get("instance") or {}).get("type") != instance_type
+            or r.get("content_digest") != digest_val):
+        return False
+    c = r.get("configuration") or {}
+    want_env = entry.get("env") or None
+    got_env = c.get("env") or None
+    if c.get("cgroup_mib") != entry.get("cgroup_mib") or got_env != want_env:
+        return False
+    check_row = r if not want_env else {**r, "configuration": {**c, "env": None}}
+    if not bench_records.eligible(check_row):
+        return False
+    cache = (r.get("provenance") or {}).get("cache") or {}
+    if isolate_cache and cache.get("mode") != "fresh-per-model":
+        return False
+    want_mode = _canonical_mode(entry["mode"])
+    want_args = list(entry.get("args") or [])
+    got_args = list(c.get("args") or [])
+    if want_mode == "-tlc":
+        if r.get("mode") == "-tlc" and got_args == want_args:
+            return True
+        return (bench_records.is_unreduced_twin(r)
+                and [a for a in got_args if a != "-tlc"] == [a for a in want_args if a != "-tlc"])
+    if want_mode == "-compile" and "-tlc" in want_args:
+        return (r.get("mode") == "-compile" and got_args == want_args
+                and bench_records.is_unreduced_twin(r))
+    return r.get("mode") == want_mode and got_args == want_args
+
+
+def filter_missing_entries(es, records, *, revision, instance_type, digests,
+                           with_tlc_companion=False, isolate_cache=False,
+                           instance_arch=None, tlc_version=None, expected_cache=None):
+    """Return `(missing_entries, satisfied_count)` against canonical `records`.
+
+    When `with_tlc_companion` is active, a `default` entry and its matching
+    unreduced twin must either already be paired in `records` via
+    `bench_records.unreduced_twin` (matching `fresh-per-model` when
+    `isolate_cache` is set), or else any already-present half must match the
+    exact `bench_records.twin_key` that this invocation will produce so the
+    newly collected half pairs with it.
+    """
+    from benchmarking import bench_records
+    twins = bench_records.unreduced_twins(records) if with_tlc_companion else {}
+    default_identities = set()
+    paired_identities = set()
+    if with_tlc_companion:
+        for e in es:
+            if e["mode"] != "default" or "-tlc" in (e.get("args") or []):
+                continue
+            ident = _companion_identity(e)
+            default_identities.add(ident)
+            matches = [r for r in records if _record_satisfies_entry(
+                r, e, revision=revision, instance_type=instance_type,
+                digest_val=digests.get(e["model"]), isolate_cache=isolate_cache)]
+            if any(bench_records.unreduced_twin(r, twins) is not None for r in matches):
+                paired_identities.add(ident)
+    missing, satisfied = [], 0
+    for e in es:
+        matches = [r for r in records if _record_satisfies_entry(
+            r, e, revision=revision, instance_type=instance_type,
+            digest_val=digests.get(e["model"]), isolate_cache=isolate_cache)]
+        if not matches:
+            missing.append(e)
+            continue
+        if with_tlc_companion:
+            ident = _companion_identity(e)
+            is_default = e["mode"] == "default" and "-tlc" not in (e.get("args") or [])
+            is_twin = _is_companion_entry(e)
+            if (is_default or is_twin) and ident in default_identities and ident not in paired_identities:
+                cache = expected_cache if expected_cache is not None else _expected_cache(isolate_cache, e.get("env"))
+                planned_key = _planned_twin_key(
+                    e, revision=revision, instance_type=instance_type, instance_arch=instance_arch,
+                    digest_val=digests.get(e["model"]), tlc_version=tlc_version, cache=cache)
+                if planned_key is None or not any(
+                        bench_records.twin_key(r) == planned_key
+                        and (not is_twin or bench_records.is_unreduced_twin(r))
+                        for r in matches):
+                    missing.append(e)
+                    continue
+        satisfied += 1
+    return missing, satisfied
 
 
 def entries(man, sizes=DEFAULT_SIZES, models="", modes="", pin_adapt="", with_tlc_companion=False):
@@ -578,7 +809,8 @@ def commit_range(base, rev):
 
 
 def print_verdict(h, v):
-    base, rev = h.get("base", {}).get("commit"), h["commit"]
+    base = (h.get("base") or {}).get("commit")
+    rev = h.get("commit") or "unknown"
     print(f"\nverdict: {v['outcome']}  ({(base + '..') if base else 'baseline, '}{rev}; {len(h['runs'])} runs on {h['machine']})")
     for f in v["count_failures"]:
         print(f"  COUNT MISMATCH {f['key']}: {'; '.join(f['problems'])}")
@@ -625,16 +857,157 @@ def resolve_model(bench, mid):
     return available[mid]
 
 
-def run_suite(a, bench=None, resolve=None, man=None):
+def _model_digests(model_ids, *, resolve=None, stage=False, dry_run=False, root=ROOT):
+    """Compute current `content_digest` per model id (falling back to pinned
+    `report-policy.json` digests only for absent local checkouts in `--dry-run`)."""
+    from benchmarking.baselines import content_digest
+    if resolve is not None:
+        resolved = {mid: resolve(mid) for mid in model_ids}
+    else:
+        resolved = resolve_models(list(model_ids), stage=stage)
+    policy_inputs = {}
+    if dry_run:
+        policy_path = os.path.join(root, "bench", "report-policy.json")
+        if os.path.isfile(policy_path):
+            try:
+                with open(policy_path) as source:
+                    policy_inputs = json.load(source).get("baseline_inputs") or {}
+            except (OSError, ValueError):
+                policy_inputs = {}
+    digests = {}
+    for mid in model_ids:
+        m = resolved.get(mid)
+        tla, cfg = (m or {}).get("tla"), (m or {}).get("cfg")
+        if tla and cfg and os.path.isfile(tla) and os.path.isfile(cfg):
+            digests[mid] = content_digest(m)
+        elif dry_run and mid in policy_inputs:
+            digests[mid] = (policy_inputs[mid] or {}).get("content_digest")
+        else:
+            digests[mid] = None
+    return digests
+
+
+def _source_rel(path, root):
+    try:
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _suite_out_path(a, *, rev, slice_spec, missing_only, records, root=ROOT):
+    """Choose the history output path and protect prior records under `--missing`.
+
+    `legacy.ingest` replaces a source file's canonical records atomically
+    (HARNESS-18). Overwriting a history file that already owns records skipped
+    by `--missing` would delete those records from `bench/records/`.
+    """
+    owned_sources = {(r.get("provenance") or {}).get("source") for r in records or ()}
+
+    def occupied(path):
+        rel = _source_rel(path, root)
+        return os.path.exists(path) or (rel is not None and rel in owned_sources)
+
+    if a.out:
+        if missing_only and occupied(a.out):
+            sys.exit(f"suite --missing refuses to overwrite existing history file {a.out} "
+                     "(would drop previously ingested records); pass a fresh --out path")
+        return a.out
+    history_dir = (HISTORY if Path(root).resolve() == Path(ROOT).resolve()
+                   else os.path.join(root, "bench", "history"))
+    slice_suffix = f"-slice{slice_spec.replace('/', 'of')}" if slice_spec else ""
+    stem = f"{rev or 'external'}{slice_suffix}"
+    candidate = os.path.join(history_dir, f"{stem}.json")
+    if not missing_only or not occupied(candidate):
+        return candidate
+    suffix = 1
+    while True:
+        candidate = os.path.join(history_dir, f"{stem}-missing-{suffix}.json")
+        if not occupied(candidate):
+            return candidate
+        suffix += 1
+
+
+def _target_arch(target_instance, actual_info, records):
+    if target_instance == actual_info["type"]:
+        return actual_info["arch"]
+    arches = sorted({(r.get("instance") or {}).get("arch") for r in records or ()
+                     if (r.get("instance") or {}).get("type") == target_instance
+                     and (r.get("instance") or {}).get("arch")})
+    return arches[0] if len(arches) == 1 else None
+
+
+def run_suite(a, bench=None, resolve=None, man=None, *, root=ROOT):
     """`bench.py suite`. Returns the exit status. `bench` (the module), `resolve`
     (model id -> bench model dict) and `man` can be given by tests."""
     if bench is None:
         import bench
     man = man or load_manifest(a.manifest)
+    with_companion = getattr(a, "with_tlc_companion", False)
+    isolate_cache = getattr(a, "isolate_cache", False)
+    missing_only = getattr(a, "missing", False)
+    slice_spec = getattr(a, "slice", "") or ""
+    bin_rev = getattr(a, "bin_rev", "") or ""
+    instance_type = getattr(a, "instance_type", "") or ""
+    dry_run = getattr(a, "dry_run", False)
+
+    if bin_rev and not a.bin and not dry_run:
+        sys.exit("--bin-rev requires --bin (or --dry-run for planning)")
+    if missing_only and a.bin and not bin_rev:
+        sys.exit("suite --missing with --bin requires --bin-rev")
+    if slice_spec:
+        try:
+            bench_budget.parse_slice(slice_spec)
+        except ValueError as e:
+            sys.exit(str(e))
+
     es = entries(man, a.sizes, a.models, getattr(a, "modes", ""), getattr(a, "pin_adapt", ""),
-                 with_tlc_companion=getattr(a, "with_tlc_companion", False))
+                 with_tlc_companion=with_companion)
     if not es:
         sys.exit("no benchmark runs selected")
+
+    from benchmarking.records import instance_info, load_records
+    actual_info = instance_info(bench_machine.machine_desc())
+    actual_instance = actual_info["type"]
+    target_instance = instance_type or actual_instance
+    if instance_type and not dry_run and instance_type != actual_instance:
+        sys.exit("suite --instance-type differs from this host; pass --dry-run for planning or run on the target instance")
+
+    records = load_records(root)
+    runner_commit = bench_machine.git_commit()
+    target_rev = (bin_rev or None) if a.bin else (bin_rev or runner_commit)
+    if missing_only:
+        model_ids = list(dict.fromkeys(e["model"] for e in es))
+        digests = _model_digests(model_ids, resolve=resolve, stage=not dry_run, dry_run=dry_run, root=root)
+        target_arch = _target_arch(target_instance, actual_info, records)
+        target_tlc_version = bench_machine.tla2tools_info().get("revision")
+        es, satisfied = filter_missing_entries(
+            es, records, revision=target_rev, instance_type=target_instance, digests=digests,
+            with_tlc_companion=with_companion, isolate_cache=isolate_cache,
+            instance_arch=target_arch, tlc_version=target_tlc_version)
+        print(f"suite --missing: {len(es)} missing run(s) ({satisfied} satisfied) "
+              f"for {target_rev or 'unknown'} on {target_instance or 'unknown'}", flush=True)
+        if not es:
+            return PASS
+
+    if slice_spec:
+        es = slice_entries(es, slice_spec, records=records)
+        if not es:
+            print(f"suite --slice {slice_spec}: 0 runs in slice", flush=True)
+            return PASS
+
+    es = order_entries_shortest_first(es, records=records)
+    if dry_run:
+        tlx_walls, tlc_walls = _cost_indices(records)
+        header = f"suite --dry-run: {len(es)} run(s)" + (f" (slice {slice_spec})" if slice_spec else "")
+        print(header, flush=True)
+        for e in es:
+            est = estimate_entry_cost(e, tlx_walls=tlx_walls, tlc_walls=tlc_walls)
+            extra = (" " + " ".join(e["args"])) if e.get("args") else ""
+            print(f"  {e['key']}  est={est:.1f}s{extra}", flush=True)
+        return PASS
+
+    out = _suite_out_path(a, rev=target_rev, slice_spec=slice_spec,
+                          missing_only=missing_only, records=records, root=root)
     resolve = resolve or (lambda mid: resolve_model(bench, mid))
     slow = {}
     for s in a.inject_slow or []:
@@ -648,20 +1021,32 @@ def run_suite(a, bench=None, resolve=None, man=None):
         cleanup = bench.build_release("tlx-bench-")
         binary = cleanup.__enter__()
     try:
-        return _run_suite(a, bench, resolve, es, binary, slow_for)
+        return _run_suite(a, bench, resolve, es, binary, slow_for, out=out, root=root)
     finally:
         if cleanup:
             cleanup.__exit__(None, None, None)
 
 
-def _run_suite(a, bench, resolve, es, binary, slow_for):
+def _run_suite(a, bench, resolve, es, binary, slow_for, *, out=None, root=ROOT):
     base_bin = os.path.abspath(a.base_bin) if a.base_bin else None
     bins = ([("base", base_bin)] if base_bin else []) + [("new", binary)]
     instr = perf_instructions_available() and not a.no_instructions
-    rev = bench_machine.git_commit()
-    out = a.out or os.path.join(HISTORY, f"{rev}.json")
-    h = {"suite": True, "tla2tools": bench_machine.tla2tools_info(), "commit": rev, "date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": bench_machine.machine_desc(),
+    runner_commit = bench_machine.git_commit()
+    bin_rev = getattr(a, "bin_rev", "") or ""
+    rev = (bin_rev or None) if a.bin else runner_commit
+    slice_spec = getattr(a, "slice", "") or ""
+    slice_suffix = f"-slice{slice_spec.replace('/', 'of')}" if slice_spec else ""
+    out = out or a.out or os.path.join(HISTORY, f"{rev or 'external'}{slice_suffix}.json")
+    h = {"suite": True, "tla2tools": bench_machine.tla2tools_info(), "commit": rev,
+         "date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": bench_machine.machine_desc(),
          "instructions": instr, "repeat": a.repeat, "sizes": a.sizes, "runs": {}}
+    if a.bin:
+        h["bin"] = binary
+        h["runner_commit"] = runner_commit
+        if bin_rev:
+            h["bin_revs"] = {"new": bin_rev}
+    if slice_spec:
+        h["slice"] = slice_spec
     base = {"commit": a.base_rev or "unknown", "runs": {}} if base_bin else None
     if base:
         h["base"] = base
@@ -729,12 +1114,12 @@ def _run_suite(a, bench, resolve, es, binary, slow_for):
         v = judge(base["runs"], h["runs"], es, skipped, compare)
         v["retried"] = retry
     h["verdict"] = v
-    h["range"] = commit_range(base["commit"], rev) if base and base["commit"] != "unknown" else []
+    h["range"] = commit_range(base["commit"], rev) if base and base["commit"] != "unknown" and rev else []
     save()
     print_verdict(h, v)
     from benchmarking.legacy import ingest
-    ingest(out)
-    print(f"recorded in {os.path.relpath(out, ROOT)}")
+    ingest(out, root=root)
+    print(f"recorded in {os.path.relpath(out, root)}")
     return exit_status(v)
 
 
@@ -788,11 +1173,12 @@ def trend_markdown(hists, last=6, man=None):
         return "\n".join(out + ["No suite run recorded yet."]) + "\n"
     cur = hists[-1]
     prev = hists[-2] if len(hists) > 1 else None
-    out += [f"Latest: `{cur['commit']}` ({cur['date']}), {cur['machine']}; verdict {cur.get('verdict', {}).get('outcome', '?')}"
+    rev_of = lambda h: h.get("commit") or "unknown"
+    out += [f"Latest: `{rev_of(cur)}` ({cur['date']}), {cur['machine']}; verdict {cur.get('verdict', {}).get('outcome', '?')}"
             + (f" against `{cur['base']['commit']}`" if cur.get("base") else " (baseline)") + ".", ""]
     if prev:
         same = prev["machine"] == cur["machine"]
-        out += [f"Previous recorded: `{prev['commit']}` ({prev['date']})" + ("" if same else ", **different machine: the change column is not meaningful**") + ".", ""]
+        out += [f"Previous recorded: `{rev_of(prev)}` ({prev['date']})" + ("" if same else ", **different machine: the change column is not meaningful**") + ".", ""]
     out += ["| size | model | mode | workers | wall s | cpu s | rss MiB | instr (G) | vs TLC | vs prev |", "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     speed = {}
     for k, r in sorted(cur["runs"].items(), key=lambda kv: (SIZES.index(kv[1]["tier"]) if kv[1]["tier"] in SIZES else 9, kv[0])):
@@ -813,7 +1199,7 @@ def trend_markdown(hists, last=6, man=None):
         out.append(f"| {t} | {mode} | {w} | {len(xs)} | {geomean(xs):.1f}x |")
     shown = hists[-last:]
     out += ["", f"## Wall time over the last {len(shown)} recorded revisions (s)", "",
-            "| model | mode | w | " + " | ".join(f"`{h['commit'][:8]}`<br>{h['date'][:10]}" for h in shown) + " |",
+            "| model | mode | w | " + " | ".join(f"`{rev_of(h)[:8]}`<br>{h['date'][:10]}" for h in shown) + " |",
             "|---|---|---:|" + "---:|" * len(shown)]
     keys = sorted(cur["runs"], key=lambda k: (SIZES.index(cur["runs"][k]["tier"]) if cur["runs"][k]["tier"] in SIZES else 9, k))
     for k in keys:
@@ -821,7 +1207,7 @@ def trend_markdown(hists, last=6, man=None):
         out.append(f"| {r['model']} | {r['mode']} | {r['workers']} | " + " | ".join(fmt_s(h["runs"][k]["min"]) if k in h["runs"] else "-" for h in shown) + " |")
     machines = {}
     for h in shown:
-        machines.setdefault(h["machine"], []).append(h["commit"][:8])
+        machines.setdefault(h["machine"], []).append(rev_of(h)[:8])
     out += ["", "Machines: " + "; ".join(f"{', '.join(cs)}: {m}" for m, cs in machines.items()), ""]
     flagged = [h for h in shown if h.get("verdict", {}).get("outcome") in ("REGRESSION", "INCONCLUSIVE")]
     if flagged:
@@ -829,7 +1215,7 @@ def trend_markdown(hists, last=6, man=None):
         for h in flagged:
             v = h["verdict"]
             names = [r["key"] for r in v.get("regressions", [])] + [f["key"] for f in v.get("count_failures", [])]
-            out.append(f"- `{h['commit']}`: {v['outcome']}" + (f" ({', '.join(names)})" if names else ""))
+            out.append(f"- `{rev_of(h)}`: {v['outcome']}" + (f" ({', '.join(names)})" if names else ""))
         out.append("")
     return "\n".join(out)
 
@@ -867,7 +1253,10 @@ def previous_recorded(rev, hists, is_ancestor=None):
     """The newest suite history before `rev` whose commit is an ancestor of it."""
     is_ancestor = is_ancestor or (lambda c, r: subprocess.run(["git", "merge-base", "--is-ancestor", c, r], cwd=ROOT, capture_output=True).returncode == 0)
     for h in reversed(hists):
-        c = h["commit"].split("-dirty")[0]
+        commit = h.get("commit")
+        if not commit:
+            continue
+        c = commit.split("-dirty")[0]
         if c != rev[:len(c)] and is_ancestor(c, rev):
             return c
     return None
@@ -989,11 +1378,20 @@ def add_args(sub):
     p.add_argument("--models", default="", help="only models whose id equals or contains one of these")
     p.add_argument("--modes", default="", help="only these run modes: default,compile,interp,tlc (default: all)")
     p.add_argument("--bin", default="", help="tlx binary under test (default: build target/release)")
+    p.add_argument("--bin-rev", default="", help="the revision of --bin (recorded on the history and used by --missing)")
     p.add_argument("--base-bin", default="", help="tlx binary of the previous recorded revision (A/B)")
     p.add_argument("--base-rev", default="", help="the revision of --base-bin (recorded, names the commit range)")
+    p.add_argument("--missing", action="store_true",
+                   help="skip runs already satisfied by an eligible record in bench/records/ (for this revision, instance and input digest)")
+    p.add_argument("--instance-type", default="",
+                   help="target instance type for --missing checks (execution requires this host; pair with --dry-run for local planning)")
+    p.add_argument("--slice", default="",
+                   help="I/N: the I-th of N load-balanced slices by estimated model cost (groups all runs of a model together)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the selected, sliced and shortest-first scheduled runs without building or running tlx")
     p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
     p.add_argument("--with-tlc-companion", action="store_true",
-                   help="also measure a same-instance `-tlc` twin of every default-mode run (same model, workers, arguments, environment and cache policy)")
+                   help="also measure a same-instance `-tlc` twin of every default-mode run unless already covered by `compile` + `[\"-tlc\"]` (same model, workers, arguments, environment and cache policy)")
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--max-minutes", type=int, default=0, help="stop starting new runs after M minutes (the rest is reported as skipped: inconclusive)")
     p.add_argument("--threshold", type=float, default=0.05)

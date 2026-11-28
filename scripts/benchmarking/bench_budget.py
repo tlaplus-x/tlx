@@ -5,6 +5,44 @@ import math
 import time
 
 
+def parse_slice(spec):
+    """Parse an `I/N` shard specifier (`1 <= I <= N`) into `(index, total)`."""
+    parts = str(spec).split("/")
+    if len(parts) != 2:
+        raise ValueError(f"--slice expects I/N with 1 <= I <= N, got {spec}")
+    try:
+        index, total = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(f"--slice expects I/N with 1 <= I <= N, got {spec}") from None
+    if not 1 <= index <= total:
+        raise ValueError(f"--slice expects I/N with 1 <= I <= N, got {spec}")
+    return index, total
+
+
+def balance_slices(items, n, cost):
+    """Partition `items` into `n` load-balanced slices using deterministic LPT.
+
+    Items are assigned longest-estimated-first onto the least-loaded slice
+    (ties broken by item order, then slice index), and each returned slice is
+    sorted by item.
+    """
+    if type(n) is not int or n < 1:
+        raise ValueError(f"slice count must be a positive integer, got {n!r}")
+    slices = [[] for _ in range(n)]
+    load = [0.0] * n
+    weighted = []
+    for item in items:
+        weight = float(cost(item))
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"slice cost must be finite and non-negative, got {weight!r} for {item!r}")
+        weighted.append((item, weight))
+    for item, weight in sorted(weighted, key=lambda pair: (-pair[1], pair[0])):
+        slot = min(range(n), key=lambda j: (load[j], j))
+        slices[slot].append(item)
+        load[slot] += weight
+    return [sorted(s) for s in slices]
+
+
 class Budget:
     def __init__(self, minutes=None, deadline_at=None):
         if minutes is not None and (not math.isfinite(minutes) or minutes <= 0):

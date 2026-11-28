@@ -88,7 +88,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -120,7 +123,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -183,7 +189,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
@@ -330,11 +339,17 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
@@ -433,11 +448,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 300,
@@ -460,11 +489,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 300,
@@ -503,6 +546,10 @@
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 300,
@@ -611,15 +658,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 600,
@@ -694,6 +751,10 @@
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 600,
@@ -716,7 +777,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
@@ -4634,7 +4698,10 @@
     },
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     }
    ],
    "expect": {
@@ -4656,7 +4723,10 @@
     },
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     }
    ],
    "expect": {
@@ -4803,11 +4873,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 600,
@@ -4825,11 +4909,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 1800,
@@ -4847,7 +4945,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
@@ -4930,7 +5031,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -4957,7 +5061,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -4984,15 +5091,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 600,
@@ -5010,7 +5127,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5037,15 +5157,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 1800,
@@ -5063,7 +5193,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5090,15 +5223,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "compile",
-     "workers": 16
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 1800,
@@ -5117,7 +5260,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5144,7 +5290,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5171,7 +5320,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5198,11 +5350,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 1800,
@@ -5220,7 +5386,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5247,7 +5416,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5274,7 +5446,10 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "interp",
@@ -5301,11 +5476,25 @@
    "runs": [
     {
      "mode": "compile",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-tlc"
+     ]
+    },
+    {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-tlc"
+     ]
     },
     {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "timeout_s": 1800,
