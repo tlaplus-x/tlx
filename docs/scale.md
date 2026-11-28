@@ -80,21 +80,29 @@ Details that matter:
   that memoizes little does not touch a full table per thread. Under pressure the quota is halved and a
   thread clears its table when it exceeds it.
 - Representative candidates buffered by workers for VIEW/SYMMETRY (design.md §7.3,
-  `explore/order.rs`) are held until the level is resolved, i.e. a whole level of new states. With a
+  `explore/order/`) are held until the level is resolved, i.e. a whole level of new states. With a
   state codec (compiled tier) each worker keeps them XOR-varint encoded against the previous candidate,
   as the queue's blocks are, in segments of whole records (`TLX_SEG_BYTES`) together with what only a
   kept candidate needs (parent log entry as the record's log reference, action and depth as varints),
-  and decodes them in offer order when resolving; from stage 4 on, while over budget (as the queue: no more below 7/8 of it), the full
-  segments go to disk and resolving
-  reads them back with read-ahead. In memory stay 24 B per candidate (key, fingerprint, record index),
-  the level's best-key tables and BFS positions, about 100-150 B per state of the widest level in all:
-  with several workers a VIEW/SYMMETRY model whose widest level has N states needs about that much
-  beyond the budget. Resolving queues the whole next level at once and offers its segments to the disk
-  every 1024 states, as expanding does. The interpreter keeps the state objects. The gauge tracks reserved capacities as they grow, including candidate metadata, encoded buffers and codec scratch, the sharded best-key tables, BFS positions/counts (until their last reader releases them), and resolve indices, ranks and output tables. Clearing a buffer keeps it charged; under pressure workers shrink empty candidate buffers at level boundaries and release best-key table capacity after resolving a level. In-place unstable sorting allocates no additional sort workspace. Interpreted states' heap data is covered by RSS. (MultiPaxos_MC with 8 workers: the widest
+  and decodes them in offer order when resolving (`order/store.rs`); from stage 4 on, while over budget
+  (as the queue: no more below 7/8 of it), the full segments go to disk and resolving reads them back
+  with read-ahead. In memory stay compacted metadata: 20 B per candidate in SoA vectors (packed 8 B key,
+  4 B record index, 8 B fingerprint, with a cold overflow side table when `(parent_pos, succ_idx)` exceeds
+  the inline `(40, 24)` bit range), 8 B packed values in the sharded `Order::best` tables (plus a cold
+  overflow map per shard), 8 B per state in `Table` (`(u32, u32)`, widening to `(u64, u64)` above `u32::MAX`),
+  4 B per parent in `Counts` (`AtomicU32`, with an overflow map), and 4 B per kept candidate in `resolve`
+  ranks (`Vec<u32>`, widening to `Vec<u64>` above `u32::MAX`). Resolving queues the whole next level at once
+  and offers its segments to the disk every 1024 states, as expanding does. The interpreter keeps the state
+  objects. The gauge tracks reserved capacities as they grow, including candidate metadata, encoded buffers
+  and codec scratch, the sharded best-key tables, BFS positions/counts (until their last reader releases them),
+  and resolve indices, ranks and output tables. Clearing a buffer keeps it charged; under pressure workers
+  shrink empty candidate buffers at level boundaries and release best-key table capacity after resolving a
+  level. In-place unstable sorting allocates no additional sort workspace. Interpreted states' heap data is
+  covered by RSS. (Historical baseline before metadata compaction on MultiPaxos_MC with 8 workers: the widest
   level, 4M states of 335 words, took about 40 GiB as objects, beyond the default budget, and about 1.1 GiB
   encoded. With `-maxmem 400M` the candidates still peaked at 1.5 GB, and a 16-worker run in a control
-  group of 1.7 GiB was killed; with spilled segments, 24-byte metadata and the next level spilled while
-  resolving, the candidates peak at 0.56 GB and the process at 1.1 GB instead of 2.0 GB.)
+  group of 1.7 GiB was killed; with spilled segments, the earlier 24-byte metadata and the next level spilled
+  while resolving, the candidates peaked at 0.56 GB and the process at 1.1 GB instead of 2.0 GB.)
 - Allocator behavior counts: the global allocator is mimalloc, which returns freed pages after a delay.
   After a pressure stage was reached the monitor calls `mem::purge` (`mi_collect(true)`) before each
   sample; default runs never call it. On Linux, transparent huge pages are disabled when `-maxmem` is
