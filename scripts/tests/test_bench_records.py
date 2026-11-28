@@ -1593,6 +1593,47 @@ class RecordsTest(unittest.TestCase):
         self.assertIn(br.store_file(companion), detail)
         self.assertNotIn(br.store_file(newer), detail)
 
+    def test_compile_with_tlc_serves_as_unreduced_twin_and_yields_to_newer_or_tied_tlc(self):
+        # A `-compile` record with `args: ["-tlc"]` and `compatibility: True`
+        # executes the identical unreduced compiled search and pairs with a
+        # matching `default` row on the same instance/cache/digest.
+        reduced, compile_twin = self.twin_pair(
+            default={'args': ['-maxmem', '512']},
+            twin={'mode': '-compile', 'args': ['-tlc', '-maxmem', '512'], 'compatibility': True},
+        )
+        detail = br.render([reduced, compile_twin], {'models': []}).split('## ' + br.SECTIONS[1])[1].split('\n## ')[0]
+        self.assertIn('| 9.00 | 9.00× |', detail)
+        self.assertIn(br.store_file(compile_twin), detail)
+        # Missing `-tlc`, compatibility != True, or differing extra args must not pair.
+        for label, over in (
+                ('no -tlc arg', {'args': ['-maxmem', '512'], 'compatibility': True}),
+                ('compatibility False', {'args': ['-tlc', '-maxmem', '512'], 'compatibility': False}),
+                ('compatibility absent', {'args': ['-tlc', '-maxmem', '512']}),
+                ('mismatched extra args', {'args': ['-tlc', '-maxmem', '256'], 'compatibility': True}),
+        ):
+            with self.subTest(case=label):
+                _, bad = self.twin_pair(default={'args': ['-maxmem', '512']},
+                                        twin={'mode': '-compile', **over})
+                if label == 'compatibility absent':
+                    bad['configuration'].pop('compatibility', None)
+                self.assertNotIn('-tlc twin', br.render([reduced, bad], {'models': []}))
+        # A default row that already passes `-tlc` is not paired with a twin.
+        default_tlc, _ = self.twin_pair(default={'args': ['-tlc', '-maxmem', '512']})
+        self.assertNotIn('-tlc twin', br.render([default_tlc, compile_twin], {'models': []}))
+        # Precedence between `-compile -tlc` and dedicated `-tlc`: newer date wins;
+        # on an exact date tie, dedicated `-tlc` wins.
+        _, dedicated = self.twin_pair(default={'args': ['-maxmem', '512']},
+                                      twin={'mode': '-tlc', 'args': ['-maxmem', '512'], 'walls': [12.0, 12.0, 12.0]})
+        dedicated['id'] = 'dedicated-tlc'
+        # Equal date -> dedicated `-tlc` wins.
+        self.assertEqual(br.unreduced_twin(reduced, br.unreduced_twins([compile_twin, dedicated]))['id'], 'dedicated-tlc')
+        # Newer `-compile -tlc` beats older `-tlc`.
+        newer_compile = {**compile_twin, 'id': 'newer-compile', 'date': '2026-10-08'}
+        self.assertEqual(br.unreduced_twin(reduced, br.unreduced_twins([newer_compile, dedicated]))['id'], 'newer-compile')
+        # Newer `-tlc` beats older `-compile -tlc`.
+        newer_dedicated = {**dedicated, 'id': 'newer-tlc', 'date': '2026-10-09'}
+        self.assertEqual(br.unreduced_twin(reduced, br.unreduced_twins([newer_compile, newer_dedicated]))['id'], 'newer-tlc')
+
     def test_report_sections_ratios_and_gaps(self):
         tx = self.record(category=['corpus', 'compiled'], content_digest='digest')
         tc = self.record(tool='tlc', mode='-tlc', content_digest='digest', tlc_version='v')

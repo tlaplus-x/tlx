@@ -143,12 +143,29 @@ def eligible(r):
 
 
 # The run modes whose search is reduced by default, and the TLC-compatible mode
-# that measures the same configuration unreduced. A companion `-tlc` run is only
+# that measures the same configuration unreduced. A companion `-tlc` run (or an
+# equivalent `-compile` run passing `-tlc` with `compatibility is True`) is only
 # a like-for-like twin when it was measured on the same instance (the store
 # records the instance type and architecture), from the same revision and input,
 # with the same worker count, TLC version and configuration.
 REDUCED_MODES = ('default',)
 TWIN_MODE = '-tlc'
+
+
+def is_unreduced_twin(r):
+    """Whether `r` is an eligible unreduced tlx `-tlc` measurement.
+
+    Accepts both dedicated `mode == '-tlc'` runs and `-compile` runs passing
+    `-tlc` with `configuration.compatibility is True`, because `tlx check
+    -compile -tlc` executes the identical unreduced compiled search.
+    """
+    if r.get('tool') != 'tlx' or not eligible(r) or not r['metrics'].get('wall_s'):
+        return False
+    mode = r.get('mode')
+    if mode == TWIN_MODE:
+        return True
+    c = r.get('configuration') or {}
+    return mode == '-compile' and c.get('compatibility') is True and '-tlc' in (c.get('args') or [])
 
 
 def twin_key(r):
@@ -161,6 +178,10 @@ def twin_key(r):
     same bytes under the same cache regime (F2/F3); they are part of the key
     because a warm and an isolated run differ by several times on fast models.
 
+    `-tlc` is stripped from `configuration.args` so a `-compile` run with
+    `args: ["-tlc", ...]` pairs with a `default` run carrying the same remaining
+    arguments.
+
     Fails closed: a row whose machine type, architecture, input digest or cache
     provenance is unknown cannot be shown to be the same measurement, so it has
     no twin key and is never paired.
@@ -170,8 +191,9 @@ def twin_key(r):
     if not i.get('type') or not i.get('arch') or not r.get('content_digest') or not cache:
         return None
     c = r.get('configuration') or {}
+    args = tuple(a for a in (c.get('args') or []) if a != '-tlc')
     return (r['model'], r['revision'], i['type'], i['arch'], r['workers'],
-            r['content_digest'], r['tlc_version'], tuple(c.get('args') or []),
+            r['content_digest'], r['tlc_version'], args,
             json.dumps(c.get('env') or {}, sort_keys=True), c.get('cgroup_mib'), c.get('hogs') or 0,
             c.get('variant'), json.dumps(cache, sort_keys=True))
 
@@ -179,19 +201,23 @@ def twin_key(r):
 def unreduced_twins(rows):
     """Map each configuration's `twin_key` to the eligible unreduced `-tlc` row.
 
-    Only an eligible row with a wall time is evidence, the same gate the report
-    and the speedup inventory apply to a published row: a twin the report would
-    reject cannot label a published ratio. The newest such row wins, on the same
-    (date, id) order the report's own selection uses.
+    Accepts both `mode == '-tlc'` and eligible `-compile` (`-tlc`,
+    `compatibility is True`) records. Only an eligible row with a wall time is
+    evidence, the same gate the report and the speedup inventory apply to a
+    published row: a twin the report would reject cannot label a published
+    ratio. The newest such row wins, with a dedicated `mode == '-tlc'` row
+    winning an exact date tie.
     """
     out = {}
     for r in rows:
-        if r.get('tool') != 'tlx' or r.get('mode') != TWIN_MODE or not eligible(r) or not r['metrics'].get('wall_s'):
+        if not is_unreduced_twin(r):
             continue
         key = twin_key(r)
         if key is None:
             continue
-        if key not in out or (r['date'] or '', r['id']) >= (out[key]['date'] or '', out[key]['id']):
+        rank = (r['date'] or '', r.get('mode') == TWIN_MODE, r['id'])
+        prev = out.get(key)
+        if prev is None or rank >= (prev['date'] or '', prev.get('mode') == TWIN_MODE, prev['id']):
             out[key] = r
     return out
 
@@ -199,11 +225,13 @@ def unreduced_twins(rows):
 def unreduced_twin(r, twins):
     """The same-instance unreduced twin of a default-mode row, or None.
 
-    The store must hold an eligible tlx `-tlc` record whose configuration,
-    revision, instance, worker count and input match this row's; otherwise there
-    is no like-for-like number and the report prints none.
+    The store must hold an eligible tlx `-tlc` (or `-compile -tlc`) record whose
+    configuration, revision, instance, worker count and input match this row's;
+    otherwise there is no like-for-like number and the report prints none.
     """
     if r.get('tool') != 'tlx' or r.get('mode') not in REDUCED_MODES:
+        return None
+    if '-tlc' in ((r.get('configuration') or {}).get('args') or []):
         return None
     key = twin_key(r)
     if key is None:

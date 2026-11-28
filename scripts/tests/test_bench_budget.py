@@ -629,6 +629,27 @@ class BenchBudget(unittest.TestCase):
                            'Model checking completed. No error has been found.\n', 1, 0)
         self.assertEqual(parsed['result'], 'success')
 
+    def test_parse_slice_and_balance_slices_share_lpt_partitioning(self):
+        self.assertEqual(budget.parse_slice('1/1'), (1, 1))
+        self.assertEqual(budget.parse_slice('2/4'), (2, 4))
+        self.assertEqual(budget.parse_slice('4/4'), (4, 4))
+        for bad in ('', '1', '1/2/3', '0/2', '3/2', '-1/2', 'a/2', '1/0'):
+            with self.subTest(spec=bad), self.assertRaisesRegex(ValueError, '--slice expects I/N'):
+                budget.parse_slice(bad)
+        costs = {'big': 100.0, 'mid1': 60.0, 'mid2': 50.0, 'small1': 10.0, 'small2': 5.0}
+        slices = budget.balance_slices(costs, 2, costs.__getitem__)
+        self.assertEqual(slices, [['big', 'small1', 'small2'], ['mid1', 'mid2']])
+        self.assertEqual(budget.balance_slices([], 3, lambda _: 1.0), [[], [], []])
+        with self.assertRaises(ValueError):
+            budget.balance_slices(['a'], 0, lambda _: 1.0)
+        with self.assertRaises(ValueError):
+            budget.balance_slices(['a'], 2, lambda _: -1.0)
+        with self.assertRaises(ValueError):
+            budget.balance_slices(['a'], 2, lambda _: float('nan'))
+        # tlcbase_slices delegates directly to balance_slices.
+        ms = {'M1': {'tlc': {'wall_s': 100}}, 'M2': {'tlc': {'wall_s': 60}}, 'M3': {'tlc': {'wall_s': 50}}}
+        self.assertEqual(bench.tlcbase_slices(ms, 2, 1800, [1]), [['M1'], ['M2', 'M3']])
+
 
 if __name__ == '__main__':
     unittest.main()

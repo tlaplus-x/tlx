@@ -48,10 +48,12 @@ name the same statistic.
 
 A default-mode row can apply automatic symmetry, so its ratio compares a reduced search with TLC's
 unreduced one. When the store also holds a same-instance unreduced twin - an eligible tlx `-tlc`
-record with the same model, revision, instance type and architecture, worker count, input digest,
-TLC version, configuration (arguments, environment and memory limit) and recorded cache provenance -
-the per-model tables gain `-tlc twin s` and `-tlc / default` columns: the twin's timed wall time
-(cited in the row's Evidence) and the factor by which the reduced run was faster on the same machine.
+record (or an eligible `-compile` record passing `-tlc` with `configuration.compatibility` true)
+with the same model, revision, instance type and architecture, worker count, input digest,
+TLC version, remaining configuration (arguments without `-tlc`, environment and memory limit) and
+recorded cache provenance - the per-model tables gain `-tlc twin s` and `-tlc / default` columns:
+the twin's timed wall time (cited in the row's Evidence) and the factor by which the reduced run
+was faster on the same machine.
 The pairing fails closed: a row whose machine type, architecture, input digest or cache provenance
 is unknown is not paired, because a ratio across unknown hosts, inputs or cache regimes is not
 quotable. The TLC ratio beside them is unchanged: it still compares the reduced run with TLC's own
@@ -332,14 +334,42 @@ report ratios because they were measured on another machine.
 manifest run that does not already pass `-tlc`, one companion `tlc` run of the same model, worker
 count, timeout, extra arguments, environment and memory limit on the same instance, under the same
 cache policy (both rows record that policy in `provenance.cache`, which the report requires to match).
+When the selection already includes a `compile` run with `"-tlc"` in `args` matching the same model,
+workers, remaining arguments, environment and memory limit, `with_companions` skips the redundant
+separate `tlc` run: `tlx check -compile -tlc` executes the exact same unreduced compiled search, and
+`bench_records.py` pairs that eligible `-compile` (`compatibility: true`, `"-tlc"` in `args`) record
+as the `default` row's unreduced twin when no dedicated `mode: "-tlc"` record is newer.
 That is the like-for-like twin the speedup audit requires: the two rows can be divided without mixing
 machines or cache regimes. The companion's counts are checked against the manifest's pin when
 that pin came from TLC (`tlc-oracle`, `tlc-bench`); when the pin came from a reduced run
 (`tlx-pinned`) only its verdict is enforced, because the companion exists to measure the unreduced
 counts and checking them against a reduced pin would reject the measurement. The option is off by
-default: it roughly doubles the runs of a default-mode selection and consumes the same budget. The
-stored twin is mode `-tlc`, tool `tlx`, so it is not confused with a TLC baseline row. Section 1
-describes how the report pairs the two.
+default. The stored dedicated twin is mode `-tlc`, tool `tlx`, so it is not confused with a TLC
+baseline row. Section 1 describes how the report pairs the two.
+
+**Incremental sharding and shortest-first scheduling.** `bench.py suite` accepts `--missing`,
+`--bin-rev REV`, `--instance-type TYPE`, `--slice I/N` and `--dry-run`:
+
+- `--missing` filters out runs already satisfied by an eligible canonical record in `bench/records/`
+  for the target `(revision, instance_type, content_digest)` (and, under `--with-tlc-companion`, checks
+  whether the matching unreduced twin is already paired via `bench_records.unreduced_twin` or matches
+  the exact `twin_key` attributes this run will produce). To keep incremental `--missing` passes from
+  clobbering previously ingested records on `ingest`, an explicit `--out` that already exists or owns
+  stored records is refused, and omitted `--out` automatically chooses a fresh `-missing-<N>.json`
+  history file when the default path is already occupied. Passing `--bin` without `--bin-rev` records
+  `commit: null`, `bin` and `runner_commit` on the history file so an external binary never inherits
+  the runner checkout's commit; `--missing` with `--bin` requires `--bin-rev`.
+- `--slice I/N` partitions the remaining models into `N` load-balanced shards using the same
+  longest-processing-time (LPT) balancer as `tlcbase` (`benchmarking.bench_budget.balance_slices`),
+  keeping all selected runs of each model in one slice so `--with-tlc-companion` same-instance pairing
+  is preserved.
+- Within every `suite` run (sliced or unsliced), models execute **shortest-estimated-first** using
+  (1) stored `bench/records/` wall times, else (2) stored `bench/tlc-baselines/` wall times /
+  `tlc_1w_s`, else (3) size-tier fallbacks (`small: 2 s`, `medium: 30 s`, `large: 180 s`,
+  `huge: 600 s`), keeping each model's `default` and companion twin adjacent so slow or unestimated
+  models cannot starve fast models before `--max-minutes` / `--deadline-min`. Use `--dry-run` (with
+  `--instance-type` if planning off-host) to inspect the filtered, sliced and ordered run list without
+  building or running `tlx`.
 
 Use `bench.py suite --modes compile` to select only compiled entries when a manifest
 also contains default-mode runs. The CCF and MongoDB compiled entries pass `-tlc`

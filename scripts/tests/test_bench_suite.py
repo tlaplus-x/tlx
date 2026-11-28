@@ -103,6 +103,66 @@ class Manifest(unittest.TestCase):
         self.assertEqual(S.companion_expect({"result": "deadlock", "source": "tlc-bench"}),
                          {"result": "deadlock", "source": "tlc-bench"})
 
+    def test_with_companions_deduplicates_compile_tlc_entries(self):
+        m = {"version": 1, "models": [
+            {"id": "M/covered", "size": "medium", "timeout_s": 60,
+             "runs": [{"mode": "compile", "workers": 1, "args": ["-tlc"]},
+                      {"mode": "compile", "workers": 16, "args": ["-tlc"]},
+                      {"mode": "default", "workers": 1},
+                      {"mode": "default", "workers": 16}],
+             "expect": {"result": "success", "source": "tlc-oracle", "distinct": 5}},
+            {"id": "M/uncovered", "size": "medium", "timeout_s": 60,
+             "runs": [{"mode": "compile", "workers": 1},  # no -tlc: does not cover twin
+                      {"mode": "compile", "workers": 1, "args": ["-tlc", "-maxmem", "512"]},  # different args
+                      {"mode": "default", "workers": 1}],
+             "expect": {"result": "success", "source": "tlc-oracle", "distinct": 5}},
+        ]}
+        es = S.entries(m, "medium", with_tlc_companion=True)
+        covered = [e for e in es if e["model"] == "M/covered"]
+        self.assertEqual([(e["mode"], e["workers"], e["args"]) for e in covered],
+                         [("compile", 1, ["-tlc"]), ("compile", 16, ["-tlc"]),
+                          ("default", 1, []), ("default", 16, [])])
+        uncovered = [e for e in es if e["model"] == "M/uncovered"]
+        self.assertEqual([(e["mode"], e["workers"], e["args"]) for e in uncovered],
+                         [("compile", 1, []), ("compile", 1, ["-tlc", "-maxmem", "512"]),
+                          ("default", 1, []), ("tlc", 1, [])])
+
+    def test_manifest_flagship_external_models_have_1w_16w_and_tlc_compile(self):
+        manifest = S.load_manifest()
+        self.assertEqual(S.validate_manifest(manifest), [])
+        by_id = {m["id"]: m for m in manifest["models"]}
+        flagship = (
+            "ext/etcd-raft/MCetcdraft_3s_t2",
+            "ext/etcd-raft/MCetcdraft_4s_t3_reconfig",
+            "ext/zookeeper/FastLeaderElection_medium",
+            "ext/alpha-zk/MC_tlx_Zab_new",
+            "ext/mongo/MCRaftMongo",
+            "ext/mongo/MCMongoReplReconfig",
+            "ext/logless-reconfig/MCMongoRaftReconfig",
+            "ext/cassandra/Accord_baseline__deep_chain",
+            "ext/cassandra/Accord_baseline__deep_chain_live",
+            "ext/elastic/consensus",
+            "ext/vanlightly-kafka/kraft_kip_853_small",
+            "ext/pingcap/DistributedTransaction_Test1",
+        )
+        for mid in flagship:
+            with self.subTest(model=mid):
+                runs = by_id[mid]["runs"]
+                for w in (1, 16):
+                    self.assertTrue(any(r["mode"] == "compile" and r["workers"] == w and "-tlc" in (r.get("args") or [])
+                                        for r in runs), f"{mid} missing compile -tlc {w}w")
+                    self.assertTrue(any(r["mode"] == "default" and r["workers"] == w
+                                        for r in runs), f"{mid} missing default {w}w")
+        # Every external compile run sitting beside a default run passes -tlc.
+        for m in manifest["models"]:
+            if not m["id"].startswith("ext/"):
+                continue
+            has_default = any(r["mode"] == "default" and "-tlc" not in (r.get("args") or []) for r in m["runs"])
+            if has_default:
+                for r in m["runs"]:
+                    if r["mode"] == "compile":
+                        self.assertIn("-tlc", r.get("args") or [], f"{m['id']} compile {r['workers']}w missing -tlc")
+
     def test_oracle_problems(self):
         m = man()
         ok = {"A/one": {"tlc": {"result": "success", "distinct": 5, "generated": 10, "depth": 3}},
@@ -1256,6 +1316,321 @@ print("The depth of the complete state graph search is 3.")
             for argv in calls:
                 self.assertIn("-generate", argv)
                 self.assertIn("-seed", argv)
+
+
+class ShardingSchedulingAndMissing(testkit.GuardedTestCase):
+    """`suite --missing`, `--slice I/N`, shortest-first scheduling, and `--bin` provenance."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(self.root, "bench"))
+        self.specs = {}
+        for name in ("Fast", "Medium", "Heavy", "Unknown"):
+            tla = os.path.join(self.root, f"{name}.tla")
+            cfg = os.path.join(self.root, f"{name}.cfg")
+            write(tla, f"---- MODULE {name} ----\n====\n")
+            write(cfg, "INIT Init\nNEXT Next\n")
+            self.specs[f"ext/{name}"] = {"id": f"ext/{name}", "tla": tla, "cfg": cfg, "flags": [], "tlc": {}}
+
+    def _stored_row(self, model, *, mode="default", workers=1, rev="e5dffafd5419e069ccd854d7aa674d18631eea15",
+                    instance="SA5.4XLARGE32", arch="x86_64", tlc_version="tlc-v1", args=(), wall=5.0,
+                    compatibility=None, cache_mode="fresh-per-model", cache_warmup=True,
+                    variant=None, count_problems=None, tool="tlx", ptr=None):
+        from benchmarking.baselines import content_digest
+        from benchmarking.records import normalize
+        raw = {
+            "tool": tool, "model": model, "mode": mode, "workers": workers,
+            "walls": [wall, wall, wall], "cpu": [wall, wall, wall], "rss_mib": [32.0, 32.0, 32.0],
+            "result": "success", "distinct": 10, "generated": 20, "depth": 3,
+            "args": list(args), "content_digest": content_digest(self.specs[model]),
+            "tlc_version": tlc_version,
+        }
+        if compatibility is not None:
+            raw["compatibility"] = compatibility
+        if cache_mode is not None:
+            raw["cache"] = {"mode": cache_mode,
+                            "initial_state": "empty" if cache_mode == "fresh-per-model" else "unknown",
+                            "warmup": cache_warmup}
+        if count_problems is not None:
+            raw["count_problems"] = count_problems
+        header = {"suite": True, "repeat": 3, "commit": rev, "date": "2026-11-28 10:00:00",
+                  "machine": f"{arch}, tencent {instance}", "tla2tools": {"revision": tlc_version}}
+        return normalize(header, raw, "bench/history/s.json", ptr or f"/runs/{model}:{mode}:{workers}",
+                         revision=rev, variant=variant)
+
+    def test_cost_estimation_priority_and_shortest_first_scheduling(self):
+        from benchmarking.records import write_records
+        tlx_fast = self._stored_row("ext/Medium", mode="default", workers=1, wall=1.5)
+        tlc_heavy = self._stored_row("ext/Heavy", mode="-tlc", workers=1, wall=250.0, rev=None, tool="tlc", ptr="/runs/tlc")
+        tlx_walls, tlc_walls = S._cost_indices([tlx_fast, tlc_heavy])
+        man = {"version": 1, "models": [
+            {"id": "ext/Heavy", "size": "large", "timeout_s": 600,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Unknown", "size": "huge", "timeout_s": 1800,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Medium", "size": "medium", "timeout_s": 300,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Fast", "size": "small", "timeout_s": 120,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+        ]}
+        es = S.entries(man, "all", with_tlc_companion=True)
+        # Cost priorities: (a) stored tlx (1.5s), (b) stored TLC (250s), (c) size fallback (small=2s, huge=600s).
+        by_key = {e["key"]: S.estimate_entry_cost(e, tlx_walls=tlx_walls, tlc_walls=tlc_walls) for e in es}
+        self.assertEqual(by_key["medium:ext/Medium:default:1w"], 1.5)
+        self.assertEqual(by_key["small:ext/Fast:default:1w"], 2.0)
+        self.assertEqual(by_key["large:ext/Heavy:default:1w"], 250.0)
+        self.assertEqual(by_key["huge:ext/Unknown:default:1w"], 600.0)
+        # Shortest-first orders models by total cost and keeps default + companion adjacent.
+        ordered = S.order_entries_shortest_first(es, records=[tlx_fast, tlc_heavy])
+        models_order = list(dict.fromkeys(e["model"] for e in ordered))
+        self.assertEqual(models_order, ["ext/Fast", "ext/Medium", "ext/Heavy", "ext/Unknown"])
+        for i in range(0, len(ordered), 2):
+            self.assertEqual(ordered[i]["model"], ordered[i + 1]["model"])
+            self.assertEqual((ordered[i]["mode"], ordered[i + 1]["mode"]), ("default", "tlc"))
+        # LPT slicing keeps all entries of each model in the same slice.
+        s1 = S.slice_entries(es, "1/2", records=[tlx_fast, tlc_heavy])
+        s2 = S.slice_entries(es, "2/2", records=[tlx_fast, tlc_heavy])
+        m1, m2 = {e["model"] for e in s1}, {e["model"] for e in s2}
+        self.assertEqual(m1 & m2, set())
+        self.assertEqual(m1 | m2, {"ext/Fast", "ext/Medium", "ext/Heavy", "ext/Unknown"})
+        self.assertEqual(len(s1) + len(s2), len(es))
+        # Verify write_records round-trip is clean for the fixture.
+        write_records([tlx_fast], self.root)
+
+    def test_missing_filters_satisfied_keys_and_checks_companion_twins(self):
+        from benchmarking.baselines import content_digest
+        full_rev = "e5dffafd5419e069ccd854d7aa674d18631eea15"
+        short_rev = "e5dffafd5419"
+        man = {"version": 1, "models": [
+            {"id": "ext/Fast", "size": "small", "timeout_s": 60,
+             "runs": [{"mode": "compile", "workers": 1, "args": ["-tlc"]}, {"mode": "default", "workers": 1}],
+             "expect": {"source": "unpinned"}},
+            {"id": "ext/Medium", "size": "medium", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}],
+             "expect": {"source": "unpinned"}},
+            {"id": "ext/Heavy", "size": "large", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}],
+             "expect": {"source": "unpinned"}},
+        ]}
+        es = S.entries(man, "all", with_tlc_companion=True)
+        digests = {mid: content_digest(m) for mid, m in self.specs.items()}
+        records = [
+            # ext/Fast has both default and compile -tlc paired under full_rev + fresh-per-model.
+            self._stored_row("ext/Fast", mode="default", rev=full_rev, cache_mode="fresh-per-model"),
+            self._stored_row("ext/Fast", mode="-compile", rev=full_rev, args=["-tlc"], compatibility=True, cache_mode="fresh-per-model"),
+            # ext/Medium has default with full_rev + fresh-per-model, but NO twin yet.
+            self._stored_row("ext/Medium", mode="default", rev=full_rev, cache_mode="fresh-per-model"),
+            # ext/Heavy has default under shared-batch (incompatible with --isolate-cache) and an ineligible record.
+            self._stored_row("ext/Heavy", mode="default", rev=full_rev, cache_mode="shared-batch"),
+            self._stored_row("ext/Heavy", mode="-tlc", rev=full_rev, cache_mode="fresh-per-model", count_problems=["mismatch"]),
+        ]
+        # When running with matching full_rev/arch/tlc_version, ext/Medium's stored default can pair with the new twin.
+        missing, satisfied = S.filter_missing_entries(
+            es, records, revision=full_rev, instance_type="SA5.4XLARGE32", digests=digests,
+            with_tlc_companion=True, isolate_cache=True, instance_arch="x86_64", tlc_version="tlc-v1")
+        self.assertEqual(satisfied, 3)  # ext/Fast default + compile -tlc, plus ext/Medium default
+        self.assertEqual([(e["model"], e["mode"]) for e in missing],
+                         [("ext/Medium", "tlc"), ("ext/Heavy", "default"), ("ext/Heavy", "tlc")])
+        # Adding a matching `-compile -tlc` record satisfies ext/Medium's synthesized `tlc` companion too.
+        records.append(self._stored_row("ext/Medium", mode="-compile", rev=full_rev, args=["-tlc"],
+                                        compatibility=True, cache_mode="fresh-per-model"))
+        missing2, satisfied2 = S.filter_missing_entries(
+            es, records, revision=full_rev, instance_type="SA5.4XLARGE32", digests=digests,
+            with_tlc_companion=True, isolate_cache=True, instance_arch="x86_64", tlc_version="tlc-v1")
+        self.assertEqual(satisfied2, 4)
+        self.assertEqual([(e["model"], e["mode"]) for e in missing2],
+                         [("ext/Heavy", "default"), ("ext/Heavy", "tlc")])
+        # Already-paired ext/Fast stays satisfied even when queried with short_rev, whereas
+        # an unpaired single half at full_rev cannot pair with a short_rev follow-up run!
+        unpaired_single = [self._stored_row("ext/Medium", mode="default", rev=full_rev, cache_mode="fresh-per-model")]
+        med_es = [e for e in es if e["model"] == "ext/Medium"]
+        missing_short, satisfied_short = S.filter_missing_entries(
+            med_es, unpaired_single, revision=short_rev, instance_type="SA5.4XLARGE32", digests=digests,
+            with_tlc_companion=True, isolate_cache=True, instance_arch="x86_64", tlc_version="tlc-v1")
+        self.assertEqual(satisfied_short, 0)
+        self.assertEqual([(e["model"], e["mode"]) for e in missing_short],
+                         [("ext/Medium", "default"), ("ext/Medium", "tlc")])
+        # Mixed 40-char / 12-char halves do not pair in bench_records.unreduced_twin and must NOT report 0 missing.
+        fast_es = [e for e in es if e["model"] == "ext/Fast"]
+        mixed_rev = [
+            self._stored_row("ext/Fast", mode="default", rev=full_rev, cache_mode="fresh-per-model"),
+            self._stored_row("ext/Fast", mode="-compile", rev=short_rev, args=["-tlc"], compatibility=True, cache_mode="fresh-per-model"),
+        ]
+        m_short, _ = S.filter_missing_entries(
+            fast_es, mixed_rev, revision=short_rev, instance_type="SA5.4XLARGE32", digests=digests,
+            with_tlc_companion=True, isolate_cache=True, instance_arch="x86_64", tlc_version="tlc-v1")
+        self.assertEqual([(e["model"], e["mode"]) for e in m_short], [("ext/Fast", "default")])
+        m_full, _ = S.filter_missing_entries(
+            fast_es, mixed_rev, revision=full_rev, instance_type="SA5.4XLARGE32", digests=digests,
+            with_tlc_companion=True, isolate_cache=True, instance_arch="x86_64", tlc_version="tlc-v1")
+        self.assertEqual([(e["model"], e["mode"]) for e in m_full], [("ext/Fast", "compile")])
+        # Mismatched tlc_version, arch, variant, cache, or missing compatibility=True on -compile -tlc
+        # must schedule the non-matching half(ves) so the result actually pairs.
+        for label, twin_over, expected_missing in (
+                ("mismatched tlc_version", {"tlc_version": "tlc-old"}, [("ext/Fast", "compile")]),
+                ("mismatched arch", {"arch": "aarch64"}, [("ext/Fast", "compile")]),
+                ("mismatched variant", {"variant": "new"}, [("ext/Fast", "compile")]),
+                ("mismatched cache mode", {"cache_mode": "shared-batch"}, [("ext/Fast", "compile")]),
+                ("mismatched cache warmup", {"cache_warmup": False}, [("ext/Fast", "compile")]),
+                ("compile -tlc compatibility False", {"compatibility": False}, [("ext/Fast", "compile")]),
+                ("compile -tlc compatibility absent", {"compatibility": None}, [("ext/Fast", "compile")]),
+        ):
+            with self.subTest(case=label):
+                pair = [
+                    self._stored_row("ext/Fast", mode="default", rev=full_rev, cache_mode="fresh-per-model"),
+                    self._stored_row("ext/Fast", mode="-compile", rev=full_rev, args=["-tlc"],
+                                     compatibility=twin_over.get("compatibility", True),
+                                     cache_mode=twin_over.get("cache_mode", "fresh-per-model"),
+                                     cache_warmup=twin_over.get("cache_warmup", True),
+                                     tlc_version=twin_over.get("tlc_version", "tlc-v1"),
+                                     arch=twin_over.get("arch", "x86_64"),
+                                     variant=twin_over.get("variant")),
+                ]
+                got_missing, _ = S.filter_missing_entries(
+                    fast_es, pair, revision=full_rev, instance_type="SA5.4XLARGE32", digests=digests,
+                    with_tlc_companion=True, isolate_cache=(twin_over.get("cache_mode", "fresh-per-model") == "fresh-per-model"),
+                    instance_arch="x86_64", tlc_version="tlc-v1",
+                    expected_cache={"mode": "fresh-per-model", "initial_state": "empty", "warmup": True})
+                self.assertEqual([(e["model"], e["mode"]) for e in got_missing], expected_missing)
+
+    def test_consecutive_missing_passes_preserve_prior_ingested_records(self):
+        from benchmarking.records import load_records
+        man = {"version": 1, "models": [
+            {"id": "ext/Fast", "size": "small", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Medium", "size": "medium", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Heavy", "size": "large", "timeout_s": 60,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+        ]}
+        fake_bin = fake(self.tmp.name, "inc-tlx", sleep=0.0)
+        rev = "e5dffafd5419"
+
+        def run_missing(models, out=""):
+            a = argparse.Namespace(manifest=None, sizes="all", models=models, modes="", pin_adapt="",
+                                   with_tlc_companion=False, isolate_cache=True,
+                                   missing=True, slice="", bin=fake_bin, bin_rev=rev,
+                                   instance_type="", dry_run=False,
+                                   base_bin="", base_rev="", repeat=1, max_minutes=0,
+                                   threshold=0.05, max_noise=0.5, min_delta=0.01,
+                                   no_instructions=True, inject_slow=[], out=out)
+            buf = io.StringIO()
+            with patch.object(S.bench_machine, "machine_desc", return_value="x86_64, tencent SA5.4XLARGE32"), \
+                 contextlib.redirect_stdout(buf):
+                rc = S.run_suite(a, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+            return rc, buf.getvalue()
+
+        # Pass 1: collect ext/Fast into default history path and ingest into bench/records/.
+        rc1, out1 = run_missing("ext/Fast")
+        self.assertEqual(rc1, 0, out1)
+        self.assertEqual({r["model"] for r in load_records(self.root)}, {"ext/Fast"})
+        first_hist = os.path.join(self.root, "bench", "history", f"{rev}.json")
+        self.assertTrue(os.path.isfile(first_hist))
+
+        # Explicit --out pointing to an already-existing history file is refused under --missing.
+        with self.assertRaisesRegex(SystemExit, "refuses to overwrite existing history file"):
+            run_missing("ext/Fast,ext/Medium", out=first_hist)
+
+        # Pass 2: default --out picks a non-colliding history file so Pass 1's ext/Fast survives ingest!
+        rc2, out2 = run_missing("ext/Fast,ext/Medium")
+        self.assertEqual(rc2, 0, out2)
+        self.assertIn("1 missing run(s) (1 satisfied)", out2)
+        self.assertEqual({r["model"] for r in load_records(self.root)}, {"ext/Fast", "ext/Medium"})
+        second_hist = os.path.join(self.root, "bench", "history", f"{rev}-missing-1.json")
+        self.assertTrue(os.path.isfile(second_hist))
+
+        # Pass 3: both models are now satisfied -> 0 missing runs, no extra history file created.
+        rc3, out3 = run_missing("ext/Fast,ext/Medium")
+        self.assertEqual(rc3, 0, out3)
+        self.assertIn("0 missing run(s) (2 satisfied)", out3)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "bench", "history", f"{rev}-missing-2.json")))
+        self.assertEqual({r["model"] for r in load_records(self.root)}, {"ext/Fast", "ext/Medium"})
+
+        # Even if first_hist is removed on disk, passing its path explicitly is still refused while its records remain owned.
+        os.remove(first_hist)
+        with self.assertRaisesRegex(SystemExit, "refuses to overwrite existing history file"):
+            run_missing("ext/Heavy", out=first_hist)
+
+    def test_run_suite_missing_slice_dry_run_and_external_bin_provenance(self):
+        from benchmarking.records import write_records
+        man = {"version": 1, "models": [
+            {"id": "ext/Heavy", "size": "large", "timeout_s": 60, "tlc_1w_s": 200.0,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+            {"id": "ext/Fast", "size": "small", "timeout_s": 60, "tlc_1w_s": 1.0,
+             "runs": [{"mode": "default", "workers": 1}], "expect": {"source": "unpinned"}},
+        ]}
+        write_records([self._stored_row("ext/Heavy", mode="default", rev="e5dffafd5419",
+                                        instance="SA5.4XLARGE32", cache_mode="fresh-per-model")], self.root)
+        # Dry-run planning works off-host with --instance-type and --bin-rev, printing only missing runs.
+        a = argparse.Namespace(manifest=None, sizes="all", models="", modes="", pin_adapt="",
+                               with_tlc_companion=False, isolate_cache=True,
+                               missing=True, slice="1/2", bin="", bin_rev="e5dffafd5419",
+                               instance_type="SA5.4XLARGE32", dry_run=True,
+                               base_bin="", base_rev="", repeat=1, max_minutes=0,
+                               threshold=0.05, max_noise=0.5, min_delta=0.01,
+                               no_instructions=True, inject_slow=[], out="")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = S.run_suite(a, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("1 missing run(s) (1 satisfied)", buf.getvalue())
+        self.assertIn("small:ext/Fast:default:1w", buf.getvalue())
+        self.assertNotIn("ext/Heavy", buf.getvalue())
+        # Empty slice 2/2 exits 0 cleanly without running anything.
+        a.slice = "2/2"
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc = S.run_suite(a, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("0 runs in slice", buf2.getvalue())
+        # Refusals: --missing --bin without --bin-rev; --bin-rev without --bin (non-dry-run); --instance-type mismatch.
+        for label, over, msg in (
+                ("missing+bin no bin-rev", {"dry_run": False, "bin": "/fake/tlx", "bin_rev": "", "missing": True}, "--bin-rev"),
+                ("bin-rev no bin", {"dry_run": False, "bin": "", "bin_rev": "abc1234", "missing": False}, "--bin-rev requires --bin"),
+                ("instance mismatch", {"dry_run": False, "bin": "/fake/tlx", "bin_rev": "abc1234", "instance_type": "OTHER"}, "--instance-type"),
+                ("bad slice", {"slice": "3/2"}, "--slice expects I/N"),
+        ):
+            with self.subTest(case=label):
+                bad = argparse.Namespace(**{**vars(a), **over})
+                with self.assertRaisesRegex(SystemExit, msg):
+                    S.run_suite(bad, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+        # External --bin provenance (HARNESS-19): commit is None when --bin-rev is omitted,
+        # and print_verdict + trend_markdown + previous_recorded handle commit=None cleanly.
+        fake_bin = fake(self.tmp.name, "ext-tlx", sleep=0.0)
+        out_path = os.path.join(self.tmp.name, "ext-run.json")
+        run_args = argparse.Namespace(manifest=None, sizes="small", models="ext/Fast", modes="", pin_adapt="",
+                                      with_tlc_companion=False, isolate_cache=False,
+                                      missing=False, slice="", bin=fake_bin, bin_rev="",
+                                      instance_type="", dry_run=False,
+                                      base_bin="", base_rev="", repeat=1, max_minutes=0,
+                                      threshold=0.05, max_noise=0.5, min_delta=0.01,
+                                      no_instructions=True, inject_slow=[], out=out_path)
+        out_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf):
+            rc = S.run_suite(run_args, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+        self.assertEqual(rc, 0, out_buf.getvalue())
+        h = read(out_path)
+        self.assertIsNone(h["commit"])
+        self.assertEqual(h["bin"], os.path.abspath(fake_bin))
+        self.assertTrue(h["runner_commit"])
+        self.assertNotIn("bin_revs", h)
+        self.assertIn("baseline, unknown", out_buf.getvalue())
+        md = S.trend_markdown([h])
+        self.assertIn("`unknown`", md)
+        self.assertIsNone(S.previous_recorded("abc1234", [h], lambda c, r: True))
+        # With explicit --bin-rev, commit and bin_revs.new record the supplied revision.
+        out_path2 = os.path.join(self.tmp.name, "ext-run-rev.json")
+        run_args.bin_rev = "e5dffafd5419"
+        run_args.out = out_path2
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc2 = S.run_suite(run_args, bench=bench, resolve=self.specs.__getitem__, man=man, root=self.root)
+        self.assertEqual(rc2, 0)
+        h2 = read(out_path2)
+        self.assertEqual(h2["commit"], "e5dffafd5419")
+        self.assertEqual(h2["bin_revs"], {"new": "e5dffafd5419"})
+        self.assertEqual(h2["bin"], os.path.abspath(fake_bin))
 
 
 if __name__ == "__main__":
