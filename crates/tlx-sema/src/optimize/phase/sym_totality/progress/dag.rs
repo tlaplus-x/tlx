@@ -31,11 +31,13 @@ pub(super) struct DagComponent {
 
 pub(super) fn extract_lit(checker: &TotalityChecker<'_>, e: &Expr) -> Option<LitVal> {
     match &*e.kind {
-        ExprKind::Str(s) => Some(LitVal::Str(s.clone())),
+        ExprKind::Str(s) if !checker.all_keys.contains_str(s) => Some(LitVal::Str(s.clone())),
         ExprKind::Bool(b) => Some(LitVal::Bool(*b)),
         ExprKind::Num(n) => i32::try_from(*n).ok().map(LitVal::Int),
         ExprKind::Const(c) => match checker.consts.get(c) {
-            Some(ConstInfo::Value(tlx_front::cfg::CfgValue::Str(s))) => Some(LitVal::Str(Arc::from(s.as_str()))),
+            Some(ConstInfo::Value(tlx_front::cfg::CfgValue::Str(s))) if !checker.all_keys.contains_str(s.as_str()) => {
+                Some(LitVal::Str(Arc::from(s.as_str())))
+            }
             Some(ConstInfo::Value(tlx_front::cfg::CfgValue::Bool(b))) => Some(LitVal::Bool(*b)),
             Some(ConstInfo::Value(tlx_front::cfg::CfgValue::Int(n))) => i32::try_from(*n).ok().map(LitVal::Int),
             _ => None,
@@ -48,7 +50,9 @@ pub(super) fn extract_lit(checker: &TotalityChecker<'_>, e: &Expr) -> Option<Lit
 pub(super) fn extract_finite_lit_domain(s: &Shape) -> Option<BTreeSet<LitVal>> {
     match s {
         Shape::Bool => Some(BTreeSet::from([LitVal::Bool(false), LitVal::Bool(true)])),
-        Shape::Str(Some(ss)) if (2..=MAX_DAG_VALUES).contains(&ss.len()) => Some(ss.iter().cloned().map(LitVal::Str).collect()),
+        Shape::Str { groups: 0, unmoved: Some(ss) } if (2..=MAX_DAG_VALUES).contains(&ss.len()) => {
+            Some(ss.iter().cloned().map(LitVal::Str).collect())
+        }
         Shape::Int(Some((lo, hi))) if *lo < *hi && (*hi as i128 - *lo as i128 + 1) <= MAX_DAG_VALUES as i128 => {
             Some((*lo..=*hi).map(LitVal::Int).collect())
         }

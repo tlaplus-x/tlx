@@ -1,7 +1,11 @@
 use tlx_front::cfg::parse_cfg;
 use tlx_sema::{
-    hir::{Expr, ExprKind, OpRef, RootSymbol},
-    optimize::{equiv_symmetry_certificate, symmetry_certificate},
+    hir::{Expr, ExprKind, OpRef, RootSymbol, VarId},
+    optimize::{
+        choose_symmetry_certificate_with_typed_groups, equiv_symmetry_certificate, equiv_symmetry_certificate_with_typed_groups,
+        symmetry_certificate, symmetry_certificate_with_typed_groups, symmetry_projection_certificate_with_typed_groups,
+        symmetry_view_certificate_with_typed_groups, CheckSpec, SymGroup,
+    },
     Program,
 };
 
@@ -2168,4 +2172,610 @@ Inv == \A x \in big : (<<1, 2, 3, 4, 5, 6, 7, 8>>)[x] > 0
         certify_equiv_direct("TruncatedFix9", truncated_fix_9, cfg, group).is_none(),
         "unconverged >8-step fixpoint inference must fail closed to Top"
     );
+}
+
+fn certify_typed_roots(name: &str, spec: &str, cfg: &str, init: &str, next: &str, invs: &[&str], groups: &[SymGroup]) -> Option<String> {
+    let dir = tlx_testkit::TempDir::new("equiv-typed-roots");
+    let path = dir.write(&format!("{name}.tla"), spec);
+    let mut p = Program::load(&path, &[]).unwrap();
+    p.resolve_all_root();
+    let mut resolve = |root: &str| {
+        let Some(RootSymbol::Def(id)) = p.lookup_root(root) else { panic!("missing {root}") };
+        Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+    };
+    let init_e = resolve(init);
+    let next_e = resolve(next);
+    let inv_es: Vec<Expr> = invs.iter().map(|r| resolve(r)).collect();
+    equiv_symmetry_certificate_with_typed_groups(
+        &p,
+        &parse_cfg(cfg).unwrap(),
+        &init_e,
+        &next_e,
+        CheckSpec::invariants_only(&inv_es),
+        groups,
+    )
+}
+
+#[test]
+fn typed_str_scalarset_groups_mixed_products_string_typeok_and_accord_certify() {
+    // 1. |S| = 2 Str group + x \in STRING / [T -> STRING] / [f : STRING] in TypeOK.
+    let str2_spec = r#"---- MODULE StrTwoTypeOK ----
+EXTENDS Naturals, Sequences
+CONSTANTS KeyEntries
+VARIABLES cur, map, rec, q
+Init ==
+  /\ cur \in KeyEntries
+  /\ map = [k \in KeyEntries |-> "idle"]
+  /\ rec = [owner |-> cur, tag |-> "ok"]
+  /\ q = <<cur>>
+Next ==
+  \E k \in KeyEntries :
+    /\ cur' = k
+    /\ map' = [map EXCEPT ![k] = "busy"]
+    /\ rec' = [rec EXCEPT !.owner = k]
+    /\ q' = IF Len(q) < 2 THEN Append(q, k) ELSE <<k>>
+TypeOK ==
+  /\ cur \in STRING
+  /\ map \in [KeyEntries -> STRING]
+  /\ rec \in [owner : STRING, tag : {"ok"}]
+  /\ q \in Seq(STRING)
+====
+"#;
+    let str2_cfg = "CONSTANTS KeyEntries = {\"k1\", \"k2\"}\nINIT Init\nNEXT Next\nINVARIANT TypeOK\n";
+    let str2_groups = [SymGroup::str(vec!["k1".into(), "k2".into()])];
+    let proof_str2 = certify_typed_roots("StrTwoTypeOK", str2_spec, str2_cfg, "Init", "Next", &["TypeOK"], &str2_groups)
+        .expect("|S| = 2 Str group with STRING TypeOK must certify");
+    assert!(proof_str2.contains("namespace TlxOptimization.GeneratedEquivSymmetry"));
+    assert!(proof_str2.contains("SetPred.cup (SetPred.atomPred"));
+    assert!(proof_str2.contains("SetPred.group"));
+
+    // 2. |S| = 3 Str group with symmetric k-subsets of strings.
+    let str3_spec = r#"---- MODULE StrThreeQuorum ----
+EXTENDS Naturals, FiniteSets
+CONSTANTS Keys, Quorums
+VARIABLES chosen
+Init == chosen = {}
+Next == \E q \in Quorums : chosen' = q
+Inv == chosen \subseteq Keys /\ Cardinality(chosen) <= 2
+====
+"#;
+    let str3_cfg = "CONSTANTS\n  Keys = {\"k1\", \"k2\", \"k3\"}\n  Quorums = {{\"k1\", \"k2\"}, {\"k1\", \"k3\"}, {\"k2\", \"k3\"}}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let str3_groups = [SymGroup::str(vec!["k1".into(), "k2".into(), "k3".into()])];
+    let proof_str3 = certify_typed_roots("StrThreeQuorum", str3_spec, str3_cfg, "Init", "Next", &["Inv"], &str3_groups)
+        .expect("|S| = 3 Str group with symmetric k-subsets must certify");
+    assert!(proof_str3.contains("Expr.powerset"));
+
+    // 3. Mixed Model x Str product, INCLUDING same-name ModelValue {a, b} vs Str {"a", "b"}!
+    let mixed_spec = r#"---- MODULE MixedModelStr ----
+CONSTANTS Nodes, Keys
+VARIABLES owner
+Init == owner = [n \in Nodes |-> [k \in Keys |-> FALSE]]
+Next == \E n \in Nodes, k \in Keys : owner' = [owner EXCEPT ![n][k] = ~@]
+Inv == \A n \in Nodes : DOMAIN owner[n] = Keys /\ (\A k \in Keys : k \in STRING)
+====
+"#;
+    let mixed_cfg = "CONSTANTS Nodes = {a, b}\n  Keys = {\"a\", \"b\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let mixed_groups = [SymGroup::model(vec!["a".into(), "b".into()]), SymGroup::str(vec!["a".into(), "b".into()])];
+    let proof_mixed = certify_typed_roots("MixedModelStr", mixed_spec, mixed_cfg, "Init", "Next", &["Inv"], &mixed_groups)
+        .expect("mixed same-name Model x Str product must certify");
+    assert!(proof_mixed.contains("abbrev GroupCount : Nat := 2"));
+    // STRING SetPred must include ONLY group 1 (Str), NOT group 0 (Model)!
+    assert!(proof_mixed.contains("(SetPred.group (fun g => g.val == 1))"));
+
+    // 4. Full-retention tuple VIEW composes with Str group; omitting-var VIEW declines.
+    {
+        let dir = tlx_testkit::TempDir::new("str-view");
+        let path = dir.write("StrTwoTypeOK.tla", str2_spec);
+        let mut p = Program::load(&path, &[]).unwrap();
+        p.resolve_all_root();
+        let mut resolve = |root: &str| {
+            let Some(RootSymbol::Def(id)) = p.lookup_root(root) else { panic!("missing {root}") };
+            Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+        };
+        let init_e = resolve("Init");
+        let next_e = resolve("Next");
+        let inv_es = [resolve("TypeOK")];
+        let cfg_parsed = parse_cfg(str2_cfg).unwrap();
+        let all_vars: Vec<VarId> = (0..p.vars.len()).map(|i| VarId(i as u32)).collect();
+        assert!(symmetry_view_certificate_with_typed_groups(
+            &p,
+            &cfg_parsed,
+            &init_e,
+            &next_e,
+            CheckSpec::invariants_only(&inv_es),
+            &str2_groups,
+            &all_vars,
+            init_e.span,
+        )
+        .is_some());
+        assert!(symmetry_view_certificate_with_typed_groups(
+            &p,
+            &cfg_parsed,
+            &init_e,
+            &next_e,
+            CheckSpec::invariants_only(&inv_es),
+            &str2_groups,
+            &all_vars[..all_vars.len() - 1],
+            init_e.span,
+        )
+        .is_none());
+    }
+
+    // 5. AccordExec-faithful Accord_baseline__two_lockers with Str KeyEntries = {"k1", "k2"}
+    //    and expanded SetEnum constant `MCTaskKeys == <<{"k1", "k2"}, {"k1", "k2"}>>`!
+    let accord_str_spec = r#"---- MODULE AccordStrTwoLockers ----
+EXTENDS Integers, FiniteSets, Sequences
+CONSTANTS
+    CmdEntries, KeyEntries, NumTasks, TaskTxns, TaskKeys, TaskParent,
+    MinBatch, BlockedLimit, PAlwaysReady, PModelLoading, PAllowAdoption,
+    PPartialRounds, PUpgradeOnStart, PSubmitBeforeRelease,
+    PAllowUnseqIncrWithTxn, PAllowFifoAdoption, PAllowDoubleLock, PBagInterleaves
+
+Tasks == 1..NumTasks
+Entries == CmdEntries \cup KeyEntries
+
+VARIABLES cfg, phase, pending, adopted, fifoAt, plog, loading, clock
+
+Kinds == {"ATOMIC", "PRIORITY", "UNSEQ"}
+Loads == {"SYNC", "ASYNC", "INCR"}
+Phases == {"New", "Claimed", "Started", "Done"}
+ConfigDomain == [kind: Kinds, load: Loads]
+
+IsChild(t) == TaskParent[t] # 0
+HoldsAcrossRuns(t) == cfg[t].load = "INCR" /\ TaskTxns[t] # {}
+
+LegalConfigFor(t, c) ==
+    /\ (c.load = "INCR" /\ c.kind = "UNSEQ" /\ TaskTxns[t] # {}) => PAllowUnseqIncrWithTxn
+    /\ (c.kind = "ATOMIC" /\ IsChild(t)) =>
+           /\ TaskTxns[t] \subseteq TaskTxns[TaskParent[t]]
+           /\ (c.load = "SYNC") => TaskKeys[t] \subseteq TaskKeys[TaskParent[t]]
+
+IsFifo(t) == fifoAt[t] > 0
+Region(t) == IF IsFifo(t) THEN "FIFO" ELSE IF cfg[t].kind = "UNSEQ" THEN "BAG" ELSE "ORD"
+FifoKey(t) == fifoAt[t] * (NumTasks + 1) + t
+
+HoldsPos(t, e) ==
+    IF e \in CmdEntries
+    THEN /\ e \in TaskTxns[t]
+         /\ \/ phase[t] = "Claimed"
+            \/ (phase[t] = "Started" /\ HoldsAcrossRuns(t))
+    ELSE e \in pending[t] /\ phase[t] \in {"Claimed", "Started"}
+
+HoldsLock(t, e) ==
+    e \in CmdEntries /\ e \in TaskTxns[t] /\ phase[t] = "Started" /\ HoldsAcrossRuns(t)
+
+Occupies(t, e, X, A) ==
+    /\ t \notin X
+    /\ \/ HoldsPos(t, e)
+       \/ /\ t \in A
+          /\ (IF e \in CmdEntries THEN e \in TaskTxns[t] ELSE e \in pending[t])
+
+LeastStamped(f) == CHOOSE t \in f : \A u \in f : FifoKey(t) <= FifoKey(u)
+
+Prefix(e, X, A, L) ==
+    IF (~L) /\ PModelLoading /\ e \in loading
+    THEN {}
+    ELSE LET occ == {t \in Tasks : Occupies(t, e, X, A)}
+             f == {t \in occ : Region(t) = "FIFO"}
+             o == {t \in occ : Region(t) = "ORD"}
+             bag == {t \in occ : Region(t) = "BAG"}
+             lk == {t \in f : HoldsLock(t, e)}
+             extra == IF PBagInterleaves THEN bag ELSE {}
+         IN IF lk # {} THEN {CHOOSE t \in lk : TRUE} \cup extra
+            ELSE IF f # {} THEN {LeastStamped(f)} \cup extra
+            ELSE IF o # {} THEN {CHOOSE t \in o : \A u \in o : t <= u} \cup extra
+            ELSE bag
+
+Leads(t, e) == t \in Prefix(e, {}, {}, FALSE)
+WLeads(t, e, X) == t \in Prefix(e, X, {t}, TRUE)
+Min2(a, b) == IF a < b THEN a ELSE b
+
+NeedsAlwaysReady(t) ==
+    /\ cfg[t].kind = "ATOMIC" /\ cfg[t].load # "SYNC" /\ IsChild(t)
+    /\ ~(TaskKeys[t] \subseteq TaskKeys[TaskParent[t]])
+
+AlwaysReady(t) ==
+    CASE PAlwaysReady = "NEVER"     -> FALSE
+      [] PAlwaysReady = "ALWAYS"    -> cfg[t].load # "SYNC"
+      [] PAlwaysReady = "FIRST_RUN" -> NeedsAlwaysReady(t) /\ phase[t] # "Started"
+      [] OTHER                      -> NeedsAlwaysReady(t)
+
+Threshold(t) ==
+    IF cfg[t].load = "SYNC" THEN Cardinality(pending[t])
+    ELSE Min2(Cardinality(pending[t]), IF AlwaysReady(t) THEN 1 ELSE MinBatch)
+
+LedKeys(t, X) == {e \in pending[t] : WLeads(t, e, X)}
+BlockedKeys(t, X) ==
+    {e \in LedKeys(t, X) : \E u \in Tasks \ (X \cup {t}) : HoldsPos(u, e)}
+
+KeyReady(t, X) ==
+    \/ Cardinality(LedKeys(t, X)) >= Threshold(t)
+    \/ (cfg[t].load # "SYNC" /\ BlockedLimit > 0 /\ Cardinality(BlockedKeys(t, X)) >= BlockedLimit)
+
+TxnReady(t, X) ==
+    \A e \in TaskTxns[t] :
+        WLeads(t, e, X) /\ ~\E u \in Tasks \ (X \cup {t}) : HoldsLock(u, e)
+
+LeadsAllTxns(t) == \A e \in TaskTxns[t] : Leads(t, e)
+NoForeignLock(t) == \A e \in TaskTxns[t] : ~\E u \in Tasks \ {t} : HoldsLock(u, e)
+
+CanRun(t) ==
+    /\ phase[t] \in {"Claimed", "Started"}
+    /\ LeadsAllTxns(t) /\ (PAllowDoubleLock \/ NoForeignLock(t))
+    /\ LET led == {e \in pending[t] : Leads(t, e)}
+           blk == {e \in led : \E u \in Tasks \ {t} : HoldsPos(u, e)}
+       IN \/ Cardinality(led) >= Threshold(t)
+          \/ (cfg[t].load # "SYNC" /\ BlockedLimit > 0 /\ Cardinality(blk) >= BlockedLimit)
+
+InheritedStamp(t, at) == IF fifoAt[TaskParent[t]] > 0 THEN fifoAt[TaskParent[t]] ELSE at
+
+Setup(t) ==
+    /\ phase[t] = "New"
+    /\ IsChild(t) => /\ phase[TaskParent[t]] \in {"Started", "Done"}
+                     /\ (cfg[t].kind = "ATOMIC") => ~PSubmitBeforeRelease
+    /\ fifoAt' = IF cfg[t].kind = "ATOMIC" /\ IsChild(t)
+                 THEN [fifoAt EXCEPT ![t] = InheritedStamp(t, clock)]
+                 ELSE fifoAt
+    /\ clock' = clock + 1
+    /\ phase' = [phase EXCEPT ![t] = "Claimed"]
+    /\ UNCHANGED << cfg, pending, adopted, plog, loading >>
+
+Run(t) ==
+    /\ CanRun(t)
+    /\ LET firstRun == phase[t] # "Started"
+           upgrade == /\ firstRun /\ PUpgradeOnStart /\ fifoAt[t] = 0
+                      /\ cfg[t].load = "INCR"
+                      /\ (TaskTxns[t] # {} \/ cfg[t].kind = "ATOMIC")
+           led == {e \in pending[t] : Leads(t, e)}
+           batches == IF pending[t] = {} THEN {{}}
+                      ELSE IF PPartialRounds /\ cfg[t].load = "INCR"
+                      THEN (SUBSET led) \ {{}}
+                      ELSE {led}
+       IN \E batch \in batches :
+            LET rest == pending[t] \ batch
+                fin == rest = {} \/ cfg[t].load # "INCR"
+                newKids == IF PSubmitBeforeRelease
+                           THEN {c \in Tasks : TaskParent[c] = t /\ phase[c] = "New" /\ cfg[c].kind = "ATOMIC"}
+                           ELSE {}
+                fa1 == [u \in Tasks |->
+                          IF u = t /\ upgrade THEN clock
+                          ELSE IF u \in newKids
+                          THEN (IF fifoAt[t] > 0 THEN fifoAt[t] ELSE clock)
+                          ELSE fifoAt[u]]
+            IN /\ pending' = [pending EXCEPT ![t] = IF fin THEN {} ELSE rest]
+               /\ fifoAt' = fa1
+               /\ clock' = clock + 1
+               /\ plog' = [e \in Entries |->
+                             IF e \in batch \/ (e \in TaskTxns[t] /\ firstRun)
+                             THEN Append(plog[e], t) ELSE plog[e]]
+               /\ phase' = [u \in Tasks |->
+                              IF u = t THEN (IF fin THEN "Done" ELSE "Started")
+                              ELSE IF u \in newKids THEN "Claimed" ELSE phase[u]]
+    /\ UNCHANGED << cfg, adopted, loading >>
+
+LoadCompletes(e) ==
+    /\ PModelLoading
+    /\ e \in loading
+    /\ loading' = loading \ {e}
+    /\ UNCHANGED << cfg, phase, pending, adopted, fifoAt, plog, clock >>
+
+Adopt(t, e) ==
+    /\ PAllowAdoption
+    /\ e \in KeyEntries /\ e \notin TaskKeys[t] /\ e \notin adopted[t]
+    /\ ~(PModelLoading /\ e \in loading)
+    /\ phase[t] \in {"Claimed", "Started"}
+    /\ PAllowFifoAdoption \/ ~IsFifo(t)
+    /\ adopted' = [adopted EXCEPT ![t] = @ \cup {e}]
+    /\ pending' = [pending EXCEPT ![t] = @ \cup {e}]
+    /\ UNCHANGED << cfg, phase, fifoAt, plog, loading, clock >>
+
+TaskNext(t) == Setup(t) \/ Run(t) \/ (\E e \in KeyEntries : Adopt(t, e))
+Next == (\E t \in Tasks : TaskNext(t)) \/ (\E e \in Entries : LoadCompletes(e))
+
+Init ==
+    /\ cfg \in [Tasks -> ConfigDomain]
+    /\ \A t \in Tasks : LegalConfigFor(t, cfg[t])
+    /\ phase = [t \in Tasks |-> "New"]
+    /\ pending = [t \in Tasks |-> TaskKeys[t]]
+    /\ adopted = [t \in Tasks |-> {}]
+    /\ fifoAt = [t \in Tasks |-> 0]
+    /\ plog = [e \in Entries |-> << >>]
+    /\ loading \in (IF PModelLoading THEN SUBSET Entries ELSE {{}})
+    /\ clock = 1
+
+WaitsFor(a, b) ==
+    /\ a # b
+    /\ \E e \in Entries :
+         /\ ~(PModelLoading /\ e \in loading)
+         /\ HoldsPos(a, e)
+         /\ \/ (a \notin Prefix(e,{},{},FALSE) /\ b \in Prefix(e,{},{},FALSE))
+            \/ HoldsLock(b, e)
+
+Live == {t \in Tasks : phase[t] # "Done"}
+
+RECURSIVE EventuallyRunnable(_)
+EventuallyRunnable(S) ==
+    LET nxt == S \cup {t \in Live \ S : TxnReady(t, S) /\ KeyReady(t, S)}
+    IN IF nxt = S THEN S ELSE EventuallyRunnable(nxt)
+
+NoStuck == Live \subseteq EventuallyRunnable({})
+
+Layer(t) == IF IsFifo(t) THEN 0 ELSE IF cfg[t].kind = "UNSEQ" THEN 2 ELSE 1
+RankKey(t) == IF IsFifo(t) THEN FifoKey(t) ELSE IF Layer(t) = 2 THEN 0 ELSE t
+RankLt(x, y) == Layer(x) < Layer(y) \/ (Layer(x) = Layer(y) /\ RankKey(x) < RankKey(y))
+RankOK == \A a, b \in Tasks : WaitsFor(a, b) => RankLt(b, a)
+
+RECURSIVE TransClose(_)
+TransClose(R) ==
+    LET nxt == R \cup {<<a,c>> \in Tasks \X Tasks :
+                          \E b \in Tasks : <<a,b>> \in R /\ <<b,c>> \in R}
+    IN IF nxt = R THEN R ELSE TransClose(nxt)
+
+NoCycle == \A t \in Tasks : <<t,t>> \notin TransClose({<<a,b>> \in Tasks \X Tasks : WaitsFor(a,b)})
+
+TypeOK ==
+    /\ cfg \in [Tasks -> ConfigDomain]
+    /\ phase \in [Tasks -> Phases]
+    /\ pending \in [Tasks -> SUBSET KeyEntries]
+    /\ adopted \in [Tasks -> SUBSET KeyEntries]
+    /\ fifoAt \in [Tasks -> Nat]
+    /\ DOMAIN plog = Entries
+    /\ \A e \in Entries : \A i \in 1..Len(plog[e]) : plog[e][i] \in Tasks
+    /\ clock \in Nat
+    /\ loading \subseteq Entries
+
+Inv_LockerIsFifo ==
+    \A t \in Tasks : (phase[t] = "Started" /\ HoldsAcrossRuns(t)) => IsFifo(t)
+
+Inv_LockLeads ==
+    \A t \in Tasks : \A e \in Entries :
+        HoldsLock(t, e) =>
+            \/ (PModelLoading /\ e \in loading)
+            \/ LET f == {u \in Tasks : Occupies(u, e, {}, {}) /\ Region(u) = "FIFO"}
+               IN t \in f /\ LeastStamped(f) = t
+
+Inv_OneProspectiveLocker ==
+    \A e \in CmdEntries :
+        ~\E t, u \in Tasks :
+            /\ t # u
+            /\ HoldsAcrossRuns(t) /\ e \in TaskTxns[t]
+            /\ HoldsAcrossRuns(u) /\ e \in TaskTxns[u]
+            /\ t \in Prefix(e,{},{},FALSE) /\ u \in Prefix(e,{},{},FALSE)
+
+Inv_AtMostOneLock ==
+    \A e \in Entries : \A t, u \in Tasks : (HoldsLock(t, e) /\ HoldsLock(u, e)) => t = u
+
+RECURSIVE UnitOf(_)
+UnitOf(t) == IF IsChild(t) /\ cfg[t].kind = "ATOMIC" THEN UnitOf(TaskParent[t]) ELSE t
+
+Inv_Isolation ==
+    \A e \in Entries :
+        ~\E i, j, k \in 1..Len(plog[e]) :
+            /\ i < j /\ j < k
+            /\ LET a == plog[e][i] x == plog[e][j] b == plog[e][k]
+               IN a # b /\ UnitOf(a) = UnitOf(b) /\ UnitOf(x) # UnitOf(a)
+
+MCTaskTxns == <<{"c1"}, {"c1"}>>
+MCTaskKeys == <<{"k1", "k2"}, {"k1", "k2"}>>
+MCTaskParent == <<0, 0>>
+====
+"#;
+    let accord_cfg = r#"CONSTANTS
+  CmdEntries = {"c1"}
+  KeyEntries = {"k1", "k2"}
+  NumTasks = 2
+  TaskTxns <- MCTaskTxns
+  TaskKeys <- MCTaskKeys
+  TaskParent <- MCTaskParent
+  MinBatch = 1
+  BlockedLimit = 0
+  PAlwaysReady = "ON_NON_SUBSET"
+  PModelLoading = FALSE
+  PAllowAdoption = FALSE
+  PPartialRounds = TRUE
+  PUpgradeOnStart = TRUE
+  PSubmitBeforeRelease = TRUE
+  PAllowUnseqIncrWithTxn = FALSE
+  PAllowFifoAdoption = FALSE
+  PAllowDoubleLock = FALSE
+  PBagInterleaves = FALSE
+INIT Init
+NEXT Next
+"#;
+    let all_invs = &[
+        "TypeOK",
+        "Inv_LockerIsFifo",
+        "Inv_LockLeads",
+        "Inv_OneProspectiveLocker",
+        "Inv_AtMostOneLock",
+        "Inv_Isolation",
+        "RankOK",
+        "NoCycle",
+        "NoStuck",
+    ];
+    let proof_accord = certify_typed_roots("AccordStrTwoLockers", accord_str_spec, accord_cfg, "Init", "Next", all_invs, &str2_groups)
+        .expect("Accord_baseline__two_lockers with Str KeyEntries must certify");
+    for needle in [
+        "namespace TlxOptimization.GeneratedEquivSymmetry",
+        "Expr.groupSet",
+        "Expr.chooseKeyFree",
+        "Expr.fixSet",
+        "Expr.iterRec",
+        "theorem certificate",
+        "theorem orbit_key_equivalent",
+    ] {
+        assert!(proof_accord.contains(needle), "missing {needle} in Accord Str certificate");
+    }
+}
+
+#[test]
+fn typed_str_scalarset_fail_closed_rejections() {
+    let str_group = [SymGroup::str(vec!["k1".into(), "k2".into()])];
+    let base_cfg = "CONSTANTS KeyEntries = {\"k1\", \"k2\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+
+    // 1. Literal "k1" in Init, Next, or Inv must refuse.
+    for (name, init, next, inv) in [
+        ("LitInit", r#"x = "k1""#, r#"x' \in KeyEntries"#, r#"x \in KeyEntries"#),
+        ("LitNext", r#"x \in KeyEntries"#, r#"x' = "k1""#, r#"x \in KeyEntries"#),
+        ("LitInv", r#"x \in KeyEntries"#, r#"x' \in KeyEntries"#, r#"x # "k1" \/ x = "k1""#),
+    ] {
+        let spec =
+            format!("---- MODULE {name} ----\nCONSTANTS KeyEntries\nVARIABLE x\nInit == {init}\nNext == {next}\nInv == {inv}\n====\n");
+        assert!(certify_typed_roots(name, &spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none(), "{name} must refuse");
+    }
+
+    // 2. .cfg scalar "k1" referenced by spec must refuse.
+    let cfg_scalar_spec = r#"---- MODULE CfgStrScalar ----
+CONSTANTS KeyEntries, Bad
+VARIABLE x
+Init == x = Bad
+Next == x' \in KeyEntries
+Inv == x \in KeyEntries
+====
+"#;
+    let cfg_scalar_cfg = "CONSTANTS KeyEntries = {\"k1\", \"k2\"}\n  Bad = \"k1\"\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify_typed_roots("CfgStrScalar", cfg_scalar_spec, cfg_scalar_cfg, "Init", "Next", &["Inv"], &str_group).is_none());
+
+    // 3. Partial string set {"k1", "other"} in SetEnum or .cfg must refuse.
+    let partial_enum_spec = r#"---- MODULE PartialStrEnum ----
+CONSTANTS KeyEntries
+VARIABLE x
+Init == x \in {"k1", "other"}
+Next == x' \in KeyEntries
+Inv == x \in KeyEntries \cup {"other"}
+====
+"#;
+    assert!(certify_typed_roots("PartialStrEnum", partial_enum_spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none());
+
+    let partial_cfg_spec = r#"---- MODULE PartialStrCfg ----
+CONSTANTS KeyEntries, Partial
+VARIABLE x
+Init == x \in Partial
+Next == x' \in KeyEntries
+Inv == x \in KeyEntries \cup Partial
+====
+"#;
+    let partial_cfg = "CONSTANTS KeyEntries = {\"k1\", \"k2\"}\n  Partial = {\"k1\", \"other\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify_typed_roots("PartialStrCfg", partial_cfg_spec, partial_cfg, "Init", "Next", &["Inv"], &str_group).is_none());
+
+    // 4. Colliding record field names: Record, Field, RecordSet (expr & SetPred), ExceptKey::Field.
+    for (name, body) in [
+        ("RecLitCollide", "Init == x \\in KeyEntries /\\ r = [k1 |-> 0]\nNext == x' \\in KeyEntries /\\ r' = r\nInv == TRUE"),
+        ("RecFieldCollide", "Init == x \\in KeyEntries /\\ r = [k1 |-> 0]\nNext == x' \\in KeyEntries /\\ r' = r\nInv == r.k1 = 0"),
+        (
+            "RecSetPredCollide",
+            "Init == x \\in KeyEntries /\\ r = [a |-> 0]\nNext == x' \\in KeyEntries /\\ r' = r\nInv == r \\in [k1 : {0}]",
+        ),
+        ("RecSetExprCollide", "Init == x \\in KeyEntries /\\ r \\in [k1 : {0, 1}]\nNext == x' \\in KeyEntries /\\ r' = r\nInv == TRUE"),
+        (
+            "RecExceptCollide",
+            "Init == x \\in KeyEntries /\\ r = [k1 |-> 0]\nNext == x' \\in KeyEntries /\\ r' = [r EXCEPT !.k1 = 1]\nInv == TRUE",
+        ),
+    ] {
+        let spec = format!("---- MODULE {name} ----\nCONSTANTS KeyEntries\nVARIABLES x, r\n{body}\n====\n");
+        assert!(certify_typed_roots(name, &spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none(), "{name} must refuse");
+    }
+
+    // 5. Len(k) on moved Str key must refuse.
+    let len_spec = r#"---- MODULE StrLenKey ----
+EXTENDS Sequences
+CONSTANTS KeyEntries
+VARIABLE x
+Init == x \in KeyEntries
+Next == x' \in KeyEntries
+Inv == Len(x) = 2
+====
+"#;
+    assert!(certify_typed_roots("StrLenKey", len_spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none());
+
+    // 6. CHOOSE k \in KeyEntries : TRUE must refuse.
+    let choose_spec = r#"---- MODULE StrChooseKey ----
+CONSTANTS KeyEntries
+VARIABLE x
+Init == x = (CHOOSE k \in KeyEntries : TRUE)
+Next == x' \in KeyEntries
+Inv == x \in KeyEntries
+====
+"#;
+    assert!(certify_typed_roots("StrChooseKey", choose_spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none());
+
+    // 7. Cross-kind ModelValue {a, b} vs Str {"a", "b"} groupSet confusion must refuse both ways.
+    let model_only_spec = r#"---- MODULE CrossKindModel ----
+CONSTANTS S
+VARIABLE x
+Init == x \in S
+Next == x' \in S
+Inv == x \in S
+====
+"#;
+    let model_cfg = "CONSTANTS S = {a, b}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let str_cfg = "CONSTANTS S = {\"a\", \"b\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(
+        certify_typed_roots(
+            "CrossKindModel",
+            model_only_spec,
+            model_cfg,
+            "Init",
+            "Next",
+            &["Inv"],
+            &[SymGroup::str(vec!["a".into(), "b".into()])]
+        )
+        .is_none(),
+        "Str group must not match ModelValue set"
+    );
+    assert!(
+        certify_typed_roots(
+            "CrossKindModel",
+            model_only_spec,
+            str_cfg,
+            "Init",
+            "Next",
+            &["Inv"],
+            &[SymGroup::model(vec!["a".into(), "b".into()])]
+        )
+        .is_none(),
+        "Model group must not match Str set"
+    );
+
+    // 8. Unbounded Shape::Str { unmoved: None } (widened >32 strings) aliasing moved Str keys must refuse.
+    let many_strs: String = (1..=33).map(|i| format!("\"s{i}\"")).collect::<Vec<_>>().join(", ");
+    let widened_spec = format!(
+        "---- MODULE WidenedStr ----\nCONSTANTS KeyEntries\nVARIABLES x, u\nInit == x \\in KeyEntries /\\ u \\in {{{many_strs}}}\nNext == x' \\in KeyEntries /\\ u' = u\nInv == x # u\n====\n"
+    );
+    assert!(
+        certify_typed_roots("WidenedStr", &widened_spec, base_cfg, "Init", "Next", &["Inv"], &str_group).is_none(),
+        "widened Shape::Str {{ unmoved: None }} must fail closed when Str group is active"
+    );
+
+    // 9. Public typed non-EquivSym entry points decline Str groups (choose_sym, projection emitters).
+    let dir = tlx_testkit::TempDir::new("public-str-decline");
+    let path = dir.write(
+        "StrDeclinePub.tla",
+        r#"---- MODULE StrDeclinePub ----
+CONSTANTS KeyEntries
+VARIABLES x, dead
+Init == x \in KeyEntries /\ dead = 0
+Next == x' \in KeyEntries /\ dead' = dead
+Inv == x \in KeyEntries
+View == <<x>>
+====
+"#,
+    );
+    let mut p = Program::load(&path, &[]).unwrap();
+    p.resolve_all_root();
+    let mut resolve = |root: &str| {
+        let Some(RootSymbol::Def(id)) = p.lookup_root(root) else { panic!("missing {root}") };
+        Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+    };
+    let init_e = resolve("Init");
+    let next_e = resolve("Next");
+    let inv_es = [resolve("Inv")];
+    let view_e = resolve("View");
+    let cfg_parsed = parse_cfg(base_cfg).unwrap();
+    let spec = CheckSpec::invariants_only(&inv_es);
+    assert!(choose_symmetry_certificate_with_typed_groups(&p, &cfg_parsed, &init_e, &next_e, spec, &str_group).is_none());
+    assert!(symmetry_projection_certificate_with_typed_groups(&p, &cfg_parsed, &init_e, &next_e, spec, &str_group, &view_e).is_none());
+    let dispatched = symmetry_certificate_with_typed_groups(&p, &cfg_parsed, &init_e, &next_e, spec, &str_group)
+        .expect("symmetry_certificate_with_typed_groups should certify via EquivSym");
+    assert!(dispatched.contains("namespace TlxOptimization.GeneratedEquivSymmetry"));
 }

@@ -30,17 +30,19 @@ mod threshold;
 
 pub use age::{age_projection, age_projection_with_spec};
 pub use cert::{
-    symmetry_certificate, symmetry_certificate_with_spec, symmetry_projection_certificate, symmetry_projection_certificate_with_spec,
+    symmetry_certificate, symmetry_certificate_with_spec, symmetry_certificate_with_typed_groups, symmetry_projection_certificate,
+    symmetry_projection_certificate_with_spec, symmetry_projection_certificate_with_typed_groups,
 };
-pub use choose_sym::{choose_symmetry_certificate, choose_symmetry_certificate_with_spec};
+pub use choose_sym::{choose_symmetry_certificate, choose_symmetry_certificate_with_spec, choose_symmetry_certificate_with_typed_groups};
 pub use equiv_sym::{
     symmetry_certificate as equiv_symmetry_certificate, symmetry_certificate_with_spec as equiv_symmetry_certificate_with_spec,
+    symmetry_certificate_with_typed_groups as equiv_symmetry_certificate_with_typed_groups,
 };
 pub use erasure::{unobserved_projection, unobserved_projection_with_spec};
 pub use history::{history_projection, history_projection_with_spec};
 pub use ordered::{ordered_projection, ordered_projection_with_spec, OrderedHistory, OrderedPlan, OrderedShape};
 pub use sequence::{sequence_length_projection, sequence_length_projection_with_spec};
-pub use spec::{CheckSpec, FieldProjection, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
+pub use spec::{CheckSpec, FieldProjection, SymGroup, SymGroupKind, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
 pub use sym_totality::{cfg_constants_supported, cfg_constants_supported_with_value_defs};
 
@@ -61,7 +63,7 @@ pub(in crate::optimize::phase) use hir_util::{
     atom_nat, collect_unchanged_excluding, expr_alpha_eq, expr_alpha_eq_with_locals, expr_structurally_eq, max_local, mentions_local,
     mentions_var, mentions_var_where, mentions_vars, ordinary_unchanged,
 };
-pub(in crate::optimize::phase) use spec::{parse_retained_view, ObsBundle, OwnedCheckSpec};
+pub(in crate::optimize::phase) use spec::{has_str_group, model_groups, parse_retained_view, ObsBundle, OwnedCheckSpec};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -163,14 +165,33 @@ pub fn symmetry_view_certificate_with_spec(
     retained: &[VarId],
     span: Span,
 ) -> Option<String> {
+    let typed = model_groups(groups);
+    symmetry_view_certificate_with_typed_groups(program, cfg, init, next, spec, &typed, retained, span)
+}
+
+/// Typed-group counterpart of [`symmetry_view_certificate_with_spec`]. Full-retention
+/// views compose with typed symmetry groups (including opaque `Str` scalarsets); views
+/// omitting variables delegate to [`symmetry_projection_certificate_with_typed_groups`],
+/// which currently declines `Str` groups.
+#[allow(clippy::too_many_arguments)]
+pub fn symmetry_view_certificate_with_typed_groups(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[SymGroup],
+    retained: &[VarId],
+    span: Span,
+) -> Option<String> {
     let unique =
         !retained.is_empty() && retained.iter().enumerate().all(|(i, v)| v.idx() < program.vars.len() && !retained[..i].contains(v));
     if !unique {
         return None;
     }
     if retained.len() == program.vars.len() {
-        return symmetry_certificate_with_spec(program, cfg, init, next, spec, groups);
+        return symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, groups);
     }
     let flat = Expr::new(ExprKind::Tuple(retained.iter().map(|&v| Expr::new(ExprKind::Var(v), span)).collect()), span);
-    symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, &flat)
+    symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, groups, &flat)
 }

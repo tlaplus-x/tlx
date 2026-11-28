@@ -4,13 +4,14 @@
 
 mod expr;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tlx_front::cfg::CfgValue;
 
-use super::{AtomKey, GroupInfo, GroupMask};
+use super::{AtomKey, GroupInfo, GroupMask, MovedKeys};
 use crate::optimize::phase::sym_totality::{CheckEnv, Shape, TotalityChecker};
+use crate::optimize::phase::SymGroupKind;
 use crate::{builtins::Builtin as B, hir::*, Program};
 
 const MAX_NODES: usize = 60_000;
@@ -34,7 +35,7 @@ enum AtomKind {
 pub(in crate::optimize::phase) struct LowerCtx<'a> {
     var_map: Vec<Option<usize>>,
     groups: &'a [GroupInfo],
-    all_keys: &'a BTreeSet<Arc<str>>,
+    all_keys: &'a MovedKeys,
     consts: &'a BTreeMap<ConstId, &'a CfgValue>,
     totality: &'a TotalityChecker<'a>,
     check_env: CheckEnv,
@@ -61,7 +62,7 @@ impl<'a> LowerCtx<'a> {
     pub(in crate::optimize::phase) fn new(
         program: &'a Program,
         groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
+        all_keys: &'a MovedKeys,
         consts: &'a BTreeMap<ConstId, &'a CfgValue>,
         totality: &'a TotalityChecker<'a>,
     ) -> Self {
@@ -72,7 +73,7 @@ impl<'a> LowerCtx<'a> {
     pub(in crate::optimize::phase) fn with_retained(
         program: &'a Program,
         groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
+        all_keys: &'a MovedKeys,
         consts: &'a BTreeMap<ConstId, &'a CfgValue>,
         totality: &'a TotalityChecker<'a>,
         retained: &[VarId],
@@ -87,7 +88,7 @@ impl<'a> LowerCtx<'a> {
     fn with_var_map(
         var_map: Vec<Option<usize>>,
         groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
+        all_keys: &'a MovedKeys,
         consts: &'a BTreeMap<ConstId, &'a CfgValue>,
         totality: &'a TotalityChecker<'a>,
     ) -> Self {
@@ -249,13 +250,28 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    fn str_groups_mask(&self) -> GroupMask {
+        let mut mask: GroupMask = 0;
+        for (gi, g) in self.groups.iter().enumerate() {
+            if g.kind == SymGroupKind::Str {
+                mask |= 1 << gi;
+            }
+        }
+        mask
+    }
+
     fn int_expr(&mut self, n: i128) -> String {
         let id = self.atom_id(AtomKey::Int(n));
         format!("(Expr.atom {id})")
     }
 
-    fn str_atom_id(&mut self, s: &Arc<str>) -> usize {
-        self.atom_id(AtomKey::Str(s.clone()))
+    /// Lower a key-free string literal or record field name; fails closed (`None`)
+    /// if `s` belongs to any active `SymGroupKind::Str` group.
+    fn str_atom_id(&mut self, s: &Arc<str>) -> Option<usize> {
+        if self.all_keys.contains_str(s) {
+            return None;
+        }
+        Some(self.atom_id(AtomKey::Str(s.clone())))
     }
 
     pub(in crate::optimize::phase) fn lower_form(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
@@ -840,6 +856,17 @@ impl<'a> LowerCtx<'a> {
                 let expr = self.lower_cfg_value(val)?;
                 Some(format!("(SetPred.expr {expr})"))
             }
+            ExprKind::CfgLiteral(val) => {
+                if let Some((mask, fixed)) = self.try_group_set(val) {
+                    if fixed.is_empty() && mask != 0 {
+                        self.used_groups |= mask;
+                        let m = self.mask_lean(mask);
+                        return Some(format!("(SetPred.group {m})"));
+                    }
+                }
+                let expr = self.lower_cfg_value(val)?;
+                Some(format!("(SetPred.expr {expr})"))
+            }
             ExprKind::SetEnum(es) => {
                 if let Some(cfg_set) = self.try_const_set_enum(es) {
                     if let Some((mask, fixed)) = self.try_group_set(&cfg_set) {
@@ -851,6 +878,11 @@ impl<'a> LowerCtx<'a> {
                             }
                             let expr = self.lower_cfg_value(&cfg_set)?;
                             return Some(format!("(SetPred.expr {expr})"));
+                        }
+                    }
+                    if let CfgValue::Set(elems) = &cfg_set {
+                        if let Some(ksub) = self.try_symmetric_k_subsets(elems) {
+                            return Some(format!("(SetPred.expr {ksub})"));
                         }
                     }
                 }
@@ -891,7 +923,7 @@ impl<'a> LowerCtx<'a> {
             ExprKind::RecordSet(fields) => {
                 let mut pairs = Vec::with_capacity(fields.len());
                 for (name, set) in fields {
-                    let fid = self.str_atom_id(name);
+                    let fid = self.str_atom_id(name)?;
                     let sp = self.lower_set_pred_rec(set, allow_prime, in_prime)?;
                     pairs.push(format!("({fid}, {sp})"));
                 }
@@ -908,7 +940,13 @@ impl<'a> LowerCtx<'a> {
                 }
                 (B::StringSet, []) => {
                     let id = self.atom_pred_id("STRING");
-                    Some(format!("(SetPred.atomPred {id})"))
+                    let str_mask = self.str_groups_mask();
+                    if str_mask != 0 {
+                        let m = self.mask_lean(str_mask);
+                        Some(format!("(SetPred.cup (SetPred.atomPred {id}) (SetPred.group {m}))"))
+                    } else {
+                        Some(format!("(SetPred.atomPred {id})"))
+                    }
                 }
                 (B::Boolean, []) => {
                     let t = self.atom_id(AtomKey::Bool(true));

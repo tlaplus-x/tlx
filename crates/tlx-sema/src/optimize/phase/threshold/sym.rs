@@ -14,7 +14,6 @@ mod lower;
 mod output;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
 use tlx_front::cfg::Config;
 
@@ -23,10 +22,12 @@ use crate::{hir::*, Program};
 use super::super::{
     branches_with_if,
     domain::Atom,
-    equiv_sym::{classify_key_set, collect_const_bindings, lower::LowerCtx, validate_groups, AtomKey, GroupInfo, GroupMask},
-    expr_alpha_eq,
+    equiv_sym::{
+        classify_key_set, collect_const_bindings, lower::LowerCtx, validate_typed_groups, AtomKey, GroupInfo, GroupMask, MovedKeys,
+    },
+    expr_alpha_eq, has_str_group,
     sym_norm::{desugar_except_at, SymNormalizer},
-    sym_totality, CheckSpec,
+    sym_totality, CheckSpec, SymGroup,
 };
 use super::{analyze_counters, build_view, CounterKind, CounterSpec};
 
@@ -72,7 +73,7 @@ fn build_slots_and_templates(
     program: &Program,
     counters: &[CounterSpec],
     groups: &[GroupInfo],
-    all_keys: &BTreeSet<Arc<str>>,
+    all_keys: &MovedKeys,
     ctx: &mut LowerCtx<'_>,
 ) -> Option<SlotLayout> {
     let mut slots: Vec<SlotInfo> = Vec::new();
@@ -148,20 +149,23 @@ fn build_slots_and_templates(
 /// Certify in-place threshold-counter saturation followed by generic equivariant
 /// symmetry for the exact installed `VIEW` expression. Fails closed (`None`)
 /// whenever any counter cap, key set, transfer, test, or observation falls
-/// outside the certified composed IR.
-pub(in crate::optimize::phase) fn symmetry_projection_certificate_with_spec(
+/// outside the certified composed IR. Declines `SymGroupKind::Str` groups.
+pub(in crate::optimize::phase) fn symmetry_projection_certificate_with_typed_groups(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
     spec: CheckSpec<'_>,
-    groups: &[Vec<String>],
+    groups: &[SymGroup],
     installed_view: &Expr,
 ) -> Option<String> {
+    if has_str_group(groups) {
+        return None;
+    }
     if !super::super::cfg_constants_supported(program, cfg) {
         return None;
     }
-    let (groups, all_keys) = validate_groups(groups)?;
+    let (groups, all_keys) = validate_typed_groups(groups)?;
     let const_bindings = collect_const_bindings(program, cfg)?;
     let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
     let init_norm = norm.normalize(init)?;

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tlx_front::cfg::CfgValue;
 
 use super::super::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind, RecOpKind};
+use super::super::SymGroupKind;
 use super::progress::{apply_progress_bound, infer_progress_bounds, seed_progress_bound};
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, PlaceKey, Shape, TotalityChecker, MAX_I32_U32, MAX_STEPS, MAX_STR_SET, MAX_UNMOVED_SET};
@@ -309,7 +310,7 @@ impl<'a> TotalityChecker<'a> {
         match &*e.kind {
             ExprKind::Bool(_) => Shape::Bool,
             ExprKind::Num(n) => i32::try_from(*n).map_or(Shape::Top, |k| Shape::Int(Some((k, k)))),
-            ExprKind::Str(s) => Shape::Str(Some(BTreeSet::from([s.clone()]))),
+            ExprKind::Str(s) => self.str_atom_shape(s),
             ExprKind::CfgLiteral(v) => self.cfg_value_shape(v),
             ExprKind::Var(v) => {
                 if let Some(ov) = env.var_overrides.get(&(*v, in_prime)) {
@@ -644,7 +645,9 @@ impl<'a> TotalityChecker<'a> {
             (B::Boolean, []) => Shape::Set { elem: Box::new(Shape::Bool), finite: true, max_card: Some(2) },
             (B::Nat, []) => Shape::Set { elem: Box::new(Shape::Int(Some((0, i32::MAX)))), finite: false, max_card: None },
             (B::Int, []) => Shape::Set { elem: Box::new(Shape::Int(None)), finite: false, max_card: None },
-            (B::StringSet, []) => Shape::Set { elem: Box::new(Shape::Str(None)), finite: false, max_card: None },
+            (B::StringSet, []) => {
+                Shape::Set { elem: Box::new(Shape::Str { groups: self.str_groups_mask(), unmoved: None }), finite: false, max_card: None }
+            }
             (B::DotDot, [a, b]) => {
                 let sa = self.infer_expr(a, in_prime, vars, env, steps);
                 let sb = self.infer_expr(b, in_prime, vars, env, steps);
@@ -787,9 +790,14 @@ impl<'a> TotalityChecker<'a> {
             (B::ColonGt, [k, v]) => {
                 let ks = self.infer_expr(k, in_prime, vars, env, steps);
                 let vs = self.infer_expr(v, in_prime, vars, env, steps);
-                // Do NOT mark `Bool` literal singletons (`TRUE :> v`) as `exact_dom` because
-                // `Shape::Bool` represents `{TRUE, FALSE}`, not `{TRUE}`.
-                let exact_dom = matches!(&*k.kind, ExprKind::Num(_) | ExprKind::Str(_));
+                // Do NOT mark `Bool` literal singletons (`TRUE :> v`) or moved `Str` keys
+                // as `exact_dom`: `Shape::Bool` represents `{TRUE, FALSE}` and a moved `Str`
+                // key's shape represents the entire `Str` group, not the singleton.
+                let exact_dom = match &*k.kind {
+                    ExprKind::Num(_) => true,
+                    ExprKind::Str(s) => !self.all_keys.contains_str(s),
+                    _ => false,
+                };
                 Shape::Func { dom: Box::new(ks), exact_dom, range: Box::new(vs), max_dom: Some(1) }
             }
             (B::AtAt, [a, b]) => {
@@ -1031,7 +1039,7 @@ impl<'a> TotalityChecker<'a> {
         match v {
             CfgValue::Bool(_) => Shape::Bool,
             CfgValue::Int(n) => i32::try_from(*n).map_or(Shape::Top, |k| Shape::Int(Some((k, k)))),
-            CfgValue::Str(s) => Shape::Str(Some(BTreeSet::from([Arc::from(s.as_str())]))),
+            CfgValue::Str(s) => self.str_atom_shape(s),
             CfgValue::ModelValue(m) => self.model_atom_shape(m),
             CfgValue::Tuple(es) => Shape::Tuple(es.iter().map(|x| self.cfg_value_shape(x)).collect()),
             CfgValue::Set(es) => {
@@ -1088,9 +1096,10 @@ impl<'a> TotalityChecker<'a> {
         }
         let mut bools = [false; 2];
         let mut ints = BTreeSet::new();
-        let mut strs = 0usize;
+        let mut unmoved_strs: BTreeSet<&str> = BTreeSet::new();
+        let mut str_keys: BTreeSet<&str> = BTreeSet::new();
         let mut model_keys: BTreeSet<&str> = BTreeSet::new();
-        let mut unmoved_count = 0usize;
+        let mut unmoved_models: BTreeSet<&str> = BTreeSet::new();
         for v in es {
             match v {
                 CfgValue::Bool(b) => bools[usize::from(*b)] = true,
@@ -1098,12 +1107,18 @@ impl<'a> TotalityChecker<'a> {
                     let Ok(k) = i32::try_from(*n) else { return false };
                     ints.insert(k);
                 }
-                CfgValue::Str(_) => strs += 1,
+                CfgValue::Str(s) => {
+                    if self.all_keys.contains_str(s.as_str()) {
+                        str_keys.insert(s.as_str());
+                    } else {
+                        unmoved_strs.insert(s.as_str());
+                    }
+                }
                 CfgValue::ModelValue(m) => {
-                    if self.all_keys.contains(m.as_str()) {
+                    if self.all_keys.contains_model(m.as_str()) {
                         model_keys.insert(m.as_str());
                     } else {
-                        unmoved_count += 1;
+                        unmoved_models.insert(m.as_str());
                     }
                 }
                 _ => return false,
@@ -1119,11 +1134,15 @@ impl<'a> TotalityChecker<'a> {
                 return false;
             }
         }
-        if strs > MAX_STR_SET || unmoved_count > MAX_UNMOVED_SET {
+        if unmoved_strs.len() > MAX_STR_SET || unmoved_models.len() > MAX_UNMOVED_SET {
             return false;
         }
         for g in self.groups {
-            let count = g.key_set.iter().filter(|k| model_keys.contains(k.as_ref())).count();
+            let keys = match g.kind {
+                SymGroupKind::Model => &model_keys,
+                SymGroupKind::Str => &str_keys,
+            };
+            let count = g.key_set.iter().filter(|k| keys.contains(k.as_ref())).count();
             if count > 0 && count != g.key_set.len() {
                 return false;
             }
@@ -1219,11 +1238,20 @@ impl<'a> TotalityChecker<'a> {
     pub(super) fn model_atom_shape(&self, m: &str) -> Shape {
         let mv_type = MvType::of_name(m);
         for (gi, g) in self.groups.iter().enumerate() {
-            if g.key_set.contains(m) {
+            if g.kind == SymGroupKind::Model && g.key_set.contains(m) {
                 return Shape::Model { groups: 1u16 << gi, mv_type, unmoved: Some(BTreeSet::new()) };
             }
         }
         Shape::Model { groups: 0, mv_type, unmoved: Some(BTreeSet::from([Arc::from(m)])) }
+    }
+
+    pub(super) fn str_atom_shape(&self, s: &str) -> Shape {
+        for (gi, g) in self.groups.iter().enumerate() {
+            if g.kind == SymGroupKind::Str && g.key_set.contains(s) {
+                return Shape::Str { groups: 1u16 << gi, unmoved: Some(BTreeSet::new()) };
+            }
+        }
+        Shape::Str { groups: 0, unmoved: Some(BTreeSet::from([Arc::from(s)])) }
     }
 
     // ---- Sound narrowing (exact single-atom exclusion & integer bounds ONLY) ----

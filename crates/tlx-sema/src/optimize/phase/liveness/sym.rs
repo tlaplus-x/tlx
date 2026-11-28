@@ -23,10 +23,10 @@ use crate::{hir::*, Program};
 use super::super::{
     branches_positioned, branches_with_if_positioned,
     domain::{Atom, Domains},
-    equiv_sym::{collect_const_bindings, validate_groups},
-    expr_alpha_eq, expr_alpha_eq_with_locals,
+    equiv_sym::{collect_const_bindings, validate_typed_groups},
+    expr_alpha_eq, expr_alpha_eq_with_locals, has_str_group,
     sym_norm::{desugar_except_at, SymNormalizer},
-    sym_totality, Branch, CheckSpec,
+    sym_totality, Branch, CheckSpec, SymGroup,
 };
 use super::{control_candidates, derive_analysis, Analysis, Control, Slot};
 
@@ -62,20 +62,23 @@ pub(super) struct StepCase {
 /// Certify phase-dependent field masking followed by generic equivariant
 /// symmetry for the exact installed `VIEW` expression. Fails closed (`None`)
 /// whenever any step, sentinel, phase, key set, or observation falls outside
-/// the certified composed IR.
-pub(in crate::optimize::phase) fn symmetry_projection_certificate_with_spec(
+/// the certified composed IR. Declines `SymGroupKind::Str` groups.
+pub(in crate::optimize::phase) fn symmetry_projection_certificate_with_typed_groups(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
     spec: CheckSpec<'_>,
-    groups: &[Vec<String>],
+    groups: &[SymGroup],
     installed_view: &Expr,
 ) -> Option<String> {
+    if has_str_group(groups) {
+        return None;
+    }
     if !super::super::cfg_constants_supported(program, cfg) {
         return None;
     }
-    let (groups, all_keys) = validate_groups(groups)?;
+    let (groups, all_keys) = validate_typed_groups(groups)?;
     let const_bindings = collect_const_bindings(program, cfg)?;
     let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
     let init_norm = norm.normalize(init)?;
@@ -107,7 +110,7 @@ pub(in crate::optimize::phase) fn symmetry_projection_certificate_with_spec(
     // matches `installed_view` (allowing any equivariant key-free dead-field
     // sentinels actually installed in `installed_view`).
     let (matched, installed_sentinels) =
-        find_matching_analysis(program, &domains, (&initial, &step_pos), norm_spec, &all_keys, installed_view, init.span)?;
+        find_matching_analysis(program, &domains, (&initial, &step_pos), norm_spec, &all_keys.model, installed_view, init.span)?;
 
     let cert = lower::emit_composed(
         program,

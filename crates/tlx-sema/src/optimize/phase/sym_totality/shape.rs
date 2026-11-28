@@ -237,13 +237,28 @@ fn expr_mentions_local_rec(e: &Expr, target: LocalId, budget: &mut usize) -> boo
 /// True iff every value described by `s` contains zero moved symmetry keys and no `Top`.
 pub(crate) fn shape_is_key_free(s: &Shape) -> bool {
     match s {
-        Shape::Bottom | Shape::Bool | Shape::Int(_) | Shape::Str(_) => true,
+        Shape::Bottom | Shape::Bool | Shape::Int(_) => true,
         Shape::Top => false,
+        Shape::Str { groups, .. } => *groups == 0,
         Shape::Model { groups, .. } => *groups == 0,
         Shape::Set { elem, .. } | Shape::Seq { elem, .. } => shape_is_key_free(elem),
         Shape::Tuple(ts) | Shape::Union(ts) => ts.iter().all(shape_is_key_free),
         Shape::Record(fs) => fs.values().all(shape_is_key_free),
         Shape::Func { dom, range, .. } => shape_is_key_free(dom) && shape_is_key_free(range),
+    }
+}
+
+/// True iff `s` contains any widened/unbounded `Shape::Str { unmoved: None, .. }`.
+/// Whenever a `SymGroupKind::Str` group is active, such strings cannot be proved
+/// disjoint from moved `Str` keys and must fail closed outside pure `x \in STRING`.
+pub(super) fn shape_has_unbounded_str(s: &Shape) -> bool {
+    match s {
+        Shape::Str { unmoved: None, .. } => true,
+        Shape::Set { elem, .. } | Shape::Seq { elem, .. } => shape_has_unbounded_str(elem),
+        Shape::Tuple(ts) | Shape::Union(ts) => ts.iter().any(shape_has_unbounded_str),
+        Shape::Record(fs) => fs.values().any(shape_has_unbounded_str),
+        Shape::Func { dom, range, .. } => shape_has_unbounded_str(dom) || shape_has_unbounded_str(range),
+        _ => false,
     }
 }
 
@@ -274,16 +289,17 @@ pub(super) fn join_shape(a: &Shape, b: &Shape) -> Shape {
         (Shape::Top, _) | (_, Shape::Top) => Shape::Top,
         (Shape::Int(Some((al, ah))), Shape::Int(Some((bl, bh)))) => Shape::Int(Some(((*al).min(*bl), (*ah).max(*bh)))),
         (Shape::Int(_), Shape::Int(_)) => Shape::Int(None),
-        (Shape::Str(Some(s1)), Shape::Str(Some(s2))) => {
-            let mut m = s1.clone();
-            m.extend(s2.iter().cloned());
-            if m.len() > MAX_STR_SET {
-                Shape::Str(None)
-            } else {
-                Shape::Str(Some(m))
-            }
+        (Shape::Str { groups: g1, unmoved: u1 }, Shape::Str { groups: g2, unmoved: u2 }) => {
+            let unmoved = match (u1, u2) {
+                (Some(s1), Some(s2)) => {
+                    let mut m = s1.clone();
+                    m.extend(s2.iter().cloned());
+                    (m.len() <= MAX_STR_SET).then_some(m)
+                }
+                _ => None,
+            };
+            Shape::Str { groups: g1 | g2, unmoved }
         }
-        (Shape::Str(_), Shape::Str(_)) => Shape::Str(None),
         (Shape::Model { groups: g1, mv_type: t1, unmoved: u1 }, Shape::Model { groups: g2, mv_type: t2, unmoved: u2 }) => {
             let unmoved = match (u1, u2) {
                 (Some(a), Some(b)) => {
@@ -368,7 +384,7 @@ pub(super) fn same_variant_family(a: &Shape, b: &Shape) -> bool {
         (a, b),
         (Shape::Bool, Shape::Bool)
             | (Shape::Int(_), Shape::Int(_))
-            | (Shape::Str(_), Shape::Str(_))
+            | (Shape::Str { .. }, Shape::Str { .. })
             | (Shape::Model { .. }, Shape::Model { .. })
             | (Shape::Set { .. }, Shape::Set { .. })
             | (Shape::Seq { .. }, Shape::Seq { .. })
@@ -477,7 +493,11 @@ pub(super) fn narrow_record_field_eq(cur: &Shape, field: &str, other: &Shape, eq
         };
         if eq {
             if disjoint_shapes(fval, other)
-                || matches!((fval, other), (Shape::Str(Some(a)), Shape::Str(Some(b))) if a.is_disjoint(b))
+                || matches!(
+                    (fval, other),
+                    (Shape::Str { groups: g1, unmoved: Some(a) }, Shape::Str { groups: g2, unmoved: Some(b) })
+                        if (g1 & g2) == 0 && a.is_disjoint(b)
+                )
                 || matches!((fval, other), (Shape::Int(Some((a1, a2))), Shape::Int(Some((b1, b2)))) if a2 < b1 || b2 < a1)
             {
                 changed = true;
@@ -544,16 +564,19 @@ pub(super) fn narrow_shape(cur: &Shape, fact: &Shape) -> Shape {
         }
         (Shape::Int(None), Shape::Int(Some(b))) => Shape::Int(Some(*b)),
         (Shape::Int(Some(a)), Shape::Int(None)) => Shape::Int(Some(*a)),
-        (Shape::Str(Some(s1)), Shape::Str(Some(s2))) => {
-            let inter: BTreeSet<_> = s1.intersection(s2).cloned().collect();
-            if inter.is_empty() {
+        (Shape::Str { groups: g1, unmoved: u1 }, Shape::Str { groups: g2, unmoved: u2 }) => {
+            let g = g1 & g2;
+            let u = match (u1, u2) {
+                (Some(a), Some(b)) => Some(a.intersection(b).cloned().collect()),
+                (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+                (None, None) => None,
+            };
+            if g == 0 && u.as_ref().is_some_and(BTreeSet::is_empty) {
                 Shape::Bottom
             } else {
-                Shape::Str(Some(inter))
+                Shape::Str { groups: g, unmoved: u }
             }
         }
-        (Shape::Str(None), Shape::Str(Some(s))) => Shape::Str(Some(s.clone())),
-        (Shape::Str(Some(s)), Shape::Str(None)) => Shape::Str(Some(s.clone())),
         (Shape::Model { groups: g1, mv_type: t1, unmoved: u1 }, Shape::Model { groups: g2, mv_type: t2, unmoved: u2 }) => {
             let g = g1 & g2;
             let u = match (u1, u2) {
@@ -599,7 +622,7 @@ pub(super) fn disjoint_shapes(a: &Shape, b: &Shape) -> bool {
     match (a, b) {
         (Shape::Bool, Shape::Bool)
         | (Shape::Int(_), Shape::Int(_))
-        | (Shape::Str(_), Shape::Str(_))
+        | (Shape::Str { .. }, Shape::Str { .. })
         | (Shape::Model { .. }, Shape::Model { .. })
         | (Shape::Set { .. }, Shape::Set { .. })
         // In TLA+, Func, Tuple, Seq, and Record are all extensionally equal function values
@@ -659,17 +682,17 @@ pub(super) fn exclude_single_value(cur: &Shape, lit: &Shape) -> Option<Shape> {
                 _ => Some(Shape::Union(kept)),
             }
         }
-        (Shape::Str(Some(set)), Shape::Str(Some(ex))) if ex.len() == 1 => {
+        (Shape::Str { groups, unmoved: Some(set) }, Shape::Str { groups: 0, unmoved: Some(ex) }) if ex.len() == 1 => {
             let s = ex.iter().next().unwrap();
             if !set.contains(s) {
                 return None;
             }
             let mut next = set.clone();
             next.remove(s);
-            if next.is_empty() {
+            if *groups == 0 && next.is_empty() {
                 Some(Shape::Bottom)
             } else {
-                Some(Shape::Str(Some(next)))
+                Some(Shape::Str { groups: *groups, unmoved: Some(next) })
             }
         }
         (Shape::Int(Some((lo, hi))), Shape::Int(Some((k, k2)))) if k == k2 => {
@@ -689,7 +712,7 @@ pub(super) fn exclude_single_value(cur: &Shape, lit: &Shape) -> Option<Shape> {
 
 pub(super) fn is_singleton_equal(a: &Shape, b: &Shape) -> bool {
     match (a, b) {
-        (Shape::Str(Some(s1)), Shape::Str(Some(s2))) => s1.len() == 1 && s1 == s2,
+        (Shape::Str { groups: 0, unmoved: Some(s1) }, Shape::Str { groups: 0, unmoved: Some(s2) }) => s1.len() == 1 && s1 == s2,
         (Shape::Int(Some((a1, a2))), Shape::Int(Some((b1, b2)))) => a1 == a2 && a1 == b1 && b1 == b2,
         (Shape::Model { groups: 0, unmoved: Some(u1), .. }, Shape::Model { groups: 0, unmoved: Some(u2), .. }) => u1.len() == 1 && u1 == u2,
         (Shape::Tuple(t1), Shape::Tuple(t2)) => t1.is_empty() && t2.is_empty(),
@@ -708,7 +731,7 @@ pub(super) fn shapes_comparable(a: &Shape, b: &Shape) -> bool {
         (Shape::Model { mv_type: MvType::Untyped, .. }, _) | (_, Shape::Model { mv_type: MvType::Untyped, .. }) => true,
         (Shape::Model { mv_type: MvType::Typed(c1), .. }, Shape::Model { mv_type: MvType::Typed(c2), .. }) => c1 == c2,
         (Shape::Model { .. }, _) | (_, Shape::Model { .. }) => false,
-        (Shape::Bool, Shape::Bool) | (Shape::Int(_), Shape::Int(_)) | (Shape::Str(_), Shape::Str(_)) => true,
+        (Shape::Bool, Shape::Bool) | (Shape::Int(_), Shape::Int(_)) | (Shape::Str { .. }, Shape::Str { .. }) => true,
         (Shape::Set { elem: e1, .. }, Shape::Set { elem: e2, .. }) => shapes_comparable(e1, e2),
         (Shape::Tuple(t1), Shape::Tuple(t2)) => t1.len() != t2.len() || t1.iter().zip(t2).all(|(x, y)| shapes_comparable(x, y)),
         (Shape::Seq { elem: e1, .. }, Shape::Seq { elem: e2, .. }) => shapes_comparable(e1, e2),
@@ -728,7 +751,7 @@ pub(super) fn shapes_comparable(a: &Shape, b: &Shape) -> bool {
             shapes_comparable(dom, &Shape::Int(None)) && shapes_comparable(range, elem)
         }
         (Shape::Func { dom, range, .. }, Shape::Record(r)) | (Shape::Record(r), Shape::Func { dom, range, .. }) => {
-            shapes_comparable(dom, &Shape::Str(None)) && r.values().all(|v| shapes_comparable(range, v))
+            shapes_comparable(dom, &Shape::str_unmoved(r.keys().cloned().collect())) && r.values().all(|v| shapes_comparable(range, v))
         }
         (Shape::Tuple(ts), Shape::Record(_)) | (Shape::Record(_), Shape::Tuple(ts)) => ts.is_empty(),
         _ => false,
@@ -802,7 +825,7 @@ pub(super) fn shape_safe_for_lazy_membership(val: &Shape, elem: &Shape, groups: 
                         })
                 }
                 Shape::Func { dom, range: vr, .. } => {
-                    matches!(&**dom, Shape::Str(_) | Shape::Bottom)
+                    matches!(&**dom, Shape::Str { .. } | Shape::Bottom)
                         && ef.values().all(|e| shapes_comparable(vr, e) && shape_safe_for_lazy_membership(vr, e, groups))
                 }
                 _ => false,
@@ -869,7 +892,7 @@ pub(super) fn is_seq_shape(s: &Shape) -> bool {
 
 pub(super) fn shape_is_exact_cup_scalar(s: &Shape) -> bool {
     match s {
-        Shape::Bottom | Shape::Bool | Shape::Str(Some(_)) | Shape::Model { unmoved: Some(_), .. } => true,
+        Shape::Bottom | Shape::Bool | Shape::Str { unmoved: Some(_), .. } | Shape::Model { unmoved: Some(_), .. } => true,
         Shape::Union(us) => us.iter().all(shape_is_exact_cup_scalar),
         _ => false,
     }
@@ -924,7 +947,7 @@ pub(super) fn fnapp_index_valid_for(container: &Shape, key: &Shape, groups: &[Gr
     match container {
         Shape::Bottom => true,
         Shape::Tuple(_) | Shape::Seq { .. } => is_int_shape(key),
-        Shape::Record(_) => matches!(key, Shape::Str(_) | Shape::Bottom),
+        Shape::Record(_) => matches!(key, Shape::Str { .. } | Shape::Bottom),
         Shape::Func { dom, exact_dom, .. } => key_inhabits_domain_kind(key, dom, *exact_dom, groups),
         Shape::Union(us) if !us.is_empty() => us.iter().all(|u| fnapp_index_valid_for(u, key, groups)),
         _ => false,
@@ -936,7 +959,7 @@ fn shape_disjoint_from_model_dom(key: &Shape, dom_groups: GroupMask, dom_unmoved
         Shape::Bottom => true,
         Shape::Bool
         | Shape::Int(_)
-        | Shape::Str(_)
+        | Shape::Str { .. }
         | Shape::Set { finite: true, .. }
         | Shape::Seq { .. }
         | Shape::Tuple(_)
@@ -954,7 +977,10 @@ pub(super) fn shape_provably_nonempty(s: &Shape, groups: &[GroupInfo]) -> bool {
     match s {
         Shape::Bool => true,
         Shape::Int(Some((lo, hi))) => lo <= hi,
-        Shape::Str(Some(ss)) => !ss.is_empty(),
+        Shape::Str { groups: mask, unmoved } => {
+            unmoved.as_ref().is_some_and(|u| !u.is_empty())
+                || groups.iter().enumerate().any(|(gi, g)| (*mask & (1u16 << gi)) != 0 && !g.keys.is_empty())
+        }
         Shape::Model { groups: mask, unmoved, .. } => {
             unmoved.as_ref().is_some_and(|u| !u.is_empty())
                 || groups.iter().enumerate().any(|(gi, g)| (*mask & (1u16 << gi)) != 0 && !g.keys.is_empty())
@@ -980,7 +1006,12 @@ pub(super) fn except_key_provably_absent(container: &Shape, key: &Shape, groups:
     }
     match container {
         Shape::Tuple(ts) => matches!(key, Shape::Int(Some((lo, hi))) if (*hi as i128) < 1 || (*lo as i128) > ts.len() as i128),
-        Shape::Record(fs) => matches!(key, Shape::Str(Some(ks)) if ks.iter().all(|k| !fs.contains_key(k))),
+        Shape::Record(fs) => matches!(
+            key,
+            Shape::Str { groups: kg, unmoved: Some(ks) }
+                if ks.iter().all(|k| !fs.contains_key(k))
+                    && groups.iter().enumerate().all(|(gi, g)| (*kg & (1u16 << gi)) == 0 || g.keys.iter().all(|k| !fs.contains_key(k)))
+        ),
         // A non-empty exact untyped model-value domain is always materialized as an enumerated
         // `Value::Fcn` (never `Value::Tuple([])`), whose untyped model-value keys compare safely
         // with any well-formed finite value and return `Ok(None)` on any provably disjoint key.
@@ -1032,7 +1063,7 @@ fn key_inhabits_domain_kind(key: &Shape, dom: &Shape, exact_dom: bool, groups: &
     match dom {
         Shape::Bottom | Shape::Top => false,
         Shape::Int(_) => is_int_shape(key),
-        Shape::Str(_) => matches!(key, Shape::Str(_)),
+        Shape::Str { .. } => matches!(key, Shape::Str { .. }),
         Shape::Bool => matches!(key, Shape::Bool),
         Shape::Model { .. } => matches!(key, Shape::Model { .. }) && shapes_comparable(key, dom),
         Shape::Set { elem: de, finite: true, .. } => match key {
@@ -1201,7 +1232,7 @@ pub(super) fn fn_dom_range(s: &Shape) -> Option<(Shape, Shape, Option<u32>)> {
         Shape::Record(fs) => {
             let keys: BTreeSet<Arc<str>> = fs.keys().cloned().collect();
             let range = fs.values().fold(Shape::Bottom, |acc, x| join_shape(&acc, x));
-            Some((Shape::Str(Some(keys)), range, u32::try_from(fs.len()).ok()))
+            Some((Shape::str_unmoved(keys), range, u32::try_from(fs.len()).ok()))
         }
         _ => None,
     }
@@ -1250,7 +1281,7 @@ pub(super) fn shape_in_exact_domain(key: &Shape, dom: &Shape) -> bool {
         (Shape::Union(us), d) => us.iter().all(|u| shape_in_exact_domain(u, d)),
         (Shape::Bool, Shape::Bool) => true,
         (Shape::Int(Some((kl, kh))), Shape::Int(Some((dl, dh)))) => kl >= dl && kh <= dh,
-        (Shape::Str(Some(ks)), Shape::Str(Some(ds))) => ks.is_subset(ds),
+        (Shape::Str { groups: kg, unmoved: Some(ku) }, Shape::Str { groups: dg, unmoved: Some(du) }) => (kg & !dg) == 0 && ku.is_subset(du),
         (Shape::Model { groups: kg, unmoved: Some(ku), .. }, Shape::Model { groups: dg, unmoved: Some(du), .. }) => {
             (kg & !dg) == 0 && ku.is_subset(du)
         }
@@ -1266,8 +1297,7 @@ pub(super) fn shape_universe_size(s: &Shape, groups: &[GroupInfo]) -> Option<u32
         Shape::Bottom => Some(0),
         Shape::Bool => Some(2),
         Shape::Int(Some((lo, hi))) => u32::try_from(*hi as i128 - *lo as i128 + 1).ok().filter(|&v| v <= MAX_I32_U32),
-        Shape::Str(Some(ss)) => u32::try_from(ss.len()).ok(),
-        Shape::Model { groups: mask, unmoved: Some(u), .. } => {
+        Shape::Str { groups: mask, unmoved: Some(u) } | Shape::Model { groups: mask, unmoved: Some(u), .. } => {
             let mut total = u32::try_from(u.len()).ok()?;
             for (gi, g) in groups.iter().enumerate() {
                 if (mask & (1u16 << gi)) != 0 {

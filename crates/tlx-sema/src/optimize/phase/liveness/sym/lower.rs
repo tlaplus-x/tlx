@@ -9,7 +9,7 @@ use crate::{builtins::Builtin as B, hir::*, visit, Program};
 use super::super::super::{
     binding, collect_unchanged_excluding,
     domain::Atom,
-    equiv_sym::{classify_key_set, fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo, GroupMask},
+    equiv_sym::{classify_key_set, fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo, GroupMask, MovedKeys},
     mentions_local, sym_totality, variable, Branch, CheckSpec, OpenCert,
 };
 use super::super::{ActionRead, Analysis, Control, ObsContext, ObsSink, Slot};
@@ -22,7 +22,7 @@ const MAX_CASES: usize = 128;
 pub(super) fn emit_composed(
     program: &Program,
     groups: &[GroupInfo],
-    all_keys: &BTreeSet<Arc<str>>,
+    all_keys: &MovedKeys,
     const_bindings: &BTreeMap<ConstId, &tlx_front::cfg::CfgValue>,
     totality: &sym_totality::TotalityChecker<'_>,
     a: &Analysis<'_>,
@@ -85,7 +85,7 @@ pub(super) fn emit_composed(
         let is_dead_somewhere = a.live.get(slot).is_some_and(|ps| ps.len() < phases.len());
         let sentinel = match installed_sentinels.get(slot) {
             Some(s) => s.clone(),
-            None => a.sentinel_for_slot(slot, initial, Some(all_keys), orig_init.span)?,
+            None => a.sentinel_for_slot(slot, initial, Some(&all_keys.model), orig_init.span)?,
         };
         match ctx.lower_empty_var_expr(&sentinel) {
             Some(expr) => sentinel_exprs.push(expr),

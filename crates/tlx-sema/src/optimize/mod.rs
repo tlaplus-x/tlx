@@ -12,13 +12,16 @@ mod projection;
 pub use lean::projection_lean;
 pub use phase::{
     age_projection, age_projection_with_spec, cfg_constants_supported, cfg_constants_supported_with_value_defs,
-    choose_symmetry_certificate, choose_symmetry_certificate_with_spec, equiv_symmetry_certificate, equiv_symmetry_certificate_with_spec,
-    history_projection, history_projection_with_spec, infer_var_domains, ordered_projection, ordered_projection_with_spec,
-    phase_projection, phase_projection_with_spec, phase_projection_with_spec_avoiding, proves_var_membership, sequence_length_projection,
-    sequence_length_projection_with_spec, symmetry_certificate, symmetry_certificate_with_spec, symmetry_projection_certificate,
-    symmetry_projection_certificate_with_spec, symmetry_view_certificate_with_spec, threshold_counter_projection,
+    choose_symmetry_certificate, choose_symmetry_certificate_with_spec, choose_symmetry_certificate_with_typed_groups,
+    equiv_symmetry_certificate, equiv_symmetry_certificate_with_spec, equiv_symmetry_certificate_with_typed_groups, history_projection,
+    history_projection_with_spec, infer_var_domains, ordered_projection, ordered_projection_with_spec, phase_projection,
+    phase_projection_with_spec, phase_projection_with_spec_avoiding, proves_var_membership, sequence_length_projection,
+    sequence_length_projection_with_spec, symmetry_certificate, symmetry_certificate_with_spec, symmetry_certificate_with_typed_groups,
+    symmetry_projection_certificate, symmetry_projection_certificate_with_spec, symmetry_projection_certificate_with_typed_groups,
+    symmetry_view_certificate_with_spec, symmetry_view_certificate_with_typed_groups, threshold_counter_projection,
     threshold_counter_projection_with_spec, unobserved_projection, unobserved_projection_with_spec, CheckSpec, FieldProjection,
-    OrderedHistory, OrderedPlan, OrderedShape, SymNormalizer, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER,
+    OrderedHistory, OrderedPlan, OrderedShape, SymGroup, SymGroupKind, SymNormalizer, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS,
+    AUTOSYM_MAX_ORDER,
 };
 pub use projection::unobserved_variables;
 mod certify;

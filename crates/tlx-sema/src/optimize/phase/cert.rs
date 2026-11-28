@@ -6,7 +6,7 @@ use tlx_front::cfg::Config;
 use crate::hir::Expr;
 use crate::Program;
 
-use super::spec::CheckSpec;
+use super::spec::{model_groups, CheckSpec, SymGroup};
 use super::{choose_sym, equiv_sym, keyed, liveness, threshold};
 
 /// An emitted Lean certificate body whose `TlxOptimization.<namespace>` section
@@ -206,7 +206,7 @@ pub fn symmetry_certificate(
 }
 
 /// Generate a connected Lean symmetry certificate covering invariants, init properties,
-/// constraints, action constraints, and action properties.
+/// constraints, action constraints, and action properties for `ModelValue` groups.
 pub fn symmetry_certificate_with_spec(
     program: &Program,
     cfg: &Config,
@@ -215,9 +215,24 @@ pub fn symmetry_certificate_with_spec(
     spec: CheckSpec<'_>,
     groups: &[Vec<String>],
 ) -> Option<String> {
-    keyed::symmetry_certificate_with_spec(program, cfg, init, next, spec, groups)
-        .or_else(|| equiv_sym::symmetry_certificate_with_spec(program, cfg, init, next, spec, groups))
-        .or_else(|| choose_sym::choose_symmetry_certificate_with_spec(program, cfg, init, next, spec, groups))
+    let typed = model_groups(groups);
+    symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, &typed)
+}
+
+/// Generate a connected Lean symmetry certificate covering invariants, init properties,
+/// constraints, action constraints, and action properties for typed `Model` / `Str` groups.
+/// Non-`EquivSym` emitters decline `SymGroupKind::Str` groups.
+pub fn symmetry_certificate_with_typed_groups(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[SymGroup],
+) -> Option<String> {
+    keyed::symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, groups)
+        .or_else(|| equiv_sym::symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, groups))
+        .or_else(|| choose_sym::choose_symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, groups))
 }
 
 /// Certify unobserved-variable erasure followed by symmetry for the exact
@@ -249,8 +264,74 @@ pub fn symmetry_projection_certificate_with_spec(
     groups: &[Vec<String>],
     view: &Expr,
 ) -> Option<String> {
-    keyed::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view)
-        .or_else(|| equiv_sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
-        .or_else(|| liveness::sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
-        .or_else(|| threshold::sym::symmetry_projection_certificate_with_spec(program, cfg, init, next, spec, groups, view))
+    let typed = model_groups(groups);
+    symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, &typed, view)
+}
+
+/// Typed-group counterpart of [`symmetry_projection_certificate_with_spec`].
+/// Currently all composed projection+symmetry emitters decline `SymGroupKind::Str` groups.
+pub fn symmetry_projection_certificate_with_typed_groups(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[SymGroup],
+    view: &Expr,
+) -> Option<String> {
+    keyed::symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, groups, view)
+        .or_else(|| equiv_sym::symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, groups, view))
+        .or_else(|| liveness::sym::symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, groups, view))
+        .or_else(|| threshold::sym::symmetry_projection_certificate_with_typed_groups(program, cfg, init, next, spec, groups, view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::{ExprKind, OpRef, RootSymbol};
+    use tlx_front::cfg::parse_cfg;
+
+    #[test]
+    fn non_equiv_sym_emitters_explicitly_decline_str_groups() {
+        let spec = r#"---- MODULE StrDecline ----
+CONSTANTS K
+VARIABLES x, dead
+Init == x \in K /\ dead = 0
+Next == x' \in K /\ dead' = dead
+Inv == x \in K
+View == <<x>>
+====
+"#;
+        let cfg = parse_cfg("CONSTANTS K = {\"k1\", \"k2\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n").unwrap();
+        let dir = tlx_testkit::TempDir::new("str-decline");
+        let path = dir.write("StrDecline.tla", spec);
+        let mut p = Program::load(&path, &[]).unwrap();
+        p.resolve_all_root();
+        let mut resolve = |name: &str| {
+            let Some(RootSymbol::Def(id)) = p.lookup_root(name) else { panic!("missing {name}") };
+            Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+        };
+        let init = resolve("Init");
+        let next = resolve("Next");
+        let inv = [resolve("Inv")];
+        let view = resolve("View");
+        let check = CheckSpec::invariants_only(&inv);
+        let str_groups = [SymGroup::str(vec!["k1".into(), "k2".into()])];
+
+        assert!(keyed::symmetry_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups).is_none());
+        assert!(keyed::symmetry_projection_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups, &view).is_none());
+        assert!(choose_sym::choose_symmetry_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups).is_none());
+        assert!(equiv_sym::symmetry_projection_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups, &view).is_none());
+        assert!(
+            liveness::sym::symmetry_projection_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups, &view).is_none()
+        );
+        assert!(
+            threshold::sym::symmetry_projection_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups, &view).is_none()
+        );
+        // Meanwhile, EquivSym DOES certify the exact same Str group directly and via top-level dispatch.
+        assert!(equiv_sym::symmetry_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups).is_some());
+        let dispatched = symmetry_certificate_with_typed_groups(&p, &cfg, &init, &next, check, &str_groups)
+            .expect("top-level typed dispatch should route Str groups to EquivSym");
+        assert!(dispatched.contains("namespace TlxOptimization.GeneratedEquivSymmetry"));
+    }
 }

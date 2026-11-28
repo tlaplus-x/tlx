@@ -8,6 +8,7 @@ use tlx_front::cfg::CfgValue;
 
 use super::{AtomKey, AtomKind, GroupMask, LowerCtx, Shape, Slot};
 use crate::optimize::phase::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind, RecOpKind};
+use crate::optimize::phase::SymGroupKind;
 use crate::{builtins::Builtin as B, hir::*};
 
 /// One exact set of `k`-subsets of a single symmetric group, together with the
@@ -24,7 +25,7 @@ impl LowerCtx<'_> {
         match &*e.kind {
             ExprKind::Num(n) => Some(self.int_expr(*n)),
             ExprKind::Str(s) => {
-                let id = self.str_atom_id(s);
+                let id = self.str_atom_id(s)?;
                 Some(format!("(Expr.atom {id})"))
             }
             ExprKind::Bool(b) => {
@@ -65,6 +66,11 @@ impl LowerCtx<'_> {
                     if self.try_group_set(&cfg_set).is_some_and(|(mask, _)| mask != 0) {
                         return self.lower_cfg_value(&cfg_set);
                     }
+                    if let CfgValue::Set(elems) = &cfg_set {
+                        if let Some(ksub) = self.try_symmetric_k_subsets(elems) {
+                            return Some(ksub);
+                        }
+                    }
                 }
                 let items: Vec<_> = es.iter().map(|x| self.lower_expr_rec(x, allow_prime, in_prime)).collect::<Option<_>>()?;
                 Some(format!("(Expr.setEnum [{}])", items.join(", ")))
@@ -72,7 +78,7 @@ impl LowerCtx<'_> {
             ExprKind::Record(fields) => {
                 let mut pairs = Vec::with_capacity(fields.len());
                 for (name, val) in fields {
-                    let fid = self.str_atom_id(name);
+                    let fid = self.str_atom_id(name)?;
                     let ev = self.lower_expr_rec(val, allow_prime, in_prime)?;
                     pairs.push(format!("({fid}, {ev})"));
                 }
@@ -80,7 +86,7 @@ impl LowerCtx<'_> {
             }
             ExprKind::Field { record, field } => {
                 let rec = self.lower_expr_rec(record, allow_prime, in_prime)?;
-                let fid = self.str_atom_id(field);
+                let fid = self.str_atom_id(field)?;
                 Some(format!("(Expr.fnApp {rec} (Expr.atom {fid}))"))
             }
             ExprKind::FnApp { func, args } => {
@@ -133,7 +139,7 @@ impl LowerCtx<'_> {
             ExprKind::RecordSet(fields) => {
                 let mut pairs = Vec::with_capacity(fields.len());
                 for (name, set) in fields {
-                    let fid = self.str_atom_id(name);
+                    let fid = self.str_atom_id(name)?;
                     let es = self.lower_expr_rec(set, allow_prime, in_prime)?;
                     pairs.push(format!("({fid}, {es})"));
                 }
@@ -593,7 +599,7 @@ impl LowerCtx<'_> {
     fn lower_except_key(&mut self, key: &ExceptKey, allow_prime: bool, in_prime: bool) -> Option<String> {
         match key {
             ExceptKey::Field(name) => {
-                let fid = self.str_atom_id(name);
+                let fid = self.str_atom_id(name)?;
                 Some(format!("(Expr.atom {fid})"))
             }
             ExceptKey::Index(args) if args.len() == 1 => self.lower_expr_rec(&args[0], allow_prime, in_prime),
@@ -787,11 +793,27 @@ impl LowerCtx<'_> {
         }
     }
 
+    fn try_const_cfg_value(&self, e: &Expr, depth: usize) -> Option<CfgValue> {
+        if depth == 0 {
+            return None;
+        }
+        match &*e.kind {
+            ExprKind::Bool(b) => Some(CfgValue::Bool(*b)),
+            ExprKind::Num(n) => i64::try_from(*n).ok().map(CfgValue::Int),
+            ExprKind::Str(s) => Some(CfgValue::Str(s.to_string())),
+            ExprKind::Const(cid) => Some((*self.consts.get(cid)?).clone()),
+            ExprKind::CfgLiteral(v) => Some((**v).clone()),
+            ExprKind::Tuple(es) => es.iter().map(|x| self.try_const_cfg_value(x, depth - 1)).collect::<Option<_>>().map(CfgValue::Tuple),
+            ExprKind::SetEnum(es) => es.iter().map(|x| self.try_const_cfg_value(x, depth - 1)).collect::<Option<_>>().map(CfgValue::Set),
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.try_const_cfg_value(&args[0], depth - 1),
+            _ => None,
+        }
+    }
+
     pub(super) fn try_const_set_enum(&self, es: &[Expr]) -> Option<CfgValue> {
         let mut vals = Vec::with_capacity(es.len());
         for e in es {
-            let ExprKind::Const(cid) = &*e.kind else { return None };
-            vals.push((*self.consts.get(cid)?).clone());
+            vals.push(self.try_const_cfg_value(e, 32)?);
         }
         Some(CfgValue::Set(vals))
     }
@@ -799,18 +821,26 @@ impl LowerCtx<'_> {
     pub(super) fn try_group_set<'b>(&self, val: &'b CfgValue) -> Option<(GroupMask, Vec<&'b CfgValue>)> {
         let CfgValue::Set(elems) = val else { return None };
         let mut model_names: BTreeSet<&str> = BTreeSet::new();
+        let mut str_names: BTreeSet<&str> = BTreeSet::new();
         let mut fixed = Vec::new();
         for elem in elems {
             match elem {
-                CfgValue::ModelValue(m) if self.all_keys.contains(m.as_str()) => {
+                CfgValue::ModelValue(m) if self.all_keys.contains_model(m.as_str()) => {
                     model_names.insert(m.as_str());
+                }
+                CfgValue::Str(s) if self.all_keys.contains_str(s.as_str()) => {
+                    str_names.insert(s.as_str());
                 }
                 _ => fixed.push(elem),
             }
         }
         let mut mask: GroupMask = 0;
         for (gi, g) in self.groups.iter().enumerate() {
-            let count = g.key_set.iter().filter(|k| model_names.contains(k.as_ref())).count();
+            let names = match g.kind {
+                SymGroupKind::Model => &model_names,
+                SymGroupKind::Str => &str_names,
+            };
+            let count = g.key_set.iter().filter(|k| names.contains(k.as_ref())).count();
             if count == g.key_set.len() {
                 mask |= 1 << gi;
             } else if count > 0 {
@@ -821,14 +851,14 @@ impl LowerCtx<'_> {
     }
 
     /// A `.cfg` value that is one key-free atom, for the fixed part of a
-    /// stratified `k`-subset family. Symmetric model values belong on the moved
-    /// side and are never fixed here.
+    /// stratified `k`-subset family. Symmetric moved keys (both `Model` and `Str`)
+    /// belong on the moved side and are never fixed here.
     fn fixed_atom_key(&self, v: &CfgValue) -> Option<AtomKey> {
         match v {
             CfgValue::Int(n) => Some(AtomKey::Int(i128::from(*n))),
-            CfgValue::Str(s) => Some(AtomKey::Str(Arc::from(s.as_str()))),
+            CfgValue::Str(s) if !self.all_keys.contains_str(s.as_str()) => Some(AtomKey::Str(Arc::from(s.as_str()))),
             CfgValue::Bool(b) => Some(AtomKey::Bool(*b)),
-            CfgValue::ModelValue(m) if !self.all_keys.contains(m.as_str()) => Some(AtomKey::Model(Arc::from(m.as_str()))),
+            CfgValue::ModelValue(m) if !self.all_keys.contains_model(m.as_str()) => Some(AtomKey::Model(Arc::from(m.as_str()))),
             _ => None,
         }
     }
@@ -843,7 +873,7 @@ impl LowerCtx<'_> {
     /// A stratum lowers to `{Q \cup F : Q \in SUBSET Group_g, Cardinality(Q) \in
     /// sizes}` and the strata combine with `\cup`, so no new certificate
     /// definition is needed.
-    fn try_symmetric_k_subsets(&mut self, elems: &[CfgValue]) -> Option<String> {
+    pub(super) fn try_symmetric_k_subsets(&mut self, elems: &[CfgValue]) -> Option<String> {
         if elems.is_empty() {
             return None;
         }
@@ -855,13 +885,21 @@ impl LowerCtx<'_> {
             let mut group: Option<usize> = None;
             for item in sub {
                 match item {
-                    CfgValue::ModelValue(m) if self.all_keys.contains(m.as_str()) => {
-                        let gi = self.groups.iter().position(|g| g.key_set.contains(m.as_str()))?;
+                    CfgValue::ModelValue(m) if self.all_keys.contains_model(m.as_str()) => {
+                        let gi = self.groups.iter().position(|g| g.kind == SymGroupKind::Model && g.key_set.contains(m.as_str()))?;
                         if group.is_some_and(|prev| prev != gi) {
                             return None;
                         }
                         group = Some(gi);
                         moved.insert(Arc::from(m.as_str()));
+                    }
+                    CfgValue::Str(s) if self.all_keys.contains_str(s.as_str()) => {
+                        let gi = self.groups.iter().position(|g| g.kind == SymGroupKind::Str && g.key_set.contains(s.as_str()))?;
+                        if group.is_some_and(|prev| prev != gi) {
+                            return None;
+                        }
+                        group = Some(gi);
+                        moved.insert(Arc::from(s.as_str()));
                     }
                     other => {
                         fixed.insert(self.fixed_atom_key(other)?);
@@ -878,6 +916,9 @@ impl LowerCtx<'_> {
                 stratum.group = Some(gi);
             }
             stratum.moved.insert(moved);
+        }
+        if strata.values().all(|s| s.group.is_none()) {
+            return None;
         }
         // Every stratum must be exactly the union of its group's `k`-subsets.
         for stratum in strata.values() {
@@ -939,6 +980,9 @@ impl LowerCtx<'_> {
         match val {
             CfgValue::Int(n) => Some(self.int_expr(i128::from(*n))),
             CfgValue::Str(s) => {
+                if self.all_keys.contains_str(s.as_str()) {
+                    return None;
+                }
                 let id = self.atom_id(AtomKey::Str(Arc::from(s.as_str())));
                 Some(format!("(Expr.atom {id})"))
             }
@@ -947,7 +991,7 @@ impl LowerCtx<'_> {
                 Some(format!("(Expr.atom {id})"))
             }
             CfgValue::ModelValue(m) => {
-                if self.all_keys.contains(m.as_str()) {
+                if self.all_keys.contains_model(m.as_str()) {
                     return None;
                 }
                 let id = self.atom_id(AtomKey::Model(Arc::from(m.as_str())));
@@ -982,22 +1026,20 @@ impl LowerCtx<'_> {
     /// applies when it lowers the value to `Expr.atom`.
     fn cfg_value_is_atom(&self, v: &CfgValue) -> bool {
         match v {
-            CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::Bool(_) => true,
-            CfgValue::ModelValue(m) => !self.all_keys.contains(m.as_str()),
+            CfgValue::Int(_) | CfgValue::Bool(_) => true,
+            CfgValue::Str(s) => !self.all_keys.contains_str(s.as_str()),
+            CfgValue::ModelValue(m) => !self.all_keys.contains_model(m.as_str()),
             _ => false,
         }
     }
 
     fn is_definitely_atom(&self, e: &Expr) -> bool {
         match &*e.kind {
-            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Decimal(_) => true,
+            ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Decimal(_) => true,
+            ExprKind::Str(s) => !self.all_keys.contains_str(s),
             ExprKind::CfgLiteral(v) => self.cfg_value_is_atom(v),
             ExprKind::Local(id) => self.local_atom_kind(*id) == AtomKind::Atom,
-            ExprKind::Const(cid) => match self.consts.get(cid) {
-                Some(CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::Bool(_)) => true,
-                Some(CfgValue::ModelValue(m)) => !self.all_keys.contains(m.as_str()),
-                _ => false,
-            },
+            ExprKind::Const(cid) => self.consts.get(cid).is_some_and(|v| self.cfg_value_is_atom(v)),
             ExprKind::Builtin { op, args } => match op {
                 B::Cardinality
                 | B::Len
@@ -1055,11 +1097,7 @@ impl LowerCtx<'_> {
             ExprKind::SetFilter { bound, .. } => self.is_definitely_atom_set(&bound.set),
             ExprKind::SetMap { expr, .. } => self.is_definitely_atom(expr),
             ExprKind::Const(cid) => match self.consts.get(cid) {
-                Some(CfgValue::Set(es)) => es.iter().all(|v| match v {
-                    CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::Bool(_) => true,
-                    CfgValue::ModelValue(m) => !self.all_keys.contains(m.as_str()),
-                    _ => false,
-                }),
+                Some(CfgValue::Set(es)) => es.iter().all(|v| self.cfg_value_is_atom(v)),
                 _ => false,
             },
             ExprKind::Builtin { op, args } => match (op, args.as_slice()) {

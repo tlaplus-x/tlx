@@ -1,6 +1,5 @@
 //! Connected certificates for deleting unobserved variables with proved-total
 //! pure deterministic updates over structured TLA+ values.
-use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use super::{
@@ -94,7 +93,7 @@ pub fn unobserved_projection_with_spec(
     }
 
     let const_info = collect_const_info(program, cfg);
-    let empty_keys = BTreeSet::new();
+    let empty_keys = super::equiv_sym::MovedKeys::default();
     let totality = TotalityChecker::with_const_info(program, &[], &empty_keys, const_info, &init_norm, &next_norm, None);
     if spec.is_constrained() && !constrained_observations_total(&totality, norm_spec) {
         return None;

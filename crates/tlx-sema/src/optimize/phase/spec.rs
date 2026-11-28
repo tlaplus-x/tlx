@@ -20,6 +20,40 @@ pub const AUTOSYM_MAX_KEYS: usize = 7;
 /// factor in the emitters' `GroupMask`.
 pub const AUTOSYM_MAX_GROUPS: usize = 16;
 
+/// Atom kind of one full permutation group factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SymGroupKind {
+    /// Permutes `ModelValue` atoms.
+    Model,
+    /// Permutes opaque `String` scalarset atoms (never record field names).
+    Str,
+}
+
+/// One typed full permutation group factor (`Model` or opaque `Str`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymGroup {
+    pub kind: SymGroupKind,
+    pub keys: Vec<String>,
+}
+
+impl SymGroup {
+    pub fn model(keys: Vec<String>) -> Self {
+        Self { kind: SymGroupKind::Model, keys }
+    }
+
+    pub fn str(keys: Vec<String>) -> Self {
+        Self { kind: SymGroupKind::Str, keys }
+    }
+}
+
+pub(in crate::optimize::phase) fn model_groups(raw: &[Vec<String>]) -> Vec<SymGroup> {
+    raw.iter().map(|keys| SymGroup::model(keys.clone())).collect()
+}
+
+pub(in crate::optimize::phase) fn has_str_group(groups: &[SymGroup]) -> bool {
+    groups.iter().any(|g| g.kind == SymGroupKind::Str)
+}
+
 /// All safety-level observations and admission constraints checked by `tlx-runtime`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CheckSpec<'a> {

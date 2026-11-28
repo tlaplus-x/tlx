@@ -93,6 +93,25 @@ pub fn choose_symmetry_certificate_with_spec(
     spec: super::CheckSpec<'_>,
     raw_groups: &[Vec<String>],
 ) -> Option<String> {
+    let typed = super::model_groups(raw_groups);
+    choose_symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, &typed)
+}
+
+/// Typed-group counterpart of [`choose_symmetry_certificate_with_spec`].
+/// Declines `SymGroupKind::Str` groups.
+pub fn choose_symmetry_certificate_with_typed_groups(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: super::CheckSpec<'_>,
+    typed_groups: &[super::SymGroup],
+) -> Option<String> {
+    if super::has_str_group(typed_groups) {
+        return None;
+    }
+    let raw_groups: Vec<Vec<String>> = typed_groups.iter().map(|g| g.keys.clone()).collect();
+    let raw_groups = raw_groups.as_slice();
     if !super::cfg_constants_supported(program, cfg) {
         return None;
     }

@@ -2,7 +2,6 @@
 //! observation lowering into the composed `ThresholdSymRule` Lean IR.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
 use tlx_front::cfg::Config;
 
@@ -11,7 +10,7 @@ use crate::{builtins::Builtin as B, hir::*, visit, Program};
 use super::super::super::{
     binding, collect_unchanged_excluding,
     domain::{Atom, Domains},
-    equiv_sym::{classify_key_set, fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo},
+    equiv_sym::{classify_key_set, fold_form_conj, lower::LowerCtx, AtomKey, GroupInfo, MovedKeys},
     mentions_local,
     normalize::opaque_recursive_def_vars,
     ordinary_unchanged,
@@ -49,7 +48,7 @@ pub(super) fn lower_all<'a>(
     cfg: &'a Config,
     domains: &'a Domains,
     groups: &'a [GroupInfo],
-    all_keys: &'a BTreeSet<Arc<str>>,
+    all_keys: &'a MovedKeys,
     counters: &'a BTreeMap<VarId, CounterSpec>,
     layout: &'a SlotLayout,
     initial: &[Branch],
@@ -97,7 +96,7 @@ struct Emitter<'a, 'c> {
     cfg: &'a Config,
     domains: &'a Domains,
     groups: &'a [GroupInfo],
-    all_keys: &'a BTreeSet<Arc<str>>,
+    all_keys: &'a MovedKeys,
     counters: &'a BTreeMap<VarId, CounterSpec>,
     scalar_slot: &'a BTreeMap<VarId, usize>,
     map_entries: &'a BTreeMap<VarId, Vec<SlotEntrySpec>>,

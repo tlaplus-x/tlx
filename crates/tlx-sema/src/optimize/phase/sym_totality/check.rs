@@ -411,7 +411,18 @@ impl<'a> TotalityChecker<'a> {
     }
 
     /// Strict totality check for a value expression, returning its verified `Shape`.
+    /// When any `SymGroupKind::Str` group is active, rejects any expression whose
+    /// verified shape contains an unbounded `Shape::Str { unmoved: None, .. }` so
+    /// unmoved strings remain provably disjoint from moved `Str` keys.
     pub(super) fn check_expr(&self, e: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> Option<Shape> {
+        let shape = self.check_expr_inner(e, allow_prime, in_prime, env, steps)?;
+        if self.has_str_groups() && shape_has_unbounded_str(&shape) {
+            return None;
+        }
+        Some(shape)
+    }
+
+    fn check_expr_inner(&self, e: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> Option<Shape> {
         if *steps == 0 {
             return None;
         }
@@ -419,7 +430,7 @@ impl<'a> TotalityChecker<'a> {
         match &*e.kind {
             ExprKind::Bool(_) => Some(Shape::Bool),
             ExprKind::Num(n) => i32::try_from(*n).ok().map(|k| Shape::Int(Some((k, k)))),
-            ExprKind::Str(s) => Some(Shape::Str(Some(BTreeSet::from([s.clone()])))),
+            ExprKind::Str(s) => Some(self.str_atom_shape(s)),
             ExprKind::CfgLiteral(v) => {
                 let s = self.cfg_value_shape(v);
                 (!shape_contains_top(&s) && shape_self_comparable(&s) && shape_has_safe_set_cards(&s, self.groups)).then_some(s)
@@ -1051,8 +1062,8 @@ impl<'a> TotalityChecker<'a> {
             Shape::Int(Some((lo, hi))) if *lo <= *hi && (*hi as i128 - *lo as i128) <= MAX_ITER_REC_STEPS as i128 => {
                 (*lo..=*hi).map(|v| Shape::Int(Some((v, v)))).collect()
             }
-            Shape::Str(Some(ss)) if !ss.is_empty() && ss.len() <= MAX_ITER_REC_STEPS as usize => {
-                ss.iter().map(|s| Shape::Str(Some(BTreeSet::from([s.clone()])))).collect()
+            Shape::Str { groups: 0, unmoved: Some(ss) } if !ss.is_empty() && ss.len() <= MAX_ITER_REC_STEPS as usize => {
+                ss.iter().map(|s| Shape::str_unmoved(BTreeSet::from([s.clone()]))).collect()
             }
             _ => vec![init_shape.clone()],
         };
@@ -1331,7 +1342,11 @@ impl<'a> TotalityChecker<'a> {
             (B::ColonGt, [k, v]) => {
                 let ks = self.check_expr(k, allow_prime, in_prime, env, steps)?;
                 let vs = self.check_expr(v, allow_prime, in_prime, env, steps)?;
-                let exact_dom = matches!(&*k.kind, ExprKind::Num(_) | ExprKind::Str(_));
+                let exact_dom = match &*k.kind {
+                    ExprKind::Num(_) => true,
+                    ExprKind::Str(s) => !self.all_keys.contains_str(s),
+                    _ => false,
+                };
                 Some(Shape::Func { dom: Box::new(ks), exact_dom, range: Box::new(vs), max_dom: Some(1) })
             }
             (B::AtAt, [a, b]) => {
@@ -1577,7 +1592,9 @@ impl<'a> TotalityChecker<'a> {
     fn check_membership(&self, val: &Shape, set: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> bool {
         match &*set.kind {
             ExprKind::Builtin { op: B::Nat | B::Int, args } if args.is_empty() => shapes_comparable(val, &Shape::Int(None)),
-            ExprKind::Builtin { op: B::StringSet, args } if args.is_empty() => shapes_comparable(val, &Shape::Str(None)),
+            ExprKind::Builtin { op: B::StringSet, args } if args.is_empty() => {
+                shapes_comparable(val, &Shape::Str { groups: self.str_groups_mask(), unmoved: None })
+            }
             ExprKind::Builtin { op: B::Boolean, args } if args.is_empty() => shapes_comparable(val, &Shape::Bool),
             ExprKind::Builtin { op: B::Seq, args } if args.len() == 1 => {
                 if !is_seq_or_untyped_model(val) || self.check_membership_domain_elem(&args[0], allow_prime, in_prime, env, steps).is_none()
@@ -1823,7 +1840,9 @@ impl<'a> TotalityChecker<'a> {
         match &*set.kind {
             ExprKind::Builtin { op: B::Nat, args } if args.is_empty() => Some(Shape::Int(Some((0, i32::MAX)))),
             ExprKind::Builtin { op: B::Int, args } if args.is_empty() => Some(Shape::Int(None)),
-            ExprKind::Builtin { op: B::StringSet, args } if args.is_empty() => Some(Shape::Str(None)),
+            ExprKind::Builtin { op: B::StringSet, args } if args.is_empty() => {
+                Some(Shape::Str { groups: self.str_groups_mask(), unmoved: None })
+            }
             ExprKind::Builtin { op: B::Boolean, args } if args.is_empty() => Some(Shape::Bool),
             ExprKind::Builtin { op: B::Seq, args } if args.len() == 1 => {
                 let elem = self.check_membership_domain_elem(&args[0], allow_prime, in_prime, env, steps)?;
