@@ -15,15 +15,34 @@ use tlx_front::cfg::{CfgValue, Config, EffectiveConst};
 
 use super::domain::Atom;
 use super::sym_norm::SymNormalizer;
-use super::CheckSpec;
+use super::{has_str_group, model_groups, CheckSpec, SymGroup, SymGroupKind};
 use crate::{hir::*, Program};
 
 pub(in crate::optimize::phase) type GroupMask = u16;
 
 #[derive(Clone, Debug)]
 pub(in crate::optimize::phase) struct GroupInfo {
+    pub(in crate::optimize::phase) kind: SymGroupKind,
     pub(in crate::optimize::phase) keys: Vec<Arc<str>>,
     pub(in crate::optimize::phase) key_set: BTreeSet<Arc<str>>,
+}
+
+/// Kind-separated sets of all moved symmetry keys so `ModelValue("a")` and
+/// `Str("a")` can never alias across kinds.
+#[derive(Clone, Debug, Default)]
+pub(in crate::optimize::phase) struct MovedKeys {
+    pub(in crate::optimize::phase) model: BTreeSet<Arc<str>>,
+    pub(in crate::optimize::phase) str: BTreeSet<Arc<str>>,
+}
+
+impl MovedKeys {
+    pub(in crate::optimize::phase) fn contains_model(&self, m: &str) -> bool {
+        self.model.contains(m)
+    }
+
+    pub(in crate::optimize::phase) fn contains_str(&self, s: &str) -> bool {
+        self.str.contains(s)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,12 +55,12 @@ pub(in crate::optimize::phase) enum AtomKey {
 }
 
 impl AtomKey {
-    pub(in crate::optimize::phase) fn from_key_free_atom(a: &Atom, all_keys: &BTreeSet<Arc<str>>) -> Option<Self> {
+    pub(in crate::optimize::phase) fn from_key_free_atom(a: &Atom, all_keys: &MovedKeys) -> Option<Self> {
         match a {
             Atom::Num(n) => Some(Self::Int(*n)),
             Atom::Bool(b) => Some(Self::Bool(*b)),
-            Atom::Str(s) => Some(Self::Str(s.clone())),
-            Atom::Model(m) => (!all_keys.contains(m)).then(|| Self::Model(m.clone())),
+            Atom::Str(s) => (!all_keys.contains_str(s)).then(|| Self::Str(s.clone())),
+            Atom::Model(m) => (!all_keys.contains_model(m)).then(|| Self::Model(m.clone())),
         }
     }
 
@@ -80,7 +99,7 @@ pub fn symmetry_certificate(
 }
 
 /// Generate a connected `EquivRule` certificate covering invariants, init properties,
-/// constraints, action constraints, and action properties.
+/// constraints, action constraints, and action properties for `ModelValue` groups.
 pub fn symmetry_certificate_with_spec(
     program: &Program,
     cfg: &Config,
@@ -89,7 +108,22 @@ pub fn symmetry_certificate_with_spec(
     spec: CheckSpec<'_>,
     groups: &[Vec<String>],
 ) -> Option<String> {
-    let (groups, all_keys) = validate_groups(groups)?;
+    let typed = model_groups(groups);
+    symmetry_certificate_with_typed_groups(program, cfg, init, next, spec, &typed)
+}
+
+/// Generate a connected `EquivRule` certificate covering invariants, init properties,
+/// constraints, action constraints, and action properties for typed `Model` and opaque
+/// `Str` scalarset permutation groups.
+pub fn symmetry_certificate_with_typed_groups(
+    program: &Program,
+    cfg: &Config,
+    init: &Expr,
+    next: &Expr,
+    spec: CheckSpec<'_>,
+    groups: &[SymGroup],
+) -> Option<String> {
+    let (groups, all_keys) = validate_typed_groups(groups)?;
     let const_bindings = collect_const_bindings(program, cfg)?;
     let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
     let init_norm = norm.normalize(init)?;
@@ -149,17 +183,21 @@ pub fn symmetry_certificate_with_spec(
 
 /// Generate a connected `ErasedEquivRule` certificate composing unobserved-variable
 /// erasure with recursive equivariant symmetry over the exact retained-variable tuple.
-pub fn symmetry_projection_certificate_with_spec(
+/// Declines `SymGroupKind::Str` groups.
+pub fn symmetry_projection_certificate_with_typed_groups(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
     spec: CheckSpec<'_>,
-    groups: &[Vec<String>],
+    groups: &[SymGroup],
     view: &Expr,
 ) -> Option<String> {
+    if has_str_group(groups) {
+        return None;
+    }
     let (retained, omitted) = super::parse_retained_view(program, view)?;
-    let (groups, all_keys) = validate_groups(groups)?;
+    let (groups, all_keys) = validate_typed_groups(groups)?;
     let const_bindings = collect_const_bindings(program, cfg)?;
     let mut norm = SymNormalizer::for_equiv_with_config(program, cfg);
     let init_norm = norm.normalize(init)?;
@@ -286,29 +324,38 @@ fn extract_hidden_transfers(
     Some(out)
 }
 
-pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, BTreeSet<Arc<str>>)> {
+pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option<(Vec<GroupInfo>, MovedKeys)> {
+    let typed = model_groups(raw);
+    validate_typed_groups(&typed)
+}
+
+pub(in crate::optimize::phase) fn validate_typed_groups(raw: &[SymGroup]) -> Option<(Vec<GroupInfo>, MovedKeys)> {
     if raw.is_empty() || raw.len() > super::AUTOSYM_MAX_GROUPS {
         return None;
     }
     let mut groups = Vec::with_capacity(raw.len());
-    let mut all_keys = BTreeSet::new();
+    let mut all_keys = MovedKeys::default();
     let mut order: u128 = 1;
     for g in raw {
-        if !(2..=super::AUTOSYM_MAX_KEYS).contains(&g.len()) {
+        if !(2..=super::AUTOSYM_MAX_KEYS).contains(&g.keys.len()) {
             return None;
         }
-        let keys: Vec<Arc<str>> = g.iter().map(|s| Arc::from(s.as_str())).collect();
+        let keys: Vec<Arc<str>> = g.keys.iter().map(|s| Arc::from(s.as_str())).collect();
         let key_set: BTreeSet<Arc<str>> = keys.iter().cloned().collect();
-        if key_set.len() != g.len() || !all_keys.is_disjoint(&key_set) {
+        let target_set = match g.kind {
+            SymGroupKind::Model => &mut all_keys.model,
+            SymGroupKind::Str => &mut all_keys.str,
+        };
+        if key_set.len() != g.keys.len() || !target_set.is_disjoint(&key_set) {
             return None;
         }
-        let fact: u128 = (1..=g.len() as u128).product();
+        let fact: u128 = (1..=g.keys.len() as u128).product();
         order = order.checked_mul(fact)?;
         if order > super::AUTOSYM_MAX_ORDER {
             return None;
         }
-        all_keys.extend(key_set.iter().cloned());
-        groups.push(GroupInfo { keys, key_set });
+        target_set.extend(key_set.iter().cloned());
+        groups.push(GroupInfo { kind: g.kind, keys, key_set });
     }
     Some((groups, all_keys))
 }
@@ -319,28 +366,46 @@ pub(in crate::optimize::phase) fn validate_groups(raw: &[Vec<String>]) -> Option
 pub(in crate::optimize::phase) fn classify_key_set(
     keys: &BTreeSet<Atom>,
     groups: &[GroupInfo],
-    all_keys: &BTreeSet<Arc<str>>,
+    all_keys: &MovedKeys,
 ) -> Option<(Vec<usize>, Vec<Atom>)> {
     let mut sym_groups = Vec::new();
-    let mut covered_keys: BTreeSet<Arc<str>> = BTreeSet::new();
+    let mut covered_model: BTreeSet<Arc<str>> = BTreeSet::new();
+    let mut covered_str: BTreeSet<Arc<str>> = BTreeSet::new();
     for (gi, g) in groups.iter().enumerate() {
-        let present = g.keys.iter().filter(|k| keys.contains(&Atom::Model((*k).clone()))).count();
+        let present = match g.kind {
+            SymGroupKind::Model => g.keys.iter().filter(|k| keys.contains(&Atom::Model((*k).clone()))).count(),
+            SymGroupKind::Str => g.keys.iter().filter(|k| keys.contains(&Atom::Str((*k).clone()))).count(),
+        };
         if present == g.keys.len() {
             sym_groups.push(gi);
-            covered_keys.extend(g.keys.iter().cloned());
+            match g.kind {
+                SymGroupKind::Model => covered_model.extend(g.keys.iter().cloned()),
+                SymGroupKind::Str => covered_str.extend(g.keys.iter().cloned()),
+            }
         } else if present != 0 {
             return None;
         }
     }
     let mut fixed_keys = Vec::new();
     for k in keys {
-        if let Atom::Model(m) = k {
-            if covered_keys.contains(m) {
-                continue;
+        match k {
+            Atom::Model(m) => {
+                if covered_model.contains(m) {
+                    continue;
+                }
+                if all_keys.contains_model(m) {
+                    return None;
+                }
             }
-            if all_keys.contains(m) {
-                return None;
+            Atom::Str(s) => {
+                if covered_str.contains(s) {
+                    continue;
+                }
+                if all_keys.contains_str(s) {
+                    return None;
+                }
             }
+            _ => {}
         }
         fixed_keys.push(k.clone());
     }

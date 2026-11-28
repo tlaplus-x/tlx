@@ -69,31 +69,39 @@ struct Case {
 }
 
 /// Generate a connected keyed symmetry certificate covering invariants, init properties,
-/// constraints, action constraints, and action properties.
-pub fn symmetry_certificate_with_spec(
+/// constraints, action constraints, and action properties. Declines `SymGroupKind::Str`.
+pub fn symmetry_certificate_with_typed_groups(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
     spec: super::CheckSpec<'_>,
-    groups: &[Vec<String>],
+    groups: &[super::SymGroup],
 ) -> Option<String> {
-    emit(program, cfg, init, next, spec, groups, vec![])
+    if super::has_str_group(groups) {
+        return None;
+    }
+    let raw: Vec<Vec<String>> = groups.iter().map(|g| g.keys.clone()).collect();
+    emit(program, cfg, init, next, spec, &raw, vec![])
 }
 
 /// Certify erasure followed by symmetry covering invariants, init properties,
-/// constraints, action constraints, and action properties.
-pub fn symmetry_projection_certificate_with_spec(
+/// constraints, action constraints, and action properties. Declines `SymGroupKind::Str`.
+pub fn symmetry_projection_certificate_with_typed_groups(
     program: &Program,
     cfg: &Config,
     init: &Expr,
     next: &Expr,
     spec: super::CheckSpec<'_>,
-    groups: &[Vec<String>],
+    groups: &[super::SymGroup],
     view: &Expr,
 ) -> Option<String> {
+    if super::has_str_group(groups) {
+        return None;
+    }
     let (_, omitted) = super::parse_retained_view(program, view)?;
-    emit(program, cfg, init, next, spec, groups, omitted)
+    let raw: Vec<Vec<String>> = groups.iter().map(|g| g.keys.clone()).collect();
+    emit(program, cfg, init, next, spec, &raw, omitted)
 }
 
 fn emit(

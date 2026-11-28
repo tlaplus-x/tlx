@@ -61,7 +61,7 @@ pub(in crate::optimize::phase) fn write_common_header(
         literal(&format!(
             "Disjoint product of {} full permutation group(s) {:?}; {var_count} retained variables in recursive equivariant Val",
             groups.len(),
-            groups.iter().map(|g| &g.keys).collect::<Vec<_>>(),
+            groups.iter().map(|g| (g.kind, &g.keys)).collect::<Vec<_>>(),
         ))
     )
     .unwrap();

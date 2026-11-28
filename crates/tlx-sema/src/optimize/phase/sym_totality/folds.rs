@@ -140,7 +140,7 @@ impl<'a> TotalityChecker<'a> {
                     (**elem).clone()
                 }
                 Shape::Record(fs) => {
-                    let Shape::Str(Some(ks)) = &idx_s else { return None };
+                    let Shape::Str { groups: 0, unmoved: Some(ks) } = &idx_s else { return None };
                     let mut out = Shape::Bottom;
                     for k in ks {
                         out = join_shape(&out, fs.get(k)?);

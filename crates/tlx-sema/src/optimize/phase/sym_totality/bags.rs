@@ -200,7 +200,7 @@ fn fold_bag_eff_card(ac: AcOpKind, info: &BagInfo) -> Option<u32> {
 fn is_a_bag_arg_total(s: &Shape, groups: &[GroupInfo]) -> bool {
     match s {
         Shape::Top => false,
-        Shape::Bottom | Shape::Bool | Shape::Int(_) | Shape::Str(_) | Shape::Model { .. } | Shape::Set { .. } => true,
+        Shape::Bottom | Shape::Bool | Shape::Int(_) | Shape::Str { .. } | Shape::Model { .. } | Shape::Set { .. } => true,
         Shape::Func { .. } | Shape::Tuple(_) | Shape::Seq { .. } | Shape::Record(_) => fn_dom_range(s).is_some_and(|(d, _, c)| {
             shape_self_comparable(&d)
                 && shape_has_safe_set_cards(&d, groups)

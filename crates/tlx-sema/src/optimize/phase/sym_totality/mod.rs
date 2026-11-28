@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use tlx_front::cfg::{CfgValue, Config, ConstBinding};
 
-use super::equiv_sym::{GroupInfo, GroupMask};
+use super::equiv_sym::{GroupInfo, GroupMask, MovedKeys};
 use super::sym_norm::{RecOpKind, SymNormalizer};
+use super::SymGroupKind;
 use crate::{builtins::Builtin as B, hir::*, Program};
 
 mod bags;
@@ -73,8 +74,12 @@ pub(crate) enum Shape {
     Bool,
     /// Signed 32-bit integer (`Some((lo, hi))` = guaranteed `lo <= v <= hi` in `i32`).
     Int(Option<(i32, i32)>),
-    /// String (`Some(set)` = exact finite upper bound on possible strings).
-    Str(Option<BTreeSet<Arc<str>>>),
+    /// Strings: moved `SymGroupKind::Str` symmetry `groups` and optional exact finite
+    /// set of unmoved string literals (`None` = widened/unbounded string).
+    Str {
+        groups: GroupMask,
+        unmoved: Option<BTreeSet<Arc<str>>>,
+    },
     /// Model values: moved symmetry `groups`, typing, and optional exact set of unmoved names.
     Model {
         groups: GroupMask,
@@ -107,6 +112,12 @@ pub(crate) enum Shape {
     },
     /// Small finite union of distinct shapes.
     Union(Vec<Shape>),
+}
+
+impl Shape {
+    pub(super) fn str_unmoved(set: BTreeSet<Arc<str>>) -> Self {
+        Self::Str { groups: 0, unmoved: Some(set) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -463,7 +474,7 @@ impl<'a> SubstAcyclicity<'a> {
 pub(crate) struct TotalityChecker<'a> {
     program: &'a Program,
     groups: &'a [GroupInfo],
-    all_keys: &'a BTreeSet<Arc<str>>,
+    all_keys: &'a MovedKeys,
     consts: BTreeMap<ConstId, ConstInfo<'a>>,
     var_shapes: Vec<Shape>,
     allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
@@ -756,7 +767,7 @@ fn check_observations_total_inner(
     let Some((init_norm, next_norm, spec_norm, consts, rec_ops)) = normalize_for_totality(program, cfg, init, next, obs_only) else {
         return false;
     };
-    let empty_keys = BTreeSet::new();
+    let empty_keys = MovedKeys::default();
     let mut checker =
         TotalityChecker::with_const_info_and_rec_ops(program, &[], &empty_keys, consts, &init_norm, &next_norm, None, rec_ops);
     checker.allow_unbounded_seq_len = allow_unbounded_seq_len;
@@ -803,7 +814,7 @@ pub(crate) fn build_choose_totality_checker<'a>(
     program: &'a Program,
     cfg: &'a Config,
     groups: &'a [GroupInfo],
-    all_keys: &'a BTreeSet<Arc<str>>,
+    all_keys: &'a MovedKeys,
     init_norm: &Expr,
     next_norm: &Expr,
     spec_norm: super::CheckSpec<'_>,
@@ -827,7 +838,7 @@ impl<'a> TotalityChecker<'a> {
     pub(crate) fn with_const_info(
         program: &'a Program,
         groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
+        all_keys: &'a MovedKeys,
         consts: BTreeMap<ConstId, ConstInfo<'a>>,
         init_norm: &Expr,
         next_norm: &Expr,
@@ -840,7 +851,7 @@ impl<'a> TotalityChecker<'a> {
     pub(crate) fn with_const_info_and_rec_ops(
         program: &'a Program,
         groups: &'a [GroupInfo],
-        all_keys: &'a BTreeSet<Arc<str>>,
+        all_keys: &'a MovedKeys,
         consts: BTreeMap<ConstId, ConstInfo<'a>>,
         init_norm: &Expr,
         next_norm: &Expr,
@@ -861,6 +872,20 @@ impl<'a> TotalityChecker<'a> {
         };
         checker.var_shapes = checker.infer_var_shapes(init_norm, next_norm);
         checker
+    }
+
+    pub(super) fn str_groups_mask(&self) -> GroupMask {
+        let mut mask: GroupMask = 0;
+        for (gi, g) in self.groups.iter().enumerate() {
+            if g.kind == SymGroupKind::Str {
+                mask |= 1u16 << gi;
+            }
+        }
+        mask
+    }
+
+    pub(super) fn has_str_groups(&self) -> bool {
+        self.str_groups_mask() != 0
     }
 
     pub(crate) fn rec_op_kind(&self, id: DefId) -> Option<RecOpKind> {
@@ -911,7 +936,11 @@ impl<'a> TotalityChecker<'a> {
         // retained state variables; every retained variable must therefore be self-comparable
         // and have safe <= i32::MAX set cardinality bounds.
         for (i, shape) in self.var_shapes.iter().enumerate() {
-            if !omitted.contains(&VarId(i as u32)) && (!shape_self_comparable(shape) || !shape_has_safe_set_cards(shape, self.groups)) {
+            if !omitted.contains(&VarId(i as u32))
+                && (!shape_self_comparable(shape)
+                    || !shape_has_safe_set_cards(shape, self.groups)
+                    || (self.has_str_groups() && shape_has_unbounded_str(shape)))
+            {
                 return false;
             }
         }
@@ -1060,16 +1089,37 @@ impl<'a> TotalityChecker<'a> {
     }
 
     pub(crate) fn group_key_shape(&self, mask: GroupMask) -> Shape {
+        let mut model_mask: GroupMask = 0;
+        let mut str_mask: GroupMask = 0;
         let mut mv_type: Option<MvType> = None;
         for (gi, g) in self.groups.iter().enumerate() {
-            if (mask & (1u16 << gi)) != 0 {
-                for k in &g.keys {
-                    let kt = MvType::of_name(k);
-                    mv_type = Some(mv_type.map_or(kt, |acc| acc.join(kt)));
+            let bit = 1u16 << gi;
+            if (mask & bit) != 0 {
+                match g.kind {
+                    SymGroupKind::Model => {
+                        model_mask |= bit;
+                        for k in &g.keys {
+                            let kt = MvType::of_name(k);
+                            mv_type = Some(mv_type.map_or(kt, |acc| acc.join(kt)));
+                        }
+                    }
+                    SymGroupKind::Str => {
+                        str_mask |= bit;
+                    }
                 }
             }
         }
-        Shape::Model { groups: mask, mv_type: mv_type.unwrap_or(MvType::Unknown), unmoved: Some(BTreeSet::new()) }
+        match (model_mask != 0, str_mask != 0) {
+            (true, false) => {
+                Shape::Model { groups: model_mask, mv_type: mv_type.unwrap_or(MvType::Unknown), unmoved: Some(BTreeSet::new()) }
+            }
+            (false, true) => Shape::Str { groups: str_mask, unmoved: Some(BTreeSet::new()) },
+            (true, true) => join_shape(
+                &Shape::Model { groups: model_mask, mv_type: mv_type.unwrap_or(MvType::Unknown), unmoved: Some(BTreeSet::new()) },
+                &Shape::Str { groups: str_mask, unmoved: Some(BTreeSet::new()) },
+            ),
+            (false, false) => Shape::Bottom,
+        }
     }
 
     pub(crate) fn bind_branch_bounds(&self, bounds: &[Bound], env: &mut CheckEnv) -> Option<()> {
