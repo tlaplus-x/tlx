@@ -416,38 +416,66 @@ impl RssGuard {
         }
     }
 
+    /// The memory of the recorded behavior graph that checking no longer
+    /// holds, `bytes` (its fingerprints were spilled): the product graph
+    /// may use them.
+    pub(crate) fn release(&mut self, bytes: usize) {
+        self.available = self.available.saturating_add(bytes);
+    }
+
     /// The memory check of a product graph (`tlx_live::check_lasso_within`):
     /// records its largest size for `-stats`, and stops it over the budget
-    /// (the message in `err`).
+    /// (the message in `err`). `reclaim` runs at most once, the first time
+    /// the product would exceed the budget: it gives memory of the recorded
+    /// graph back (the bytes released, 0 if nothing could be freed) and both
+    /// checks run again before the product is stopped. The caller must turn
+    /// a failed reclamation into its own error.
     pub(crate) fn product<'a>(
-        &'a self,
+        &'a mut self,
         peak: &'a mut (usize, usize, usize),
         err: &'a mut Option<String>,
-    ) -> impl FnMut(usize, usize, usize) -> bool + 'a {
+        reclaim: &'a mut (dyn FnMut() -> usize + Send),
+    ) -> impl FnMut(usize, usize, usize) -> bool + Send + 'a {
         let gauge = Gauge::new();
         let part = Part::default();
+        let mut reclaimed = false;
         move |nodes, edges, bytes| {
             part.set(&gauge, bytes);
             if gauge.bytes() > peak.2 {
                 *peak = (nodes, edges, bytes);
             }
-            if gauge.bytes() > self.available {
-                *err = Some(crate::explore::liveness_memory_error(
-                    &format!("the liveness automaton and product ({nodes} nodes, {edges} edges so far)"),
-                    self.budget.saturating_add(gauge.bytes() - self.available),
-                    self.budget,
-                ));
+            let failure = |this: &RssGuard| -> Option<String> {
+                if gauge.bytes() > this.available {
+                    return Some(crate::explore::liveness_memory_error(
+                        &format!("the liveness automaton and product ({nodes} nodes, {edges} edges so far)"),
+                        this.budget.saturating_add(gauge.bytes() - this.available),
+                        this.budget,
+                    ));
+                }
+                this.check(&|| {
+                    format!("the product of the behavior graph and a property's automaton ({nodes} nodes, {edges} edges so far)")
+                })
+                .err()
+            };
+            if let Some(e) = failure(self) {
+                if !reclaimed {
+                    reclaimed = true;
+                    // (The memory freed is credited before the checks run
+                    // again: the graph no longer holds it.)
+                    let freed = reclaim();
+                    if freed > 0 {
+                        self.available = self.available.saturating_add(freed);
+                    }
+                    if let Some(e) = failure(self) {
+                        *err = Some(e);
+                        return false;
+                    }
+                    return true;
+                }
+                *err = Some(e);
                 return false;
             }
-            match self
-                .check(&|| format!("the product of the behavior graph and a property's automaton ({nodes} nodes, {edges} edges so far)"))
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    *err = Some(e);
-                    false
-                }
-            }
+            true
         }
     }
 }
@@ -709,6 +737,56 @@ mod tests {
         assert_eq!(b.used(5), 5);
         b.sample();
         assert!(b.used(5) > 1 << 20);
+    }
+
+    /// A guard of the product's memory checks without the process's
+    /// resident memory (`limit` unlimited, so only `available` decides).
+    fn guard(available: usize) -> RssGuard {
+        RssGuard { budget: 1 << 30, limit: usize::MAX, available }
+    }
+
+    /// A product over the budget reclaims the recorded graph's memory once
+    /// and runs both checks again: freed enough, the product goes on.
+    #[test]
+    fn product_reclaims_once_and_checks_again() {
+        let mut g = guard(0);
+        let (mut peak, mut err) = ((0, 0, 0), None);
+        let mut calls = 0;
+        {
+            let mut reclaim = || {
+                calls += 1;
+                1000
+            };
+            let mut within = g.product(&mut peak, &mut err, &mut reclaim);
+            assert!(within(2, 3, 100), "the reclaimed memory covers the product");
+            // A larger product no longer fits: the memory is reclaimed only
+            // once, and the check fails with the message of the budget.
+            assert!(!within(2, 3, 2000));
+        }
+        assert_eq!(calls, 1, "the recorded graph is reclaimed only once");
+        assert_eq!(g.available, 1000);
+        assert_eq!(peak, (2, 3, 2000), "the largest product is recorded");
+        assert!(err.as_deref().is_some_and(|e| e.starts_with(crate::explore::LIVENESS_MEMORY)));
+    }
+
+    /// Nothing to reclaim (`-spill off`, or nothing spilled yet): the
+    /// product fails with the message of the budget, as before.
+    #[test]
+    fn product_fails_when_nothing_can_be_reclaimed() {
+        let mut g = guard(10);
+        let (mut peak, mut err) = ((0, 0, 0), None);
+        let mut calls = 0;
+        {
+            let mut reclaim = || {
+                calls += 1;
+                0
+            };
+            let mut within = g.product(&mut peak, &mut err, &mut reclaim);
+            assert!(!within(0, 0, 100));
+        }
+        assert_eq!(calls, 1);
+        assert_eq!(g.available, 10);
+        assert!(err.is_some());
     }
 
     #[test]

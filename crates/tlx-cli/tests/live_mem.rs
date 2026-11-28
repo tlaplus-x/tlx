@@ -101,6 +101,29 @@ fn graph_over_the_budget() {
     assert_eq!(code, 0, "{out}");
 }
 
+/// `-spill always` and `-spill off`: the same verdicts, violated property
+/// names and counterexamples as the default (`-spill auto`), with the
+/// fingerprints of the behavior graph and the other logs on disk, and the
+/// spill directory removed at the end.
+#[test]
+fn the_spill_modes_check_the_same_properties() {
+    for prop in ["Live", "Bad"] {
+        let dir = spec_dir(&format!("spill-{prop}"), &format!("SPECIFICATION Spec\nPROPERTY {prop}\nCHECK_DEADLOCK FALSE\n"));
+        let meta = dir.child_path("meta");
+        let meta = meta.to_str().unwrap().to_string();
+        let (code, plain) = run(&dir, &["-compile", "-workers", "1"], &[]);
+        for mode in ["off", "always"] {
+            let (code2, out) = run(&dir, &["-compile", "-workers", "1", "-spill", mode, "-metadir", &meta, "-stats"], &[]);
+            assert_eq!(code2, code, "-spill {mode}:\n{out}");
+            assert_eq!(result(&out), result(&plain), "-spill {mode}:\n{out}");
+            if mode == "always" {
+                assert!(out.contains("disk: spilled bytes written"), "-spill always wrote nothing:\n{out}");
+            }
+            assert!(!std::path::Path::new(&meta).exists(), "-spill {mode} left its directory: {out}");
+        }
+    }
+}
+
 /// A small graph never fails for the memory the process holds anyway
 /// (on Linux, with 8 workers and transparent huge pages, the
 /// resident memory alone exceeded a 128 MiB budget): only what liveness

@@ -282,6 +282,10 @@ pub(crate) fn liveness<T: Tier>(
     // A search stopped by TLCSet("exit", TRUE): TLC checks the graph of the
     // states it expanded (those left on the queue are not).
     let expanded = if m.stop_requested() { (st.distinct - st.left) as usize } else { usize::MAX };
+    // (The search's disk layer: where the fingerprints of the behavior
+    // graph go under `-spill always` or memory pressure.)
+    let fallback = tlx_runtime::io::Spill::default();
+    let spill = opts.map_or(&fallback, |o| &o.spill);
     // (An atom failed during the search: TLC reports it as it evaluates
     // them there, `live_error`.)
     let mut lv = match r.live_error.take() {
@@ -289,7 +293,7 @@ pub(crate) fn liveness<T: Tier>(
         None if r.live_witness.is_some() => {
             live::rendered(base, r.live_witness.take().unwrap().replay(m, &base.liveness_input()), view, false)
         }
-        None => live::check(m, workers, expanded, view, r.live_graph.take(), guard),
+        None => live::check(m, workers, expanded, view, r.live_graph.take(), guard, spill),
     };
     if matches!(&lv, live::Liveness::Error(e) if e.is_layout_miss()) {
         // A compiled model cannot widen its layout after the search: the
@@ -302,7 +306,7 @@ pub(crate) fn liveness<T: Tier>(
         let view = live::TraceView::new(base, "Initial predicate".into());
         lv = match opts {
             Some(opts) if !base.has_view_or_symmetry() => interpreted_liveness(base, opts, workers, expanded, &view, guard),
-            _ => live::check(base, workers, expanded, &view, None, guard),
+            _ => live::check(base, workers, expanded, &view, None, guard, spill),
         };
     }
     r.elapsed += start.elapsed();
@@ -333,7 +337,7 @@ fn interpreted_liveness(
     match (r.live_error, r.live_witness, r.live_graph, r.outcome) {
         (Some(e), _, _, _) | (_, _, _, Outcome::Error(e)) => live::Liveness::Error(e),
         (_, Some(witness), _, Outcome::Ok) => live::rendered(base, witness.replay(base, &base.liveness_input()), view, false),
-        (_, _, graph, Outcome::Ok) => live::check(base, workers, expanded, view, graph, guard),
+        (_, _, graph, Outcome::Ok) => live::check(base, workers, expanded, view, graph, guard, &opts.spill),
         _ => live::Liveness::Error(tlx_runtime::ModelError::new("internal error: the interpreter's search recorded no liveness graph")),
     }
 }
