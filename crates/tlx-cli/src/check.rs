@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tlx_eval::model::WarningKind;
+use tlx_eval::model::{StateRenderOpts, WarningKind};
 use tlx_eval::InterpModel;
 use tlx_runtime::{explore, ErrorContext, Model, Options, Outcome, Report};
 use tlx_sema::Program;
@@ -17,6 +17,7 @@ use crate::report::{
     finish, finish_with_trace, live_branches, Run, EXIT_ASSUMPTION, EXIT_CONFIG_ERROR, EXIT_EVAL_ERROR, EXIT_GENERAL_ERROR,
     EXIT_LIVENESS_EVAL,
 };
+use crate::tier::Tier;
 use crate::{autosym, coverage, live, load, out, process, recovery, settings, simulation, stats, symcheck};
 use crate::{parse_only, print_finished, print_mode, PROGRESS_EVERY, PROGRESS_EVERY_SHORT};
 
@@ -246,8 +247,17 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
             print_finished(started);
             return ExitCode::from(EXIT_EVAL_ERROR);
         }
-        let run =
-            Run { workers: 1, actions: Vec::new(), started, sim: None, fp_mem: a.fp_mem(), opts: None, coverage: None, checkpoint: None };
+        let run = Run {
+            workers: 1,
+            actions: Vec::new(),
+            started,
+            sim: None,
+            fp_mem: a.fp_mem(),
+            opts: None,
+            coverage: None,
+            checkpoint: None,
+            render: a.render_opts(),
+        };
         return finish(&model, r, &run);
     }
     let mut opts = a.options(a.workers, check_deadlock);
@@ -276,6 +286,7 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
         opts: Some(Options { checkpoint: None, ..opts.clone() }),
         coverage,
         checkpoint: opts.checkpoint.clone(),
+        render: a.render_opts(),
     };
     if a.compile {
         print_start(&recovery);
@@ -332,7 +343,7 @@ fn run(prepared: Prepared, started: Instant) -> ExitCode {
 
 /// Explore (from checkpoint `recover` if given), writing the states to the
 /// `-dump` file if requested.
-fn explore_dumping<M: Model>(
+fn explore_dumping<M: Tier>(
     m: &M,
     opts: &Options,
     dump: &Option<(PathBuf, tlx_runtime::DumpOptions)>,
@@ -343,7 +354,16 @@ fn explore_dumping<M: Model>(
     }
     let Some((path, o)) = dump else { return explore(m, opts) };
     let o = tlx_runtime::DumpOptions { reduced: out::reduced(), ..*o };
-    let dump = match tlx_runtime::DumpObserver::create(m, path, o) {
+    // TLC's `-view` rendering of the states; the observer derives the
+    // `-difftrace` labels from these full texts (its parent state need not be
+    // resident).
+    let base = m.base();
+    let render_opts = StateRenderOpts { use_view: o.use_view, difftrace: false };
+    let render = move |s: &M::State| {
+        let vals = m.values(s);
+        base.render_dump_state(&vals, m.level(s), None, render_opts)
+    };
+    let dump = match tlx_runtime::DumpObserver::create_with(m, path, o, Some(Box::new(render))) {
         Ok(d) => d,
         Err(e) => {
             out::warning(code::GENERAL, &format!("cannot write {}: {e}", path.display()));

@@ -62,7 +62,7 @@ WORKDIR = os.path.join(ROOT, "target", "tlcsuite")
 INCLUDES = [a for d in ("community", "apalache") for a in ("-I", os.path.join(TP, d))]
 TEST_BASES = ("ModelCheckerTestCase", "PCalModelCheckerTestCase", "SuiteTestCase", "SuiteETestCase")
 # Command-line options of TLC's tools that tlx does not have (docs/compat.md section 2).
-OUT_OF_CONTRACT = ("-continue", "-dfid", "-invlevel", "-view")
+OUT_OF_CONTRACT = ("-continue", "-dfid", "-invlevel")
 SIMULATION = ("-simulate", "-generate")
 
 JUNIT_EXIT = {"SUCCESS": 0, "VIOLATION_ASSUMPTION": 10, "VIOLATION_DEADLOCK": 11, "VIOLATION_SAFETY": 12, "VIOLATION_LIVENESS": 13,

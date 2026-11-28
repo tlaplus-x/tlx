@@ -98,8 +98,8 @@ fn outcome<T: Tier>(
         }
         Outcome::InvariantViolated(name) if r.in_init => {
             let state = match saved_trace {
-                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None)).unwrap_or_default(),
-                None => r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default(),
+                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None, None)).unwrap_or_default(),
+                None => r.trace.first().map(|t| view.show(0, &t.state, None, None, None)).unwrap_or_default(),
             };
             out::error(code::TLC_INVARIANT_VIOLATED_INITIAL, &format!("Invariant {name} is violated by the initial state:\n{state}\n"));
             EXIT_INVARIANT
@@ -125,8 +125,8 @@ fn outcome<T: Tier>(
         Outcome::InitPropertyViolated(label) => {
             // TLC shows just the state (no behavior).
             let state = match saved_trace {
-                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None)).unwrap_or_default(),
-                None => r.trace.first().map(|t| view.show(0, &t.state, None, None)).unwrap_or_default(),
+                Some(saved) => saved.first().map(|(v, _)| view.show_values(0, v, None, None, None)).unwrap_or_default(),
+                None => r.trace.first().map(|t| view.show(0, &t.state, None, None, None)).unwrap_or_default(),
             };
             out::error(code::TLC_PROPERTY_VIOLATED_INITIAL, &format!("Property {label} is violated by the initial state:\n{state}\n"));
             EXIT_LIVENESS
@@ -191,13 +191,15 @@ fn trace<'a, T: Tier>(
         let mut text = String::new();
         if let Some(saved) = saved_trace {
             for (i, (vals, action)) in saved.iter().enumerate() {
+                let prev = i.checked_sub(1).and_then(|p| saved.get(p)).map(|(v, _)| v);
                 let next = saved.get(i + 1).map(|(v, _)| v);
-                text += &view.step_values(i, &view.label(*action), vals, next, *action);
+                text += &view.step_values(i, &view.label(*action), vals, prev, next, *action);
             }
         } else {
             for (i, step) in r.trace.iter().enumerate() {
+                let prev = i.checked_sub(1).and_then(|p| r.trace.get(p)).map(|t| &t.state);
                 let next = r.trace.get(i + 1).map(|t| &t.state);
-                text += &view.step(i, &view.label(step.action), &step.state, next, step.action);
+                text += &view.step(i, &view.label(step.action), &step.state, prev, next, step.action);
             }
         }
         // The incomplete successor ends the behavior.

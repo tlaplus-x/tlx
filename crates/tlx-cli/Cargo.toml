@@ -27,6 +27,10 @@ path = "tests/optimization.rs"
 name = "archive_elision"
 path = "tests/archive_elision.rs"
 
+[[test]]
+name = "view_difftrace"
+path = "tests/view_difftrace.rs"
+
 [dependencies]
 tlx-base.workspace = true
 tlx-front.workspace = true

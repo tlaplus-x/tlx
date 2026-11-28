@@ -45,10 +45,11 @@ pub fn violation_message(names: &[String]) -> String {
 }
 
 /// How the states of a counterexample are shown and its steps labeled
-/// (a safety trace, a lasso): the state through the ALIAS if there is one,
-/// else as the model renders it.
-type Text<'a, S> = dyn Fn(usize, &S, Option<&S>) -> String + 'a;
-type ValText<'a> = dyn Fn(usize, &Arc<[Value]>, Option<&Arc<[Value]>>) -> String + 'a;
+/// (a safety trace, a lasso): through the ALIAS, through `-view`'s VIEW, or
+/// as the model renders them; with `-difftrace` only what changed from the
+/// preceding state.
+type Text<'a, S> = dyn Fn(usize, &S, Option<&S>, Option<&S>) -> String + 'a;
+type ValText<'a> = dyn Fn(usize, &Arc<[Value]>, Option<&Arc<[Value]>>, Option<&Arc<[Value]>>) -> String + 'a;
 
 pub struct TraceView<'a, S> {
     text: Box<Text<'a, S>>,
@@ -65,18 +66,24 @@ pub struct TraceView<'a, S> {
 }
 
 impl<'a, S> TraceView<'a, S> {
-    /// The states of `t` shown through the ALIAS, or (without one, or if it
-    /// cannot be evaluated) as `t` renders them; `init` labels the initial
-    /// state.
-    pub fn new<T: Tier<State = S>>(t: &'a T, init: String) -> TraceView<'a, S> {
+    /// The states of `t` as `opts` shows them (`-view`, `-difftrace`);
+    /// `init` labels the initial state.
+    pub fn new<T: Tier<State = S>>(t: &'a T, init: String, opts: tlx_eval::model::StateRenderOpts) -> TraceView<'a, S> {
         let base = t.base();
-        let text = move |i: usize, s: &S, next: Option<&S>| {
+        let text = move |i: usize, s: &S, prev: Option<&S>, next: Option<&S>| {
             let next = next.map(|n| t.values(n));
-            base.render_alias(&t.values(s), next.as_deref(), i as u32 + 1).unwrap_or_else(|| t.render(s))
+            // (The predecessor is only needed for `-difftrace`: do not decode
+            // it otherwise. Its level is the printed one, `i`: the state is
+            // rendered as it was shown, not at its BFS discovery depth, which
+            // a lasso may differ from.)
+            let prev = prev.filter(|_| opts.difftrace).map(|p| (t.values(p), i as u32));
+            let prev = prev.as_ref().map(|(v, l)| (&v[..], *l));
+            base.render_trace_state(&t.values(s), i as u32 + 1, prev, next.as_deref(), opts)
         };
-        let val_text = move |i: usize, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>| {
-            base.render_alias(vals, next.map(|n| n.as_ref()), i as u32 + 1)
-                .unwrap_or_else(|| tlx_runtime::Model::render(base, &tlx_eval::model::State::new(vals.clone(), i as u32 + 1, 0)))
+        let val_text = move |i: usize, vals: &Arc<[Value]>, prev: Option<&Arc<[Value]>>, next: Option<&Arc<[Value]>>| {
+            // (A trace state's number is its level in the states shown.)
+            let prev = prev.filter(|_| opts.difftrace).map(|p| (&p[..], i as u32));
+            base.render_trace_state(vals, i as u32 + 1, prev, next.map(|n| &n[..]), opts)
         };
         TraceView {
             text: Box::new(text),
@@ -88,12 +95,13 @@ impl<'a, S> TraceView<'a, S> {
         }
     }
 
-    /// State number `i + 1` of a trace (reached by action `into`), followed
-    /// by `next` if any. The states of a trace are shown in order: `Trace`
-    /// in the ALIAS is the trace up to the state shown.
-    pub fn show(&self, i: usize, s: &S, next: Option<&S>, into: Option<u32>) -> String {
+    /// State number `i + 1` of a trace (reached by action `into`), preceded
+    /// by `prev` and followed by `next` if any. The states of a trace are
+    /// shown in order: `Trace` in the ALIAS is the trace up to the state
+    /// shown.
+    pub fn show(&self, i: usize, s: &S, prev: Option<&S>, next: Option<&S>, into: Option<u32>) -> String {
         use tlx_runtime::live::{with_path, CurrentPath, PathNode};
-        let Some(path) = &self.path else { return (self.text)(i, s, next) };
+        let Some(path) = &self.path else { return (self.text)(i, s, prev, next) };
         let node = {
             let mut p = path.borrow_mut();
             p.truncate(i);
@@ -102,14 +110,21 @@ impl<'a, S> TraceView<'a, S> {
             p.push(node.clone());
             node
         };
-        with_path(Some(CurrentPath::Known(node)), || (self.text)(i, s, next))
+        with_path(Some(CurrentPath::Known(node)), || (self.text)(i, s, prev, next))
     }
 
     /// Like `show`, rendering pre-decoded owned variable values so traces
     /// survive value-store GC during a secondary liveness recheck search.
-    pub fn show_values(&self, i: usize, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>, into: Option<u32>) -> String {
+    pub fn show_values(
+        &self,
+        i: usize,
+        vals: &Arc<[Value]>,
+        prev: Option<&Arc<[Value]>>,
+        next: Option<&Arc<[Value]>>,
+        into: Option<u32>,
+    ) -> String {
         use tlx_runtime::live::{with_path, CurrentPath, PathNode};
-        let Some(path) = &self.path else { return (self.val_text)(i, vals, next) };
+        let Some(path) = &self.path else { return (self.val_text)(i, vals, prev, next) };
         let node = {
             let mut p = path.borrow_mut();
             p.truncate(i);
@@ -118,7 +133,7 @@ impl<'a, S> TraceView<'a, S> {
             p.push(node.clone());
             node
         };
-        with_path(Some(CurrentPath::Known(node)), || (self.val_text)(i, vals, next))
+        with_path(Some(CurrentPath::Known(node)), || (self.val_text)(i, vals, prev, next))
     }
 
     /// The label of a step: `<Initial predicate>` or `<Action ...>`, by the
@@ -130,14 +145,23 @@ impl<'a, S> TraceView<'a, S> {
         }
     }
 
-    /// The printed state `i + 1` of a trace (reached by `into`) under `label`.
-    pub fn step(&self, i: usize, label: &str, s: &S, next: Option<&S>, into: Option<u32>) -> String {
-        crate::out::state(i + 1, label, &self.show(i, s, next, into))
+    /// The printed state `i + 1` of a trace (preceded by `prev`, reached by
+    /// `into`) under `label`.
+    pub fn step(&self, i: usize, label: &str, s: &S, prev: Option<&S>, next: Option<&S>, into: Option<u32>) -> String {
+        crate::out::state(i + 1, label, &self.show(i, s, prev, next, into))
     }
 
     /// Like `step`, rendering pre-decoded owned variable values.
-    pub fn step_values(&self, i: usize, label: &str, vals: &Arc<[Value]>, next: Option<&Arc<[Value]>>, into: Option<u32>) -> String {
-        crate::out::state(i + 1, label, &self.show_values(i, vals, next, into))
+    pub fn step_values(
+        &self,
+        i: usize,
+        label: &str,
+        vals: &Arc<[Value]>,
+        prev: Option<&Arc<[Value]>>,
+        next: Option<&Arc<[Value]>>,
+        into: Option<u32>,
+    ) -> String {
+        crate::out::state(i + 1, label, &self.show_values(i, vals, prev, next, into))
     }
 }
 
@@ -243,8 +267,9 @@ fn render<S>(l: &tlx_runtime::liveness::Lasso<S>, view: &TraceView<S>) -> (Strin
             None => view.label(None),
             Some(a) => label(*a),
         };
+        let prev = k.checked_sub(1).and_then(|p| l.states.get(p)).map(|(s, _)| s);
         let next = &l.states[l.next(k)].0;
-        text += &view.step(k, &lab, s, Some(next), action(*into));
+        text += &view.step(k, &lab, s, prev, Some(next), action(*into));
         if crate::dump_trace::requested() {
             states.push(((view.values)(s), action(*into)));
         }

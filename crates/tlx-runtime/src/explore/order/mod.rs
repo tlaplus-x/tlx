@@ -615,6 +615,10 @@ pub(super) struct OrderLocal<'m, S> {
     cands: CandBuf,
     /// Their states.
     store: CandStore<'m, S>,
+    /// The fingerprints of the states expanded at this level, by their log
+    /// entry: the parents of the buffered candidates. Filled only when the
+    /// observer asks for the parent fingerprint (`-difftrace`).
+    parent_fps: std::collections::HashMap<u64, u64>,
     /// Separate charges for `cands` and `store` so `filter_candidates` can
     /// update `cands` while `store` is deposited in `Shared::gc_roots`.
     cands_charge: Charge,
@@ -632,6 +636,7 @@ impl<'m, S> OrderLocal<'m, S> {
             pos: 0,
             cands: CandBuf::default(),
             store: CandStore::new(codec, seg_bytes),
+            parent_fps: std::collections::HashMap::new(),
             cands_charge: Charge::default(),
             store_charge: Charge::default(),
         }
@@ -714,6 +719,9 @@ impl<M: Model> WorkerState<'_, '_, M> {
         let shared = self.shared;
         let order = shared.order.as_ref().expect("ordered search");
         let o = self.order.as_mut().expect("ordered search");
+        if shared.observer.is_some_and(|obs| obs.needs_parent_fingerprint()) {
+            o.parent_fps.entry(task.log).or_insert_with(|| shared.model.fingerprint(&task.state));
+        }
         let key = (o.pos, idx);
         let packed_key = pack_key(key);
         let seen = &shared.seen;
@@ -875,9 +883,11 @@ impl<M: Model> WorkerState<'_, '_, M> {
                 self.max_depth = depth;
                 self.slot.max_depth.store(depth as u64, Ordering::Relaxed);
             }
-            // (The observer is not told the parent: only its log entry is kept.)
-            if let Some(o) = shared.observer {
-                o.on_new_state(&state, fp, depth, None);
+            // (The parent state itself is not resident here; the observer
+            // asked for its fingerprint when it renders `-difftrace`.)
+            let parent_fp = self.order.as_ref().and_then(|o| o.parent_fps.get(&parent)).copied();
+            if let Some(obs) = shared.observer {
+                obs.on_new_state(&state, fp, depth, parent_fp);
             }
             let span = stats::span();
             // (`TLCExt!Trace` on the state: its parent's path and the state.)
@@ -931,6 +941,7 @@ impl<M: Model> WorkerState<'_, '_, M> {
         if let Some(o) = &mut self.order {
             o.cands = cands;
             o.store = store;
+            o.parent_fps.clear();
             o.account(&order.cand_bytes);
         }
         let table = Arc::new(Table::new(start, entries, table_charge));

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use tlx_base::knobs;
 
 /// The first line of the usage message.
-pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxSetSize N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]";
+pub const USAGE: &str = "usage: tlx check Spec.tla [-config Spec.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxSetSize N] [-maxmem MiB|fraction] [-spill auto|off|always] [-metadir DIR] [-maxdisk MiB] [-checkpoint MIN] [-recover DIR] [-fpmem MiB|fraction] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-view] [-difftrace] [-coverage N] [-stats [json[=FILE]]]";
 
 /// `tlx check -h`.
 const HELP_OPTIONS: &str = "\
@@ -39,6 +39,13 @@ Options shared with TLC (same names and meaning):
                        deadlock, temporal property), write the
                        counterexample to FILE as TLC does (JSON, or a TLA+
                        module defining CounterExample); may be repeated
+  -view                show the states of a counterexample and of -dump
+                       through the configuration's VIEW (unless an ALIAS
+                       is configured, which TLC evaluates first)
+  -difftrace           show only the fields of a counterexample state that
+                       differ from the preceding state (State 1 is shown in
+                       full); in -dump dot, the node label is the diff and
+                       its tooltip the full state
   -coverage N          print TLC's coverage statistics of the actions every
                        N minutes and at the end (model checking only)
   -fpmem X             fingerprint-set memory: a fraction in (0,1) of the

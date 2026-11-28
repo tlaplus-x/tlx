@@ -48,6 +48,8 @@ pub(crate) struct Run {
     /// counterexample replay complete so replay-time store exhaustion can
     /// preserve the last committed checkpoint.
     pub(crate) checkpoint: Option<Arc<tlx_runtime::Checkpointer>>,
+    /// `-view` / `-difftrace`: how counterexample states are shown.
+    pub(crate) render: tlx_eval::model::StateRenderOpts,
 }
 
 /// A simulation being reported.
@@ -74,7 +76,7 @@ pub(crate) fn finish_with_trace<T: Tier>(
 ) -> ExitCode {
     let base = m.base();
     let init = run.sim.as_ref().map_or_else(|| "Initial predicate".to_string(), |sim| sim.init_label.clone());
-    let view = live::TraceView::new(m, init);
+    let view = live::TraceView::new(m, init, run.render);
     explain_incomplete(m, &mut r, saved_trace.as_deref());
     let recorded = match &r.live_graph {
         Some(Ok(g)) => g.bytes(),
@@ -303,7 +305,7 @@ pub(crate) fn liveness<T: Tier>(
             tlx_base::diag::Topic::Compile,
             "layout miss checking temporal properties; checking them with the interpreter",
         );
-        let view = live::TraceView::new(base, "Initial predicate".into());
+        let view = live::TraceView::new(base, "Initial predicate".into(), run.render);
         lv = match opts {
             Some(opts) if !base.has_view_or_symmetry() => interpreted_liveness(base, opts, workers, expanded, &view, guard),
             _ => live::check(base, workers, expanded, &view, None, guard, spill),

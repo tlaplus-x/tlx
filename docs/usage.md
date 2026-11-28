@@ -325,8 +325,9 @@ cannot. Such a prefix shows that the property fails; it is not a complete execut
 ([DOC-08](development-standards.md)). For the whole behavior, check the spec again without `VIEW`
 and without `SYMMETRY`, where the same violation is reported with a complete trace.
 
-TLC's `-view` command-line option is not implemented; the `VIEW` configuration keyword is
-([features.md](features.md) section 1). In the default mode a `VIEW` that is a tuple of state
+TLC's `-view` command-line option shows counterexample and `-dump` states through the same
+expression ([configuration.md](configuration.md)); the `VIEW` configuration keyword owns the
+fingerprinting semantics ([features.md](features.md) section 1). In the default mode a `VIEW` that is a tuple of state
 variables may additionally compose with automatic symmetry
 ([section 6.3](#63-automatic-symmetry-in-the-default-mode)); `-tlc` and `-noautosymmetry` keep the
 plain `VIEW` search.
@@ -1041,9 +1042,9 @@ Command-line options are not part of the compatibility contract, but tlx follows
 
 | TLC option | In tlx |
 |---|---|
-| `-config`, `-workers`, `-deadlock`, `-depth`, `-seed`, `-simulate`, `-generate`, `-dump`, `-dumpTrace`, `-coverage`, `-tool`, `-nowarning`, `-fpmem`, `-fpbits`, `-maxSetSize`, `-checkpoint`, `-recover`, `-metadir`, `-h` | implemented with TLC's meaning (restrictions: `-simulate` has no `file=`; `-dump` has no `constrained`; `-dumpTrace` has only `json` and `tla`; `-coverage` is action-level only) |
+| `-config`, `-workers`, `-deadlock`, `-depth`, `-seed`, `-simulate`, `-generate`, `-dump`, `-dumpTrace`, `-view`, `-difftrace`, `-coverage`, `-tool`, `-nowarning`, `-fpmem`, `-fpbits`, `-maxSetSize`, `-checkpoint`, `-recover`, `-metadir`, `-h` | implemented with TLC's meaning (restrictions: `-simulate` has no `file=`; `-dump` has no `constrained`; `-dumpTrace` has only `json` and `tla`; `-coverage` is action-level only) |
 | `-cleanup`, `-noGenerateSpecTE` | accepted, no effect |
-| `-continue`, `-difftrace`, `-fp`, `-terse`, `-view`, `-userFile`, `-inv`, `-postCondition`, `-dfid`, `-lncheck`, `-debugger`, ... | not implemented; usage error, exit code 2 |
+| `-continue`, `-fp`, `-terse`, `-userFile`, `-inv`, `-postCondition`, `-dfid`, `-lncheck`, `-debugger`, ... | not implemented; usage error, exit code 2 |
 | `-DTLA-Library` | `-I dir` or `TLX_PATH` |
 
 tlx-only options: `-I`, `-progress`, `-compile`, `-interp`, `-tlc`, `-optimize`, `-proofdir`,
