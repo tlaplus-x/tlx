@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use tlx_front::cfg::ConstBinding;
 use tlx_sema::hir::*;
-use tlx_value::{ops, Sym, Value};
+use tlx_sema::optimize::{SymGroup, SymGroupKind};
+use tlx_value::{ops, SymAtom, Value};
 
 use super::{behavior, Behavior, InterpModel};
 use crate::env::Env;
@@ -92,23 +93,34 @@ fn location(ip: &Interp, sp: Span) -> String {
     format!("{file}:{}:{}", sp.line, sp.col)
 }
 
-/// The elements of `v` if it is a set of at least two model values of the
-/// same type.
-fn model_value_set(v: &Value) -> Option<Vec<Value>> {
+/// The elements of `v` if it is a homogeneous set of at least two model values
+/// of the same model-value type, or at least two strings.
+fn scalarset_elems(v: &Value) -> Option<Vec<Value>> {
     let Value::Set(es) = v else { return None };
     if es.len() < 2 {
         return None;
     }
-    let mut ty = None;
-    for e in es.iter() {
-        let Value::ModelValue(m) = e else { return None };
-        match ty {
-            None => ty = Some(m.model_value_type()),
-            Some(t) if t != m.model_value_type() => return None,
-            Some(_) => {}
+    match &es[0] {
+        Value::ModelValue(first) => {
+            let ty = first.model_value_type();
+            es.iter().all(|e| matches!(e, Value::ModelValue(m) if m.model_value_type() == ty)).then(|| es.to_vec())
         }
+        Value::Str(_) => es.iter().all(|e| matches!(e, Value::Str(_))).then(|| es.to_vec()),
+        _ => None,
     }
-    Some(es.to_vec())
+}
+
+/// Convert a non-empty homogeneous slice of `SymAtom` keys to a typed `SymGroup`.
+pub fn sym_group_from_atoms(keys: &[SymAtom]) -> Option<SymGroup> {
+    let first = *keys.first()?;
+    let kind = match first {
+        SymAtom::Model(_) => SymGroupKind::Model,
+        SymAtom::Str(_) => SymGroupKind::Str,
+    };
+    if !keys.iter().all(|k| matches!((first, *k), (SymAtom::Model(_), SymAtom::Model(_)) | (SymAtom::Str(_), SymAtom::Str(_)))) {
+        return None;
+    }
+    Some(SymGroup { kind, keys: keys.iter().map(|m| m.sym().as_str().to_owned()).collect() })
 }
 
 /// The value the cfg gives the root constant or definition `name`.
@@ -146,7 +158,7 @@ pub fn candidates(ip: &Arc<Interp>) -> Vec<Candidate> {
         if out.iter().any(|c| &c.name == name) {
             continue;
         }
-        if let Some(elems) = cfg_bound_value(ip, name).as_ref().and_then(model_value_set) {
+        if let Some(elems) = cfg_bound_value(ip, name).as_ref().and_then(scalarset_elems) {
             out.push(Candidate { name: name.clone(), elems });
         }
     }
@@ -154,7 +166,7 @@ pub fn candidates(ip: &Arc<Interp>) -> Vec<Candidate> {
 }
 
 /// The model values the declared SYMMETRY moves.
-fn declared_support(model: &InterpModel) -> HashSet<tlx_value::SymAtom> {
+fn declared_support(model: &InterpModel) -> HashSet<SymAtom> {
     let mut out = model.group.moved_syms();
     if !out.is_empty() {
         return out;
@@ -165,9 +177,9 @@ fn declared_support(model: &InterpModel) -> HashSet<tlx_value::SymAtom> {
     let _ = ops::for_each_element(&set, &mut |f| {
         if let Ok(keys) = ops::enumerate_normalized(&ops::domain(&f)?) {
             for k in keys {
-                if let (Value::ModelValue(m), Ok(img)) = (&k, ops::apply(&f, &k)) {
+                if let (Some(atom), Ok(img)) = (SymAtom::from_value(&k), ops::apply(&f, &k)) {
                     if img != k {
-                        out.insert(tlx_value::SymAtom::Model(*m));
+                        out.insert(atom);
                     }
                 }
             }
@@ -200,8 +212,8 @@ fn checked_parts(model: &InterpModel) -> Vec<Expr> {
 /// admission or the terminal predicate when the stopped search is replayed.
 pub(super) fn trace_replay_limit(model: &InterpModel) -> Option<&'static str> {
     let impure = |entries: &[Expr]| {
-        let mask_of = |_: Sym| 0;
-        let mut an = analyze::Analyzer::new(&model.ip, &mask_of);
+        let mask_of = |_: SymAtom| 0;
+        let mut an = analyze::Analyzer::new(&model.ip, &mask_of, 0);
         an.run(entries);
         (an.effects.iter().any(|e| e.what != "Trace"), an.overflow)
     };
@@ -244,16 +256,20 @@ pub fn analyze(model: &InterpModel) -> Analysis {
     let declared = declared_support(model);
     // (At most 64 candidates are analyzed: one bit each.)
     let analyzed: Vec<usize> = (0..cands.len()).filter(|&i| !cands[i].elems.iter().all(|e| is_declared(e, &declared))).take(64).collect();
-    let mut masks: HashMap<Sym, Mask> = HashMap::new();
+    let mut masks: HashMap<SymAtom, Mask> = HashMap::new();
+    let mut string_mask: Mask = 0;
     for (bit, &i) in analyzed.iter().enumerate() {
         for e in &cands[i].elems {
-            if let Value::ModelValue(m) = e {
-                *masks.entry(*m).or_default() |= 1 << bit;
+            if let Some(atom) = SymAtom::from_value(e) {
+                *masks.entry(atom).or_default() |= 1 << bit;
+                if matches!(atom, SymAtom::Str(_)) {
+                    string_mask |= 1 << bit;
+                }
             }
         }
     }
-    let mask_of = |m: Sym| masks.get(&m).copied().unwrap_or(0);
-    let mut an = analyze::Analyzer::new(ip, &mask_of);
+    let mask_of = |a: SymAtom| masks.get(&a).copied().unwrap_or(0);
+    let mut an = analyze::Analyzer::new(ip, &mask_of, string_mask);
     if !analyzed.is_empty() && model.has_behavior {
         // The declared `VIEW` shapes the reduced fingerprint, so its own
         // effects and (non-)equivariance are part of the reduction: a view that
@@ -300,8 +316,8 @@ pub fn analyze(model: &InterpModel) -> Analysis {
     Analysis { sets, effects, incomplete: an.overflow, forced: Vec::new(), elapsed: started.elapsed() }
 }
 
-fn is_declared(e: &Value, declared: &HashSet<tlx_value::SymAtom>) -> bool {
-    matches!(e, Value::ModelValue(m) if declared.contains(&tlx_value::SymAtom::Model(*m)))
+fn is_declared(e: &Value, declared: &HashSet<SymAtom>) -> bool {
+    SymAtom::from_value(e).is_some_and(|a| declared.contains(&a))
 }
 
 /// The classes of the elements of `c` that transpositions fixing every
@@ -319,8 +335,8 @@ fn classes(ip: &Interp, c: &Candidate, atoms: &[analyze::Atom]) -> Verdict {
     let mut pinned_by = BTreeSet::new();
     for x in 0..n {
         for y in x + 1..n {
-            let (Value::ModelValue(a), Value::ModelValue(b)) = (&c.elems[x], &c.elems[y]) else { continue };
-            match atoms.iter().find(|at| shape::fixed_by(&at.value, *a, *b) != Some(true)) {
+            let (Some(a), Some(b)) = (SymAtom::from_value(&c.elems[x]), SymAtom::from_value(&c.elems[y])) else { continue };
+            match atoms.iter().find(|at| shape::fixed_by(&at.value, a, b) != Some(true)) {
                 None => {
                     let (rx, ry) = (root(&mut parent, x), root(&mut parent, y));
                     parent[rx] = ry;
@@ -384,7 +400,7 @@ impl SetResult {
     }
 
     /// Generators of the proven group: adjacent transpositions of each class.
-    pub fn generators(&self) -> Vec<HashMap<tlx_value::SymAtom, Value>> {
+    pub fn generators(&self) -> Vec<HashMap<SymAtom, Value>> {
         let Verdict::Proven { classes, .. } = &self.verdict else { return Vec::new() };
         classes.iter().flat_map(|cl| transpositions(cl)).collect()
     }
@@ -403,11 +419,14 @@ impl SetResult {
 }
 
 /// Adjacent transpositions of `elems`: generators of all their permutations.
-pub fn transpositions(elems: &[Value]) -> Vec<HashMap<tlx_value::SymAtom, Value>> {
+pub fn transpositions(elems: &[Value]) -> Vec<HashMap<SymAtom, Value>> {
     let mut out = Vec::new();
     for pair in elems.windows(2) {
-        let (Value::ModelValue(a), Value::ModelValue(b)) = (&pair[0], &pair[1]) else { continue };
-        out.push(HashMap::from([(tlx_value::SymAtom::Model(*a), pair[1].clone()), (tlx_value::SymAtom::Model(*b), pair[0].clone())]));
+        let (Some(a), Some(b)) = (SymAtom::from_value(&pair[0]), SymAtom::from_value(&pair[1])) else { continue };
+        if !matches!((a, b), (SymAtom::Model(_), SymAtom::Model(_)) | (SymAtom::Str(_), SymAtom::Str(_))) {
+            continue;
+        }
+        out.push(HashMap::from([(a, pair[1].clone()), (b, pair[0].clone())]));
     }
     out
 }
@@ -430,11 +449,12 @@ impl Analysis {
     /// A SYMMETRY definition of the proven group, to paste into the spec
     /// (`Permutations(RM) \cup Permutations(Acceptor)`), `None` when a
     /// class cannot be named in TLA+ (it leaves out elements no constant
-    /// names).
+    /// names) or when any proven set contains `Value::Str` elements (which
+    /// manual `.cfg` `SYMMETRY` cannot permute).
     pub fn symmetry_definition(&self) -> Option<String> {
         let mut parts = Vec::new();
         for s in self.proven() {
-            if !s.full() {
+            if !s.full() || s.candidate.elems.iter().any(|e| matches!(e, Value::Str(_))) {
                 return None;
             }
             parts.push(format!("Permutations({})", s.candidate.name));

@@ -42,6 +42,10 @@ impl<'a> Analyzer<'a> {
                 return Sh::plain();
             }
             (B::TLCGet, [x]) if matches!(&*x.kind, ExprKind::Str(s) if &**s == "level" || &**s == "config") => {
+                self.expr(x);
+                if matches!(&*x.kind, ExprKind::Str(s) if &**s == "config") {
+                    self.breaker(self.string_mask, "TLCGet(\"config\")", span);
+                }
                 return Sh::plain();
             }
             _ => {}
@@ -60,16 +64,25 @@ impl<'a> Analyzer<'a> {
         match op {
             // Predicates and numbers.
             B::Eq | B::Neq | B::In | B::NotIn | B::Not | B::Implies | B::Equiv => plain(),
-            B::SubsetEq | B::Lt | B::Gt | B::Le | B::Ge | B::IsFiniteSet | B::IsABag => plain(),
+            B::SubsetEq | B::IsFiniteSet | B::IsABag => plain(),
+            B::Lt | B::Gt | B::Le | B::Ge => {
+                self.breaker((arg(0).scalar_mask() | arg(1).scalar_mask()) & self.string_mask, op.name(), span);
+                plain()
+            }
             B::BagIn | B::SqSubseteq | B::IsInjective | B::GraphConnected => plain(),
             B::GraphStronglyConnected | B::UGraphConnected | B::UGraphStronglyConnected => plain(),
             B::Assert | B::AssertError | B::Unchanged | B::Enabled | B::Always => plain(),
             B::Eventually | B::LeadsTo | B::Compose | B::WhilePlus | B::Plus | B::Minus => plain(),
-            B::Mul | B::Pow | B::Div | B::Mod | B::Neg | B::Cardinality | B::Len => plain(),
-            B::BagCardinality | B::CopiesIn | B::Gcd | B::Atoi | B::Choose => plain(),
+            B::Mul | B::Pow | B::Div | B::Mod | B::Neg | B::Cardinality => plain(),
+            B::Len | B::Atoi => {
+                self.breaker(arg(0).scalar_mask() & self.string_mask, op.name(), span);
+                plain()
+            }
+            B::BagCardinality | B::CopiesIn | B::Gcd | B::Choose => plain(),
             B::Prime | B::TLCEval => arg(0),
             B::TLCCache => arg(0),
-            B::Boolean | B::StringSet | B::Nat | B::Int => Sh::set(plain()),
+            B::Boolean | B::Nat | B::Int => Sh::set(plain()),
+            B::StringSet => Sh::set(Sh::scalar(self.string_mask)),
             B::DotDot => Sh::set(plain()),
             B::Any => Sh::set(Sh::any(0)),
             // Sets.
@@ -84,14 +97,29 @@ impl<'a> Analyzer<'a> {
             B::SetToSeqs => Sh::set(Sh::seq(arg(0).elems())),
             // Sequences (and strings).
             B::Seq => Sh::set(Sh::seq(arg(0).elems())),
-            B::Concat => Sh::seq(arg(0).range().join(&arg(1).range())).join(&arg(0).scalar_part()).join(&arg(1).scalar_part()),
+            B::Concat => {
+                if arg(0).may_be_scalar() || arg(1).may_be_scalar() {
+                    self.breaker(self.string_mask, "\\o", span);
+                }
+                Sh::seq(arg(0).range().join(&arg(1).range())).join(&arg(0).scalar_part()).join(&arg(1).scalar_part())
+            }
             B::Append => Sh::seq(arg(0).range().join(&arg(1))),
             B::Head => arg(0).range(),
-            B::Tail | B::SubSeq => Sh::seq(arg(0).range()).join(&arg(0).scalar_part()),
+            B::Tail | B::SubSeq => {
+                if arg(0).may_be_scalar() {
+                    self.breaker(self.string_mask, op.name(), span);
+                }
+                Sh::seq(arg(0).range()).join(&arg(0).scalar_part())
+            }
             // The result holds `r`'s and `t`'s elements (`s` is only searched
             // for), or is `r` or `t` itself (the definition's first two
             // guards); with three strings it is a string, like `\o`'s.
-            B::ReplaceAllSubSeqs => Sh::seq(arg(0).range().join(&arg(2).range())).join(&arg(0)).join(&arg(2)),
+            B::ReplaceAllSubSeqs => {
+                if arg(0).may_be_scalar() || arg(1).may_be_scalar() || arg(2).may_be_scalar() {
+                    self.breaker(self.string_mask, op.name(), span);
+                }
+                Sh::seq(arg(0).range().join(&arg(2).range())).join(&arg(0)).join(&arg(2))
+            }
             B::SelectSeq => self.select_seq(arg(0), arg(1), span),
             B::SortSeq => self.sort_seq(arg(0), arg(1), span),
             B::AllSubSeqs => Sh::set(Sh::seq(arg(0).range())),
@@ -251,9 +279,14 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `ToString` and the JSON/FP writer operations print the names of the
-    /// values they see.
+    /// values they see; `ToString` and `ToJson*` also synthesize arbitrary
+    /// strings, breaking all `Str` candidates unconditionally.
     fn name_writer(&mut self, op: B, x: Sh, span: Span) -> Sh {
-        self.breaker(x.mask(), op.name(), span);
+        let mut m = x.mask();
+        if matches!(op, B::ToString | B::ToJson | B::ToJsonArray | B::ToJsonObject) {
+            m |= self.string_mask;
+        }
+        self.breaker(m, op.name(), span);
         Sh::plain()
     }
 
@@ -325,7 +358,7 @@ impl<'a> Analyzer<'a> {
         if op != B::IOEnv {
             self.effect(op.name(), span);
         }
-        self.breaker(a.iter().fold(0, |acc, s| acc | s.mask()), op.name(), span);
+        self.breaker(a.iter().fold(0, |acc, s| acc | s.mask()) | self.string_mask, op.name(), span);
         Sh::any(0)
     }
 }

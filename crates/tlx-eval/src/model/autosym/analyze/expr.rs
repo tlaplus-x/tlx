@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tlx_sema::hir::*;
-use tlx_value::Value;
+use tlx_value::{Sym, SymAtom, Value};
 
 use super::super::shape::{self, Lit, OpVal, Sh, ALL};
 use super::{choices::unique_choice, Analyzer, Arg, Atom, AtomKey};
@@ -23,7 +23,8 @@ impl<'a> Analyzer<'a> {
             return Sh::any(ALL);
         }
         match &*e.kind {
-            ExprKind::Num(_) | ExprKind::Decimal(_) | ExprKind::Str(_) | ExprKind::Bool(_) => Sh::plain(),
+            ExprKind::Num(_) | ExprKind::Decimal(_) | ExprKind::Bool(_) => Sh::plain(),
+            ExprKind::Str(s) => self.str_lit(s, e.span),
             // Synthesized only by a certified normalization; no automatic
             // symmetry candidate is derived from it.
             ExprKind::CfgLiteral(_) => Sh::any(ALL),
@@ -50,16 +51,40 @@ impl<'a> Analyzer<'a> {
             ExprKind::SetMap { expr, bounds } => self.set_map(expr, bounds),
             ExprKind::Tuple(es) => Sh::tup(es.iter().map(|x| self.expr(x)).collect()),
             ExprKind::FnConstruct { bounds, body } => self.fn_construct(bounds, body),
-            ExprKind::FnApp { func, args } => self.fn_app(func, args),
+            ExprKind::FnApp { func, args } => self.fn_app(func, args, e.span),
             ExprKind::FnSet { domain, range } => self.fn_set(domain, range),
-            ExprKind::Record(fs) => self.record(fs),
-            ExprKind::RecordSet(fs) => self.record_set(fs),
-            ExprKind::Field { record, field } => self.expr(record).field(field),
-            ExprKind::Except { base, updates } => self.except(base, updates),
+            ExprKind::Record(fs) => self.record(fs, e.span),
+            ExprKind::RecordSet(fs) => self.record_set(fs, e.span),
+            ExprKind::Field { record, field } => {
+                self.check_record_field(field, e.span);
+                self.expr(record).field(field)
+            }
+            ExprKind::Except { base, updates } => self.except(base, updates, e.span),
             ExprKind::At => self.at.last().cloned().unwrap_or_else(|| Sh::any(ALL)),
             ExprKind::BoxAction { action, sub } | ExprKind::AngleAction { action, sub } => self.action(action, sub),
             // Fairness only concerns liveness, which auto symmetry leaves out.
             ExprKind::Fairness { .. } => Sh::plain(),
+        }
+    }
+
+    fn str_lit(&mut self, s: &str, span: Span) -> Sh {
+        if self.string_mask == 0 {
+            return Sh::plain();
+        }
+        let sym = Sym::new(s);
+        if (self.mask_of)(SymAtom::Str(sym)) != 0 {
+            let v = Value::Str(sym);
+            let name = v.to_string();
+            self.atom(AtomKey::StrLit(sym), &v, &name, span)
+        } else {
+            Sh::plain()
+        }
+    }
+
+    fn check_record_field(&mut self, field: &str, span: Span) {
+        if self.string_mask != 0 {
+            let m = (self.mask_of)(SymAtom::Str(Sym::new(field)));
+            self.breaker(m, format!("record field .{field}"), span);
         }
     }
 
@@ -182,10 +207,13 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `f[a]`: indexing a function (a tuple index, otherwise its range).
-    fn fn_app(&mut self, func: &Expr, args: &[Expr]) -> Sh {
+    fn fn_app(&mut self, func: &Expr, args: &[Expr], span: Span) -> Sh {
         let f = self.expr(func);
         for a in args {
             self.expr(a);
+        }
+        if self.string_mask != 0 {
+            self.breaker(f.scalar_mask() & self.string_mask, "string indexing", span);
         }
         if args.len() == 1 {
             f.apply(Lit::of(&args[0]).as_ref())
@@ -202,9 +230,10 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `[ a |-> e, .. ]`: a record whose fields take the fields' shapes.
-    fn record(&mut self, fs: &[(Arc<str>, Expr)]) -> Sh {
+    fn record(&mut self, fs: &[(Arc<str>, Expr)], span: Span) -> Sh {
         let mut m = BTreeMap::new();
         for (k, x) in fs {
+            self.check_record_field(k, span);
             let s = self.expr(x);
             m.insert(k.clone(), s);
         }
@@ -212,9 +241,10 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `[ a : S, .. ]`: the set of records over the fields' elements.
-    fn record_set(&mut self, fs: &[(Arc<str>, Expr)]) -> Sh {
+    fn record_set(&mut self, fs: &[(Arc<str>, Expr)], span: Span) -> Sh {
         let mut m = BTreeMap::new();
         for (k, x) in fs {
+            self.check_record_field(k, span);
             let s = self.expr(x).elems();
             m.insert(k.clone(), s);
         }
@@ -222,10 +252,10 @@ impl<'a> Analyzer<'a> {
     }
 
     /// `[ f EXCEPT !.k = v ]`: apply the updates to the base value.
-    fn except(&mut self, base: &Expr, updates: &[(Vec<ExceptKey>, Expr)]) -> Sh {
+    fn except(&mut self, base: &Expr, updates: &[(Vec<ExceptKey>, Expr)], span: Span) -> Sh {
         let mut b = self.expr(base);
         for (keys, v) in updates {
-            b = self.update(&b, keys, v);
+            b = self.update(&b, keys, v, span);
         }
         b
     }
@@ -277,7 +307,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn update(&mut self, b: &Sh, keys: &[ExceptKey], v: &Expr) -> Sh {
+    fn update(&mut self, b: &Sh, keys: &[ExceptKey], v: &Expr, span: Span) -> Sh {
         let Some((k, rest)) = keys.split_first() else {
             self.at.push(b.clone());
             let r = self.expr(v);
@@ -286,14 +316,15 @@ impl<'a> Analyzer<'a> {
         };
         match k {
             ExceptKey::Field(f) => {
+                self.check_record_field(f, span);
                 let lit = Lit::Str(f.clone());
-                let inner = self.update(&b.field(f), rest, v);
+                let inner = self.update(&b.field(f), rest, v, span);
                 b.with_entry(&Sh::plain(), Some(&lit), &inner)
             }
             ExceptKey::Index(ix) => {
                 let mut ks: Vec<Sh> = ix.iter().map(|x| self.expr(x)).collect();
                 let (ksh, lit) = if ks.len() == 1 { (ks.pop().unwrap(), Lit::of(&ix[0])) } else { (Sh::tup(ks), None) };
-                let inner = self.update(&b.apply(lit.as_ref()), rest, v);
+                let inner = self.update(&b.apply(lit.as_ref()), rest, v, span);
                 b.with_entry(&ksh, lit.as_ref(), &inner)
             }
         }
@@ -329,7 +360,11 @@ impl<'a> Analyzer<'a> {
     }
 
     pub(super) fn atom(&mut self, key: AtomKey, v: &Value, name: &str, span: Span) -> Sh {
-        let sh = match shape::of_value(v, self.mask_of) {
+        if self.string_mask != 0 {
+            let field_mask = shape::record_field_mask(v, self.mask_of);
+            self.breaker(field_mask, format!("record field name in {name}"), span);
+        }
+        let sh = match shape::of_value(v, self.mask_of, self.string_mask) {
             Some(sh) => sh,
             None => {
                 self.breaker(ALL, format!("the value of {name}"), span);
@@ -337,7 +372,8 @@ impl<'a> Analyzer<'a> {
             }
         };
         if sh.mask() != 0 && self.atom_keys.insert(key) {
-            self.atoms.push(Atom { value: v.clone(), name: name.to_string(), at: None });
+            let at = matches!(key, AtomKey::StrLit(_)).then_some(span);
+            self.atoms.push(Atom { value: v.clone(), name: name.to_string(), at });
         }
         sh
     }
@@ -345,26 +381,34 @@ impl<'a> Analyzer<'a> {
     /// A 0-ary constant-level definition: an atom, its value (`None` if
     /// it cannot be evaluated or shaped: then its body is analyzed).
     pub(super) fn const_def(&mut self, d: DefId) -> Option<Sh> {
-        if let Some(r) = self.const_defs.get(&d) {
-            // (Recorded as an atom when first evaluated.)
-            return r.clone();
+        let def = &self.ip.prog.defs[d.idx()];
+        if let Some((r, field_mask)) = self.const_defs.get(&d) {
+            // (Recorded as an atom when first evaluated; re-emit any record-field
+            // breaker because `self.breakers` is cleared at the start of each pass.)
+            let (r, field_mask) = (r.clone(), *field_mask);
+            self.breaker(field_mask, format!("record field name in {}", def.name), def.span);
+            return r;
         }
         let ip = self.ip;
-        let def = &ip.prog.defs[d.idx()];
         let e = Expr::new(ExprKind::Apply { op: OpRef::Def(d), args: Vec::new() }, def.span);
-        let r = match ip.eval(&e, &Env::default(), &Ctx::NONE) {
-            Ok(v) => match shape::of_value(&v, self.mask_of) {
-                Some(sh) => {
-                    if sh.mask() != 0 && self.atom_keys.insert(AtomKey::Def(d)) {
-                        self.atoms.push(Atom { value: v, name: def.name.to_string(), at: Some(def.span) });
+        let (r, field_mask) = match ip.eval(&e, &Env::default(), &Ctx::NONE) {
+            Ok(v) => {
+                let field_mask = if self.string_mask != 0 { shape::record_field_mask(&v, self.mask_of) } else { 0 };
+                self.breaker(field_mask, format!("record field name in {}", def.name), def.span);
+                let sh = match shape::of_value(&v, self.mask_of, self.string_mask) {
+                    Some(sh) => {
+                        if sh.mask() != 0 && self.atom_keys.insert(AtomKey::Def(d)) {
+                            self.atoms.push(Atom { value: v, name: def.name.to_string(), at: Some(def.span) });
+                        }
+                        Some(sh)
                     }
-                    Some(sh)
-                }
-                None => None,
-            },
-            Err(_) => None,
+                    None => None,
+                };
+                (sh, field_mask)
+            }
+            Err(_) => (None, 0),
         };
-        self.const_defs.insert(d, r.clone());
+        self.const_defs.insert(d, (r.clone(), field_mask));
         r
     }
 

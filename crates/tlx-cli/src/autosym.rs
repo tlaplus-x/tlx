@@ -9,7 +9,8 @@ use tlx_base::format::{self, JsonNewline};
 use tlx_eval::model::autosym::{self, Analysis};
 use tlx_eval::model::symcheck::{self, Bounds};
 use tlx_eval::model::InterpModel;
-use tlx_sema::optimize::{AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
+use tlx_sema::optimize::{SymGroup, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
+use tlx_value::SymAtom;
 
 use crate::args::Args;
 use crate::out::{self, code};
@@ -84,12 +85,7 @@ pub fn run(model: &mut InterpModel, a: &Args) -> Result<Option<Applied>, ExitCod
     let eligible_sets = if sym_eligible { eligible_proven(&an) } else { Vec::new() };
     let sym_keys: std::collections::BTreeSet<std::sync::Arc<str>> = eligible_sets
         .iter()
-        .flat_map(|s| {
-            s.candidate.elems.iter().filter_map(|e| match e {
-                tlx_value::Value::ModelValue(sym) => Some(std::sync::Arc::from(sym.as_str())),
-                _ => None,
-            })
-        })
+        .flat_map(|s| s.candidate.elems.iter().filter_map(|e| SymAtom::from_value(e).map(|a| std::sync::Arc::from(a.sym().as_str()))))
         .collect();
     let mut unprojected = (a.optimize && !eligible_sets.is_empty()).then(|| model.clone());
     let mut projection = a.optimize.then(|| model.project_state_with_sym_keys(&sym_keys)).flatten();
@@ -429,9 +425,13 @@ fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<
         note(&format!("not applied: the declared SYMMETRY product has order {declared_order}, above the certificate bound {MAX_ORDER}"));
         return Ok(None);
     }
-    let declared_atoms: std::collections::HashSet<tlx_value::SymAtom> = declared_factors.iter().flatten().copied().collect();
-    let declared_names: Vec<(Vec<String>, String)> =
-        declared_factors.iter().map(|keys| (key_names(keys), declared_factor_text(an, keys))).collect();
+    let declared_atoms: std::collections::HashSet<SymAtom> = declared_factors.iter().flatten().copied().collect();
+    let Some(declared_groups): Option<Vec<(SymGroup, String)>> =
+        declared_factors.iter().map(|keys| Some((autosym::sym_group_from_atoms(keys)?, declared_factor_text(an, keys)))).collect()
+    else {
+        note("not applied: the declared SYMMETRY has a factor with mixed atom kinds");
+        return Ok(None);
+    };
     // Proven full candidates whose elements the declared group does not move.
     let mut extra: Vec<&autosym::SetResult> = an
         .proven()
@@ -439,10 +439,7 @@ fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<
             s.full()
                 && s.candidate.elems.len() <= MAX_KEYS
                 && (2..=MAX_ORDER).contains(&s.group_order())
-                && s.candidate
-                    .elems
-                    .iter()
-                    .all(|e| matches!(e, tlx_value::Value::ModelValue(m) if !declared_atoms.contains(&tlx_value::SymAtom::Model(*m))))
+                && s.candidate.elems.iter().all(|e| SymAtom::from_value(e).is_some_and(|a| !declared_atoms.contains(&a)))
         })
         .collect();
     if extra.is_empty() {
@@ -471,16 +468,20 @@ fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<
         note("not applied: no proven symmetry group fits the combined group bounds");
         return Ok(None);
     }
-    let mut combined_names: Vec<Vec<String>> = declared_names.iter().map(|(names, _)| names.clone()).collect();
-    let mut text: Vec<String> = declared_names.into_iter().map(|(_, t)| t).collect();
+    let mut combined_groups: Vec<SymGroup> = declared_groups.iter().map(|(g, _)| g.clone()).collect();
+    let mut text: Vec<String> = declared_groups.into_iter().map(|(_, t)| t).collect();
     let mut factors = declared_factors;
     for s in &chosen {
         let keys = candidate_keys(s);
-        combined_names.push(key_names(&keys));
+        let Some(group) = autosym::sym_group_from_atoms(&keys) else {
+            note("not applied: candidate group has mixed atom kinds");
+            return Ok(None);
+        };
+        combined_groups.push(group);
         text.extend(s.group_text());
         factors.push(keys);
     }
-    let Some(certificate) = model.augmented_symmetry_certificate(&combined_names) else {
+    let Some(certificate) = model.augmented_symmetry_certificate(&combined_groups) else {
         note("not applied: no connected Lean certificate for the declared SYMMETRY superset");
         return Ok(None);
     };
@@ -521,35 +522,20 @@ fn order_of(n: usize) -> u128 {
     (1..=n as u128).fold(1u128, |a, k| a.saturating_mul(k))
 }
 
-/// The model values of a proven candidate, in cfg order.
-fn candidate_keys(s: &autosym::SetResult) -> Vec<tlx_value::SymAtom> {
-    s.candidate
-        .elems
-        .iter()
-        .filter_map(|e| match e {
-            tlx_value::Value::ModelValue(m) => Some(tlx_value::SymAtom::Model(*m)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn key_names(keys: &[tlx_value::SymAtom]) -> Vec<String> {
-    keys.iter().map(|m| m.sym().as_str().to_owned()).collect()
+/// The symmetry atoms of a proven candidate, in cfg order.
+fn candidate_keys(s: &autosym::SetResult) -> Vec<SymAtom> {
+    s.candidate.elems.iter().filter_map(SymAtom::from_value).collect()
 }
 
 /// TLA+ text of a factor of the declared group: the cfg constant that names
-/// the same model values when there is one, the explicit set otherwise.
-fn declared_factor_text(an: &Analysis, keys: &[tlx_value::SymAtom]) -> String {
+/// the same symmetry atoms when there is one, the explicit set otherwise.
+fn declared_factor_text(an: &Analysis, keys: &[SymAtom]) -> String {
     let named = an.sets.iter().find(|s| {
-        s.candidate.elems.len() == keys.len()
-            && s.candidate
-                .elems
-                .iter()
-                .all(|e| matches!(e, tlx_value::Value::ModelValue(m) if keys.contains(&tlx_value::SymAtom::Model(*m))))
+        s.candidate.elems.len() == keys.len() && s.candidate.elems.iter().all(|e| SymAtom::from_value(e).is_some_and(|a| keys.contains(&a)))
     });
     match named {
         Some(s) => format!("Permutations({})", s.candidate.name),
-        None => format!("Permutations({{{}}})", keys.iter().map(|m| m.sym().as_str()).collect::<Vec<_>>().join(", ")),
+        None => format!("Permutations({{{}}})", keys.iter().map(|m| m.to_value().to_string()).collect::<Vec<_>>().join(", ")),
     }
 }
 
@@ -558,7 +544,7 @@ struct CandGroup<'a> {
     orig_idx: usize,
     cand: &'a autosym::SetResult,
     ord: u16,
-    keys: Vec<String>,
+    group: SymGroup,
     // Every accepted full symmetric group has `2..=MAX_KEYS` keys.
     key_ids: [u32; MAX_KEYS],
     key_len: u8,
@@ -673,7 +659,7 @@ fn attainable_order(cur_ord: u16, start: usize, used: &[u32], full: &[CandGroup<
     best
 }
 
-fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
+fn search_product_subset<'a, F: FnMut(&[SymGroup]) -> Option<String>>(
     certify: &mut F,
     tried_products: &mut std::collections::HashSet<Vec<usize>>,
     full: &[CandGroup<'a>],
@@ -718,7 +704,7 @@ fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
             if !tried_products.insert(orig_key) {
                 continue;
             }
-            let groups: Vec<Vec<String>> = chosen_idxs.iter().map(|&i| full[i].keys.clone()).collect();
+            let groups: Vec<SymGroup> = chosen_idxs.iter().map(|&i| full[i].group.clone()).collect();
             cert_attempts += 1;
             if let Some(cert) = certify(&groups) {
                 let selected = chosen_idxs.into_iter().map(|i| full[i].cand).collect();
@@ -784,7 +770,7 @@ fn search_product_subset<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
     (None, budget_exhausted)
 }
 
-fn fallback_certify_groups<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
+fn fallback_certify_groups<'a, F: FnMut(&[SymGroup]) -> Option<String>>(
     certify: &mut F,
     tried_products: &mut std::collections::HashSet<Vec<usize>>,
     full: &[CandGroup<'a>],
@@ -808,7 +794,7 @@ fn fallback_certify_groups<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
             break;
         }
         probes += 1;
-        if let Some(cert) = certify(std::slice::from_ref(&item.keys)) {
+        if let Some(cert) = certify(std::slice::from_ref(&item.group)) {
             if (item.ord as u128) >= MAX_ORDER {
                 return Some((vec![item.cand], cert));
             }
@@ -844,7 +830,7 @@ fn fallback_certify_groups<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
                 if !tried_products.insert(orig_key) {
                     continue;
                 }
-                let groups: Vec<Vec<String>> = trial.iter().map(|&i| full[i].keys.clone()).collect();
+                let groups: Vec<SymGroup> = trial.iter().map(|&i| full[i].group.clone()).collect();
                 if let Some(cert) = certify(&groups) {
                     acc_idxs = trial;
                     acc_ord *= full[ci].ord;
@@ -866,13 +852,13 @@ fn certify_choose_groups<'a>(model: &InterpModel, chosen: &[&'a autosym::SetResu
     certify_groups_by(chosen, 16_384, 1_024, |groups| model.choose_symmetry_certificate(groups))
 }
 
-fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
+fn certify_groups_by<'a, F: FnMut(&[SymGroup]) -> Option<String>>(
     chosen: &[&'a autosym::SetResult],
     max_pops: usize,
     max_attempts: usize,
     mut certify: F,
 ) -> Option<(Vec<&'a autosym::SetResult>, String)> {
-    let mut raw: Vec<(usize, &'a autosym::SetResult, u16, Vec<String>)> = chosen
+    let mut raw: Vec<(usize, &'a autosym::SetResult, u16, Vec<SymAtom>, SymGroup)> = chosen
         .iter()
         .enumerate()
         .filter_map(|(orig_idx, &cand)| {
@@ -880,17 +866,10 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
                 return None;
             }
             let ord = u16::try_from(cand.group_order()).ok().filter(|&o| (2..=MAX_ORDER as u16).contains(&o))?;
-            let keys = cand
-                .candidate
-                .elems
-                .iter()
-                .map(|v| match v {
-                    tlx_value::Value::ModelValue(k) => Some(k.as_str().to_owned()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-                .filter(|ks| ks.len() <= MAX_KEYS)?;
-            Some((orig_idx, cand, ord, keys))
+            let atoms =
+                cand.candidate.elems.iter().map(SymAtom::from_value).collect::<Option<Vec<_>>>().filter(|ks| ks.len() <= MAX_KEYS)?;
+            let group = autosym::sym_group_from_atoms(&atoms)?;
+            Some((orig_idx, cand, ord, atoms, group))
         })
         .collect();
     if raw.is_empty() {
@@ -898,24 +877,22 @@ fn certify_groups_by<'a, F: FnMut(&[Vec<String>]) -> Option<String>>(
     }
     raw.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-    let mut key_map: std::collections::HashMap<&'a str, u32> = std::collections::HashMap::new();
-    for (_, cand, _, _) in &raw {
-        for v in &cand.candidate.elems {
-            if let tlx_value::Value::ModelValue(k) = v {
-                let next_id = u32::try_from(key_map.len()).expect("key count fits u32");
-                key_map.entry(k.as_str()).or_insert(next_id);
-            }
+    let mut key_map: std::collections::HashMap<SymAtom, u32> = std::collections::HashMap::new();
+    for (_, _, _, atoms, _) in &raw {
+        for &atom in atoms {
+            let next_id = u32::try_from(key_map.len()).expect("key count fits u32");
+            key_map.entry(atom).or_insert(next_id);
         }
     }
     let full: Vec<CandGroup<'a>> = raw
         .into_iter()
-        .map(|(orig_idx, cand, ord, keys)| {
+        .map(|(orig_idx, cand, ord, atoms, group)| {
             let mut key_ids = [0u32; MAX_KEYS];
-            for (slot, k) in key_ids.iter_mut().zip(&keys) {
-                *slot = key_map[k.as_str()];
+            for (slot, atom) in key_ids.iter_mut().zip(&atoms) {
+                *slot = key_map[atom];
             }
-            let key_len = keys.len() as u8;
-            CandGroup { orig_idx, cand, ord, keys, key_ids, key_len }
+            let key_len = atoms.len() as u8;
+            CandGroup { orig_idx, cand, ord, group, key_ids, key_len }
         })
         .collect();
 
@@ -1064,6 +1041,35 @@ mod tests {
         }
     }
 
+    fn mk_proven_str(name: &str, elems: &[&str]) -> autosym::SetResult {
+        let vals: Vec<tlx_value::Value> = elems.iter().map(|s| tlx_value::Value::Str(tlx_value::Sym::new(s))).collect();
+        autosym::SetResult {
+            candidate: autosym::Candidate { name: name.into(), elems: vals.clone() },
+            verdict: autosym::Verdict::Proven { classes: vec![vals], pinned_by: Vec::new() },
+            choose_verdict: None,
+        }
+    }
+
+    #[test]
+    fn certify_groups_keeps_same_name_model_and_str_factors_disjoint() {
+        let k1 = mk_proven("K1", &["a", "b"]);
+        let k2 = mk_proven_str("K2", &["a", "b"]);
+        let refs = [&k1, &k2];
+        let (sel, cert) = certify_groups_by(&refs, 16_384, 1_024, |gs| {
+            if gs.len() == 2
+                && gs[0] == SymGroup::model(vec!["a".into(), "b".into()])
+                && gs[1] == SymGroup::str(vec!["a".into(), "b".into()])
+            {
+                Some("cert-both".into())
+            } else {
+                None
+            }
+        })
+        .expect("ModelValue and Str factors sharing names must stay disjoint");
+        assert_eq!(sel.iter().map(|s| s.candidate.name.as_str()).collect::<Vec<_>>(), vec!["K1", "K2"]);
+        assert_eq!(cert, "cert-both");
+    }
+
     #[test]
     fn fallback_never_discards_higher_order_singleton_for_smaller_product() {
         // Case 1: Two order-5040 (`MAX_ORDER`) singletons `Big1`/`Big2` where the first
@@ -1079,12 +1085,12 @@ mod tests {
         let refs = [&u1, &u2, &big1, &big2, &p1, &p2];
         let mut post_big_probed = false;
         let (sel, cert) = certify_groups_by(&refs, 16_384, 1, |gs| match gs {
-            [g] if g[0] == "b1" => Some("cert-big2-5040".into()),
-            [g] if g[0] == "p1a" || g[0] == "p2a" => {
+            [g] if g.keys[0] == "b1" => Some("cert-big2-5040".into()),
+            [g] if g.keys[0] == "p1a" || g.keys[0] == "p2a" => {
                 post_big_probed = true;
                 Some("cert-p-2".into())
             }
-            [g1, g2] if g1[0] == "p1a" && g2[0] == "p2a" => {
+            [g1, g2] if g1.keys[0] == "p1a" && g2.keys[0] == "p2a" => {
                 post_big_probed = true;
                 Some("cert-p1p2-4".into())
             }
@@ -1103,9 +1109,9 @@ mod tests {
         let best = mk_proven("Best", &["m1", "m2", "m3", "m4", "m5"]);
         let refs2 = [&f1, &f2, &best, &p1, &p2];
         let (sel2, cert2) = certify_groups_by(&refs2, 16_384, 2, |gs| match gs {
-            [g] if g[0] == "m1" => Some("cert-best-120".into()),
-            [g] if g[0] == "p1a" || g[0] == "p2a" => Some("cert-p-2".into()),
-            [g1, g2] if g1[0] == "p1a" && g2[0] == "p2a" => Some("cert-p1p2-4".into()),
+            [g] if g.keys[0] == "m1" => Some("cert-best-120".into()),
+            [g] if g.keys[0] == "p1a" || g.keys[0] == "p2a" => Some("cert-p-2".into()),
+            [g1, g2] if g1.keys[0] == "p1a" && g2.keys[0] == "p2a" => Some("cert-p1p2-4".into()),
             _ => None,
         })
         .unwrap();
@@ -1123,9 +1129,9 @@ mod tests {
         let mid = mk_proven("Mid", &["s1", "s2", "s3"]);
         let refs3 = [&f1, &f2, &f3, &f4, &mid, &q1, &q2];
         let (sel3, cert3) = certify_groups_by(&refs3, 16_384, 4, |gs| match gs {
-            [g] if g[0] == "s1" => Some("cert-mid-6".into()),
-            [g] if g[0] == "q1a" || g[0] == "q2a" => Some("cert-q-6".into()),
-            [g1, g2] if g1[0] == "q1a" && g2[0] == "q2a" => Some("cert-q1q2-36".into()),
+            [g] if g.keys[0] == "s1" => Some("cert-mid-6".into()),
+            [g] if g.keys[0] == "q1a" || g.keys[0] == "q2a" => Some("cert-q-6".into()),
+            [g1, g2] if g1.keys[0] == "q1a" && g2.keys[0] == "q2a" => Some("cert-q1q2-36".into()),
             _ => None,
         })
         .unwrap();
@@ -1139,7 +1145,8 @@ mod tests {
         let bin_refs: Vec<&autosym::SetResult> = bin.iter().collect();
         let mut seen_queries = std::collections::HashSet::new();
         let (sel4, cert4) = certify_groups_by(&bin_refs, 16_384, 1_024, |gs| {
-            assert!(seen_queries.insert(gs.to_vec()), "duplicate certification query: {gs:?}");
+            let query: Vec<(tlx_sema::optimize::SymGroupKind, Vec<String>)> = gs.iter().map(|g| (g.kind, g.keys.clone())).collect();
+            assert!(seen_queries.insert(query), "duplicate certification query: {gs:?}");
             (gs.len() <= 2).then(|| format!("cert-len-{}", gs.len()))
         })
         .unwrap();

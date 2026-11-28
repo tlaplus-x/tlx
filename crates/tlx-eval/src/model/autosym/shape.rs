@@ -16,8 +16,7 @@ use std::sync::Arc;
 
 use tlx_sema::builtins::Builtin;
 use tlx_sema::hir::{DefId, Expr, ExprKind, LocalId};
-use tlx_value::LazySet;
-use tlx_value::{Sym, Value};
+use tlx_value::{LazySet, SymAtom, Value};
 
 /// Candidate sets, one bit each.
 pub(super) type Mask = u64;
@@ -245,11 +244,24 @@ impl Sh {
         }
     }
 
+    /// Whether a value of this shape may be a scalar (including via `any`
+    /// widening, preserving lattice monotonicity).
+    pub(super) fn may_be_scalar(&self) -> bool {
+        self.0.as_ref().is_some_and(|n| n.scalar.is_some() || n.any.is_some())
+    }
+
+    /// Candidate sets whose scalar elements a value of this shape may hold
+    /// (including via `any` widening).
+    pub(super) fn scalar_mask(&self) -> Mask {
+        self.0.as_ref().map_or(0, |n| n.scalar.unwrap_or(0) | n.any.unwrap_or(0))
+    }
+
     /// The scalar part (strings and sequences share `\o`, `Tail`, ...).
     pub(super) fn scalar_part(&self) -> Sh {
-        match self.0.as_ref().and_then(|n| n.scalar) {
-            Some(m) => Sh::scalar(m),
-            None => Sh::default(),
+        if self.may_be_scalar() {
+            Sh::scalar(self.scalar_mask())
+        } else {
+            Sh::default()
         }
     }
 
@@ -417,46 +429,52 @@ impl Lit {
 /// The shape of a value: `None` if it cannot be told without enumerating
 /// a set the evaluator defines (a filter of an infinite set) or a
 /// function over a lazy domain.
-pub(super) fn of_value(v: &Value, mask_of: &dyn Fn(Sym) -> Mask) -> Option<Sh> {
+pub(super) fn of_value(v: &Value, mask_of: &dyn Fn(SymAtom) -> Mask, string_mask: Mask) -> Option<Sh> {
     let join_all = |es: &mut dyn Iterator<Item = &Value>| -> Option<Sh> {
         let mut s = Sh::default();
         for e in es {
-            s = s.join(&of_value(e, mask_of)?);
+            s = s.join(&of_value(e, mask_of, string_mask)?);
         }
         Some(s)
     };
     Some(match v {
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) => Sh::plain(),
-        Value::ModelValue(m) => Sh::scalar(mask_of(*m)),
+        Value::Bool(_) | Value::Int(_) => Sh::plain(),
+        Value::Str(s) => Sh::scalar(mask_of(SymAtom::Str(*s))),
+        Value::ModelValue(m) => Sh::scalar(mask_of(SymAtom::Model(*m))),
         Value::Interval(..) => Sh::set(Sh::plain()),
         Value::Set(es) => Sh::set(join_all(&mut es.iter())?),
-        Value::Tuple(es) if es.len() <= MAX_TUPLE => Sh::tup(es.iter().map(|e| of_value(e, mask_of)).collect::<Option<_>>()?),
+        Value::Tuple(es) if es.len() <= MAX_TUPLE => Sh::tup(es.iter().map(|e| of_value(e, mask_of, string_mask)).collect::<Option<_>>()?),
         Value::Tuple(es) => Sh::seq(join_all(&mut es.iter())?),
         Value::Record(fs) => {
             let mut m = BTreeMap::new();
             for (k, x) in fs.iter() {
-                m.insert(Arc::from(k.as_str()), of_value(x, mask_of)?);
+                m.insert(Arc::from(k.as_str()), of_value(x, mask_of, string_mask)?);
             }
             Sh::rec(m)
         }
         Value::Fcn(ps, _) => Sh::fcn(join_all(&mut ps.iter().map(|(k, _)| k))?, join_all(&mut ps.iter().map(|(_, x)| x))?),
         Value::LazySet(l) => match &**l {
             LazySet::Enum(es) => Sh::set(join_all(&mut es.iter())?),
-            LazySet::Subset(x) | LazySet::KSubset(_, x) => Sh::set(Sh::set(of_value(x, mask_of)?.elems())),
-            LazySet::FcnSet(a, b) => Sh::set(Sh::fcn(of_value(a, mask_of)?.elems(), of_value(b, mask_of)?.elems())),
-            LazySet::Product(vs) => Sh::set(Sh::tup(vs.iter().map(|x| Some(of_value(x, mask_of)?.elems())).collect::<Option<_>>()?)),
+            LazySet::Subset(x) | LazySet::KSubset(_, x) => Sh::set(Sh::set(of_value(x, mask_of, string_mask)?.elems())),
+            LazySet::FcnSet(a, b) => {
+                Sh::set(Sh::fcn(of_value(a, mask_of, string_mask)?.elems(), of_value(b, mask_of, string_mask)?.elems()))
+            }
+            LazySet::Product(vs) => {
+                Sh::set(Sh::tup(vs.iter().map(|x| Some(of_value(x, mask_of, string_mask)?.elems())).collect::<Option<_>>()?))
+            }
             LazySet::RecordSet(fs) => {
                 let mut m = BTreeMap::new();
                 for (k, x) in fs {
-                    m.insert(Arc::from(k.as_str()), of_value(x, mask_of)?.elems());
+                    m.insert(Arc::from(k.as_str()), of_value(x, mask_of, string_mask)?.elems());
                 }
                 Sh::set(Sh::rec(m))
             }
-            LazySet::Seq(x) => Sh::set(Sh::seq(of_value(x, mask_of)?.elems())),
-            LazySet::Union(x) => Sh::set(of_value(x, mask_of)?.elems().elems()),
-            LazySet::Cup(a, b) => Sh::set(of_value(a, mask_of)?.elems().join(&of_value(b, mask_of)?.elems())),
-            LazySet::Cap(a, _) | LazySet::Diff(a, _) => Sh::set(of_value(a, mask_of)?.elems()),
-            LazySet::Nat | LazySet::Int | LazySet::StringSet => Sh::set(Sh::plain()),
+            LazySet::Seq(x) => Sh::set(Sh::seq(of_value(x, mask_of, string_mask)?.elems())),
+            LazySet::Union(x) => Sh::set(of_value(x, mask_of, string_mask)?.elems().elems()),
+            LazySet::Cup(a, b) => Sh::set(of_value(a, mask_of, string_mask)?.elems().join(&of_value(b, mask_of, string_mask)?.elems())),
+            LazySet::Cap(a, _) | LazySet::Diff(a, _) => Sh::set(of_value(a, mask_of, string_mask)?.elems()),
+            LazySet::Nat | LazySet::Int => Sh::set(Sh::plain()),
+            LazySet::StringSet => Sh::set(Sh::scalar(string_mask)),
             LazySet::Any => Sh::set(Sh::any(0)),
             LazySet::Custom(_) => return None,
         },
@@ -464,34 +482,85 @@ pub(super) fn of_value(v: &Value, mask_of: &dyn Fn(Sym) -> Mask) -> Option<Sh> {
     })
 }
 
-/// Whether the transposition of the model values `a` and `b` maps `v` to
+/// Mask of any `Str` candidate sets whose element name collides with a record
+/// or record-set field name inside `v`.
+pub(super) fn record_field_mask(v: &Value, mask_of: &dyn Fn(SymAtom) -> Mask) -> Mask {
+    match v {
+        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::ModelValue(_) | Value::Interval(..) => 0,
+        Value::Set(es) | Value::Tuple(es) => es.iter().fold(0, |acc, e| acc | record_field_mask(e, mask_of)),
+        Value::Record(fs) => fs.iter().fold(0, |acc, (k, x)| acc | mask_of(SymAtom::Str(*k)) | record_field_mask(x, mask_of)),
+        Value::Fcn(ps, _) => ps.iter().fold(0, |acc, (k, x)| acc | record_field_mask(k, mask_of) | record_field_mask(x, mask_of)),
+        Value::LazySet(l) => match &**l {
+            LazySet::Enum(es) | LazySet::Product(es) => es.iter().fold(0, |acc, e| acc | record_field_mask(e, mask_of)),
+            LazySet::Subset(x) | LazySet::KSubset(_, x) | LazySet::Seq(x) | LazySet::Union(x) => record_field_mask(x, mask_of),
+            LazySet::FcnSet(a, b) | LazySet::Cup(a, b) | LazySet::Cap(a, b) | LazySet::Diff(a, b) => {
+                record_field_mask(a, mask_of) | record_field_mask(b, mask_of)
+            }
+            LazySet::RecordSet(fs) => fs.iter().fold(0, |acc, (k, x)| acc | mask_of(SymAtom::Str(*k)) | record_field_mask(x, mask_of)),
+            LazySet::Nat | LazySet::Int | LazySet::StringSet | LazySet::Any | LazySet::Custom(_) => 0,
+        },
+        Value::LazyFcn(_) => 0,
+    }
+}
+
+/// Whether the transposition of the atoms `a` and `b` maps `v` to
 /// itself; `None` if that cannot be told without enumerating a set the
 /// evaluator defines.
-pub(super) fn fixed_by(v: &Value, a: Sym, b: Sym) -> Option<bool> {
-    let image = |atom| {
-        let tlx_value::SymAtom::Model(m) = atom else { return None };
-        if m == a {
-            Some(Value::ModelValue(b))
-        } else if m == b {
-            Some(Value::ModelValue(a))
+pub(super) fn fixed_by(v: &Value, a: SymAtom, b: SymAtom) -> Option<bool> {
+    let image = |atom: SymAtom| {
+        if atom == a {
+            Some(b.to_value())
+        } else if atom == b {
+            Some(a.to_value())
         } else {
             None
         }
     };
     match v {
         Value::LazySet(l) => match &**l {
-            LazySet::Enum(_) => v.normalize().ok().and_then(|v| fixed_by(&v, a, b)),
+            LazySet::Enum(es) => {
+                if es.iter().any(|e| mentions_record_field(e, a) || mentions_record_field(e, b)) {
+                    return Some(false);
+                }
+                for e in es {
+                    if !mentions(e, a) && !mentions(e, b) {
+                        continue;
+                    }
+                    let img = match tlx_value::ops::permute_shared(e, &image) {
+                        Ok(None) => continue,
+                        Ok(Some(w)) => w,
+                        Err(_) => return None,
+                    };
+                    let mut found = false;
+                    for other in es {
+                        if tlx_value::order::eq_tlc(&img, other).ok()? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
             LazySet::Subset(x) | LazySet::KSubset(_, x) | LazySet::Seq(x) | LazySet::Union(x) => fixed_by(x, a, b),
             LazySet::FcnSet(x, y) | LazySet::Cup(x, y) | LazySet::Cap(x, y) | LazySet::Diff(x, y) => {
                 Some(fixed_by(x, a, b)? && fixed_by(y, a, b)?)
             }
             LazySet::Product(vs) => vs.iter().try_fold(true, |acc, x| Some(acc && fixed_by(x, a, b)?)),
-            LazySet::RecordSet(fs) => fs.iter().try_fold(true, |acc, (_, x)| Some(acc && fixed_by(x, a, b)?)),
+            LazySet::RecordSet(fs) => {
+                if fs.iter().any(|(k, _)| SymAtom::Str(*k) == a || SymAtom::Str(*k) == b) {
+                    return Some(false);
+                }
+                fs.iter().try_fold(true, |acc, (_, x)| Some(acc && fixed_by(x, a, b)?))
+            }
             LazySet::Nat | LazySet::Int | LazySet::StringSet | LazySet::Any => Some(true),
             LazySet::Custom(_) => None,
         },
         Value::LazyFcn(_) => None,
         _ if !mentions(v, a) && !mentions(v, b) => Some(true),
+        _ if mentions_record_field(v, a) || mentions_record_field(v, b) => Some(false),
         _ => match tlx_value::ops::permute_shared(v, &image) {
             Ok(None) => Some(true),
             Ok(Some(w)) => Some(w == *v),
@@ -500,16 +569,38 @@ pub(super) fn fixed_by(v: &Value, a: Sym, b: Sym) -> Option<bool> {
     }
 }
 
-/// Whether model value `m` occurs in `v` (enumerated values only; a lazy
-/// value counts as mentioning it).
-fn mentions(v: &Value, m: Sym) -> bool {
+/// Whether atom `atom` occurs in `v` (including as a colliding record field name
+/// when `atom` is `SymAtom::Str`; a lazy value counts as mentioning it).
+fn mentions(v: &Value, atom: SymAtom) -> bool {
     match v {
-        Value::ModelValue(x) => *x == m,
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => false,
-        Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| mentions(e, m)),
-        Value::Record(fs) => fs.iter().any(|(_, x)| mentions(x, m)),
-        Value::Fcn(ps, _) => ps.iter().any(|(k, x)| mentions(k, m) || mentions(x, m)),
+        Value::ModelValue(x) => atom == SymAtom::Model(*x),
+        Value::Str(s) => atom == SymAtom::Str(*s),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => false,
+        Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| mentions(e, atom)),
+        Value::Record(fs) => fs.iter().any(|(k, x)| SymAtom::Str(*k) == atom || mentions(x, atom)),
+        Value::Fcn(ps, _) => ps.iter().any(|(k, x)| mentions(k, atom) || mentions(x, atom)),
         Value::LazySet(_) | Value::LazyFcn(_) => true,
+    }
+}
+
+/// Whether `atom` is a `Str` matching a record or record-set field name inside `v`.
+fn mentions_record_field(v: &Value, atom: SymAtom) -> bool {
+    let SymAtom::Str(s) = atom else { return false };
+    match v {
+        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::ModelValue(_) | Value::Interval(..) => false,
+        Value::Set(es) | Value::Tuple(es) => es.iter().any(|e| mentions_record_field(e, atom)),
+        Value::Record(fs) => fs.iter().any(|(k, x)| *k == s || mentions_record_field(x, atom)),
+        Value::Fcn(ps, _) => ps.iter().any(|(k, x)| mentions_record_field(k, atom) || mentions_record_field(x, atom)),
+        Value::LazySet(l) => match &**l {
+            LazySet::Enum(es) | LazySet::Product(es) => es.iter().any(|e| mentions_record_field(e, atom)),
+            LazySet::Subset(x) | LazySet::KSubset(_, x) | LazySet::Seq(x) | LazySet::Union(x) => mentions_record_field(x, atom),
+            LazySet::FcnSet(x, y) | LazySet::Cup(x, y) | LazySet::Cap(x, y) | LazySet::Diff(x, y) => {
+                mentions_record_field(x, atom) || mentions_record_field(y, atom)
+            }
+            LazySet::RecordSet(fs) => fs.iter().any(|(k, x)| *k == s || mentions_record_field(x, atom)),
+            LazySet::Nat | LazySet::Int | LazySet::StringSet | LazySet::Any | LazySet::Custom(_) => false,
+        },
+        Value::LazyFcn(_) => false,
     }
 }
 
@@ -571,12 +662,45 @@ mod tests {
 
     #[test]
     fn transpositions_fix_symmetric_values() {
+        use tlx_value::Sym;
         let (a, b, c) = (Sym::new("autosym_a"), Sym::new("autosym_b"), Sym::new("autosym_c"));
+        let (ma, mb) = (SymAtom::Model(a), SymAtom::Model(b));
+        let (sa, sb) = (SymAtom::Str(a), SymAtom::Str(b));
         let set = Value::set_from(vec![Value::ModelValue(a), Value::ModelValue(b)]).unwrap();
-        assert_eq!(fixed_by(&set, a, b), Some(true));
-        assert_eq!(fixed_by(&Value::ModelValue(a), a, b), Some(false));
-        assert_eq!(fixed_by(&Value::ModelValue(c), a, b), Some(true));
+        assert_eq!(fixed_by(&set, ma, mb), Some(true));
+        assert_eq!(fixed_by(&Value::ModelValue(a), ma, mb), Some(false));
+        assert_eq!(fixed_by(&Value::ModelValue(c), ma, mb), Some(true));
         let pairs = Value::set_from(vec![set.clone(), Value::set_from(vec![Value::ModelValue(a), Value::ModelValue(c)]).unwrap()]).unwrap();
-        assert_eq!(fixed_by(&pairs, a, b), Some(false));
+        assert_eq!(fixed_by(&pairs, ma, mb), Some(false));
+
+        // Same-named ModelValue and Str stay strictly isolated in `fixed_by`.
+        let str_set = Value::set_from(vec![Value::Str(a), Value::Str(b)]).unwrap();
+        assert_eq!(fixed_by(&str_set, sa, sb), Some(true));
+        assert_eq!(fixed_by(&Value::Str(a), sa, sb), Some(false));
+        assert_eq!(fixed_by(&Value::Str(a), ma, mb), Some(true));
+        assert_eq!(fixed_by(&Value::ModelValue(a), sa, sb), Some(true));
+        // Mixed set `{"autosym_a", "autosym_b", autosym_a}` fixes Str swap and pins ModelValue(a).
+        let mixed = Value::set_enum(vec![Value::Str(a), Value::Str(b), Value::ModelValue(a)]).unwrap();
+        assert_eq!(fixed_by(&mixed, sa, sb), Some(true));
+        assert_eq!(fixed_by(&mixed, ma, mb), Some(false));
+        // Record with colliding field name is never fixed by a Str transposition.
+        let rec = Value::record(vec![(a, Value::Int(0)), (b, Value::Int(1))]);
+        assert_eq!(fixed_by(&rec, sa, sb), Some(false));
+        assert_eq!(fixed_by(&rec, ma, mb), Some(true));
+    }
+
+    #[test]
+    fn may_be_scalar_and_scalar_mask_are_monotone_under_any_widening() {
+        assert!(!Sh::default().may_be_scalar());
+        assert!(!Sh::seq(Sh::scalar(2)).may_be_scalar());
+        assert_eq!(Sh::seq(Sh::scalar(2)).scalar_mask(), 0);
+        assert!(Sh::plain().may_be_scalar());
+        assert!(Sh::scalar(2).may_be_scalar());
+        assert_eq!(Sh::scalar(2).scalar_mask(), 2);
+        let widened = Sh::any(2);
+        assert!(widened.may_be_scalar());
+        assert_eq!(widened.scalar_mask(), 2);
+        assert!(Sh::plain().le(&Sh::any(0)));
+        assert!(Sh::any(0).may_be_scalar());
     }
 }

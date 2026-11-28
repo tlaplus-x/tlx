@@ -1185,3 +1185,318 @@ fn symcheck_error_refuses_automatic_symmetry_and_runs_unreduced() {
     assert!(r.text().contains("not applied: cross-check failed"), "big_branch stats:\n{}", r.text());
     assert!(r.stdout.contains("Error: Invariant Inv is violated."), "big_branch: {}", r.text());
 }
+
+fn distinct_count(stdout: &str) -> u64 {
+    stdout
+        .lines()
+        .find_map(|l| l.split_once(" distinct states found"))
+        .and_then(|(prefix, _)| prefix.split_whitespace().last())
+        .expect("a distinct-state statistics line")
+        .replace(',', "")
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn opaque_string_scalarsets_certify_and_reduce_in_both_tiers() {
+    let tla = "---- MODULE StrSym ----\n\
+        EXTENDS Naturals, Sequences, FiniteSets\n\
+        CONSTANT Key\n\
+        VARIABLES slot, log\n\
+        Init == slot = [k \\in Key |-> 0] /\\ log = <<>>\n\
+        Next == \\E k \\in Key :\n\
+        \x20   /\\ slot[k] < 1\n\
+        \x20   /\\ Len(log) < 2\n\
+        \x20   /\\ slot' = [slot EXCEPT ![k] = 1]\n\
+        \x20   /\\ log' = Append(log, k)\n\
+        Inv == (\\A k \\in Key : slot[k] <= 1) /\\ (Len(log) > 0 => Head(log) \\in Key)\n\
+        BadInv == Cardinality({k \\in Key : slot[k] = 1}) < 2\n\
+        ====\n";
+
+    // Test both |S| = 2 and |S| = 3 with -interp and -compile under paranoid checks.
+    for (keys_cfg, expected_unreduced) in [("{\"k1\", \"k2\"}", 5u64), ("{\"k1\", \"k2\", \"k3\"}", 10u64)] {
+        let cfg = format!("CONSTANT Key = {keys_cfg}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n");
+        let dir = tlx_testkit::TempDir::with_spec("StrSym", tla, &cfg);
+
+        // `-tlc`: exact unreduced count, prints `run without -tlc` without invalid `.cfg` SYMMETRY advice.
+        let tlc = tlx_testkit::tlx_default!().args(["check", "StrSym.tla", "-tlc", "-interp"]).dir(&dir).run();
+        assert_eq!(tlc.code, 0, "StrSym {keys_cfg} -tlc: {}", tlc.text());
+        assert_eq!(distinct_count(&tlc.stdout), expected_unreduced, "{}", tlc.text());
+        assert!(
+            tlc.stdout
+                .contains("Symmetry: Permutations(Key) is provable for safety checking and not declared; to use it, run without -tlc."),
+            "expected run-without-tlc suggestion:\n{}",
+            tlc.text()
+        );
+        assert!(!tlc.stdout.contains("SYMMETRY Perms"), "Str set must not suggest invalid .cfg SYMMETRY:\n{}", tlc.text());
+
+        for tier in ["-interp", "-compile"] {
+            let r = tlx_testkit::tlx_default!()
+                .args(["check", "StrSym.tla", tier])
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
+                .env("TLX_PARANOID", "1")
+                .env("TLX_SYMMETRY_PARANOID", "1")
+                .dir(&dir)
+                .run();
+            assert_eq!(r.code, 0, "StrSym {keys_cfg} {tier}: {}", r.text());
+            assert!(
+                r.stdout.contains("Optimizations: symmetry Permutations(Key) (certificate generated; safety checks only)."),
+                "StrSym {keys_cfg} {tier}: {}",
+                r.text()
+            );
+            assert!(r.stdout.contains("(symmetry-reduced)"), "StrSym {keys_cfg} {tier}: {}", r.text());
+            assert!(distinct_count(&r.stdout) < expected_unreduced, "expected reduction for {keys_cfg} {tier}: {}", r.text());
+        }
+
+        // Verify generated certificate is EquivSymCertificate with no sorry.
+        let proof = std::fs::read_dir(dir.join("proofs"))
+            .unwrap()
+            .map(|e| e.unwrap().path().join("Optimization.lean"))
+            .find(|p| p.exists())
+            .expect("generated EquivSym certificate");
+        let lean = std::fs::read_to_string(proof).unwrap();
+        assert!(lean.contains("namespace TlxOptimization.GeneratedEquivSymmetry"), "{lean}");
+        assert!(lean.contains("theorem counterexample_lifts"), "{lean}");
+        assert!(!lean.contains("sorry"), "{lean}");
+
+        // Exact safety violation verdict and counterexample length preserved.
+        let bad_cfg = format!("CONSTANT Key = {keys_cfg}\nINIT Init\nNEXT Next\nINVARIANT BadInv\nCHECK_DEADLOCK FALSE\n");
+        let bad_dir = tlx_testkit::TempDir::with_spec("StrSym", tla, &bad_cfg);
+        let bad_tlc = tlx_testkit::tlx_default!().args(["check", "StrSym.tla", "-tlc", "-interp"]).dir(&bad_dir).run();
+        assert_eq!(bad_tlc.code, 12, "{}", bad_tlc.text());
+        let states = |s: &str| s.lines().filter(|l| l.starts_with("State ")).count();
+        for tier in ["-interp", "-compile"] {
+            let r = tlx_testkit::tlx_default!()
+                .args(["check", "StrSym.tla", tier])
+                .env("TLX_PROOF_DIR", bad_dir.join("proofs"))
+                .env("TLX_PARANOID", "1")
+                .env("TLX_SYMMETRY_PARANOID", "1")
+                .dir(&bad_dir)
+                .run();
+            assert_eq!(r.code, 12, "BadInv {keys_cfg} {tier}: {}", r.text());
+            assert!(r.stdout.contains("Error: Invariant BadInv is violated."), "{}", r.text());
+            assert_eq!(states(&r.stdout), states(&bad_tlc.stdout), "trace length mismatch for {keys_cfg} {tier}");
+        }
+    }
+}
+
+#[test]
+fn opaque_string_scalarsets_fail_closed_on_breakers() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "StrLit",
+            "---- MODULE StrLit ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT Key\n\
+             VARIABLE x\n\
+             Init == x \\in Key\n\
+             Next == x' = IF x = \"k1\" THEN x ELSE x\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrLen",
+            "---- MODULE StrLen ----\n\
+             EXTENDS Naturals, Sequences\n\
+             CONSTANT Key\n\
+             VARIABLE x\n\
+             Init == x \\in Key\n\
+             Next == Len(x) = 2 /\\ x' \\in Key\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrConcatKey",
+            "---- MODULE StrConcatKey ----\n\
+             EXTENDS Naturals, Sequences\n\
+             CONSTANT Key\n\
+             VARIABLES x, y\n\
+             Init == x \\in Key /\\ y = \"\"\n\
+             Next == x' \\in Key /\\ y' = x \\o \"x\"\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrConcatLit",
+            "---- MODULE StrConcatLit ----\n\
+             EXTENDS Naturals, Sequences\n\
+             CONSTANT Key\n\
+             VARIABLES x, y\n\
+             Init == x \\in Key /\\ y = \"\"\n\
+             Next == x' \\in Key /\\ y' = \"k\" \\o \"1\"\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrToString",
+            "---- MODULE StrToString ----\n\
+             EXTENDS Naturals, TLC\n\
+             CONSTANT Key\n\
+             VARIABLES x, y\n\
+             Init == x \\in Key /\\ y = \"\"\n\
+             Next == x' \\in Key /\\ y' = ToString(1)\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrRecField",
+            "---- MODULE StrRecField ----\n\
+             EXTENDS Naturals\n\
+             CONSTANT Key\n\
+             VARIABLES x, r\n\
+             Init == x \\in Key /\\ r = [k1 |-> 0]\n\
+             Next == x' \\in Key /\\ r' = r\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrAnyWiden",
+            "---- MODULE StrAnyWiden ----\n\
+             EXTENDS Naturals, Sequences\n\
+             CONSTANT Key\n\
+             VARIABLES x, y\n\
+             RECURSIVE Deep(_, _)\n\
+             Deep(n, v) == IF n = 0 THEN v ELSE Deep(n - 1, <<v>>)[1]\n\
+             Init == x \\in Key /\\ y = <<>>\n\
+             Next == x' \\in Key /\\ y' = Deep(10, y) \\o <<>>\n\
+             Inv == x \\in Key\n\
+             ====\n",
+        ),
+        (
+            "StrUnbounded",
+            "---- MODULE StrUnbounded ----\n\
+             EXTENDS Naturals, Sequences\n\
+             CONSTANT Key\n\
+             VARIABLES x, s\n\
+             Init == x \\in Key /\\ s = \"a\"\n\
+             Next == x' \\in Key /\\ s' = IF Len(s) < 2 THEN s \\o \"b\" ELSE s\n\
+             Inv == x \\in Key /\\ s \\in STRING\n\
+             ====\n",
+        ),
+    ];
+    let cfg = "CONSTANT Key = {\"k1\", \"k2\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    for (name, src) in cases {
+        let dir = tlx_testkit::TempDir::with_spec(name, src, cfg);
+        let tlc = tlx_testkit::tlx_default!().args(["check", &format!("{name}.tla"), "-tlc", "-interp"]).dir(&dir).run();
+        assert_eq!(tlc.code, 0, "{name} -tlc: {}", tlc.text());
+        let expected = distinct_count(&tlc.stdout);
+        for tier in ["-interp", "-compile"] {
+            let r = tlx_testkit::tlx_default!()
+                .args(["check", &format!("{name}.tla"), tier])
+                .env("TLX_PROOF_DIR", dir.join("proofs"))
+                .env("TLX_PARANOID", "1")
+                .env("TLX_SYMMETRY_PARANOID", "1")
+                .dir(&dir)
+                .run();
+            assert_eq!(r.code, 0, "{name} {tier}: {}", r.text());
+            assert!(r.stdout.contains("Optimizations: none applicable."), "{name} {tier} must fail closed:\n{}", r.text());
+            assert!(!r.stdout.contains("(symmetry-reduced)"), "{name} {tier}: {}", r.text());
+            assert_eq!(distinct_count(&r.stdout), expected, "{name} {tier}: {}", r.text());
+        }
+    }
+}
+
+#[test]
+fn same_name_model_value_and_str_isolation_end_to_end() {
+    // 1. Coexisting K1 = {a, b} (ModelValue) and K2 = {"a", "b"} (Str) certify and reduce together!
+    let coexist_tla = "---- MODULE Coexist ----\n\
+        EXTENDS Naturals, TLC\n\
+        CONSTANTS K1, K2\n\
+        VARIABLES m, s\n\
+        Init == m = [x \\in K1 |-> 0] /\\ s = [y \\in K2 |-> 0]\n\
+        Next == \\/ \\E x \\in K1 : m[x] < 1 /\\ m' = [m EXCEPT ![x] = 1] /\\ UNCHANGED s\n\
+        \x20       \\/ \\E y \\in K2 : s[y] < 1 /\\ s' = [s EXCEPT ![y] = 1] /\\ UNCHANGED m\n\
+        Inv == (\\A x \\in K1 : m[x] <= 1) /\\ (\\A y \\in K2 : s[y] <= 1)\n\
+        ====\n";
+    let coexist_cfg = "CONSTANTS\n  K1 = {a, b}\n  K2 = {\"a\", \"b\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir = tlx_testkit::TempDir::with_spec("Coexist", coexist_tla, coexist_cfg);
+    // 2^2 * 2^2 = 16 concrete states; quotiented by S_2 x S_2 -> 3 * 3 = 9 distinct states.
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "Coexist.tla", tier])
+            .env("TLX_PROOF_DIR", dir.join("proofs"))
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .dir(&dir)
+            .run();
+        assert_eq!(r.code, 0, "Coexist {tier}: {}", r.text());
+        assert!(
+            r.stdout.contains("Optimizations: symmetry Permutations(K1) x Permutations(K2) (certificate generated"),
+            "Coexist {tier}: {}",
+            r.text()
+        );
+        assert_eq!(distinct_count(&r.stdout), 9, "Coexist {tier}: {}", r.text());
+    }
+
+    // 2. ModelValue K = {a, b} with string literal "a" stays fully reduced (3 vs 4 distinct states).
+    let mv_lit_tla = "---- MODULE MvLit ----\n\
+        EXTENDS Naturals\n\
+        CONSTANT K\n\
+        VARIABLES m, tag\n\
+        Init == m = [x \\in K |-> 0] /\\ tag = \"a\"\n\
+        Next == \\E x \\in K : m[x] < 1 /\\ m' = [m EXCEPT ![x] = 1] /\\ tag' = \"a\"\n\
+        Inv == (\\A x \\in K : m[x] <= 1) /\\ tag = \"a\"\n\
+        ====\n";
+    let mv_lit_cfg = "CONSTANT K = {a, b}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir2 = tlx_testkit::TempDir::with_spec("MvLit", mv_lit_tla, mv_lit_cfg);
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "MvLit.tla", tier])
+            .env("TLX_PROOF_DIR", dir2.join("proofs"))
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .dir(&dir2)
+            .run();
+        assert_eq!(r.code, 0, "MvLit {tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: symmetry Permutations(K) (certificate generated"), "MvLit {tier}: {}", r.text());
+        assert_eq!(distinct_count(&r.stdout), 3, "MvLit {tier}: {}", r.text());
+    }
+
+    // 3. Mixed constant C = {"a", "b", a} pins ModelValue K = {a, b} while keeping Str K2 = {"a", "b"} reduced.
+    let mixed_tla = "---- MODULE MixedConst ----\n\
+        EXTENDS Naturals\n\
+        CONSTANTS K, K2, C\n\
+        VARIABLES m, s\n\
+        Init == m = [x \\in K |-> 0] /\\ s = [y \\in K2 |-> 0] /\\ (\\A x \\in K : x \\in C \\/ x \\notin C) /\\ (\\A y \\in K2 : y \\in C)\n\
+        Next == \\/ \\E x \\in K : m[x] < 1 /\\ m' = [m EXCEPT ![x] = 1] /\\ UNCHANGED s\n\
+        \x20       \\/ \\E y \\in K2 : s[y] < 1 /\\ s' = [s EXCEPT ![y] = 1] /\\ UNCHANGED m\n\
+        Inv == (\\A x \\in K : m[x] <= 1) /\\ (\\A y \\in K2 : s[y] <= 1)\n\
+        ====\n";
+    let mixed_cfg =
+        "CONSTANTS\n  K = {a, b}\n  K2 = {\"a\", \"b\"}\n  C = {\"a\", \"b\", a}\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n";
+    let dir_mixed = tlx_testkit::TempDir::with_spec("MixedConst", mixed_tla, mixed_cfg);
+    // K is pinned (4 states), K2 is reduced (3 states): 4 * 3 = 12 distinct states (vs 16 unreduced).
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "MixedConst.tla", tier])
+            .env("TLX_PROOF_DIR", dir_mixed.join("proofs"))
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .dir(&dir_mixed)
+            .run();
+        assert_eq!(r.code, 0, "MixedConst {tier}: {}", r.text());
+        assert!(r.stdout.contains("Optimizations: symmetry Permutations(K2) (certificate generated"), "MixedConst {tier}: {}", r.text());
+        assert_eq!(distinct_count(&r.stdout), 12, "MixedConst {tier}: {}", r.text());
+    }
+
+    // 4. Declared SYMMETRY over ModelValue K1 = {a, b} augmented with Str K2 = {"a", "b"}.
+    let aug_tla = format!("{}\nSym == Permutations(K1)\n====\n", coexist_tla.trim_end_matches("====\n"));
+    let aug_cfg = format!("{coexist_cfg}SYMMETRY Sym\n");
+    let dir3 = tlx_testkit::TempDir::with_spec("Coexist", &aug_tla, &aug_cfg);
+    for tier in ["-interp", "-compile"] {
+        let r = tlx_testkit::tlx_default!()
+            .args(["check", "Coexist.tla", tier])
+            .env("TLX_PROOF_DIR", dir3.join("proofs"))
+            .env("TLX_PARANOID", "1")
+            .env("TLX_SYMMETRY_PARANOID", "1")
+            .dir(&dir3)
+            .run();
+        assert_eq!(r.code, 0, "Coexist augment {tier}: {}", r.text());
+        assert!(
+            r.stdout.contains("Optimizations: symmetry Permutations(K1) x Permutations(K2) (certificate generated"),
+            "Coexist augment {tier}: {}",
+            r.text()
+        );
+        assert_eq!(distinct_count(&r.stdout), 9, "Coexist augment {tier}: {}", r.text());
+    }
+}
