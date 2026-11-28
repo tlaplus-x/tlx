@@ -61,9 +61,20 @@ impl Periodic {
         let guard = crate::mem::RssGuard::periodic(budget, base, graph.bytes());
         let input = shared.live_atoms.unwrap().live_input().unwrap();
         crate::stats::add_count("liveness: periodic checks", 1);
-        if let Ok(Some(witness)) = recorded::scan(&input, graph, shared.slots.len(), guard) {
-            *self.witness.lock() = Some(witness);
-            shared.control().stop();
+        match recorded::scan(&input, graph, shared.slots.len(), guard, &shared.opts.spill) {
+            Ok(Some(witness)) => {
+                *self.witness.lock() = Some(witness);
+                shared.control().stop();
+            }
+            Ok(None) => {}
+            // (The disk layer failed: the search cannot go on. A product
+            // that did not fit is only this check's memory: the final one
+            // decides.)
+            Err(_) => {
+                if let Some(e) = shared.opts.spill.error() {
+                    shared.fail(Outcome::Io(e.0), NO_PARENT);
+                }
+            }
         }
     }
 }

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tlx_live::{Fairness, Ltl};
+use tlx_runtime::io::{Spill, SpillConfig, SpillMode};
 use tlx_runtime::liveness::{self, LiveInput, LiveResult};
 use tlx_runtime::mem::RssGuard;
 use tlx_runtime::{admits, explore, AtomBits, Caps, ErrorKind, GcResult, Model, ModelError, Options, Outcome, StoreGc};
@@ -147,7 +148,7 @@ fn check(props: &[(String, Ltl)], fairness: Vec<Fairness>, concrete: bool) -> Li
     let r = explore(&m, &Options { workers: 1, check_deadlock: false, ..Default::default() });
     assert_eq!(r.outcome, Outcome::Ok);
     let recorded = (!concrete).then(|| r.live_graph.expect("a recorded graph"));
-    liveness::check(&m, &input, &m, 2, usize::MAX, recorded, RssGuard::new(usize::MAX, 0))
+    liveness::check(&m, &input, &m, 2, usize::MAX, recorded, RssGuard::new(usize::MAX, 0), None)
 }
 
 #[test]
@@ -364,7 +365,7 @@ fn long_lasso_keeps_pattern_ids_without_cloning_multiword_patterns() {
     assert_eq!(g_ref.action_pats.len(), 2);
 
     let (res, alloc_bytes) =
-        measure_thread_alloc_bytes(|| liveness::check(&m, &input, &m, 1, usize::MAX, Some(recorded), RssGuard::new(usize::MAX, 0)));
+        measure_thread_alloc_bytes(|| liveness::check(&m, &input, &m, 1, usize::MAX, Some(recorded), RssGuard::new(usize::MAX, 0), None));
     let LiveResult::Violated(v) = res else { panic!("expected fair-cycle violation") };
     assert_eq!(v.names, ["NeverLast"]);
     assert_eq!(v.lasso.states.len(), m.n as usize);
@@ -407,10 +408,118 @@ fn csr_topology_is_released_before_replay() {
     WATCH_FPS.store(g.fps.as_ptr() as usize, Ordering::Relaxed);
 
     m.replaying.store(true, Ordering::Relaxed);
-    let res = liveness::check(&m, &input, &m, 1, usize::MAX, Some(Ok(g)), RssGuard::new(usize::MAX, 0));
+    let res = liveness::check(&m, &input, &m, 1, usize::MAX, Some(Ok(g)), RssGuard::new(usize::MAX, 0), None);
     assert!(matches!(res, LiveResult::Violated(_)));
     assert!(m.saw_tgt_freed.load(Ordering::Relaxed), "CSR `tgt` buffer was still allocated at replay entry");
     assert!(m.saw_fps_freed.load(Ordering::Relaxed), "fingerprint vector `fps` was still allocated at replay entry");
+}
+
+/// The ring of `n` states recorded, checked with `spill` and `guard`: the
+/// result and the number of fingerprints of the graph.
+fn check_with(n: u32, props: &[(String, Ltl)], fairness: Vec<Fairness>, spill: &Spill, guard: RssGuard) -> (LiveResult<u32>, u64) {
+    let m = Ring::new(n);
+    let alone: Vec<Ltl> = props.iter().map(|(_, f)| f.clone()).collect();
+    let input = LiveInput { props, alone: &alone, fairness, concrete: false };
+    let r = explore(&m, &Options { workers: 1, check_deadlock: false, ..Default::default() });
+    assert_eq!(r.outcome, Outcome::Ok);
+    let g = r.live_graph.expect("recorded graph").expect("built");
+    let nodes = g.fps.len() as u64;
+    (liveness::check(&m, &input, &m, 1, usize::MAX, Some(Ok(g)), guard, Some(spill)), nodes)
+}
+
+/// A spill directory in a fresh temporary directory, with `cfg`.
+fn spilled(scratch: &tlx_testkit::TempDir, mode: SpillMode, cfg: impl FnOnce(&mut SpillConfig)) -> (std::path::PathBuf, Spill) {
+    let dir = scratch.child_path("spill");
+    let mut c = SpillConfig { mode, dir: Some(dir.clone()), ..Default::default() };
+    cfg(&mut c);
+    (dir, Spill::new(c))
+}
+
+/// `-spill always`: the fingerprints of the recorded graph are written out
+/// before the product search, read back only for the counterexample's lasso,
+/// and the directory goes with the check; the lasso is the one found
+/// without spilling.
+#[test]
+fn spill_always_writes_and_reads_only_the_lassos_fingerprints() {
+    let scratch = tlx_testkit::TempDir::new("liveness-fps");
+    let props = infinitely_often_zero();
+    // (Auto on a graph the product fits in: nothing is written.)
+    let (plain_dir, plain_spill) = spilled(&scratch, SpillMode::Auto, |_| {});
+    let (plain, reference_nodes) = check_with(6, &props, Vec::new(), &plain_spill, RssGuard::new(usize::MAX, 0));
+    assert_eq!(plain_spill.counters().written, 0, "Auto wrote to disk without pressure");
+    assert!(plain_spill.dir().is_none() && !plain_dir.exists());
+
+    let (dir, spill) = spilled(&scratch, SpillMode::Always, |_| {});
+    let (got, nodes) = check_with(6, &props, Vec::new(), &spill, RssGuard::new(usize::MAX, 0));
+    assert_eq!(nodes, reference_nodes);
+    let (LiveResult::Violated(want), LiveResult::Violated(got)) = (plain, got) else { panic!("a violation both ways") };
+    assert_eq!(got.names, want.names);
+    assert_eq!(got.lasso.states, want.lasso.states);
+    assert_eq!((got.lasso.cycle, got.lasso.close), (want.lasso.cycle, want.lasso.close));
+    assert_eq!(spill.counters().written, nodes * 8, "the fingerprints were not written out");
+    assert!(spill.counters().read > 0, "the lasso's fingerprints were not read back");
+    assert_eq!(spill.counters().used, 0, "the spill file was not released");
+    assert!(!dir.exists(), "the spill directory outlived the check");
+}
+
+/// `-spill always` with a property that holds: the fingerprints are still
+/// written out, and none is read (there is no lasso to replay).
+#[test]
+fn spill_always_reads_no_fingerprint_when_the_properties_hold() {
+    let scratch = tlx_testkit::TempDir::new("liveness-fps-holds");
+    let (dir, spill) = spilled(&scratch, SpillMode::Always, |_| {});
+    let fairness = vec![Fairness { strong: false, enabled: 1, taken: 0 }];
+    let (got, nodes) = check_with(6, &infinitely_often_zero(), fairness, &spill, RssGuard::new(usize::MAX, 0));
+    assert!(matches!(got, LiveResult::Holds), "the fair ring visits 0 forever");
+    assert_eq!(spill.counters().written, nodes * 8, "the fingerprints were not written out");
+    assert_eq!(spill.counters().read, 0, "fingerprints were read without a violation");
+    assert!(!dir.exists(), "the spill directory outlived the check");
+}
+
+/// A disk layer that fails writing the fingerprints: the check stops with
+/// the disk's error (a resource failure, not a verdict), and leaves no
+/// directory.
+#[test]
+fn a_failed_fingerprint_spill_is_reported() {
+    let scratch = tlx_testkit::TempDir::new("liveness-fps-fail");
+    let (dir, spill) = spilled(&scratch, SpillMode::Always, |c| c.fail_after = Some(0));
+    let (got, _) = check_with(6, &infinitely_often_zero(), Vec::new(), &spill, RssGuard::new(usize::MAX, 0));
+    let LiveResult::OutOfMemory(msg) = got else { panic!("expected the disk's error") };
+    assert!(msg.contains("the disk layer failed checking liveness"), "{msg}");
+    assert!(msg.contains("injected write error"), "{msg}");
+    assert!(!dir.exists(), "the spill directory outlived the failed check");
+}
+
+/// `-spill auto` under a budget the product cannot fit: the fingerprints are
+/// written out on demand (before the check fails) and read back for no lasso
+/// (there is none), and the directory goes.
+#[test]
+fn spill_auto_writes_the_fingerprints_under_pressure() {
+    let scratch = tlx_testkit::TempDir::new("liveness-fps-auto");
+    let (dir, spill) = spilled(&scratch, SpillMode::Auto, |_| {});
+    // A budget that leaves no room for the product: the recorded graph is
+    // charged far beyond it, so the first memory check runs out.
+    let recorded = tlx_runtime::mem::rss_bytes().unwrap_or(0) + (64 << 20);
+    let (got, nodes) = check_with(200, &infinitely_often_zero(), Vec::new(), &spill, RssGuard::new(1 << 20, recorded));
+    let LiveResult::OutOfMemory(msg) = got else { panic!("expected a memory error") };
+    assert!(msg.starts_with(tlx_runtime::explore::LIVENESS_MEMORY), "{msg}");
+    assert_eq!(spill.counters().written, nodes * 8, "the fingerprints were not written out on demand");
+    assert_eq!(spill.counters().read, 0, "no lasso reads the fingerprints");
+    assert_eq!(spill.counters().used, 0, "the spill file was not released");
+    assert!(!dir.exists(), "the spill directory outlived the check");
+}
+
+/// `-spill off` under the same pressure: nothing is written, and the check
+/// fails for the budget, as with no disk layer at all.
+#[test]
+fn spill_off_never_writes_the_fingerprints() {
+    let scratch = tlx_testkit::TempDir::new("liveness-fps-off");
+    let (dir, spill) = spilled(&scratch, SpillMode::Off, |_| {});
+    let recorded = tlx_runtime::mem::rss_bytes().unwrap_or(0) + (64 << 20);
+    let (got, _) = check_with(200, &infinitely_often_zero(), Vec::new(), &spill, RssGuard::new(1 << 20, recorded));
+    assert!(matches!(got, LiveResult::OutOfMemory(_)), "expected a memory error");
+    assert_eq!(spill.counters().written, 0, "-spill off wrote to disk");
+    assert!(!dir.exists());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -589,7 +698,7 @@ fn recorded_replay_propagates_store_full_errors() {
         assert_eq!(r.outcome, Outcome::Ok);
         let recorded = r.live_graph.expect("recorded graph");
         m.set_mode(mode);
-        liveness::check(&m, &input, &m, 1, usize::MAX, Some(recorded), RssGuard::new(usize::MAX, 0))
+        liveness::check(&m, &input, &m, 1, usize::MAX, Some(recorded), RssGuard::new(usize::MAX, 0), None)
     };
 
     // Baseline: counterexample replays cleanly when the store has budget.

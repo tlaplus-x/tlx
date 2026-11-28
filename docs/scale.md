@@ -176,6 +176,16 @@ charges the larger of the two rather than their sum (`bcastFolklore/bcastFolklor
 graph edges take 58.3 MiB CSR, 76.2 MiB for the largest 655,360-node / 6.48M-edge product, and 239.7 MiB peak
 RSS).
 
+The fingerprints of the graph's states (`8 B` per node) are not needed to build or search the product: only
+the nodes along a counterexample lasso are read, to seed the replay and to check each replayed step. Under
+`-spill always`, and under `-spill auto` when the product would otherwise go over the budget, they are
+therefore written to the spill directory (`recorded::scan`) before or while the product is built, in 1 MiB
+blocks released as they are written, and their bytes are credited back to the product's memory check
+(`mem::RssGuard`, which re-runs the budget and resident-memory checks after the reclamation). A property that
+holds reads none of them back; a violation reads the lasso's fingerprints on demand. The spilled blocks and
+their directory are released before the lasso is replayed (`RecordedWitness::replay`), and a disk-layer error
+there is reported as a resource error of the run (exit 255), not as a verdict.
+
 ## 3. Safepoints
 
 Growing, spilling and checkpointing need a moment when no worker is inside a shared structure. The level
@@ -472,7 +482,9 @@ actions, state pattern ids, id-to-fingerprint) replaces a stored graph of states
 words into `tlx_live::Bits` without copying (`Bits::from_boxed_words`). Counterexample states are
 recovered by re-executing from an initial state along the path, matching fingerprints
 (design.md §7.4) after extracting the lasso step metadata and dropping both `Csr` and the
-id-to-fingerprint vector. This costs about 120-170 B per state against about 1260 B for a graph that stored
+id-to-fingerprint vector; under `-spill always` or memory pressure the id-to-fingerprint vector is
+instead written to disk before the product search and only the lasso's fingerprints are read back
+(§2.4). This costs about 120-170 B per state against about 1260 B for a graph that stored
 states. Both passes over the edge log read blocks from disk if they spilled, with read-ahead; the second
 deletes blocks after reading.
 

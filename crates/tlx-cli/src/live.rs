@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tlx_eval::model::liveness::InterpSearchAtoms;
 use tlx_eval::InterpModel;
+use tlx_runtime::io::Spill;
 use tlx_runtime::liveness::{LiveResult, STUTTER};
 use tlx_runtime::mem::RssGuard;
 use tlx_value::Value;
@@ -150,6 +151,7 @@ pub fn check<T: Tier>(
     view: &TraceView<T::State>,
     recorded: Option<Result<tlx_runtime::LiveGraph, String>>,
     guard: RssGuard,
+    spill: &Spill,
 ) -> Liveness {
     let base = m.base();
     crate::stats::record_peak_rss("peak RSS before liveness");
@@ -166,7 +168,7 @@ pub fn check<T: Tier>(
         tlx_runtime::stats::set("liveness: fairness ENABLED from A's steps", tlx_runtime::stats::Metric::Count(from_steps as u64));
         tlx_runtime::stats::set("liveness: fairness conditions", tlx_runtime::stats::Metric::Count(live.fairness.len() as u64));
     }
-    let r = tlx_runtime::liveness::check(m, &base.liveness_input(), m, workers, expanded, recorded, guard);
+    let r = tlx_runtime::liveness::check(m, &base.liveness_input(), m, workers, expanded, recorded, guard, Some(spill));
     rendered(base, r, view, true)
 }
 

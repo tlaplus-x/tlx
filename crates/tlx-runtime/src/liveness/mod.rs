@@ -113,6 +113,13 @@ fn error_or_memory<S>(e: ModelError) -> LiveResult<S> {
 /// `TLCSet("exit", TRUE)` (TLC then checks the graph of these states; the
 /// concrete checker expands the first ones in BFS order), else
 /// `usize::MAX`.
+///
+/// `spill`: the run's disk layer (the search's). Under `-spill always`, or
+/// when the product search would otherwise go over the memory budget, the
+/// fingerprints of the graph's nodes are spilled before it and read back
+/// only for a counterexample lasso (see `recorded::scan`). Without one
+/// (`None`), a default `Spill` (Auto, its own directory) is used.
+#[allow(clippy::too_many_arguments)]
 pub fn check<M: Model>(
     m: &M,
     input: &LiveInput,
@@ -121,6 +128,7 @@ pub fn check<M: Model>(
     expanded: usize,
     recorded: Option<Result<LiveGraph, String>>,
     guard: RssGuard,
+    spill: Option<&crate::io::Spill>,
 ) -> LiveResult<M::State> {
     if input.concrete {
         return concrete::check_concrete(m, input, bits, workers, expanded, guard);
@@ -133,8 +141,16 @@ pub fn check<M: Model>(
                 "cannot check temporal properties: the search recorded no liveness edges (recovered from a checkpoint taken without them)",
             )),
         };
+    let fallback;
+    let spill = match spill {
+        Some(s) => s,
+        None => {
+            fallback = crate::io::Spill::default();
+            &fallback
+        }
+    };
     let t0 = std::time::Instant::now();
-    let r = recorded::check_recorded(m, input, g, workers, guard);
+    let r = recorded::check_recorded(m, input, g, workers, guard, spill);
     crate::stats::add_secs("liveness: check (recorded graph)", t0.elapsed());
     r
 }
