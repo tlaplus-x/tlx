@@ -8,8 +8,32 @@ use crate::recurrence::Condition;
 use crate::tableau::Automaton;
 use crate::{Bits, GraphView, Ids, Offsets};
 
-use super::automaton::{AutInfo, GraphBfs, NodeMap, Part, DENSE_LIMIT};
+use super::automaton::{AutInfo, GraphBfs, NodeMap, Part};
 use super::{Prod, NONE};
+
+/// Memory budget callback for [`Product::build`]: separates mandatory growth
+/// checks (returning `false` stops construction) from optional speculative
+/// probes (such as `NodeMap` `Sparse -> Dense` promotion, where returning
+/// `false` declines the transition without poisoning parallel sibling parts).
+pub(super) trait Budget {
+    fn check(&mut self, nodes: usize, edges: usize, bytes: usize) -> bool;
+
+    /// Check whether a transient peak of `peak_bytes` fits, reverting any
+    /// accounted bytes to `current_bytes` if declined.
+    fn try_peak(&mut self, nodes: usize, edges: usize, peak_bytes: usize, current_bytes: usize) -> bool {
+        let _ = current_bytes;
+        self.check(nodes, edges, peak_bytes)
+    }
+
+    /// Record the post-transition footprint once a transient peak drops.
+    fn settle(&mut self, _bytes: usize) {}
+}
+
+impl Budget for &mut Within<'_> {
+    fn check(&mut self, nodes: usize, edges: usize, bytes: usize) -> bool {
+        (**self)(nodes, edges, bytes)
+    }
+}
 
 /// The parent of a product node entered from a waiting state (see
 /// `AutInfo`): the step into its graph state from the graph's BFS tree
@@ -58,9 +82,9 @@ pub(crate) fn lits_hold(lits: &[(u32, bool)], bits: &Bits) -> bool {
 
 impl<'a, G: GraphView> Product<'a, G> {
     /// The memory of the product (bytes, estimated from its allocations),
-    /// with the larger of the build-time node map and the post-build SCC
-    /// search buffers (`map` is dropped before `fair_cycle` allocates `Search`).
-    fn bytes(&self, map: &NodeMap) -> usize {
+    /// with the larger of `map_bytes` and the post-build SCC search buffers
+    /// (`map` is dropped before `fair_cycle` allocates `Search`).
+    fn bytes_with_map(&self, map_bytes: usize) -> usize {
         let bfs = self.bfs;
         let nodes = self.st.capacity() * 4 + self.aq.bytes() + self.parent.capacity() * 8 + self.levels.capacity() * 8 + self.off.bytes();
         self.aut.bytes()
@@ -70,15 +94,27 @@ impl<'a, G: GraphView> Product<'a, G> {
             + nodes
             + self.tgt.capacity() * 4
             + self.gedge.bytes()
-            + map.bytes().max(self.st.len() * SEARCH_NODE_BYTES)
+            + map_bytes.max(self.st.len() * SEARCH_NODE_BYTES)
+    }
+
+    fn bytes(&self, map: &NodeMap) -> usize {
+        self.bytes_with_map(map.bytes())
     }
 
     /// Node `(s, q)` with BFS tree parent `parent` at distance `dist`,
-    /// added unless it exists: its id.
+    /// added unless it exists: its id, or `None` if `budget` stopped growth.
     #[inline]
-    fn add(&mut self, map: &mut NodeMap, s: u32, q: u32, parent: (u32, u32), dist: u32) -> u32 {
+    fn add<B: Budget + ?Sized>(&mut self, map: &mut NodeMap, s: u32, q: u32, parent: (u32, u32), dist: u32, budget: &mut B) -> Option<u32> {
         let id = self.st.len() as u32;
-        let (w, fresh) = map.get_or_insert(s, self.info.slot[q as usize], id);
+        let mut promoted = false;
+        let (w, fresh) = map.get_or_insert(s, self.info.slot[q as usize], id, |peak_map, cur_map| {
+            let ok = budget.try_peak(self.st.len(), self.tgt.len(), self.bytes_with_map(peak_map), self.bytes_with_map(cur_map));
+            promoted = ok;
+            ok
+        });
+        if promoted {
+            budget.settle(self.bytes(map));
+        }
         if fresh {
             self.st.push(s);
             self.aq.push(q);
@@ -87,30 +123,31 @@ impl<'a, G: GraphView> Product<'a, G> {
                 debug_assert!(self.levels.last().is_none_or(|&(_, d)| dist >= d));
                 self.levels.push((id, dist));
             }
+            if self.st.len().is_multiple_of(GUARD_EVERY) && !budget.check(self.st.len(), self.tgt.len(), self.bytes(map)) {
+                return None;
+            }
         }
-        w
+        Some(w)
     }
 
     /// Build the reachable product of part `part` (`bfs`: the graph's BFS,
-    /// if the part is entered from waiting states); `within` (if any) is
-    /// called as it grows (every `GUARD_EVERY` nodes, and at the end) with
-    /// its numbers of nodes and edges and its memory (`bytes`): None if it
-    /// returns false.
-    pub(super) fn build(
+    /// if the part is entered from waiting states); `budget` is called as it
+    /// grows (every `GUARD_EVERY` inserted/expanded nodes or edges, on
+    /// `NodeMap` promotion, and at the end) with its numbers of nodes and
+    /// edges and its memory (`bytes`): None if it stops construction.
+    pub(super) fn build<B: Budget + ?Sized>(
         g: &'a G,
         ck: &'a Check<'a>,
         part: &'a Part,
         bfs: Option<&'a GraphBfs>,
-        mut within: Option<&mut Within<'_>>,
+        budget: &mut B,
     ) -> Option<Product<'a, G>> {
         let (aut, info, recurrence) = (&ck.aut, &ck.info, ck.recur);
         let slots = part.states.len();
-        let map_bytes = g.num_states().checked_mul(slots).filter(|&len| len <= DENSE_LIMIT).unwrap_or(0) * 4;
+        let map_bytes = NodeMap::initial_bytes(g.num_states(), slots);
         let bfs_bytes = bfs.map_or(0, GraphBfs::bytes);
-        if let Some(f) = within.as_deref_mut() {
-            if !f(0, 0, aut.bytes() + info.bytes() + std::mem::size_of_val(recurrence) + map_bytes + bfs_bytes) {
-                return None;
-            }
+        if !budget.check(0, 0, aut.bytes() + info.bytes() + std::mem::size_of_val(recurrence) + map_bytes + bfs_bytes) {
+            return None;
         }
         let bfs = if part.entries.is_empty() { None } else { bfs };
         let mut map = NodeMap::new(g.num_states(), slots);
@@ -133,7 +170,7 @@ impl<'a, G: GraphView> Product<'a, G> {
         for &s in g.init() {
             for &q in &aut.init {
                 if !info.wait[q as usize] && mine(q) && state_ok(q, s) {
-                    p.add(&mut map, s, q, (NONE, 0), 0);
+                    p.add(&mut map, s, q, (NONE, 0), 0, budget)?;
                 }
             }
         }
@@ -165,7 +202,7 @@ impl<'a, G: GraphView> Product<'a, G> {
                     entered += 1;
                     for &q in &part.entries {
                         if state_ok(q, t) {
-                            p.add(&mut map, t, q, (FROM_WAITING, 0), dt);
+                            p.add(&mut map, t, q, (FROM_WAITING, 0), dt, budget)?;
                         }
                     }
                 }
@@ -182,12 +219,8 @@ impl<'a, G: GraphView> Product<'a, G> {
                 }
                 0
             };
-            if v % GUARD_EVERY == GUARD_EVERY - 1 {
-                if let Some(f) = within.as_deref_mut() {
-                    if !f(p.st.len(), p.tgt.len(), p.bytes(&map)) {
-                        return None;
-                    }
-                }
+            if v % GUARD_EVERY == GUARD_EVERY - 1 && !budget.check(p.st.len(), p.tgt.len(), p.bytes(&map)) {
+                return None;
             }
             let (s, q) = (p.st[v], p.aq.get(v));
             let a = &aut.states[q as usize];
@@ -200,20 +233,21 @@ impl<'a, G: GraphView> Product<'a, G> {
                     if info.wait[q2 as usize] || !state_ok(q2, t) {
                         continue;
                     }
-                    let w = p.add(&mut map, t, q2, (v as u32, li as u32), d + 1);
+                    let w = p.add(&mut map, t, q2, (v as u32, li as u32), d + 1, budget)?;
                     if info.keeps(q, q2) && ck.persist.iter().all(|c| c.holds(g.state_bits(s), bits)) {
                         p.tgt.push(w);
                         p.gedge.push(li as u32);
+                        if p.tgt.len().is_multiple_of(GUARD_EVERY) && !budget.check(p.st.len(), p.tgt.len(), p.bytes(&map)) {
+                            return None;
+                        }
                     }
                 }
             }
             p.off.push(p.tgt.len());
             v += 1;
         }
-        if let Some(f) = within {
-            if !f(p.st.len(), p.tgt.len(), p.bytes(&map)) {
-                return None;
-            }
+        if !budget.check(p.st.len(), p.tgt.len(), p.bytes(&map)) {
+            return None;
         }
         p.levels = Vec::new();
         Some(p)
@@ -255,7 +289,8 @@ impl<'a, G: GraphView> Product<'a, G> {
 /// nodes, edges and bytes, whether to go on.
 pub type Within<'a> = dyn FnMut(usize, usize, usize) -> bool + Send + 'a;
 
-/// `Product::build` calls its memory check every this many nodes expanded.
+/// `Product::build` calls its memory check every this many inserted/expanded
+/// nodes or retained product edges.
 const GUARD_EVERY: usize = 1 << 16;
 
 /// The search's arrays per product node (`Search`: region, index, low).

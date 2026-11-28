@@ -295,3 +295,229 @@ fn nested_tail_conditions_and_strong_fairness_startup_scale_linearly() {
     #[cfg(not(miri))]
     assert!(t0.elapsed().as_secs_f64() < 1.0, "startup metadata took {:?}", t0.elapsed());
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn sparse_part_avoids_eager_dense_allocation() {
+    use tlx_live::{check_lasso_csr_stats, CheckStats, Csr, Ids, Offsets};
+    // A 1,000,000-state connected ring where atom 3 holds only on states
+    // 0..200 (< 0.02% density). Negation of the property is
+    // `st(0) /\ <>st(1) /\ <>st(2) /\ []st(3)`: no waiting states (so GraphBfs
+    // is not built), >= 4 tableau states in one accepting part (`n * q >= 4M`,
+    // which would eagerly allocate and pre-charge >= 16 MiB as Dense), while
+    // only a few hundred product nodes are reachable.
+    let n = 1_000_000usize;
+    let active = 200usize;
+    let mut off = Vec::with_capacity(n + 1);
+    let mut tgt = Vec::with_capacity(2 * n);
+    for s in 0..n {
+        off.push(tgt.len() as u32);
+        tgt.push(((s + 1) % n) as u32);
+        tgt.push(s as u32); // stuttering self-loop
+    }
+    off.push(tgt.len() as u32);
+    // Pattern 0: none; 1: st(3); 2: st(0)|st(3); 3: st(1)|st(3); 4: st(2)|st(3).
+    let mut state_pat = vec![0u32; n];
+    for pat in &mut state_pat[..active] {
+        *pat = 1;
+    }
+    state_pat[0] = 2;
+    state_pat[50] = 3;
+    state_pat[100] = 4;
+    let csr = Csr {
+        init: vec![0],
+        off: Offsets::U32(off),
+        tgt,
+        edge_pat: Ids::U8(vec![0; 2 * n]),
+        state_pat,
+        state_pats: vec![
+            Bits::new(),
+            Bits::from_u64(1 << 3),
+            Bits::from_u64((1 << 0) | (1 << 3)),
+            Bits::from_u64((1 << 1) | (1 << 3)),
+            Bits::from_u64((1 << 2) | (1 << 3)),
+        ],
+        action_pats: vec![Bits::new()],
+    };
+    let prop = or(vec![not(st(0)), always(not(st(1))), always(not(st(2))), eventually(not(st(3)))]);
+
+    // Budget is 256 KiB — 64x smaller than the 16+ MiB dense table.
+    let limit = 256 * 1024;
+    let mut peak_bytes = 0usize;
+    let mut stats = CheckStats::default();
+    let res = check_lasso_csr_stats(
+        &csr,
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            peak_bytes = peak_bytes.max(bytes);
+            bytes <= limit
+        },
+        &mut stats,
+    )
+    .expect("sparse part must fit well below dense table size");
+    assert_eq!(stats.waiting_states, 0, "no GraphBfs so within isolates Product + NodeMap");
+    assert!(stats.tableau_states >= 4, "expected >= 4 tableau states, got {}", stats.tableau_states);
+    assert!(stats.product_nodes > 0 && stats.product_nodes < 1_000, "sparse product: {} nodes", stats.product_nodes);
+    assert!(peak_bytes <= limit, "peak_bytes {peak_bytes} exceeded {limit}");
+    let lasso = res.expect_err("path 0 -> 50 -> 100 stuttering at 100 violates prop");
+    assert!(!lasso.cycle.is_empty());
+    assert_eq!(lasso.prefix.first().map(|&(s, _)| s), Some(0));
+
+    // Removing st(2) makes the property hold with the same sparse footprint.
+    let mut holding = csr;
+    holding.state_pat[100] = 1;
+    let mut hold_peak = 0usize;
+    let hold_res = check_lasso_csr_stats(
+        &holding,
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            hold_peak = hold_peak.max(bytes);
+            bytes <= limit
+        },
+        &mut CheckStats::default(),
+    )
+    .expect("holding sparse part fits in tight budget");
+    assert!(hold_res.is_ok());
+    assert!(hold_peak <= limit, "hold_peak {hold_peak} exceeded {limit}");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn dense_promotion_and_budget_declined_sparse_fallback() {
+    use tlx_live::{check_lasso_csr_stats, CheckStats, Csr, Ids, Offsets};
+    // Two independent non-waiting 1-state parts (`¬prop = []st(0) \/ []st(1)`)
+    // on a 200,000-state ring where 15,500 states satisfy `st(0)` and `st(1)`:
+    // `n * q = 200_000 > EAGER_DENSE_LIMIT` (`dense_bytes = 800,000 B`).
+    // Reaching 14,337 nodes crosses the promotion threshold (`sparse = 213 KB`,
+    // transient `sparse + dense = 1,013 KB`), whereas declining promotion
+    // finishes all 15,500 nodes in `Sparse` (`cap = 28,672`, `426 KB`) inside
+    // the same `16,384`-slot node vectors.
+    let n = 200_000usize;
+    let active = 15_500usize;
+    let mut off = Vec::with_capacity(n + 1);
+    let mut tgt = Vec::with_capacity(2 * n);
+    for s in 0..n {
+        off.push(tgt.len() as u32);
+        tgt.push(((s + 1) % n) as u32);
+        tgt.push(s as u32);
+    }
+    off.push(tgt.len() as u32);
+    let mut state_pat = vec![0u32; n];
+    for pat in &mut state_pat[..active] {
+        *pat = 1;
+    }
+    let csr = Csr {
+        init: vec![0],
+        off: Offsets::U32(off),
+        tgt,
+        edge_pat: Ids::U8(vec![0; 2 * n]),
+        state_pat,
+        state_pats: vec![Bits::new(), Bits::from_u64(0b11)],
+        action_pats: vec![Bits::new()],
+    };
+    let prop = and(vec![eventually(not(st(0))), eventually(not(st(1)))]);
+
+    // Unlimited budget: promotes to Dense and reports peak including transient
+    // `sparse + dense`.
+    let mut dense_peak = 0usize;
+    let mut dense_stats = CheckStats::default();
+    let expected = check_lasso_csr_stats(
+        &csr,
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            dense_peak = dense_peak.max(bytes);
+            true
+        },
+        &mut dense_stats,
+    )
+    .expect("unlimited")
+    .expect_err("stuttering inside active prefix violates prop");
+    assert_eq!(dense_stats.waiting_states, 0);
+    assert_eq!(dense_stats.tableau_states, 2);
+    assert_eq!(dense_stats.parts, 2);
+    assert!(dense_peak > n * 4, "expected promotion peak above dense table size ({}), got {dense_peak}", n * 4);
+
+    // Serial tight budget: below the transient `sparse + dense` promotion peak,
+    // above the final `Sparse` footprint. Promotion is declined cleanly and
+    // produces the exact same counterexample.
+    let tight = dense_peak - 300 * 1024;
+    let mut declined = false;
+    let mut sparse_peak = 0usize;
+    let got_serial = check_lasso_csr_stats(
+        &csr,
+        &prop,
+        &[],
+        1,
+        &mut |_, _, bytes| {
+            if bytes <= tight {
+                sparse_peak = sparse_peak.max(bytes);
+                true
+            } else {
+                declined = true;
+                false
+            }
+        },
+        &mut CheckStats::default(),
+    )
+    .expect("declining dense promotion must allow sparse completion")
+    .expect_err("same counterexample");
+    assert!(declined, "tight budget {tight} must refuse dense promotion peak {dense_peak}");
+    assert!(sparse_peak < dense_peak, "sparse peak {sparse_peak} should be below dense promotion peak {dense_peak}");
+    assert_eq!(got_serial, expected);
+
+    // Parallel execution with two parts: budget fits both parts in Sparse
+    // concurrently and refuses concurrent promotion peaks without poisoning
+    // sibling workers.
+    for limit in [tight, sparse_peak * 2 + 128 * 1024] {
+        let got_par = check_lasso_csr_stats(&csr, &prop, &[], 2, &mut |_, _, bytes| bytes <= limit, &mut CheckStats::default())
+            .expect("parallel sparse completion under tight budget")
+            .expect_err("same counterexample");
+        assert_eq!(got_par, expected);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn high_outdegree_product_checks_budget_during_insertion() {
+    use tlx_live::{check_lasso_csr_within, Csr, Ids, Offsets};
+    // State 0 fans out directly to 100,000 distinct states (> GUARD_EVERY =
+    // 65,536). Even while expanding `v == 0`, `Product::build` must consult
+    // `within` when inserted `p.st.len()` crosses `GUARD_EVERY`.
+    let fanout = 100_000usize;
+    let n = fanout + 1;
+    let mut off = Vec::with_capacity(n + 1);
+    let mut tgt = Vec::with_capacity(2 * n);
+    off.push(0);
+    for t in 1..=fanout {
+        tgt.push(t as u32);
+    }
+    tgt.push(0); // stuttering self-loop on state 0
+    for s in 1..n {
+        off.push(tgt.len() as u32);
+        tgt.push(s as u32);
+    }
+    off.push(tgt.len() as u32);
+    let csr = Csr {
+        init: vec![0],
+        off: Offsets::U32(off),
+        tgt,
+        edge_pat: Ids::U8(vec![0; 2 * n]),
+        state_pat: vec![0; n],
+        state_pats: vec![Bits::new()],
+        action_pats: vec![Bits::new()],
+    };
+    let prop = eventually(st(0)); // ¬prop = []~st(0): 1 non-waiting accepting state
+    let mut max_seen_nodes = 0usize;
+    let res = check_lasso_csr_within(&csr, &prop, &[], &mut |nodes, _, _| {
+        max_seen_nodes = max_seen_nodes.max(nodes);
+        nodes < 65_536
+    });
+    assert!(res.is_err(), "budget must stop during state 0 fanout");
+    assert_eq!(max_seen_nodes, 65_536, "guard must trigger at GUARD_EVERY inserted nodes, not after all {fanout}");
+}
