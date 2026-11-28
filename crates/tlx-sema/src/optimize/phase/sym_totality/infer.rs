@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use tlx_front::cfg::CfgValue;
 
-use super::super::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
+use super::super::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind, RecOpKind};
+use super::progress::{apply_progress_bound, infer_progress_bounds, seed_progress_bound};
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, PlaceKey, Shape, TotalityChecker, MAX_I32_U32, MAX_STEPS, MAX_STR_SET, MAX_UNMOVED_SET};
 use crate::{builtins::Builtin as B, hir::*};
@@ -46,8 +47,10 @@ impl<'a> TotalityChecker<'a> {
                 *s = Shape::Top;
             }
         }
+        let init_shapes = cur.clone();
 
         // Step 2: Iterate Next to a fixed point.
+        let mut step2_converged = false;
         for round in 0..40 {
             let mut next_img = vec![Shape::Bottom; n];
             let mut steps = MAX_STEPS;
@@ -64,14 +67,63 @@ impl<'a> TotalityChecker<'a> {
                 }
             }
             if joined == cur {
+                step2_converged = true;
                 break;
             }
             cur = joined;
         }
 
+        // Step 2b: Only when Step 2 converged to an inductive post-fixed-point, check if an
+        // Init+Next-only finite-progress measure soundly bounds widened counters/logs, and re-run
+        // Step 2 seeded/clamped by those proven progress invariants so dependent variables
+        // (e.g. `fifoAt`) inherit the tight finite bounds.
+        let prog_bounds = if step2_converged { infer_progress_bounds(self, next, &init_shapes, &cur) } else { vec![None; n] };
+        if prog_bounds.iter().any(Option::is_some) {
+            cur = init_shapes
+                .iter()
+                .zip(&prog_bounds)
+                .map(|(s, b)| b.as_ref().map_or_else(|| s.clone(), |pb| seed_progress_bound(s, pb)))
+                .collect();
+            let mut step2b_converged = false;
+            for round in 0..40 {
+                let mut next_img = vec![Shape::Bottom; n];
+                let mut steps = MAX_STEPS;
+                self.collect_assignments(next, true, &cur, &CheckEnv::default(), &mut next_img, &mut steps);
+                if steps == 0 {
+                    return vec![Shape::Top; n];
+                }
+                let mut joined: Vec<Shape> = cur
+                    .iter()
+                    .zip(&next_img)
+                    .enumerate()
+                    .map(|(i, (a, b))| {
+                        let j = cap_shape(join_shape(a, b));
+                        prog_bounds[i].as_ref().map_or(j.clone(), |pb| apply_progress_bound(&j, pb))
+                    })
+                    .collect();
+                if round >= 24 {
+                    for (i, (old, new)) in cur.iter().zip(&mut joined).enumerate() {
+                        if old != new {
+                            let w = widen_diff(old, new);
+                            *new = prog_bounds[i].as_ref().map_or(w.clone(), |pb| apply_progress_bound(&w, pb));
+                        }
+                    }
+                }
+                if joined == cur {
+                    step2b_converged = true;
+                    break;
+                }
+                cur = joined;
+            }
+            if !step2b_converged {
+                return vec![Shape::Top; n];
+            }
+        }
+
         // Step 3: Explicit post-fixed-point closure verification!
-        // Guarantees inductiveness: if ANY variable still grows in one step of Init or Next,
-        // discard all unverified bounds and fall back to `Top` for every variable.
+        // Guarantees inductiveness: if ANY variable still grows in one step of Init or Next
+        // (modulo progress-proven counter/log caps), discard all unverified bounds and fall
+        // back to `Top` for every variable.
         let mut verify_init = vec![Shape::Bottom; n];
         let mut verify_next = vec![Shape::Bottom; n];
         let mut steps = MAX_STEPS;
@@ -81,7 +133,9 @@ impl<'a> TotalityChecker<'a> {
             return vec![Shape::Top; n];
         }
         for i in 0..n {
-            if !shape_leq(&verify_init[i], &cur[i]) || !shape_leq(&verify_next[i], &cur[i]) {
+            let next_checked =
+                prog_bounds[i].as_ref().map_or_else(|| verify_next[i].clone(), |pb| apply_progress_bound(&verify_next[i], pb));
+            if !shape_leq(&verify_init[i], &cur[i]) || !shape_leq(&next_checked, &cur[i]) {
                 return vec![Shape::Top; n];
             }
         }
@@ -378,6 +432,9 @@ impl<'a> TotalityChecker<'a> {
                 Shape::Func { dom: Box::new(dom), exact_dom, range: Box::new(range), max_dom }
             }
             ExprKind::FnApp { func, args } => {
+                if let Some((_, _, ov)) = env.expr_overrides.iter().rev().find(|(oe, op, _)| expr_alpha_eq(e, in_prime, oe, *op)) {
+                    return ov.clone();
+                }
                 if let Some(key) = fn_app_place(func, args, in_prime) {
                     if let Some(ov) = env.fn_app_overrides.get(&key) {
                         return ov.clone();
@@ -390,10 +447,14 @@ impl<'a> TotalityChecker<'a> {
                             return field_of_shape(&fs, field);
                         }
                     }
-                    if let ExprKind::Num(idx) = &*args[0].kind {
-                        if let Shape::Tuple(ts) = &fs {
-                            if let Some(u) = usize::try_from(*idx).ok().filter(|&u| (1..=ts.len()).contains(&u)) {
-                                return ts[u - 1].clone();
+                    if let Shape::Tuple(ts) = &fs {
+                        if let Shape::Int(Some((lo, hi))) = self.infer_expr(&args[0], in_prime, vars, env, steps) {
+                            if lo >= 1 && (hi as usize) <= ts.len() {
+                                let mut out = Shape::Bottom;
+                                for item in &ts[(lo as usize - 1)..(hi as usize)] {
+                                    out = join_shape(&out, item);
+                                }
+                                return out;
                             }
                         }
                     }
@@ -475,8 +536,79 @@ impl<'a> TotalityChecker<'a> {
                         return self.infer_set_elem(s, in_prime, vars, env, steps);
                     }
                 }
+                if let Some(s) = set {
+                    let (elem, finite, _) = self.infer_set_info(s, in_prime, vars, env, steps);
+                    if finite && shape_is_key_free(&elem) {
+                        return elem;
+                    }
+                }
                 Shape::Top
             }
+            ExprKind::Apply { op: OpRef::Def(id), args } => match self.rec_ops.get(id) {
+                Some(RecOpKind::FixSet) if args.len() == 2 => {
+                    let ExprKind::Lambda { params, body: step } = &*args[1].kind else { return Shape::Top };
+                    let [s_var] = params.as_slice() else { return Shape::Top };
+                    let (mut elem, finite, mut card) = self.infer_set_info(&args[0], in_prime, vars, env, steps);
+                    if !finite || *steps == 0 {
+                        return Shape::Top;
+                    }
+                    let mut converged = false;
+                    for _ in 0..8 {
+                        let mut local_env = env.clone();
+                        local_env.bind_local(*s_var, Shape::Set { elem: Box::new(elem.clone()), finite: true, max_card: card }, None);
+                        let (se, sf, sc) = self.infer_set_info(step, in_prime, vars, &local_env, steps);
+                        if !sf || *steps == 0 {
+                            return Shape::Top;
+                        }
+                        let joined = cap_shape(join_shape(&elem, &se));
+                        let next_card = shape_universe_size(&joined, self.groups)
+                            .or_else(|| card.and_then(|a| sc.and_then(|b| a.checked_add(b))))
+                            .filter(|&v| v <= MAX_I32_U32);
+                        if joined == elem && next_card == card {
+                            converged = true;
+                            break;
+                        }
+                        elem = joined;
+                        card = next_card;
+                    }
+                    if !converged {
+                        return Shape::Top;
+                    }
+                    Shape::Set { elem: Box::new(elem), finite: true, max_card: card }
+                }
+                Some(RecOpKind::IterRec) if args.len() == 2 => {
+                    let ExprKind::Lambda { params, body } = &*args[1].kind else { return Shape::Top };
+                    let [x_var] = params.as_slice() else { return Shape::Top };
+                    let ExprKind::If { cond, then: step, els: base } = &*body.kind else { return Shape::Top };
+                    let mut cur = self.infer_expr(&args[0], in_prime, vars, env, steps);
+                    let mut acc = Shape::Bottom;
+                    for _ in 0..16 {
+                        if *steps == 0 {
+                            return Shape::Top;
+                        }
+                        let mut local_env = env.clone();
+                        local_env.bind_local(*x_var, cur.clone(), None);
+                        let mut e_env = local_env.clone();
+                        self.apply_fact_with_vars(cond, false, in_prime, vars, &mut e_env);
+                        if !e_env.unreachable {
+                            let b = self.infer_expr(base, in_prime, vars, &e_env, steps);
+                            acc = cap_shape(join_shape(&acc, &b));
+                        }
+                        let mut t_env = local_env.clone();
+                        self.apply_fact_with_vars(cond, true, in_prime, vars, &mut t_env);
+                        if t_env.unreachable {
+                            return acc;
+                        }
+                        let next = self.infer_expr(step, in_prime, vars, &t_env, steps);
+                        if matches!(next, Shape::Bottom) {
+                            return acc;
+                        }
+                        cur = next;
+                    }
+                    Shape::Top
+                }
+                _ => Shape::Top,
+            },
             ExprKind::Builtin { op, args } => self.infer_builtin(*op, args, in_prime, vars, env, steps),
             _ => Shape::Top,
         }
@@ -1082,6 +1214,11 @@ impl<'a> TotalityChecker<'a> {
 
     fn apply_fact_with_vars(&self, cond: &Expr, positive: bool, in_prime: bool, vars: &[Shape], env: &mut CheckEnv) {
         match &*cond.kind {
+            ExprKind::Bool(b) => {
+                if *b != positive {
+                    env.unreachable = true;
+                }
+            }
             ExprKind::And(es) if positive => {
                 for item in es {
                     self.apply_fact_with_vars(item, true, in_prime, vars, env);
@@ -1096,14 +1233,30 @@ impl<'a> TotalityChecker<'a> {
                 self.apply_fact_with_vars(&args[0], !positive, in_prime, vars, env);
             }
             ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 => {
+                if !positive {
+                    if matches!(&*args[1].kind, ExprKind::SetEnum(es) if es.is_empty()) {
+                        env.nonempty_sets.push((args[0].clone(), in_prime));
+                    } else if matches!(&*args[0].kind, ExprKind::SetEnum(es) if es.is_empty()) {
+                        env.nonempty_sets.push((args[1].clone(), in_prime));
+                    }
+                }
                 self.narrow_eq(&args[0], &args[1], positive, in_prime, vars, env);
                 self.narrow_eq(&args[1], &args[0], positive, in_prime, vars, env);
             }
             ExprKind::Builtin { op: B::Neq, args } if args.len() == 2 => {
+                if positive {
+                    if matches!(&*args[1].kind, ExprKind::SetEnum(es) if es.is_empty()) {
+                        env.nonempty_sets.push((args[0].clone(), in_prime));
+                    } else if matches!(&*args[0].kind, ExprKind::SetEnum(es) if es.is_empty()) {
+                        env.nonempty_sets.push((args[1].clone(), in_prime));
+                    }
+                }
                 self.narrow_eq(&args[0], &args[1], !positive, in_prime, vars, env);
                 self.narrow_eq(&args[1], &args[0], !positive, in_prime, vars, env);
             }
             ExprKind::Builtin { op: B::In, args } if positive && args.len() == 2 => {
+                env.nonempty_sets.push((args[1].clone(), in_prime));
+                env.proven_members.push((args[0].clone(), args[1].clone(), in_prime));
                 let mut steps = 2000;
                 let elem = self.infer_set_elem(&args[1], in_prime, vars, env, &mut steps);
                 let origin = match &*args[1].kind {
@@ -1115,6 +1268,9 @@ impl<'a> TotalityChecker<'a> {
                 };
                 if let Some(cur) = self.read_place(&args[0], in_prime, vars, env) {
                     let narrowed = narrow_shape(&cur, &elem);
+                    if !matches!(cur, Shape::Bottom) && matches!(narrowed, Shape::Bottom) {
+                        env.unreachable = true;
+                    }
                     self.write_place(&args[0], in_prime, vars, narrowed, origin, env);
                 }
             }
@@ -1186,7 +1342,54 @@ impl<'a> TotalityChecker<'a> {
             }
             return;
         }
-        let Some(cur) = self.read_place(place, in_prime, vars, env) else { return };
+        // Sound `Cardinality(S) # 0` / `Cardinality(S) = k` (`k >= 1`) non-emptiness tracking:
+        if let ExprKind::Builtin { op: B::Cardinality, args } = &*place.kind {
+            if args.len() == 1 {
+                if let Some(k) = self.const_exact_i32(other) {
+                    if (!eq && k == 0) || (eq && k >= 1) {
+                        env.nonempty_sets.push((args[0].clone(), in_prime));
+                    }
+                }
+            }
+            return;
+        }
+        // Expression-level narrowing for non-var `FnApp` (e.g. constant tuple `TaskParent[t] # 0`).
+        let Some(cur) = self.read_place(place, in_prime, vars, env) else {
+            if matches!(&*place.kind, ExprKind::FnApp { .. }) {
+                let mut steps = 2000;
+                let cur = self.infer_expr(place, in_prime, vars, env, &mut steps);
+                let other_s = self.infer_expr(other, in_prime, vars, env, &mut steps);
+                if eq {
+                    if !matches!(cur, Shape::Top | Shape::Bottom) && !matches!(other_s, Shape::Top | Shape::Bottom) {
+                        let narrowed = narrow_shape(&cur, &other_s);
+                        if matches!(narrowed, Shape::Bottom) {
+                            env.unreachable = true;
+                        }
+                        if narrowed != cur {
+                            env.expr_overrides.push((place.clone(), in_prime, narrowed));
+                        }
+                    }
+                } else if let Some(excluded) = exclude_single_value(&cur, &other_s) {
+                    if !matches!(cur, Shape::Bottom) && matches!(excluded, Shape::Bottom) {
+                        env.unreachable = true;
+                    }
+                    env.expr_overrides.push((place.clone(), in_prime, excluded));
+                }
+            } else {
+                let mut steps = 2000;
+                let sa = self.infer_expr(place, in_prime, vars, env, &mut steps);
+                let sb = self.infer_expr(other, in_prime, vars, env, &mut steps);
+                if (!eq && is_singleton_equal(&sa, &sb))
+                    || (eq
+                        && !matches!(sa, Shape::Top | Shape::Bottom)
+                        && !matches!(sb, Shape::Top | Shape::Bottom)
+                        && matches!(narrow_shape(&sa, &sb), Shape::Bottom))
+                {
+                    env.unreachable = true;
+                }
+            }
+            return;
+        };
         let mut steps = 2000;
         let other_s = self.infer_expr(other, in_prime, vars, env, &mut steps);
         if eq {
@@ -1208,7 +1411,11 @@ impl<'a> TotalityChecker<'a> {
                 }
             }
             if !matches!(other_s, Shape::Top | Shape::Bottom) {
-                self.write_place(place, in_prime, vars, narrow_shape(&cur, &other_s), None, env);
+                let narrowed = narrow_shape(&cur, &other_s);
+                if !matches!(cur, Shape::Bottom) && matches!(narrowed, Shape::Bottom) {
+                    env.unreachable = true;
+                }
+                self.write_place(place, in_prime, vars, narrowed, None, env);
             }
         } else {
             // `l \in DOMAIN f \cup {excl} /\ l # excl ==> l \in DOMAIN f` (used by `BagsExt!BagAdd`).
@@ -1222,6 +1429,7 @@ impl<'a> TotalityChecker<'a> {
             // `seq # <<>>` proves `min_len >= 1` (and makes an empty tuple unreachable):
             if matches!(&other_s, Shape::Tuple(ts) if ts.is_empty()) {
                 if matches!(&cur, Shape::Tuple(ts) if ts.is_empty()) {
+                    env.unreachable = true;
                     self.write_place(place, in_prime, vars, Shape::Bottom, None, env);
                     return;
                 }
@@ -1239,12 +1447,21 @@ impl<'a> TotalityChecker<'a> {
             }
             // Exact single-value exclusion ONLY: never remove all unmoved values on `slot # A`!
             if let Some(excluded) = exclude_single_value(&cur, &other_s) {
+                if !matches!(cur, Shape::Bottom) && matches!(excluded, Shape::Bottom) {
+                    env.unreachable = true;
+                }
                 self.write_place(place, in_prime, vars, excluded, None, env);
             }
         }
     }
 
     fn narrow_int_cmp(&self, place: &Expr, op: B, k: i32, in_prime: bool, vars: &[Shape], env: &mut CheckEnv) {
+        if let ExprKind::Builtin { op: B::Cardinality, args } = &*place.kind {
+            if args.len() == 1 && ((op == B::Gt && k >= 0) || (op == B::Ge && k >= 1)) {
+                env.nonempty_sets.push((args[0].clone(), in_prime));
+            }
+            return;
+        }
         if let ExprKind::Builtin { op: B::Len, args } = &*place.kind {
             if args.len() == 1 {
                 self.narrow_seq_len(&args[0], op, k, in_prime, vars, env);
@@ -1263,7 +1480,22 @@ impl<'a> TotalityChecker<'a> {
             }
             return;
         }
-        let Some(Shape::Int(bounds)) = self.read_place(place, in_prime, vars, env) else { return };
+        let Some(Shape::Int(bounds)) = self.read_place(place, in_prime, vars, env) else {
+            let mut steps = 2000;
+            if let Shape::Int(Some((lo, hi))) = self.infer_expr(place, in_prime, vars, env, &mut steps) {
+                let (nlo, nhi) = match op {
+                    B::Lt => (lo, hi.min(k.saturating_sub(1))),
+                    B::Le => (lo, hi.min(k)),
+                    B::Gt => (lo.max(k.saturating_add(1)), hi),
+                    B::Ge => (lo.max(k), hi),
+                    _ => return,
+                };
+                if nlo > nhi {
+                    env.unreachable = true;
+                }
+            }
+            return;
+        };
         let (lo, hi) = bounds.unwrap_or((i32::MIN, i32::MAX));
         let (nlo, nhi) = match op {
             B::Lt => (lo, hi.min(k.saturating_sub(1))),
@@ -1274,6 +1506,8 @@ impl<'a> TotalityChecker<'a> {
         };
         if nlo <= nhi {
             self.write_place(place, in_prime, vars, Shape::Int(Some((nlo, nhi))), None, env);
+        } else {
+            env.unreachable = true;
         }
     }
 

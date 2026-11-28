@@ -1547,3 +1547,622 @@ Inv == owner \in Proc
         "call-by-name `Step(owner)` with post-assignment `Id(owner') = owner` test must certify"
     );
 }
+
+#[test]
+fn key_free_choose_recursive_and_progress_certify_accord_faithful_model() {
+    let spec = r#"---- MODULE AccordModelValue ----
+EXTENDS Integers, FiniteSets, Sequences
+CONSTANTS
+    CmdEntries, KeyEntries, NumTasks, TaskTxns, TaskKeys, TaskParent,
+    MinBatch, BlockedLimit, PAlwaysReady, PModelLoading, PAllowAdoption,
+    PPartialRounds, PUpgradeOnStart, PSubmitBeforeRelease,
+    PAllowUnseqIncrWithTxn, PAllowFifoAdoption, PAllowDoubleLock, PBagInterleaves
+
+Tasks == 1..NumTasks
+Entries == CmdEntries \cup KeyEntries
+
+VARIABLES cfg, phase, pending, adopted, fifoAt, plog, loading, clock
+
+Kinds == {"ATOMIC", "PRIORITY", "UNSEQ"}
+Loads == {"SYNC", "ASYNC", "INCR"}
+Phases == {"New", "Claimed", "Started", "Done"}
+ConfigDomain == [kind: Kinds, load: Loads]
+
+IsChild(t) == TaskParent[t] # 0
+HoldsAcrossRuns(t) == cfg[t].load = "INCR" /\ TaskTxns[t] # {}
+
+LegalConfigFor(t, c) ==
+    /\ (c.load = "INCR" /\ c.kind = "UNSEQ" /\ TaskTxns[t] # {}) => PAllowUnseqIncrWithTxn
+    /\ (c.kind = "ATOMIC" /\ IsChild(t)) =>
+           /\ TaskTxns[t] \subseteq TaskTxns[TaskParent[t]]
+           /\ (c.load = "SYNC") => TaskKeys[t] \subseteq TaskKeys[TaskParent[t]]
+
+IsFifo(t) == fifoAt[t] > 0
+Region(t) == IF IsFifo(t) THEN "FIFO" ELSE IF cfg[t].kind = "UNSEQ" THEN "BAG" ELSE "ORD"
+FifoKey(t) == fifoAt[t] * (NumTasks + 1) + t
+
+HoldsPos(t, e) ==
+    IF e \in CmdEntries
+    THEN /\ e \in TaskTxns[t]
+         /\ \/ phase[t] = "Claimed"
+            \/ (phase[t] = "Started" /\ HoldsAcrossRuns(t))
+    ELSE e \in pending[t] /\ phase[t] \in {"Claimed", "Started"}
+
+HoldsLock(t, e) ==
+    e \in CmdEntries /\ e \in TaskTxns[t] /\ phase[t] = "Started" /\ HoldsAcrossRuns(t)
+
+Occupies(t, e, X, A) ==
+    /\ t \notin X
+    /\ \/ HoldsPos(t, e)
+       \/ /\ t \in A
+          /\ (IF e \in CmdEntries THEN e \in TaskTxns[t] ELSE e \in pending[t])
+
+LeastStamped(f) == CHOOSE t \in f : \A u \in f : FifoKey(t) <= FifoKey(u)
+
+Prefix(e, X, A, L) ==
+    IF (~L) /\ PModelLoading /\ e \in loading
+    THEN {}
+    ELSE LET occ == {t \in Tasks : Occupies(t, e, X, A)}
+             f == {t \in occ : Region(t) = "FIFO"}
+             o == {t \in occ : Region(t) = "ORD"}
+             bag == {t \in occ : Region(t) = "BAG"}
+             lk == {t \in f : HoldsLock(t, e)}
+             extra == IF PBagInterleaves THEN bag ELSE {}
+         IN IF lk # {} THEN {CHOOSE t \in lk : TRUE} \cup extra
+            ELSE IF f # {} THEN {LeastStamped(f)} \cup extra
+            ELSE IF o # {} THEN {CHOOSE t \in o : \A u \in o : t <= u} \cup extra
+            ELSE bag
+
+Leads(t, e) == t \in Prefix(e, {}, {}, FALSE)
+WLeads(t, e, X) == t \in Prefix(e, X, {t}, TRUE)
+Min2(a, b) == IF a < b THEN a ELSE b
+
+NeedsAlwaysReady(t) ==
+    /\ cfg[t].kind = "ATOMIC" /\ cfg[t].load # "SYNC" /\ IsChild(t)
+    /\ ~(TaskKeys[t] \subseteq TaskKeys[TaskParent[t]])
+
+AlwaysReady(t) ==
+    CASE PAlwaysReady = "NEVER"     -> FALSE
+      [] PAlwaysReady = "ALWAYS"    -> cfg[t].load # "SYNC"
+      [] PAlwaysReady = "FIRST_RUN" -> NeedsAlwaysReady(t) /\ phase[t] # "Started"
+      [] OTHER                      -> NeedsAlwaysReady(t)
+
+Threshold(t) ==
+    IF cfg[t].load = "SYNC" THEN Cardinality(pending[t])
+    ELSE Min2(Cardinality(pending[t]), IF AlwaysReady(t) THEN 1 ELSE MinBatch)
+
+LedKeys(t, X) == {e \in pending[t] : WLeads(t, e, X)}
+BlockedKeys(t, X) ==
+    {e \in LedKeys(t, X) : \E u \in Tasks \ (X \cup {t}) : HoldsPos(u, e)}
+
+KeyReady(t, X) ==
+    \/ Cardinality(LedKeys(t, X)) >= Threshold(t)
+    \/ (cfg[t].load # "SYNC" /\ BlockedLimit > 0 /\ Cardinality(BlockedKeys(t, X)) >= BlockedLimit)
+
+TxnReady(t, X) ==
+    \A e \in TaskTxns[t] :
+        WLeads(t, e, X) /\ ~\E u \in Tasks \ (X \cup {t}) : HoldsLock(u, e)
+
+LeadsAllTxns(t) == \A e \in TaskTxns[t] : Leads(t, e)
+NoForeignLock(t) == \A e \in TaskTxns[t] : ~\E u \in Tasks \ {t} : HoldsLock(u, e)
+
+CanRun(t) ==
+    /\ phase[t] \in {"Claimed", "Started"}
+    /\ LeadsAllTxns(t) /\ (PAllowDoubleLock \/ NoForeignLock(t))
+    /\ LET led == {e \in pending[t] : Leads(t, e)}
+           blk == {e \in led : \E u \in Tasks \ {t} : HoldsPos(u, e)}
+       IN \/ Cardinality(led) >= Threshold(t)
+          \/ (cfg[t].load # "SYNC" /\ BlockedLimit > 0 /\ Cardinality(blk) >= BlockedLimit)
+
+InheritedStamp(t, at) == IF fifoAt[TaskParent[t]] > 0 THEN fifoAt[TaskParent[t]] ELSE at
+
+Setup(t) ==
+    /\ phase[t] = "New"
+    /\ IsChild(t) => /\ phase[TaskParent[t]] \in {"Started", "Done"}
+                     /\ (cfg[t].kind = "ATOMIC") => ~PSubmitBeforeRelease
+    /\ fifoAt' = IF cfg[t].kind = "ATOMIC" /\ IsChild(t)
+                 THEN [fifoAt EXCEPT ![t] = InheritedStamp(t, clock)]
+                 ELSE fifoAt
+    /\ clock' = clock + 1
+    /\ phase' = [phase EXCEPT ![t] = "Claimed"]
+    /\ UNCHANGED << cfg, pending, adopted, plog, loading >>
+
+Run(t) ==
+    /\ CanRun(t)
+    /\ LET firstRun == phase[t] # "Started"
+           upgrade == /\ firstRun /\ PUpgradeOnStart /\ fifoAt[t] = 0
+                      /\ cfg[t].load = "INCR"
+                      /\ (TaskTxns[t] # {} \/ cfg[t].kind = "ATOMIC")
+           led == {e \in pending[t] : Leads(t, e)}
+           batches == IF pending[t] = {} THEN {{}}
+                      ELSE IF PPartialRounds /\ cfg[t].load = "INCR"
+                      THEN (SUBSET led) \ {{}}
+                      ELSE {led}
+       IN \E batch \in batches :
+            LET rest == pending[t] \ batch
+                fin == rest = {} \/ cfg[t].load # "INCR"
+                newKids == IF PSubmitBeforeRelease
+                           THEN {c \in Tasks : TaskParent[c] = t /\ phase[c] = "New" /\ cfg[c].kind = "ATOMIC"}
+                           ELSE {}
+                fa1 == [u \in Tasks |->
+                          IF u = t /\ upgrade THEN clock
+                          ELSE IF u \in newKids
+                          THEN (IF fifoAt[t] > 0 THEN fifoAt[t] ELSE clock)
+                          ELSE fifoAt[u]]
+            IN /\ pending' = [pending EXCEPT ![t] = IF fin THEN {} ELSE rest]
+               /\ fifoAt' = fa1
+               /\ clock' = clock + 1
+               /\ plog' = [e \in Entries |->
+                             IF e \in batch \/ (e \in TaskTxns[t] /\ firstRun)
+                             THEN Append(plog[e], t) ELSE plog[e]]
+               /\ phase' = [u \in Tasks |->
+                              IF u = t THEN (IF fin THEN "Done" ELSE "Started")
+                              ELSE IF u \in newKids THEN "Claimed" ELSE phase[u]]
+    /\ UNCHANGED << cfg, adopted, loading >>
+
+LoadCompletes(e) ==
+    /\ PModelLoading
+    /\ e \in loading
+    /\ loading' = loading \ {e}
+    /\ UNCHANGED << cfg, phase, pending, adopted, fifoAt, plog, clock >>
+
+Adopt(t, e) ==
+    /\ PAllowAdoption
+    /\ e \in KeyEntries /\ e \notin TaskKeys[t] /\ e \notin adopted[t]
+    /\ ~(PModelLoading /\ e \in loading)
+    /\ phase[t] \in {"Claimed", "Started"}
+    /\ PAllowFifoAdoption \/ ~IsFifo(t)
+    /\ adopted' = [adopted EXCEPT ![t] = @ \cup {e}]
+    /\ pending' = [pending EXCEPT ![t] = @ \cup {e}]
+    /\ UNCHANGED << cfg, phase, fifoAt, plog, loading, clock >>
+
+TaskNext(t) == Setup(t) \/ Run(t) \/ (\E e \in KeyEntries : Adopt(t, e))
+Next == (\E t \in Tasks : TaskNext(t)) \/ (\E e \in Entries : LoadCompletes(e))
+
+Init ==
+    /\ cfg \in [Tasks -> ConfigDomain]
+    /\ \A t \in Tasks : LegalConfigFor(t, cfg[t])
+    /\ phase = [t \in Tasks |-> "New"]
+    /\ pending = [t \in Tasks |-> TaskKeys[t]]
+    /\ adopted = [t \in Tasks |-> {}]
+    /\ fifoAt = [t \in Tasks |-> 0]
+    /\ plog = [e \in Entries |-> << >>]
+    /\ loading \in (IF PModelLoading THEN SUBSET Entries ELSE {{}})
+    /\ clock = 1
+
+WaitsFor(a, b) ==
+    /\ a # b
+    /\ \E e \in Entries :
+         /\ ~(PModelLoading /\ e \in loading)
+         /\ HoldsPos(a, e)
+         /\ \/ (a \notin Prefix(e,{},{},FALSE) /\ b \in Prefix(e,{},{},FALSE))
+            \/ HoldsLock(b, e)
+
+Live == {t \in Tasks : phase[t] # "Done"}
+
+RECURSIVE EventuallyRunnable(_)
+EventuallyRunnable(S) ==
+    LET nxt == S \cup {t \in Live \ S : TxnReady(t, S) /\ KeyReady(t, S)}
+    IN IF nxt = S THEN S ELSE EventuallyRunnable(nxt)
+
+NoStuck == Live \subseteq EventuallyRunnable({})
+
+Layer(t) == IF IsFifo(t) THEN 0 ELSE IF cfg[t].kind = "UNSEQ" THEN 2 ELSE 1
+RankKey(t) == IF IsFifo(t) THEN FifoKey(t) ELSE IF Layer(t) = 2 THEN 0 ELSE t
+RankLt(x, y) == Layer(x) < Layer(y) \/ (Layer(x) = Layer(y) /\ RankKey(x) < RankKey(y))
+RankOK == \A a, b \in Tasks : WaitsFor(a, b) => RankLt(b, a)
+
+RECURSIVE TransClose(_)
+TransClose(R) ==
+    LET nxt == R \cup {<<a,c>> \in Tasks \X Tasks :
+                          \E b \in Tasks : <<a,b>> \in R /\ <<b,c>> \in R}
+    IN IF nxt = R THEN R ELSE TransClose(nxt)
+
+NoCycle == \A t \in Tasks : <<t,t>> \notin TransClose({<<a,b>> \in Tasks \X Tasks : WaitsFor(a,b)})
+
+TypeOK ==
+    /\ cfg \in [Tasks -> ConfigDomain]
+    /\ phase \in [Tasks -> Phases]
+    /\ pending \in [Tasks -> SUBSET KeyEntries]
+    /\ adopted \in [Tasks -> SUBSET KeyEntries]
+    /\ fifoAt \in [Tasks -> Nat]
+    /\ DOMAIN plog = Entries
+    /\ \A e \in Entries : \A i \in 1..Len(plog[e]) : plog[e][i] \in Tasks
+    /\ clock \in Nat
+    /\ loading \subseteq Entries
+
+Inv_LockerIsFifo ==
+    \A t \in Tasks : (phase[t] = "Started" /\ HoldsAcrossRuns(t)) => IsFifo(t)
+
+Inv_LockLeads ==
+    \A t \in Tasks : \A e \in Entries :
+        HoldsLock(t, e) =>
+            \/ (PModelLoading /\ e \in loading)
+            \/ LET f == {u \in Tasks : Occupies(u, e, {}, {}) /\ Region(u) = "FIFO"}
+               IN t \in f /\ LeastStamped(f) = t
+
+Inv_OneProspectiveLocker ==
+    \A e \in CmdEntries :
+        ~\E t, u \in Tasks :
+            /\ t # u
+            /\ HoldsAcrossRuns(t) /\ e \in TaskTxns[t]
+            /\ HoldsAcrossRuns(u) /\ e \in TaskTxns[u]
+            /\ t \in Prefix(e,{},{},FALSE) /\ u \in Prefix(e,{},{},FALSE)
+
+Inv_AtMostOneLock ==
+    \A e \in Entries : \A t, u \in Tasks : (HoldsLock(t, e) /\ HoldsLock(u, e)) => t = u
+
+RECURSIVE UnitOf(_)
+UnitOf(t) == IF IsChild(t) /\ cfg[t].kind = "ATOMIC" THEN UnitOf(TaskParent[t]) ELSE t
+
+Inv_Isolation ==
+    \A e \in Entries :
+        ~\E i, j, k \in 1..Len(plog[e]) :
+            /\ i < j /\ j < k
+            /\ LET a == plog[e][i] x == plog[e][j] b == plog[e][k]
+               IN a # b /\ UnitOf(a) = UnitOf(b) /\ UnitOf(x) # UnitOf(a)
+
+MCTaskTxnsTwo == <<CmdEntries, CmdEntries>>
+MCTaskKeysTwo == <<KeyEntries, KeyEntries>>
+MCTaskParentTwo == <<0, 0>>
+
+MCTaskTxnsDeep == <<{}, {}, {}, {}>>
+MCTaskKeysDeep == <<KeyEntries, KeyEntries, KeyEntries, KeyEntries>>
+MCTaskParentDeep == <<0, 0, 2, 3>>
+====
+"#;
+
+    let all_invs = &[
+        "TypeOK",
+        "Inv_LockerIsFifo",
+        "Inv_LockLeads",
+        "Inv_OneProspectiveLocker",
+        "Inv_AtMostOneLock",
+        "Inv_Isolation",
+        "RankOK",
+        "NoCycle",
+        "NoStuck",
+    ];
+
+    // Topology 1: two lockers with loading, adoption, partial rounds, and product of 2 groups.
+    let cfg_two = r#"CONSTANTS
+  CmdEntries = {c1, c2}
+  KeyEntries = {k1, k2}
+  NumTasks = 2
+  TaskTxns <- MCTaskTxnsTwo
+  TaskKeys <- MCTaskKeysTwo
+  TaskParent <- MCTaskParentTwo
+  MinBatch = 1
+  BlockedLimit = 1
+  PAlwaysReady = "ON_NON_SUBSET"
+  PModelLoading = TRUE
+  PAllowAdoption = TRUE
+  PPartialRounds = TRUE
+  PUpgradeOnStart = TRUE
+  PSubmitBeforeRelease = TRUE
+  PAllowUnseqIncrWithTxn = FALSE
+  PAllowFifoAdoption = FALSE
+  PAllowDoubleLock = FALSE
+  PBagInterleaves = FALSE
+INIT Init
+NEXT Next
+"#;
+    let proof_two = certify_roots(
+        "AccordModelValue",
+        spec,
+        cfg_two,
+        "Init",
+        "Next",
+        all_invs,
+        &[vec!["c1".into(), "c2".into()], vec!["k1".into(), "k2".into()]],
+    )
+    .expect("AccordExec-faithful ModelValue two-lockers spec must certify");
+    for needle in [
+        "namespace TlxOptimization.GeneratedEquivSymmetry",
+        "Expr.chooseKeyFree",
+        "Expr.fixSet",
+        "Expr.iterRec",
+        "Expr.append",
+        "Expr.len",
+        "theorem certificate",
+        "theorem orbit_key_equivalent",
+    ] {
+        assert!(proof_two.contains(needle), "missing {needle} in two-lockers certificate");
+    }
+
+    // Topology 2: deep consequence chain (`TaskParent = <<0, 0, 2, 3>>`) exercising multi-hop `UnitOf`,
+    // `InheritedStamp`, `newKids`, and `IsChild` narrowing.
+    let cfg_deep = r#"CONSTANTS
+  CmdEntries = {c1}
+  KeyEntries = {k1, k2}
+  NumTasks = 4
+  TaskTxns <- MCTaskTxnsDeep
+  TaskKeys <- MCTaskKeysDeep
+  TaskParent <- MCTaskParentDeep
+  MinBatch = 1
+  BlockedLimit = 0
+  PAlwaysReady = "ON_NON_SUBSET"
+  PModelLoading = FALSE
+  PAllowAdoption = TRUE
+  PPartialRounds = TRUE
+  PUpgradeOnStart = TRUE
+  PSubmitBeforeRelease = TRUE
+  PAllowUnseqIncrWithTxn = FALSE
+  PAllowFifoAdoption = FALSE
+  PAllowDoubleLock = FALSE
+  PBagInterleaves = FALSE
+INIT Init
+NEXT Next
+"#;
+    let proof_deep = certify_roots("AccordModelValue", spec, cfg_deep, "Init", "Next", all_invs, &[vec!["k1".into(), "k2".into()]])
+        .expect("AccordExec-faithful ModelValue deep-chain spec must certify");
+    assert!(proof_deep.contains("Expr.chooseKeyFree"));
+    assert!(proof_deep.contains("Expr.fixSet"));
+    assert!(proof_deep.contains("Expr.iterRec"));
+}
+
+#[test]
+fn key_free_choose_recursive_and_progress_negative_refusals() {
+    let group = &[vec!["k1".into(), "k2".into(), "k3".into()]];
+    let cfg = "CONSTANTS KeyEntries = {k1, k2, k3}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+
+    // Positive: non-monotone acyclic tail recursion (`2 -> 3 -> 0`) and exact equality witness CHOOSE.
+    let non_monotone_ok = r#"---- MODULE NonMonotoneAcyclicOk ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s
+Parent == <<0, 3, 0>>
+RECURSIVE Root(_)
+Root(t) == IF Parent[t] # 0 THEN Root(Parent[t]) ELSE t
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == \A t \in 1..3 : Root(t) \in 1..3 /\ LET f == 1..3 IN (t \in f /\ (CHOOSE u \in f : u = t) = t)
+====
+"#;
+    assert!(
+        certify_equiv_direct("NonMonotoneAcyclicOk", non_monotone_ok, cfg, group).is_some(),
+        "non-monotone acyclic tail recursion and exact equality witness CHOOSE must certify"
+    );
+
+    // 1. Key-bearing CHOOSE must refuse.
+    let key_choose = r#"---- MODULE KeyChoose ----
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s = KeyEntries
+Next == s' = s
+Inv == (CHOOSE k \in KeyEntries : TRUE) \in s
+====
+"#;
+    assert!(certify_equiv_direct("KeyChoose", key_choose, cfg, group).is_none(), "key-bearing CHOOSE must refuse");
+
+    // 2. Compound key-bearing CHOOSE (tuple, set, record) must refuse.
+    let tuple_key_choose = r#"---- MODULE TupleKeyChoose ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s = KeyEntries
+Next == s' = s
+Inv == (CHOOSE p \in KeyEntries \X (1..2) : TRUE)[1] \in s
+====
+"#;
+    assert!(certify_equiv_direct("TupleKeyChoose", tuple_key_choose, cfg, group).is_none(), "tuple key-bearing CHOOSE must refuse");
+
+    let subset_key_choose = r#"---- MODULE SubsetKeyChoose ----
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s = KeyEntries
+Next == s' = s
+Inv == (CHOOSE u \in SUBSET KeyEntries : TRUE) \subseteq s
+====
+"#;
+    assert!(certify_equiv_direct("SubsetKeyChoose", subset_key_choose, cfg, group).is_none(), "powerset key-bearing CHOOSE must refuse");
+
+    let rec_key_choose = r#"---- MODULE RecKeyChoose ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s = KeyEntries
+Next == s' = s
+Inv == (CHOOSE r \in [k : KeyEntries, n : 1..2] : TRUE).k \in s
+====
+"#;
+    assert!(certify_equiv_direct("RecKeyChoose", rec_key_choose, cfg, group).is_none(), "record key-bearing CHOOSE must refuse");
+
+    // 3. Unguarded potentially-empty CHOOSE must refuse.
+    let empty_choose = r#"---- MODULE EmptyChoose ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, lk
+Init == s \in SUBSET KeyEntries /\ lk \in SUBSET (1..3)
+Next == UNCHANGED <<s, lk>>
+Inv == (CHOOSE t \in lk : TRUE) \in 1..3
+====
+"#;
+    assert!(certify_equiv_direct("EmptyChoose", empty_choose, cfg, group).is_none(), "unguarded empty CHOOSE must refuse");
+
+    // 4. Strict `<` extremum CHOOSE has no witness on non-empty sets and must refuse.
+    let strict_choose = r#"---- MODULE StrictChoose ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == (CHOOSE t \in 1..3 : \A u \in 1..3 : t < u) \in 1..3
+====
+"#;
+    assert!(certify_equiv_direct("StrictChoose", strict_choose, cfg, group).is_none(), "strict `<` extremum CHOOSE must refuse");
+
+    // 5. Unproven equality witness `CHOOSE t \in 1..2 : t = 3` must refuse.
+    let bad_eq_choose = r#"---- MODULE BadEqChoose ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == (CHOOSE t \in 1..2 : t = 3) \in 1..2
+====
+"#;
+    assert!(certify_equiv_direct("BadEqChoose", bad_eq_choose, cfg, group).is_none(), "unproven equality witness CHOOSE must refuse");
+
+    // 6. Cyclic/non-terminating UnitOf (`TaskParent == <<2, 1>>`) must refuse.
+    let cyclic_unit = r#"---- MODULE CyclicUnit ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+Parent == <<2, 1>>
+RECURSIVE UnitOf(_)
+UnitOf(t) == IF Parent[t] # 0 THEN UnitOf(Parent[t]) ELSE t
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == \A t \in 1..2 : UnitOf(t) \in 1..2
+====
+"#;
+    assert!(certify_equiv_direct("CyclicUnit", cyclic_unit, cfg, group).is_none(), "cyclic tail recursion must refuse");
+
+    // 7. Non-inflationary RECURSIVE must refuse.
+    let non_infl_rec = r#"---- MODULE NonInflRec ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+RECURSIVE Shrink(_)
+Shrink(X) == IF X = {} THEN {} ELSE Shrink(X \ {1})
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == Shrink(1..2) = {}
+====
+"#;
+    assert!(certify_equiv_direct("NonInflRec", non_infl_rec, cfg, group).is_none(), "non-inflationary recursive operator must refuse");
+
+    // 8. Inflationary RECURSIVE exceeding K <= 64 universe bound must refuse.
+    let huge_fix = r#"---- MODULE HugeFix ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLE s
+RECURSIVE Reach(_)
+Reach(X) == LET nxt == X \cup {n \in 1..70 : n = 1} IN IF nxt = X THEN X ELSE Reach(nxt)
+Init == s \in SUBSET KeyEntries
+Next == s' = s
+Inv == 1 \in Reach({})
+====
+"#;
+    assert!(certify_equiv_direct("HugeFix", huge_fix, cfg, group).is_none(), "fixpoint universe > 64 must refuse");
+
+    // 9. Unbounded `clock' = clock + 1` without strict progress decrease must refuse (`clock * 2` overflows).
+    let unbounded_clock = r#"---- MODULE UnboundedClock ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, clock
+Init == s \in SUBSET KeyEntries /\ clock = 1
+Next == s' = s /\ clock' = clock + 1
+Inv == clock * 2 > 0
+====
+"#;
+    assert!(certify_equiv_direct("UnboundedClock", unbounded_clock, cfg, group).is_none(), "unbounded clock increment must refuse");
+
+    // 10. Cyclic phase DAG with `clock' = clock + 1` must refuse.
+    let cyclic_dag = r#"---- MODULE CyclicDag ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, phase, clock
+Init == s \in SUBSET KeyEntries /\ phase = "New" /\ clock = 1
+Next ==
+    \/ (phase = "New" /\ phase' = "Done" /\ clock' = clock + 1 /\ s' = s)
+    \/ (phase = "Done" /\ phase' = "New" /\ clock' = clock + 1 /\ s' = s)
+Inv == clock * 2 > 0
+====
+"#;
+    assert!(certify_equiv_direct("CyclicDag", cyclic_dag, cfg, group).is_none(), "cyclic phase DAG must refuse");
+
+    // 11. Unguarded adopted growth (`e \notin adopted` removed) allows unbounded pending refill -> must refuse.
+    let unguarded_adopt = r#"---- MODULE UnguardedAdopt ----
+EXTENDS Integers, Sequences
+CONSTANTS KeyEntries
+VARIABLES adopted, pending, plog, clock
+Init == adopted = {} /\ pending = KeyEntries /\ plog = << >> /\ clock = 1
+Next ==
+    \/ (\E e \in KeyEntries : adopted' = adopted \cup {e} /\ pending' = pending \cup {e} /\ UNCHANGED <<plog, clock>>)
+    \/ (\E b \in (SUBSET pending) \ {{}} : pending' = pending \ b /\ plog' = Append(plog, 1) /\ clock' = clock + 1 /\ UNCHANGED adopted)
+Inv == clock * 2 > 0 /\ \A i \in 1..Len(plog) : plog[i] = 1
+====
+"#;
+    assert!(certify_equiv_direct("UnguardedAdopt", unguarded_adopt, cfg, group).is_none(), "unguarded adopted growth must refuse");
+
+    // 12. `SUBSET pending` without `\ {{}}` permits empty batch -> must refuse.
+    let empty_batch = r#"---- MODULE EmptyBatch ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES pending, clock
+Init == pending = KeyEntries /\ clock = 1
+Next == \E b \in SUBSET pending : pending' = pending \ b /\ clock' = clock + 1
+Inv == clock * 2 > 0
+====
+"#;
+    assert!(certify_equiv_direct("EmptyBatch", empty_batch, cfg, group).is_none(), "possibly-empty batch shrink must refuse");
+
+    // 13. Non-additive counter update `clock' = clock * 2` even with DAG progress must refuse.
+    let mul_clock = r#"---- MODULE MulClock ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, phase, clock
+Init == s \in SUBSET KeyEntries /\ phase = "New" /\ clock = 1
+Next == phase = "New" /\ phase' = "Done" /\ clock' = clock * 2 /\ s' = s
+Inv == clock * 2 > 0
+====
+"#;
+    assert!(certify_equiv_direct("MulClock", mul_clock, cfg, group).is_none(), "multiplicative clock update must refuse");
+
+    // 14. Shared-IF splitting must never conflate EXCEPT-scoped `@` across unrelated updates.
+    let except_at_conflation = r#"---- MODULE ExceptAtConflation ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, p, q, clock
+Init == s \in SUBSET KeyEntries /\ p \in [1..1 -> {"A", "B"}] /\ q \in [1..1 -> {"A", "B"}] /\ clock = 1
+Next ==
+    /\ s' = s
+    /\ p[1] # "C" /\ q[1] # "C"
+    /\ p' = [p EXCEPT ![1] = IF @ = "A" THEN "C" ELSE @]
+    /\ q' = [q EXCEPT ![1] = IF @ = "A" THEN @ ELSE "C"]
+    /\ clock' = clock + 1
+Inv == clock * 2 > 0
+====
+"#;
+    assert!(
+        certify_equiv_direct("ExceptAtConflation", except_at_conflation, cfg, group).is_none(),
+        "EXCEPT-scoped `@` conditions must not be conflated across unrelated updates"
+    );
+
+    // 15. FixSet inference must never truncate a multi-step fixpoint shape (neither 6-step nor >8-step).
+    let truncated_fix_6 = r#"---- MODULE TruncatedFix6 ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, big
+NextVal == <<2, 3, 4, 5, 6, 6>>
+RECURSIVE Grow(_)
+Grow(X) == LET nxt == X \cup {NextVal[x] : x \in X} IN IF nxt = X THEN X ELSE Grow(nxt)
+Init == s \in SUBSET KeyEntries /\ big = Grow({1})
+Next == UNCHANGED <<s, big>>
+Inv == \A x \in big : (<<10, 20, 30, 40, 50>>)[x] > 0
+====
+"#;
+    assert!(
+        certify_equiv_direct("TruncatedFix6", truncated_fix_6, cfg, group).is_none(),
+        "6-step fixpoint must infer full 1..6 range and reject out-of-bounds tuple indexing"
+    );
+
+    let truncated_fix_9 = r#"---- MODULE TruncatedFix9 ----
+EXTENDS Integers
+CONSTANTS KeyEntries
+VARIABLES s, big
+NextVal == <<2, 3, 4, 5, 6, 7, 8, 9, 9>>
+RECURSIVE Grow(_)
+Grow(X) == LET nxt == X \cup {NextVal[x] : x \in X} IN IF nxt = X THEN X ELSE Grow(nxt)
+Init == s \in SUBSET KeyEntries /\ big = Grow({1})
+Next == UNCHANGED <<s, big>>
+Inv == \A x \in big : (<<1, 2, 3, 4, 5, 6, 7, 8>>)[x] > 0
+====
+"#;
+    assert!(
+        certify_equiv_direct("TruncatedFix9", truncated_fix_9, cfg, group).is_none(),
+        "unconverged >8-step fixpoint inference must fail closed to Top"
+    );
+}

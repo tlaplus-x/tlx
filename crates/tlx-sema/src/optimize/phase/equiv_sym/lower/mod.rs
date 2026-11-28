@@ -127,7 +127,14 @@ impl<'a> LowerCtx<'a> {
         (self.nodes <= MAX_NODES && self.emitted_bytes <= MAX_EMITTED_BYTES).then_some(())
     }
 
-    fn charge(&mut self, s: String) -> Option<String> {
+    /// Guard an intermediate lowered subtree against exceeding the remaining emitted-byte budget
+    /// without double-charging descendant bytes at every ancestor.
+    fn charge(&self, s: String) -> Option<String> {
+        (self.emitted_bytes.saturating_add(s.len()) <= MAX_EMITTED_BYTES).then_some(s)
+    }
+
+    /// Commit a completed top-level lowered form/expression against the cumulative byte budget.
+    fn commit_bytes(&mut self, s: String) -> Option<String> {
         self.emitted_bytes = self.emitted_bytes.saturating_add(s.len());
         (self.emitted_bytes <= MAX_EMITTED_BYTES).then_some(s)
     }
@@ -253,17 +260,17 @@ impl<'a> LowerCtx<'a> {
 
     pub(in crate::optimize::phase) fn lower_form(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
         let out = self.lower_form_rec(e, allow_prime, false, allow_prime)?;
-        self.charge(out)
+        self.commit_bytes(out)
     }
 
     pub(in crate::optimize::phase) fn lower_action_pred(&mut self, e: &Expr) -> Option<String> {
         let out = self.lower_form_rec(e, true, false, false)?;
-        self.charge(out)
+        self.commit_bytes(out)
     }
 
     pub(in crate::optimize::phase) fn lower_expr(&mut self, e: &Expr, allow_prime: bool) -> Option<String> {
         let out = self.lower_expr_rec(e, allow_prime, false)?;
-        self.charge(out)
+        self.commit_bytes(out)
     }
 
     pub(in crate::optimize::phase) fn lower_empty_var_expr(&mut self, e: &Expr) -> Option<String> {
@@ -275,7 +282,7 @@ impl<'a> LowerCtx<'a> {
         self.var_map = saved_vars;
         self.locals = saved_locals;
         self.check_env = saved_env;
-        self.charge(out?)
+        self.commit_bytes(out?)
     }
 
     pub(in crate::optimize::phase) fn atom_id_of(&mut self, key: AtomKey) -> usize {
@@ -443,7 +450,11 @@ impl<'a> LowerCtx<'a> {
                 }
                 (B::Implies, [a, b]) => {
                     let fa = self.lower_form_rec(a, allow_prime, in_prime, false)?;
-                    let fb = self.lower_form_rec(b, allow_prime, in_prime, false)?;
+                    let saved = self.check_env.clone();
+                    self.totality.apply_positive_fact(a, in_prime, &mut self.check_env);
+                    let fb = self.lower_form_rec(b, allow_prime, in_prime, false);
+                    self.check_env = saved;
+                    let fb = fb?;
                     Some(format!("(Form.impl {fa} {fb})"))
                 }
                 (B::Equiv, [a, b]) => {
@@ -546,7 +557,7 @@ impl<'a> LowerCtx<'a> {
         let saved = self.check_env.clone();
         let body = self.lower_erased_bounds(&b.bounds, &b.terms, omitted, allow_prime, &mut doms);
         self.check_env = saved;
-        let body = self.charge(body?)?;
+        let body = self.commit_bytes(body?)?;
         Some((doms, body))
     }
 

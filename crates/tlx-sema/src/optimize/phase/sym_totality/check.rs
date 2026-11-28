@@ -4,9 +4,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::ordinary_unchanged;
+use super::super::sym_norm::RecOpKind;
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, Shape, TotalityChecker, MAX_I32_U32};
 use crate::{builtins::Builtin as B, hir::*};
+
+const MAX_FIX_SET_BOUND: u32 = 64;
+const MAX_ITER_REC_STEPS: u32 = 16;
 
 impl<'a> TotalityChecker<'a> {
     // ---- Action-level vs Value-position totality checking ----
@@ -471,7 +475,9 @@ impl<'a> TotalityChecker<'a> {
                 field_of_shape_total(&rs, field)
             }
             ExprKind::Choose { vars, set, body } => {
-                let fv = self.allow_choose_folds?;
+                let Some(fv) = self.allow_choose_folds else {
+                    return self.check_choose_key_free(vars, set.as_ref(), body, allow_prime, in_prime, env, steps);
+                };
                 let s = set.as_ref()?;
                 let (elem, max_card) = self.check_enumerable_set(s, allow_prime, in_prime, env, steps)?;
                 let mut local_env = env.clone();
@@ -605,74 +611,13 @@ impl<'a> TotalityChecker<'a> {
                 Some(Shape::Func { dom: Box::new(dom), exact_dom, range: Box::new(range), max_dom: Some(max_dom) })
             }
             ExprKind::FnApp { func, args } => {
-                let fs = self.check_expr(func, allow_prime, in_prime, env, steps)?;
-                let arg_shapes = args.iter().map(|a| self.check_expr(a, allow_prime, in_prime, env, steps)).collect::<Option<Vec<_>>>()?;
-                let key_shape = if arg_shapes.len() == 1 { arg_shapes[0].clone() } else { Shape::Tuple(arg_shapes) };
-                if matches!(fs, Shape::Bottom) || matches!(key_shape, Shape::Bottom) {
-                    return Some(Shape::Bottom);
-                }
-                // Fast exact checks:
-                if args.len() == 1 {
-                    if let ExprKind::Str(field) = &*args[0].kind {
-                        if matches!(&fs, Shape::Record(_)) {
-                            return field_of_shape_total(&fs, field);
-                        }
-                    }
-                    // Proven `x \in DOMAIN f` (or `x \in 1..Len(seq)`) via DomOrigin or `proven_in_dom`:
-                    let proven_dom = match &*args[0].kind {
-                        ExprKind::Local(l) => env
-                            .local_dom
-                            .get(l)
-                            .is_some_and(|(orig_expr, orig_prime)| expr_struct_eq(func, in_prime, orig_expr, *orig_prime)),
-                        _ => false,
-                    } || env
-                        .proven_in_dom
-                        .iter()
-                        .any(|(k, f, fp)| expr_struct_eq(&args[0], in_prime, k, *fp) && expr_struct_eq(func, in_prime, f, *fp));
-                    if proven_dom && fnapp_index_valid_for(&fs, &key_shape, self.groups) {
-                        if let Some(key) = fn_app_place(func, args, in_prime) {
-                            if let Some(ov) = env.fn_app_overrides.get(&key) {
-                                return Some(ov.clone());
-                            }
-                        }
-                        if let Some((_, range, _)) = fn_dom_range(&fs) {
-                            return Some(range);
-                        }
-                    }
-                    if let Shape::Tuple(ts) = &fs {
-                        if let Shape::Int(Some((lo, hi))) = key_shape {
-                            if lo >= 1 && (hi as usize) <= ts.len() {
-                                let mut out = Shape::Bottom;
-                                for item in &ts[(lo as usize - 1)..(hi as usize)] {
-                                    out = join_shape(&out, item);
-                                }
-                                return Some(out);
-                            }
-                        }
-                        return None;
-                    }
-                    if let Shape::Seq { elem, min_len, .. } = &fs {
-                        if let Shape::Int(Some((lo, hi))) = key_shape {
-                            if lo >= 1 && (hi as u32) <= *min_len {
-                                return Some((**elem).clone());
-                            }
-                        }
-                        return None;
+                let mut res = self.check_fn_app_base(func, args, allow_prime, in_prime, env, steps)?;
+                for (oe, op, os) in &env.expr_overrides {
+                    if expr_alpha_eq(e, in_prime, oe, *op) {
+                        res = narrow_shape(&res, os);
                     }
                 }
-                // General fixed-domain function application: requires `exact_dom == true` so
-                // dynamic subset domains like `[q \in {r} |-> r]` can NEVER masquerade as `Proc`!
-                if let Shape::Func { dom, exact_dom: true, range, .. } = &fs {
-                    if shape_in_exact_domain(&key_shape, dom) && fnapp_index_valid_for(&fs, &key_shape, self.groups) {
-                        if let Some(key) = fn_app_place(func, args, in_prime) {
-                            if let Some(ov) = env.fn_app_overrides.get(&key) {
-                                return Some(ov.clone());
-                            }
-                        }
-                        return Some((**range).clone());
-                    }
-                }
-                None
+                Some(res)
             }
             ExprKind::Except { base, updates } => {
                 let mut cur = self.check_expr(base, allow_prime, in_prime, env, steps)?;
@@ -783,8 +728,383 @@ impl<'a> TotalityChecker<'a> {
                 Some(Shape::Set { elem: Box::new(elem), finite: true, max_card: Some(card) })
             }
             ExprKind::Builtin { op, args } => self.check_builtin(e, (*op, args), allow_prime, in_prime, env, steps),
+            ExprKind::Apply { op: OpRef::Def(id), args } => match (self.rec_ops.get(id), args.as_slice()) {
+                (Some(RecOpKind::FixSet), [init, step_lam]) => {
+                    let ExprKind::Lambda { params, body } = &*step_lam.kind else { return None };
+                    let [s_var] = params.as_slice() else { return None };
+                    self.compute_fix_set_bound(init, *s_var, body, allow_prime, in_prime, env, steps).map(|(_, sh)| sh)
+                }
+                (Some(RecOpKind::IterRec), [init, step_lam]) => {
+                    let ExprKind::Lambda { params, body } = &*step_lam.kind else { return None };
+                    let [x_var] = params.as_slice() else { return None };
+                    let ExprKind::If { cond, then, els } = &*body.kind else { return None };
+                    self.compute_iter_rec_info(init, *x_var, cond, then, els, allow_prime, in_prime, env, steps).map(|(_, sh, _)| sh)
+                }
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    fn check_fn_app_base(
+        &self,
+        func: &Expr,
+        args: &[Expr],
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<Shape> {
+        let fs = self.check_expr(func, allow_prime, in_prime, env, steps)?;
+        let arg_shapes = args.iter().map(|a| self.check_expr(a, allow_prime, in_prime, env, steps)).collect::<Option<Vec<_>>>()?;
+        let key_shape = if arg_shapes.len() == 1 { arg_shapes[0].clone() } else { Shape::Tuple(arg_shapes) };
+        if matches!(fs, Shape::Bottom) || matches!(key_shape, Shape::Bottom) {
+            return Some(Shape::Bottom);
+        }
+        // Fast exact checks:
+        if args.len() == 1 {
+            if let ExprKind::Str(field) = &*args[0].kind {
+                if matches!(&fs, Shape::Record(_)) {
+                    return field_of_shape_total(&fs, field);
+                }
+            }
+            // Proven `x \in DOMAIN f` (or `x \in 1..Len(seq)`) via DomOrigin or `proven_in_dom`:
+            let proven_dom = match &*args[0].kind {
+                ExprKind::Local(l) => {
+                    env.local_dom.get(l).is_some_and(|(orig_expr, orig_prime)| expr_struct_eq(func, in_prime, orig_expr, *orig_prime))
+                }
+                _ => false,
+            } || env
+                .proven_in_dom
+                .iter()
+                .any(|(k, f, fp)| expr_struct_eq(&args[0], in_prime, k, *fp) && expr_struct_eq(func, in_prime, f, *fp));
+            if proven_dom && fnapp_index_valid_for(&fs, &key_shape, self.groups) {
+                if let Some(key) = fn_app_place(func, args, in_prime) {
+                    if let Some(ov) = env.fn_app_overrides.get(&key) {
+                        return Some(ov.clone());
+                    }
+                }
+                if let Some((_, range, _)) = fn_dom_range(&fs) {
+                    return Some(range);
+                }
+            }
+            if let Shape::Tuple(ts) = &fs {
+                if let Shape::Int(Some((lo, hi))) = key_shape {
+                    if lo >= 1 && (hi as usize) <= ts.len() {
+                        let mut out = Shape::Bottom;
+                        for item in &ts[(lo as usize - 1)..(hi as usize)] {
+                            out = join_shape(&out, item);
+                        }
+                        return Some(out);
+                    }
+                }
+                return None;
+            }
+            if let Shape::Seq { elem, min_len, .. } = &fs {
+                if let Shape::Int(Some((lo, hi))) = key_shape {
+                    if lo >= 1 && (hi as u32) <= *min_len {
+                        return Some((**elem).clone());
+                    }
+                }
+                return None;
+            }
+        }
+        // General fixed-domain function application: requires `exact_dom == true` so
+        // dynamic subset domains like `[q \in {r} |-> r]` can NEVER masquerade as `Proc`!
+        if let Shape::Func { dom, exact_dom: true, range, .. } = &fs {
+            if shape_in_exact_domain(&key_shape, dom) && fnapp_index_valid_for(&fs, &key_shape, self.groups) {
+                if let Some(key) = fn_app_place(func, args, in_prime) {
+                    if let Some(ov) = env.fn_app_overrides.get(&key) {
+                        return Some(ov.clone());
+                    }
+                }
+                return Some((**range).clone());
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_choose_key_free(
+        &self,
+        vars: &BoundVars,
+        set: Option<&Expr>,
+        body: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<Shape> {
+        let s = set?;
+        let (elem, _) = self.check_enumerable_set(s, allow_prime, in_prime, env, steps)?;
+        if !shape_is_key_free(&elem) {
+            return None;
+        }
+        let mut local_env = env.clone();
+        let (_, origin) = self.bound_elem_info(s, in_prime, env);
+        match vars {
+            BoundVars::Many(ids) if ids.len() == 1 => local_env.bind_local(ids[0], elem.clone(), origin),
+            BoundVars::Tuple(ids) => {
+                let parts = extract_exact_tuple_arity(&elem, ids.len())?;
+                for (&id, p) in ids.iter().zip(parts) {
+                    local_env.bind_local(id, p, None);
+                }
+            }
+            _ => return None,
+        }
+        if !self.check_form(body, allow_prime, in_prime, &local_env, steps) {
+            return None;
+        }
+        if !self.is_set_provably_nonempty(s, in_prime, env, steps) {
+            return None;
+        }
+        if !self.choose_witness_exists(vars, s, body, allow_prime, in_prime, env, &local_env, steps) {
+            return None;
+        }
+        Some(elem)
+    }
+
+    fn is_set_provably_nonempty(&self, s: &Expr, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> bool {
+        if env.unreachable {
+            return true;
+        }
+        if env.nonempty_sets.iter().any(|(ns, np)| expr_alpha_eq(s, in_prime, ns, *np))
+            || env.proven_members.iter().any(|(_, ps, pp)| expr_alpha_eq(s, in_prime, ps, *pp))
+        {
+            return true;
+        }
+        match &*s.kind {
+            ExprKind::SetEnum(es) => !es.is_empty(),
+            ExprKind::Builtin { op: B::Boolean, args } if args.is_empty() => true,
+            ExprKind::Builtin { op: B::Subset, args } if args.len() == 1 => true,
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.is_set_provably_nonempty(&args[0], in_prime, env, steps),
+            ExprKind::Builtin { op: B::Cup, args } if args.len() == 2 => {
+                self.is_set_provably_nonempty(&args[0], in_prime, env, steps)
+                    || self.is_set_provably_nonempty(&args[1], in_prime, env, steps)
+            }
+            ExprKind::Builtin { op: B::Times, args } if !args.is_empty() => {
+                args.iter().all(|a| self.is_set_provably_nonempty(a, in_prime, env, steps))
+            }
+            ExprKind::Builtin { op: B::DotDot, args } if args.len() == 2 => {
+                let sa = self.infer_expr(&args[0], in_prime, &self.var_shapes, env, steps);
+                let sb = self.infer_expr(&args[1], in_prime, &self.var_shapes, env, steps);
+                matches!((sa, sb), (Shape::Int(Some((_, ah))), Shape::Int(Some((bl, _)))) if ah <= bl)
+            }
+            ExprKind::Builtin { op: B::Domain, args } if args.len() == 1 => {
+                match self.infer_expr(&args[0], in_prime, &self.var_shapes, env, steps) {
+                    Shape::Tuple(ts) => !ts.is_empty(),
+                    Shape::Seq { min_len, .. } => min_len >= 1,
+                    Shape::Record(fs) => !fs.is_empty(),
+                    _ => false,
+                }
+            }
+            ExprKind::SetMap { bounds, .. } => bounds.iter().all(|b| self.is_set_provably_nonempty(&b.set, in_prime, env, steps)),
+            ExprKind::Const(c) => match self.consts.get(c) {
+                Some(ConstInfo::Value(tlx_front::cfg::CfgValue::Set(es))) => !es.is_empty(),
+                Some(ConstInfo::Subst(did)) => match &self.program.defs[did.idx()].kind {
+                    DefKind::Op(body) => self.is_set_provably_nonempty(body, false, &CheckEnv::default(), steps),
+                    _ => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn choose_witness_exists(
+        &self,
+        vars: &BoundVars,
+        set: &Expr,
+        body: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        local_env: &CheckEnv,
+        steps: &mut usize,
+    ) -> bool {
+        if env.unreachable {
+            return true;
+        }
+        match &*body.kind {
+            ExprKind::Bool(true) => true,
+            ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => {
+                self.choose_witness_exists(vars, set, &args[0], allow_prime, in_prime, env, local_env, steps)
+            }
+            ExprKind::Builtin { op: B::Eq, args } if args.len() == 2 => {
+                let BoundVars::Many(ids) = vars else { return false };
+                let [x] = ids.as_slice() else { return false };
+                let target = if matches!(&*args[0].kind, ExprKind::Local(l) if *l == *x) && !expr_mentions_local(&args[1], *x) {
+                    Some(&args[1])
+                } else if matches!(&*args[1].kind, ExprKind::Local(l) if *l == *x) && !expr_mentions_local(&args[0], *x) {
+                    Some(&args[0])
+                } else {
+                    None
+                };
+                target.is_some_and(|t| {
+                    env.proven_members.iter().any(|(e, ps, pp)| expr_alpha_eq(t, in_prime, e, *pp) && expr_alpha_eq(set, in_prime, ps, *pp))
+                })
+            }
+            ExprKind::Quant { kind: QuantKind::Forall, bounds, body: qbody } if bounds.len() == 1 => {
+                if !expr_alpha_eq(&bounds[0].set, in_prime, set, in_prime) {
+                    return false;
+                }
+                let (x_vars, u_vars): (&[LocalId], &[LocalId]) = match (vars, &bounds[0].vars) {
+                    (BoundVars::Many(xs), BoundVars::Many(us)) if xs.len() == 1 && us.len() == 1 => (xs, us),
+                    (BoundVars::Tuple(xs), BoundVars::Tuple(us)) if xs.len() == us.len() => (xs, us),
+                    _ => return false,
+                };
+                if x_vars.iter().any(|x| u_vars.contains(x)) {
+                    return false;
+                }
+                let inner = match &*qbody.kind {
+                    ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => &args[0],
+                    _ => qbody,
+                };
+                let ExprKind::Builtin { op: B::Le | B::Ge, args } = &*inner.kind else { return false };
+                let [lhs, rhs] = args.as_slice() else { return false };
+                let pairs: Vec<(LocalId, LocalId)> = x_vars.iter().copied().zip(u_vars.iter().copied()).collect();
+                let check_dir = |kx: &Expr, ku: &Expr, steps: &mut usize| -> bool {
+                    u_vars.iter().all(|&u| !expr_mentions_local(kx, u))
+                        && x_vars.iter().all(|&x| !expr_mentions_local(ku, x))
+                        && expr_alpha_eq_with_map(kx, in_prime, ku, in_prime, &pairs)
+                        && self.check_expr(kx, allow_prime, in_prime, local_env, steps).is_some_and(|sh| is_int_shape(&sh))
+                };
+                check_dir(lhs, rhs, steps) || check_dir(rhs, lhs, steps)
+            }
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compute_fix_set_bound(
+        &self,
+        init: &Expr,
+        s_var: LocalId,
+        step: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<(u32, Shape)> {
+        let (init_elem, init_card) = self.check_enumerable_set(init, allow_prime, in_prime, env, steps)?;
+        let syn_upper: Option<u32> = outer_s_free_universe(step, s_var)
+            .and_then(|u| self.check_enumerable_set(u, allow_prime, in_prime, env, steps))
+            .and_then(|(_, uc)| init_card.checked_add(uc));
+        let mut acc_elem = init_elem;
+        let mut assumed_card = init_card;
+        for _ in 0..6 {
+            let mut step_env = env.clone();
+            step_env.bind_local(s_var, Shape::Set { elem: Box::new(acc_elem.clone()), finite: true, max_card: Some(assumed_card) }, None);
+            let (step_elem, _) = self.check_enumerable_set(step, allow_prime, in_prime, &step_env, steps)?;
+            if !shapes_comparable(&acc_elem, &step_elem) {
+                return None;
+            }
+            let next_elem = join_shape(&acc_elem, &step_elem);
+            let univ_bound = shape_universe_size(&next_elem, self.groups);
+            let bound = match (univ_bound, syn_upper) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => return None,
+            };
+            if bound > MAX_FIX_SET_BOUND {
+                return None;
+            }
+            if shape_leq(&step_elem, &acc_elem) && next_elem == acc_elem && bound <= assumed_card {
+                if !shape_self_comparable(&acc_elem) || !shape_has_safe_set_cards(&acc_elem, self.groups) {
+                    return None;
+                }
+                let final_shape = Shape::Set { elem: Box::new(acc_elem), finite: true, max_card: Some(bound) };
+                let mut verify_env = env.clone();
+                verify_env.bind_local(s_var, final_shape.clone(), None);
+                self.check_enumerable_set(step, allow_prime, in_prime, &verify_env, steps)?;
+                return Some((bound, final_shape));
+            }
+            acc_elem = next_elem;
+            assumed_card = bound;
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compute_iter_rec_info(
+        &self,
+        init: &Expr,
+        x_var: LocalId,
+        cond: &Expr,
+        step: &Expr,
+        base: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<(u32, Shape, Shape)> {
+        let init_shape = self.check_expr(init, allow_prime, in_prime, env, steps)?;
+        let seeds: Vec<Shape> = match &init_shape {
+            Shape::Int(Some((lo, hi))) if *lo <= *hi && (*hi as i128 - *lo as i128) <= MAX_ITER_REC_STEPS as i128 => {
+                (*lo..=*hi).map(|v| Shape::Int(Some((v, v)))).collect()
+            }
+            Shape::Str(Some(ss)) if !ss.is_empty() && ss.len() <= MAX_ITER_REC_STEPS as usize => {
+                ss.iter().map(|s| Shape::Str(Some(BTreeSet::from([s.clone()])))).collect()
+            }
+            _ => vec![init_shape.clone()],
+        };
+        let mut max_fuel = 1u32;
+        let mut res_shape = Shape::Bottom;
+        let mut x_union = init_shape;
+        for seed in seeds {
+            let (fuel, out, seen_x) = self.simulate_iter_rec(seed, x_var, cond, step, base, allow_prime, in_prime, env, steps)?;
+            max_fuel = max_fuel.max(fuel);
+            res_shape = join_shape(&res_shape, &out);
+            x_union = join_shape(&x_union, &seen_x);
+        }
+        Some((max_fuel, res_shape, x_union))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_iter_rec(
+        &self,
+        seed: Shape,
+        x_var: LocalId,
+        cond: &Expr,
+        step: &Expr,
+        base: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+        steps: &mut usize,
+    ) -> Option<(u32, Shape, Shape)> {
+        let mut cur = seed;
+        let mut out = Shape::Bottom;
+        let mut seen_x = cur.clone();
+        for iter in 0..=MAX_ITER_REC_STEPS {
+            let mut iter_env = env.clone();
+            iter_env.bind_local(x_var, cur.clone(), None);
+            if !self.check_form(cond, allow_prime, in_prime, &iter_env, steps) {
+                return None;
+            }
+            let mut f_env = iter_env.clone();
+            self.apply_negative_fact(cond, in_prime, &mut f_env);
+            let b_shape = self.check_expr(base, allow_prime, in_prime, &f_env, steps)?;
+            if !f_env.unreachable {
+                out = join_shape(&out, &b_shape);
+            }
+            let mut t_env = iter_env.clone();
+            self.apply_positive_fact(cond, in_prime, &mut t_env);
+            if t_env.unreachable {
+                return Some((iter + 1, out, seen_x));
+            }
+            if iter == MAX_ITER_REC_STEPS {
+                return None;
+            }
+            let next_shape = self.check_expr(step, allow_prime, in_prime, &t_env, steps)?;
+            if matches!(next_shape, Shape::Bottom) {
+                return Some((iter + 1, out, seen_x));
+            }
+            seen_x = join_shape(&seen_x, &next_shape);
+            cur = next_shape;
+        }
+        None
     }
 
     fn check_builtin(
@@ -1176,8 +1496,13 @@ impl<'a> TotalityChecker<'a> {
         steps: &mut usize,
         op: fn((i32, i32), (i32, i32)) -> Option<(i32, i32)>,
     ) -> Option<Shape> {
-        let Shape::Int(Some(ba)) = self.check_expr(a, allow_prime, in_prime, env, steps)? else { return None };
-        let Shape::Int(Some(bb)) = self.check_expr(b, allow_prime, in_prime, env, steps)? else { return None };
+        let sa = self.check_expr(a, allow_prime, in_prime, env, steps)?;
+        let sb = self.check_expr(b, allow_prime, in_prime, env, steps)?;
+        if matches!(sa, Shape::Bottom) || matches!(sb, Shape::Bottom) {
+            return Some(Shape::Bottom);
+        }
+        let Shape::Int(Some(ba)) = sa else { return None };
+        let Shape::Int(Some(bb)) = sb else { return None };
         Some(Shape::Int(Some(op(ba, bb)?)))
     }
 
@@ -1198,6 +1523,7 @@ impl<'a> TotalityChecker<'a> {
         match &*s.kind {
             ExprKind::Builtin { op: B::Nat | B::Int | B::StringSet | B::Seq, .. } => None,
             _ => match self.check_expr(s, allow_prime, in_prime, env, steps)? {
+                Shape::Bottom => Some((Shape::Bottom, 0)),
                 Shape::Set { elem, finite: true, max_card } => {
                     if !shape_self_comparable(&elem) || !shape_has_safe_set_cards(&elem, self.groups) {
                         return None;
@@ -1513,5 +1839,17 @@ impl<'a> TotalityChecker<'a> {
             }
             _ => self.check_enumerable_set(set, allow_prime, in_prime, env, steps).map(|(elem, _)| elem),
         }
+    }
+}
+
+fn outer_s_free_universe(step: &Expr, s_var: LocalId) -> Option<&Expr> {
+    match &*step.kind {
+        ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => outer_s_free_universe(&args[0], s_var),
+        ExprKind::SetFilter { bound, .. } => outer_s_free_universe(&bound.set, s_var),
+        ExprKind::Builtin { op: B::SetMinus, args } if args.len() == 2 => outer_s_free_universe(&args[0], s_var),
+        ExprKind::Builtin { op: B::Cap, args } if args.len() == 2 => {
+            outer_s_free_universe(&args[0], s_var).or_else(|| outer_s_free_universe(&args[1], s_var))
+        }
+        _ => (!expr_mentions_local(step, s_var)).then_some(step),
     }
 }

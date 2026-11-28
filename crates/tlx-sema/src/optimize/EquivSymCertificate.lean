@@ -2886,6 +2886,361 @@ theorem Val.allAtoms_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNat
     have := ha (renameVal p.inverse v) hv'
     rwa [Val.asAtom_rename] at this
 
+-- Key-free value predicate, lifting, and bounded recursion helpers
+mutual
+def rawHasNoKey {K A : Type} : RawVal K A → Bool
+  | .err => true
+  | .atom _ => true
+  | .key _ => false
+  | .seq xs => rawListHasNoKey xs
+  | .set xs => rawListHasNoKey xs
+  | .fn ps => rawPairsHasNoKey ps
+
+def rawListHasNoKey {K A : Type} : List (RawVal K A) → Bool
+  | [] => true
+  | x :: xs => rawHasNoKey x && rawListHasNoKey xs
+
+def rawPairsHasNoKey {K A : Type} : List (RawVal K A × RawVal K A) → Bool
+  | [] => true
+  | (k, v) :: ps => rawHasNoKey k && rawHasNoKey v && rawPairsHasNoKey ps
+end
+
+private theorem rawListHasNoKey_iff {K A : Type} :
+    ∀ xs : List (RawVal K A), rawListHasNoKey xs = true ↔ ∀ x ∈ xs, rawHasNoKey x = true
+  | [] => by simp only [rawListHasNoKey, List.not_mem_nil, false_implies, implies_true]
+  | x :: xs => by
+    simp only [rawListHasNoKey, Bool.and_eq_true, rawListHasNoKey_iff xs, List.mem_cons]
+    constructor
+    · rintro ⟨hx, hxs⟩ y (rfl | hy)
+      · exact hx
+      · exact hxs y hy
+    · intro h
+      exact ⟨h x (Or.inl rfl), fun y hy => h y (Or.inr hy)⟩
+
+private theorem rawPairsHasNoKey_iff {K A : Type} :
+    ∀ ps : List (RawVal K A × RawVal K A),
+      rawPairsHasNoKey ps = true ↔ ∀ kv ∈ ps, rawHasNoKey kv.1 = true ∧ rawHasNoKey kv.2 = true
+  | [] => by simp only [rawPairsHasNoKey, List.not_mem_nil, false_implies, implies_true]
+  | (k, v) :: ps => by
+    simp only [rawPairsHasNoKey, Bool.and_eq_true, rawPairsHasNoKey_iff ps, List.mem_cons]
+    constructor
+    · rintro ⟨⟨hk, hv⟩, hps⟩ kv (rfl | hkv)
+      · exact ⟨hk, hv⟩
+      · exact hps kv hkv
+    · intro h
+      exact ⟨h (k, v) (Or.inl rfl), fun kv hkv => h kv (Or.inr hkv)⟩
+
+private theorem rawPairsHasNoKey_seqPairsAux {K A : Type} (natAtom : Nat → A) :
+    ∀ (base : Nat) (xs : List (RawVal K A)),
+      rawPairsHasNoKey (seqPairsAux natAtom base xs) = rawListHasNoKey xs
+  | _, [] => rfl
+  | base, x :: xs => by
+    simp only [seqPairsAux, rawPairsHasNoKey, rawHasNoKey, Bool.true_and, rawListHasNoKey,
+      rawPairsHasNoKey_seqPairsAux natAtom (base + 1) xs]
+
+private theorem rawPairsHasNoKey_seqPairs {K A : Type} [HasNatAtom A] (xs : List (RawVal K A)) :
+    rawPairsHasNoKey (seqPairs xs) = rawListHasNoKey xs :=
+  rawPairsHasNoKey_seqPairsAux HasNatAtom.natAtom 1 xs
+
+private theorem fnPairsEq_hasNoKey {K A : Type} {R : RawVal K A → RawVal K A → Prop}
+    {ps qs : List (RawVal K A × RawVal K A)}
+    (hR : ∀ a b, R a b → rawHasNoKey a = rawHasNoKey b)
+    (h : fnPairsEq R ps qs) : rawPairsHasNoKey ps = rawPairsHasNoKey qs := by
+  apply Bool.eq_iff_iff.mpr
+  rw [rawPairsHasNoKey_iff, rawPairsHasNoKey_iff]
+  rcases h with ⟨h1, h2⟩
+  constructor
+  · intro hp q hq
+    rcases h2 q hq with ⟨kv, hkv, hr1, hr2⟩
+    rcases hp kv hkv with ⟨hk, hv⟩
+    exact ⟨(hR _ _ hr1).symm.trans hk, (hR _ _ hr2).symm.trans hv⟩
+  · intro hq kv hkv
+    rcases h1 kv hkv with ⟨q, hqm, hr1, hr2⟩
+    rcases hq q hqm with ⟨hk, hv⟩
+    exact ⟨(hR _ _ hr1).trans hk, (hR _ _ hr2).trans hv⟩
+
+theorem ValEqAux_hasNoKey {K A : Type} [HasNatAtom A] :
+    ∀ (n : Nat) (x y : RawVal K A), ValEqAux n x y → rawHasNoKey x = rawHasNoKey y
+  | 0, _, _, h => False.elim h
+  | n + 1, x, y, h => by
+    cases x with
+    | err => cases y with | err => rfl | _ => exact False.elim h
+    | atom _ => cases y with | atom _ => rfl | _ => exact False.elim h
+    | key _ => cases y with | key _ => rfl | _ => exact False.elim h
+    | set xs =>
+      cases y with
+      | set ys =>
+        apply Bool.eq_iff_iff.mpr
+        simp only [rawHasNoKey, rawListHasNoKey_iff]
+        rcases h with ⟨h1, h2⟩
+        constructor
+        · intro hx b hb
+          rcases h2 b hb with ⟨a, ha, hab⟩
+          exact (ValEqAux_hasNoKey n a b hab).symm.trans (hx a ha)
+        · intro hy a ha
+          rcases h1 a ha with ⟨b, hb, hab⟩
+          exact (ValEqAux_hasNoKey n a b hab).trans (hy b hb)
+      | _ => exact False.elim h
+    | seq xs =>
+      cases y with
+      | seq ys =>
+        simp only [rawHasNoKey, ← rawPairsHasNoKey_seqPairs]
+        exact fnPairsEq_hasNoKey (ValEqAux_hasNoKey n) h
+      | fn qs =>
+        simp only [rawHasNoKey, ← rawPairsHasNoKey_seqPairs]
+        exact fnPairsEq_hasNoKey (ValEqAux_hasNoKey n) h
+      | _ => exact False.elim h
+    | fn ps =>
+      cases y with
+      | seq ys =>
+        simp only [rawHasNoKey, ← rawPairsHasNoKey_seqPairs]
+        exact fnPairsEq_hasNoKey (ValEqAux_hasNoKey n) h
+      | fn qs =>
+        simp only [rawHasNoKey]
+        exact fnPairsEq_hasNoKey (ValEqAux_hasNoKey n) h
+      | _ => exact False.elim h
+
+theorem ValEq.hasNoKey {K A : Type} [HasNatAtom A] {x y : RawVal K A} (h : ValEq x y) :
+    rawHasNoKey x = rawHasNoKey y :=
+  ValEqAux_hasNoKey (rawDepth x + 1) x y h
+
+mutual
+theorem rawHasNoKey_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ x : RawVal (Key sizes) A, rawHasNoKey (renameRaw p x) = rawHasNoKey x
+  | .err => rfl
+  | .atom _ => rfl
+  | .key _ => rfl
+  | .seq xs => rawListHasNoKey_rename p xs
+  | .set xs => rawListHasNoKey_rename p xs
+  | .fn ps => rawPairsHasNoKey_rename p ps
+
+theorem rawListHasNoKey_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ xs : List (RawVal (Key sizes) A), rawListHasNoKey (renameRawList p xs) = rawListHasNoKey xs
+  | [] => rfl
+  | x :: xs => by simp only [renameRawList, rawListHasNoKey, rawHasNoKey_rename p x, rawListHasNoKey_rename p xs]
+
+theorem rawPairsHasNoKey_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ ps : List (RawVal (Key sizes) A × RawVal (Key sizes) A),
+      rawPairsHasNoKey (renameRawPairs p ps) = rawPairsHasNoKey ps
+  | [] => rfl
+  | (k, v) :: ps => by
+    simp only [renameRawPairs, rawPairsHasNoKey, rawHasNoKey_rename p k, rawHasNoKey_rename p v,
+      rawPairsHasNoKey_rename p ps]
+end
+
+mutual
+theorem renameRaw_of_hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ (x : RawVal (Key sizes) A), rawHasNoKey x = true → renameRaw p x = x
+  | .err, _ => rfl
+  | .atom _, _ => rfl
+  | .key _, h => Bool.noConfusion h
+  | .seq xs, h => congrArg RawVal.seq (renameRawList_of_hasNoKey p xs h)
+  | .set xs, h => congrArg RawVal.set (renameRawList_of_hasNoKey p xs h)
+  | .fn ps, h => congrArg RawVal.fn (renameRawPairs_of_hasNoKey p ps h)
+
+theorem renameRawList_of_hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ (xs : List (RawVal (Key sizes) A)), rawListHasNoKey xs = true → renameRawList p xs = xs
+  | [], _ => rfl
+  | x :: xs, h => by
+    simp only [rawListHasNoKey, Bool.and_eq_true] at h
+    simp only [renameRawList, renameRaw_of_hasNoKey p x h.1, renameRawList_of_hasNoKey p xs h.2]
+
+theorem renameRawPairs_of_hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} (p : GroupPerm sizes) :
+    ∀ (ps : List (RawVal (Key sizes) A × RawVal (Key sizes) A)),
+      rawPairsHasNoKey ps = true → renameRawPairs p ps = ps
+  | [], _ => rfl
+  | (k, v) :: ps, h => by
+    simp only [rawPairsHasNoKey, Bool.and_eq_true] at h
+    simp only [renameRawPairs, renameRaw_of_hasNoKey p k h.1.1, renameRaw_of_hasNoKey p v h.1.2,
+      renameRawPairs_of_hasNoKey p ps h.2]
+end
+
+def Val.hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] : Val sizes A → Bool :=
+  Quotient.lift rawHasNoKey (fun _ _ h => ValEq.hasNoKey h)
+
+theorem Val.hasNoKey_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (v : Val sizes A) :
+    Val.hasNoKey (renameVal p v) = Val.hasNoKey v := by
+  induction v using Quotient.ind with
+  | _ x => exact rawHasNoKey_rename p x
+
+theorem Val.rename_of_hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) {v : Val sizes A} (h : Val.hasNoKey v = true) :
+    renameVal p v = v := by
+  induction v using Quotient.ind with
+  | _ x => exact congrArg mkVal (renameRaw_of_hasNoKey p x h)
+
+def Val.allKeyFree {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A] (s : Val sizes A) : Prop :=
+  Val.isSet s ∧ ∀ v, Val.mem v s → Val.hasNoKey v = true
+
+theorem Val.allKeyFree_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (s : Val sizes A) :
+    Val.allKeyFree (renameVal p s) ↔ Val.allKeyFree s := by
+  unfold Val.allKeyFree
+  rw [Val.isSet_rename]
+  constructor
+  · rintro ⟨hs, hk⟩
+    refine ⟨hs, fun v hv => ?_⟩
+    have := hk (renameVal p v) ((Val.mem_rename p v s).mpr hv)
+    rwa [Val.hasNoKey_rename] at this
+  · rintro ⟨hs, hk⟩
+    refine ⟨hs, fun v hv => ?_⟩
+    have hv' : Val.mem (renameVal p.inverse v) s := by
+      have := (Val.mem_rename p (renameVal p.inverse v) s).mp
+      rw [renameVal_right] at this
+      exact this hv
+    have := hk (renameVal p.inverse v) hv'
+    rwa [Val.hasNoKey_rename] at this
+
+mutual
+def liftKeyFreeRaw {K A : Type} : RawVal Empty A → RawVal K A
+  | .err => .err
+  | .atom a => .atom a
+  | .key e => nomatch e
+  | .seq xs => .seq (liftKeyFreeRawList xs)
+  | .set xs => .set (liftKeyFreeRawList xs)
+  | .fn ps => .fn (liftKeyFreeRawPairs ps)
+
+def liftKeyFreeRawList {K A : Type} : List (RawVal Empty A) → List (RawVal K A)
+  | [] => []
+  | x :: xs => liftKeyFreeRaw x :: liftKeyFreeRawList xs
+
+def liftKeyFreeRawPairs {K A : Type} : List (RawVal Empty A × RawVal Empty A) → List (RawVal K A × RawVal K A)
+  | [] => []
+  | (k, v) :: ps => (liftKeyFreeRaw k, liftKeyFreeRaw v) :: liftKeyFreeRawPairs ps
+end
+
+mutual
+theorem liftKeyFreeRaw_hasNoKey {K A : Type} :
+    ∀ r : RawVal Empty A, rawHasNoKey (liftKeyFreeRaw (K := K) r) = true
+  | .err => rfl
+  | .atom _ => rfl
+  | .key e => nomatch e
+  | .seq xs => liftKeyFreeRawList_hasNoKey xs
+  | .set xs => liftKeyFreeRawList_hasNoKey xs
+  | .fn ps => liftKeyFreeRawPairs_hasNoKey ps
+
+theorem liftKeyFreeRawList_hasNoKey {K A : Type} :
+    ∀ xs : List (RawVal Empty A), rawListHasNoKey (liftKeyFreeRawList (K := K) xs) = true
+  | [] => rfl
+  | x :: xs => by
+    simp only [liftKeyFreeRawList, rawListHasNoKey, liftKeyFreeRaw_hasNoKey x, liftKeyFreeRawList_hasNoKey xs, Bool.and_self]
+
+theorem liftKeyFreeRawPairs_hasNoKey {K A : Type} :
+    ∀ ps : List (RawVal Empty A × RawVal Empty A), rawPairsHasNoKey (liftKeyFreeRawPairs (K := K) ps) = true
+  | [] => rfl
+  | (k, v) :: ps => by
+    simp only [liftKeyFreeRawPairs, rawPairsHasNoKey, liftKeyFreeRaw_hasNoKey k, liftKeyFreeRaw_hasNoKey v,
+      liftKeyFreeRawPairs_hasNoKey ps, Bool.and_self]
+end
+
+mutual
+def rawEraseKey {K A : Type} : RawVal K A → RawVal Empty A
+  | .err => .err
+  | .atom a => .atom a
+  | .key _ => .err
+  | .seq xs => .seq (rawEraseKeyList xs)
+  | .set xs => .set (rawEraseKeyList xs)
+  | .fn ps => .fn (rawEraseKeyPairs ps)
+
+def rawEraseKeyList {K A : Type} : List (RawVal K A) → List (RawVal Empty A)
+  | [] => []
+  | x :: xs => rawEraseKey x :: rawEraseKeyList xs
+
+def rawEraseKeyPairs {K A : Type} : List (RawVal K A × RawVal K A) → List (RawVal Empty A × RawVal Empty A)
+  | [] => []
+  | (k, v) :: ps => (rawEraseKey k, rawEraseKey v) :: rawEraseKeyPairs ps
+end
+
+mutual
+theorem liftKeyFreeRaw_erase {K A : Type} :
+    ∀ (x : RawVal K A), rawHasNoKey x = true → liftKeyFreeRaw (rawEraseKey x) = x
+  | .err, _ => rfl
+  | .atom _, _ => rfl
+  | .key _, h => Bool.noConfusion h
+  | .seq xs, h => congrArg RawVal.seq (liftKeyFreeRawList_erase xs h)
+  | .set xs, h => congrArg RawVal.set (liftKeyFreeRawList_erase xs h)
+  | .fn ps, h => congrArg RawVal.fn (liftKeyFreeRawPairs_erase ps h)
+
+theorem liftKeyFreeRawList_erase {K A : Type} :
+    ∀ (xs : List (RawVal K A)), rawListHasNoKey xs = true → liftKeyFreeRawList (rawEraseKeyList xs) = xs
+  | [], _ => rfl
+  | x :: xs, h => by
+    simp only [rawListHasNoKey, Bool.and_eq_true] at h
+    simp only [rawEraseKeyList, liftKeyFreeRawList, liftKeyFreeRaw_erase x h.1, liftKeyFreeRawList_erase xs h.2]
+
+theorem liftKeyFreeRawPairs_erase {K A : Type} :
+    ∀ (ps : List (RawVal K A × RawVal K A)), rawPairsHasNoKey ps = true → liftKeyFreeRawPairs (rawEraseKeyPairs ps) = ps
+  | [], _ => rfl
+  | (k, v) :: ps, h => by
+    simp only [rawPairsHasNoKey, Bool.and_eq_true] at h
+    simp only [rawEraseKeyPairs, liftKeyFreeRawPairs, liftKeyFreeRaw_erase k h.1.1, liftKeyFreeRaw_erase v h.1.2,
+      liftKeyFreeRawPairs_erase ps h.2]
+end
+
+def liftKeyFree {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (r : RawVal Empty A) : Val sizes A :=
+  mkVal (liftKeyFreeRaw r)
+
+theorem liftKeyFree_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (r : RawVal Empty A) :
+    renameVal p (liftKeyFree r) = liftKeyFree r :=
+  Val.rename_of_hasNoKey p (liftKeyFreeRaw_hasNoKey r)
+
+theorem Val.exists_lift_of_hasNoKey {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    {v : Val sizes A} (h : Val.hasNoKey v = true) :
+    ∃ r : RawVal Empty A, liftKeyFree r = v := by
+  induction v using Quotient.ind with
+  | _ x => exact ⟨rawEraseKey x, congrArg mkVal (liftKeyFreeRaw_erase x h)⟩
+
+def evalFixSet {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (step : Val sizes A → Val sizes A) : Nat → Val sizes A → Val sizes A
+  | 0, acc => acc
+  | n + 1, acc => evalFixSet step n (Val.cup acc (step acc))
+
+private theorem evalFixSet_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes) (step step' : Val sizes A → Val sizes A)
+    (hstep : ∀ v, step' (renameVal p v) = renameVal p (step v)) :
+    ∀ (n : Nat) (acc : Val sizes A),
+      evalFixSet step' n (renameVal p acc) = renameVal p (evalFixSet step n acc)
+  | 0, _ => rfl
+  | n + 1, acc => by
+    simp only [evalFixSet, hstep acc, Val.cup_rename]
+    exact evalFixSet_rename p step step' hstep n (Val.cup acc (step acc))
+
+theorem evalFixSet_fixed_of_eq {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (step : Val sizes A → Val sizes A) (acc : Val sizes A) (hfix : Val.cup acc (step acc) = acc) :
+    ∀ n : Nat, evalFixSet step n acc = acc
+  | 0 => rfl
+  | n + 1 => by
+    simp only [evalFixSet, hfix]
+    exact evalFixSet_fixed_of_eq step acc hfix n
+
+def evalIterRec {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (cond : Val sizes A → Prop) (step base : Val sizes A → Val sizes A) :
+    Nat → Val sizes A → Val sizes A
+  | 0, _ => Val.err
+  | n + 1, cur =>
+      @ite _ (cond cur) (Classical.propDecidable _)
+        (evalIterRec cond step base n (step cur))
+        (base cur)
+
+private theorem evalIterRec_rename {d : Nat} {sizes : Fin d → Nat} {A : Type} [HasNatAtom A]
+    (p : GroupPerm sizes)
+    (c c' : Val sizes A → Prop) (hc : ∀ v, c' (renameVal p v) ↔ c v)
+    (st st' : Val sizes A → Val sizes A) (hst : ∀ v, st' (renameVal p v) = renameVal p (st v))
+    (b b' : Val sizes A → Val sizes A) (hb : ∀ v, b' (renameVal p v) = renameVal p (b v)) :
+    ∀ (n : Nat) (cur : Val sizes A),
+      evalIterRec c' st' b' n (renameVal p cur) = renameVal p (evalIterRec c st b n cur)
+  | 0, _ => rfl
+  | n + 1, cur => by
+    unfold evalIterRec
+    rw [propext (hc cur)]
+    split
+    · rw [hst cur]
+      exact evalIterRec_rename p c c' hc st st' hst b b' hb n (st cur)
+    · exact hb cur
+
 -- Mutual AST for equivariant expressions, formulas, and set predicates
 mutual
 inductive Expr (d : Nat) (V : Type) where
@@ -2938,6 +3293,9 @@ inductive Expr (d : Nat) (V : Type) where
   | atomSetOp (id : Nat) (args : List (Expr d V))
   | atomSetAgg (id : Nat) (s : Expr d V)
   | atomChoose (dom : Expr d V) (pred : Form d V)
+  | chooseKeyFree (dom : Expr d V) (pred : Form d V)
+  | fixSet (bound : Nat) (init step : Expr d V)
+  | iterRec (fuel : Nat) (init : Expr d V) (cond : Form d V) (step base : Expr d V)
 
 inductive Form (d : Nat) (V : Type) where
   | truth (b : Bool)
@@ -3022,6 +3380,7 @@ structure AtomOps (A : Type) where
   atomSetOp : Nat → List A → List A
   atomSetAgg : Nat → (A → Prop) → A
   chooseAtom : (A → Prop) → A
+  chooseKeyFree : (RawVal Empty A → Prop) → RawVal Empty A
   atomRel : Nat → List A → Prop
   atomPred : Nat → A → Prop
 
@@ -3740,6 +4099,20 @@ def evalExpr {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops 
       @ite _ (Val.allAtoms sv) (Classical.propDecidable _)
         (Val.atom (ops.chooseAtom (fun a => Val.mem (Val.atom a) sv ∧ evalForm ops s t (push env (Val.atom a)) pred)))
         Val.err
+  | .chooseKeyFree dom pred =>
+      let sv := evalExpr ops s t env dom
+      @ite _ (Val.allKeyFree sv) (Classical.propDecidable _)
+        (liftKeyFree (ops.chooseKeyFree (fun r =>
+          Val.mem (liftKeyFree r) sv ∧ evalForm ops s t (push env (liftKeyFree r)) pred)))
+        Val.err
+  | .fixSet bound init step =>
+      evalFixSet (fun v => evalExpr ops s t (push env v) step) bound (evalExpr ops s t env init)
+  | .iterRec fuel init cond step base =>
+      evalIterRec
+        (fun v => evalForm ops s t (push env v) cond)
+        (fun v => evalExpr ops s t (push env v) step)
+        (fun v => evalExpr ops s t (push env v) base)
+        fuel (evalExpr ops s t env init)
 
 def evalExprList {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (ops : AtomOps A)
     (s t : State V sizes A) (env : Env sizes A) : List (Expr d V) → List (Val sizes A)
@@ -4052,6 +4425,49 @@ theorem evalExpr_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [Has
       rw [hpred]
       rfl
     · rfl
+  | .chooseKeyFree dom pred => by
+    change @ite _ (Val.allKeyFree (evalExpr _ _ _ _ dom)) (Classical.propDecidable _)
+        (liftKeyFree (ops.chooseKeyFree (fun r =>
+          Val.mem (liftKeyFree r) (evalExpr _ _ _ _ dom) ∧
+          evalForm _ _ _ (push _ (liftKeyFree r)) pred))) Val.err =
+      renameVal p (@ite _ (Val.allKeyFree (evalExpr ops s t env dom)) (Classical.propDecidable _)
+        (liftKeyFree (ops.chooseKeyFree (fun r =>
+          Val.mem (liftKeyFree r) (evalExpr ops s t env dom) ∧
+          evalForm ops s t (push env (liftKeyFree r)) pred))) Val.err)
+    rw [evalExpr_equivariant p ops s t env dom]
+    rw [propext (Val.allKeyFree_rename p _)]
+    split
+    · have hpred : (fun r => Val.mem (liftKeyFree r) (renameVal p (evalExpr ops s t env dom)) ∧
+            evalForm ops (renameState p s) (renameState p t) (push (renameEnv p env) (liftKeyFree r)) pred) =
+          (fun r => Val.mem (liftKeyFree r) (evalExpr ops s t env dom) ∧
+            evalForm ops s t (push env (liftKeyFree r)) pred) := by
+        funext r
+        have hm : Val.mem (liftKeyFree r) (renameVal p (evalExpr ops s t env dom)) ↔
+            Val.mem (liftKeyFree r) (evalExpr ops s t env dom) := by
+          have := Val.mem_rename p (liftKeyFree r) (evalExpr ops s t env dom)
+          rwa [liftKeyFree_rename] at this
+        have hf := evalForm_equivariant p ops s t (push env (liftKeyFree r)) pred
+        rw [renameEnv_push, liftKeyFree_rename] at hf
+        exact propext (and_congr hm hf)
+      rw [hpred, liftKeyFree_rename]
+    · rfl
+  | .fixSet bound init step =>
+    (congrArg (evalFixSet _ bound) (evalExpr_equivariant p ops s t env init)).trans
+      (evalFixSet_rename p _ _ (fun v => by
+        rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) step) bound _)
+  | .iterRec fuel init cond step base =>
+    (congrArg (evalIterRec _ _ _ fuel) (evalExpr_equivariant p ops s t env init)).trans
+      (evalIterRec_rename p
+        (fun v => evalForm ops s t (push env v) cond)
+        (fun v => evalForm ops (renameState p s) (renameState p t) (push (renameEnv p env) v) cond)
+        (fun v => by rw [← renameEnv_push]; exact evalForm_equivariant p ops s t (push env v) cond)
+        (fun v => evalExpr ops s t (push env v) step)
+        (fun v => evalExpr ops (renameState p s) (renameState p t) (push (renameEnv p env) v) step)
+        (fun v => by rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) step)
+        (fun v => evalExpr ops s t (push env v) base)
+        (fun v => evalExpr ops (renameState p s) (renameState p t) (push (renameEnv p env) v) base)
+        (fun v => by rw [← renameEnv_push]; exact evalExpr_equivariant p ops s t (push env v) base)
+        fuel _)
 
 theorem evalExprList_equivariant {d : Nat} {sizes : Fin d → Nat} {V A : Type} [HasNatAtom A] (p : GroupPerm sizes)
     (ops : AtomOps A) (s t : State V sizes A) (env : Env sizes A) :

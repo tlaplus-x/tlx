@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tlx_front::cfg::CfgValue;
 
 use super::{AtomKey, AtomKind, GroupMask, LowerCtx, Shape, Slot};
-use crate::optimize::phase::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind};
+use crate::optimize::phase::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind, RecOpKind};
 use crate::{builtins::Builtin as B, hir::*};
 
 impl LowerCtx<'_> {
@@ -132,9 +132,15 @@ impl LowerCtx<'_> {
             }
             ExprKind::If { cond, then, els } => {
                 let c = self.lower_form_rec(cond, allow_prime, in_prime, false)?;
-                let y = self.lower_expr_rec(then, allow_prime, in_prime)?;
-                let n = self.lower_expr_rec(els, allow_prime, in_prime)?;
-                Some(format!("(Expr.ite {c} {y} {n})"))
+                let saved = self.check_env.clone();
+                self.totality.apply_positive_fact(cond, in_prime, &mut self.check_env);
+                let y = self.lower_expr_rec(then, allow_prime, in_prime);
+                self.check_env = saved.clone();
+                self.totality.apply_negative_fact(cond, in_prime, &mut self.check_env);
+                let n = self.lower_expr_rec(els, allow_prime, in_prime);
+                self.check_env = saved;
+                let (y, n) = (y?, n?);
+                self.charge(format!("(Expr.ite {c} {y} {n})"))
             }
             ExprKind::Case { arms, other } => {
                 let o = other.as_ref()?;
@@ -146,7 +152,74 @@ impl LowerCtx<'_> {
                 }
                 Some(acc)
             }
-            ExprKind::Choose { .. } => None,
+            ExprKind::Choose { vars, set, body } => {
+                let s = set.as_ref()?;
+                let (elem_shape, dom_origin) = self.totality.bound_elem_info(s, in_prime, &self.check_env);
+                if !self.totality.is_shape_key_free(&elem_shape) {
+                    return None;
+                }
+                let dom = self.lower_expr_rec(s, allow_prime, in_prime)?;
+                match vars {
+                    BoundVars::Many(ids) if ids.len() == 1 => {
+                        let ak = self.elem_atom_kind(s);
+                        self.locals.push(Slot::Local(ids[0], ak));
+                        self.check_env.bind_local(ids[0], elem_shape, dom_origin);
+                        let pred = self.lower_form_rec(body, allow_prime, in_prime, false);
+                        self.locals.pop();
+                        self.check_env.unbind_local(ids[0]);
+                        let pred = pred?;
+                        self.charge(format!("(Expr.chooseKeyFree {dom} {pred})"))
+                    }
+                    BoundVars::Tuple(ids) => {
+                        let elem_shapes = self.totality.prove_tuple_set_arity(s, ids.len(), in_prime, &self.check_env)?;
+                        self.locals.push(Slot::Temp);
+                        let pred =
+                            self.bind_tuple_for_form(ids, &elem_shapes, 0, |ctx| ctx.lower_form_rec(body, allow_prime, in_prime, false));
+                        self.locals.pop();
+                        let pred = pred?;
+                        self.charge(format!("(Expr.chooseKeyFree {dom} {pred})"))
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Apply { op: OpRef::Def(id), args } => match (self.totality.rec_op_kind(*id), args.as_slice()) {
+                (Some(RecOpKind::FixSet), [init, step_lam]) => {
+                    let ExprKind::Lambda { params, body } = &*step_lam.kind else { return None };
+                    let [s_var] = params.as_slice() else { return None };
+                    let (bound, acc_shape) = self.totality.fix_set_bound(init, *s_var, body, allow_prime, in_prime, &self.check_env)?;
+                    let e_init = self.lower_expr_rec(init, allow_prime, in_prime)?;
+                    self.locals.push(Slot::Local(*s_var, AtomKind::Unknown));
+                    self.check_env.bind_local(*s_var, acc_shape, None);
+                    let e_step = self.lower_expr_rec(body, allow_prime, in_prime);
+                    self.locals.pop();
+                    self.check_env.unbind_local(*s_var);
+                    let e_step = e_step?;
+                    self.charge(format!("(Expr.fixSet {bound} {e_init} {e_step})"))
+                }
+                (Some(RecOpKind::IterRec), [init, step_lam]) => {
+                    let ExprKind::Lambda { params, body } = &*step_lam.kind else { return None };
+                    let [x_var] = params.as_slice() else { return None };
+                    let ExprKind::If { cond, then, els } = &*body.kind else { return None };
+                    let (fuel, _, x_union) =
+                        self.totality.iter_rec_info(init, *x_var, cond, then, els, allow_prime, in_prime, &self.check_env)?;
+                    let e_init = self.lower_expr_rec(init, allow_prime, in_prime)?;
+                    self.locals.push(Slot::Local(*x_var, AtomKind::Unknown));
+                    self.check_env.bind_local(*x_var, x_union, None);
+                    let e_cond = self.lower_form_rec(cond, allow_prime, in_prime, false);
+                    let saved = self.check_env.clone();
+                    self.totality.apply_positive_fact(cond, in_prime, &mut self.check_env);
+                    let e_step = self.lower_expr_rec(then, allow_prime, in_prime);
+                    self.check_env = saved.clone();
+                    self.totality.apply_negative_fact(cond, in_prime, &mut self.check_env);
+                    let e_base = self.lower_expr_rec(els, allow_prime, in_prime);
+                    self.check_env = saved;
+                    self.locals.pop();
+                    self.check_env.unbind_local(*x_var);
+                    let (e_cond, e_step, e_base) = (e_cond?, e_step?, e_base?);
+                    self.charge(format!("(Expr.iterRec {fuel} {e_init} {e_cond} {e_step} {e_base})"))
+                }
+                _ => None,
+            },
             ExprKind::And(_) | ExprKind::Or(_) | ExprKind::Quant { .. } => {
                 let f = self.lower_form_rec(e, allow_prime, in_prime, false)?;
                 Some(format!("(Expr.ofForm {f})"))
