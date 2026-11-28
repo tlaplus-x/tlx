@@ -310,6 +310,7 @@ impl<'a> TotalityChecker<'a> {
             ExprKind::Bool(_) => Shape::Bool,
             ExprKind::Num(n) => i32::try_from(*n).map_or(Shape::Top, |k| Shape::Int(Some((k, k)))),
             ExprKind::Str(s) => Shape::Str(Some(BTreeSet::from([s.clone()]))),
+            ExprKind::CfgLiteral(v) => self.cfg_value_shape(v),
             ExprKind::Var(v) => {
                 if let Some(ov) = env.var_overrides.get(&(*v, in_prime)) {
                     return ov.clone();
@@ -359,8 +360,13 @@ impl<'a> TotalityChecker<'a> {
                 }
                 Shape::Set { elem: Box::new(elem), finite: true, max_card: u32::try_from(es.len()).ok() }
             }
-            ExprKind::SetFilter { bound, pred: _ } => {
+            ExprKind::SetFilter { bound, pred } => {
                 let (elem, finite, max_card) = self.infer_set_info(&bound.set, in_prime, vars, env, steps);
+                // A filter keeps only the elements that satisfy `pred`, so the
+                // established place narrowing (tagged record unions, integer
+                // ranges, membership) may be assumed while inferring the
+                // element shape of the filtered set.
+                let elem = self.narrow_filter_elem(bound, pred, &elem, in_prime, vars, env);
                 Shape::Set { elem: Box::new(elem), finite, max_card }
             }
             ExprKind::SetMap { expr, bounds } => {
@@ -1048,6 +1054,10 @@ impl<'a> TotalityChecker<'a> {
         }
         match &*e.kind {
             ExprKind::Num(n) => i32::try_from(*n).ok(),
+            ExprKind::CfgLiteral(v) => match &**v {
+                CfgValue::Int(n) => i32::try_from(*n).ok(),
+                _ => None,
+            },
             ExprKind::Const(c) => match self.consts.get(c)? {
                 ConstInfo::Value(CfgValue::Int(n)) => i32::try_from(*n).ok(),
                 ConstInfo::Subst(def_id) => {
@@ -1153,6 +1163,10 @@ impl<'a> TotalityChecker<'a> {
                 shape_is_exact_cup_scalar(&sa) && shape_is_exact_cup_scalar(&sb) && !matches!(join_shape(&sa, &sb), Shape::Top)
             }
             ExprKind::Builtin { op: B::TLCEval, args } if args.len() == 1 => self.is_exact_static_set_inner(&args[0], seen, depth + 1),
+            ExprKind::CfgLiteral(v) => match &**v {
+                CfgValue::Set(es) => self.cfg_set_is_exact(es),
+                _ => false,
+            },
             ExprKind::Const(c) => match self.consts.get(c) {
                 Some(ConstInfo::Value(CfgValue::Set(es))) => self.cfg_set_is_exact(es),
                 Some(ConstInfo::Subst(def_id)) => {
@@ -1179,6 +1193,12 @@ impl<'a> TotalityChecker<'a> {
                             vals.push(CfgValue::Int(k));
                         }
                         ExprKind::Str(st) => vals.push(CfgValue::Str(st.to_string())),
+                        ExprKind::CfgLiteral(v) => match &**v {
+                            v @ (CfgValue::Bool(_) | CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::ModelValue(_)) => {
+                                vals.push(v.clone());
+                            }
+                            _ => return false,
+                        },
                         ExprKind::Const(c) => match self.consts.get(c) {
                             Some(ConstInfo::Value(
                                 v @ (CfgValue::Bool(_) | CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::ModelValue(_)),
@@ -1210,6 +1230,27 @@ impl<'a> TotalityChecker<'a> {
 
     pub(super) fn apply_fact(&self, cond: &Expr, positive: bool, in_prime: bool, env: &mut CheckEnv) {
         self.apply_fact_with_vars(cond, positive, in_prime, &self.var_shapes, env);
+    }
+
+    /// Refine the element shape of `{x \in S : pred}` by assuming `pred` on the
+    /// bound element. Every element of the filtered set satisfies `pred`, so the
+    /// existing place narrowing (tagged record unions, integer ranges,
+    /// membership) applies. Only the single-binder form is refined.
+    pub(super) fn narrow_filter_elem(
+        &self,
+        bound: &Bound,
+        pred: &Expr,
+        elem: &Shape,
+        in_prime: bool,
+        vars: &[Shape],
+        env: &CheckEnv,
+    ) -> Shape {
+        let BoundVars::Many(ids) = &bound.vars else { return elem.clone() };
+        let [id] = ids.as_slice() else { return elem.clone() };
+        let mut local_env = env.clone();
+        local_env.bind_local(*id, elem.clone(), None);
+        self.apply_fact_with_vars(pred, true, in_prime, vars, &mut local_env);
+        local_env.locals.get(id).cloned().unwrap_or_else(|| elem.clone())
     }
 
     fn apply_fact_with_vars(&self, cond: &Expr, positive: bool, in_prime: bool, vars: &[Shape], env: &mut CheckEnv) {
@@ -1259,6 +1300,15 @@ impl<'a> TotalityChecker<'a> {
                 env.proven_members.push((args[0].clone(), args[1].clone(), in_prime));
                 let mut steps = 2000;
                 let elem = self.infer_set_elem(&args[1], in_prime, vars, env, &mut steps);
+                // `r.f \in S` rules out tagged-record-union variants whose `f`
+                // cannot be in `S`, exactly like `r.f = lit` does.
+                if let ExprKind::Field { record, field } = &*args[0].kind {
+                    if let Some(cur) = self.read_place(record, in_prime, vars, env) {
+                        if let Some(narrowed) = narrow_record_field_eq(&cur, field, &elem, true) {
+                            self.write_place(record, in_prime, vars, narrowed, None, env);
+                        }
+                    }
+                }
                 let origin = match &*args[1].kind {
                     ExprKind::Builtin { op: B::Domain | B::BagToSet, args: da } if da.len() == 1 => {
                         env.proven_in_dom.push((args[0].clone(), da[0].clone(), in_prime));
@@ -1651,12 +1701,33 @@ impl<'a> TotalityChecker<'a> {
                 let keep = origin.or_else(|| env.local_dom.get(l).cloned());
                 env.bind_local(*l, shape, keep);
             }
-            ExprKind::Field { record, field } => {
-                if let Some(Shape::Record(mut map)) = self.read_place(record, in_prime, vars, env) {
+            ExprKind::Field { record, field } => match self.read_place(record, in_prime, vars, env) {
+                Some(Shape::Record(mut map)) => {
                     map.insert(field.clone(), shape);
                     self.write_place(record, in_prime, vars, Shape::Record(map), None, env);
                 }
-            }
+                // A tagged-record union narrows the field inside every variant
+                // that carries it, so `m.acc \in Acceptor` refines `m` instead
+                // of being dropped with the union structure.
+                Some(Shape::Union(us)) => {
+                    let updated: Vec<Shape> = us
+                        .iter()
+                        .map(|u| match u {
+                            Shape::Record(fs) => match fs.get(field) {
+                                Some(cur) => {
+                                    let mut map = fs.clone();
+                                    map.insert(field.clone(), narrow_shape(cur, &shape));
+                                    Shape::Record(map)
+                                }
+                                None => u.clone(),
+                            },
+                            _ => u.clone(),
+                        })
+                        .collect();
+                    self.write_place(record, in_prime, vars, Shape::Union(updated), None, env);
+                }
+                _ => {}
+            },
             ExprKind::FnApp { func, args } => {
                 if let Some(key) = fn_app_place(func, args, in_prime) {
                     env.fn_app_overrides.insert(key, shape);

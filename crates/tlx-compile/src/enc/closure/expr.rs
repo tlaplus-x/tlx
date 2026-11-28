@@ -28,6 +28,9 @@ impl<'a> Analyzer<'a> {
             H::Decimal(_) => VShape::Shape(Shape::Dyn),
             H::Str(s) => VShape::Shape(Shape::Atom(vec![Value::Str(Sym::new(s.as_ref()))].into())),
             H::Bool(_) => VShape::Shape(Shape::Bool),
+            // Synthesized only by a certified normalization, never by a program
+            // the compiled tier lowers.
+            H::CfgLiteral(_) => VShape::Shape(Shape::Dyn),
             H::Var(v) => VShape::Shape(self.refined_value(v.idx(), false)),
             H::InstVar { .. } => VShape::Shape(Shape::Dyn),
             H::Const(c) => self.const_value(e, *c, env),

@@ -326,6 +326,9 @@ impl Interp {
             ExprKind::Decimal(d) => return Err(EvalError::new(format!("real number literal {d} is not supported"))),
             ExprKind::Str(s) => Value::Str(self.syms.get(s)),
             ExprKind::Bool(b) => Value::Bool(*b),
+            // Only a certified normalization synthesizes this leaf; evaluating it
+            // is the configured literal, exactly as the runtime binds it.
+            ExprKind::CfgLiteral(v) => crate::interp::cfg_value(v)?,
             ExprKind::Var(v) => self.read_var(*v, cx, span)?,
             // Primed in an ENABLED that quantifies over it: its own value
             // in the partial next state (see `Interp::enabled`).

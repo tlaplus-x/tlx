@@ -35,12 +35,36 @@ enum ProbeStep {
 }
 
 impl InterpModel {
+    /// The cfg bindings a certified state projection may be installed over.
+    /// A zero-arity `Def = value` binding stays refused here: only the
+    /// certified symmetry families lower the configured literal.
     fn cfg_constants_allow_certification(&self) -> bool {
+        self.cfg_constants_allow(false)
+    }
+
+    /// The cfg bindings the certified symmetry families may be installed over:
+    /// [`cfg_constants_allow_certification`] plus zero-arity `Def = value`
+    /// literal assignments, whose configured value the equivariant lowering
+    /// splices in and records in the raw certificate.
+    fn cfg_constants_allow_symmetry(&self) -> bool {
+        self.cfg_constants_allow(true)
+    }
+
+    fn cfg_constants_allow(&self, value_defs: bool) -> bool {
         let cfg = &self.ip.cfg;
-        tlx_sema::optimize::cfg_constants_supported(&self.ip.prog, cfg)
+        let supported = if value_defs {
+            tlx_sema::optimize::cfg_constants_supported_with_value_defs(&self.ip.prog, cfg)
+        } else {
+            tlx_sema::optimize::cfg_constants_supported(&self.ip.prog, cfg)
+        };
+        supported
             && cfg.constants.iter().all(|b| match b {
-                // `Def = value` still needs a value-override certificate.
-                ConstBinding::Value { name, module: None, .. } => self.ip.root_def(name).is_none(),
+                ConstBinding::Value { name, module: None, .. } => match self.ip.root_def(name) {
+                    None => true,
+                    // A zero-arity definition replaced by a literal is certified
+                    // by the symmetry families only.
+                    Some(d) => value_defs && self.ip.prog.defs[d.idx()].params.is_empty(),
+                },
                 // Pure definition and parameterized-constant substitutions are
                 // resolved and certified by `cfg_constants_supported`.
                 ConstBinding::Subst { module: None, .. } => true,
@@ -445,7 +469,7 @@ impl InterpModel {
             || !self.possible.is_empty()
             || !self.postconditions.is_empty()
             || self.alias.is_some()
-            || !self.cfg_constants_allow_certification()
+            || !self.cfg_constants_allow_symmetry()
         {
             return None;
         }

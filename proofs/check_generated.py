@@ -58,6 +58,8 @@ DEFAULT_CASES = (
     ("GeneratedSymmetry", "check", "proofs/symmetry/DeclaredProduct.tla", None, ("-interp",), (0,)),
     ("GeneratedSymmetry", "check", "proofs/symmetry/TupleView.tla", None, ("-interp",), (0,)),
     ("GeneratedEquivSymmetry", "check", "proofs/symmetry/KeyValMaps.tla", None, ("-interp",), (0,)),
+    ("GeneratedEquivSymmetry", "check", "proofs/symmetry/CfgValueOverride.tla", None, ("-interp",), (0,)),
+    ("GeneratedEquivSymmetry", "check", "proofs/symmetry/FixedAtomSubsets.tla", None, ("-interp",), (0,)),
     ("GeneratedErasedSymmetry", "check", "proofs/symmetry/TupleViewErased.tla", None, ("-interp",), (0,)),
     ("GeneratedChooseSymmetry", "check", "proofs/symmetry/ChooseSym.tla", None, ("-interp",), (0,)),
     ("GeneratedNested", "check", "proofs/ordered/Nested.tla", None, ("-interp", "-optimize", "-noautosymmetry"), (0,)),

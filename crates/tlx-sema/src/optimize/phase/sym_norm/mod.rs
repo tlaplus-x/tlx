@@ -164,12 +164,52 @@ impl<'a> SymNormalizer<'a> {
     /// the certificate's binding obligation.
     fn expand_declared_override(&self, name: &str, args: &[Expr]) -> Option<String> {
         let cfg = self.cfg?;
+        if let Some(repr) = self.expand_declared_value_override(name, args) {
+            return Some(repr);
+        }
         let target = cfg.last_constant_subst(name)?;
         let super::ConstSubstTarget::Def(target) = super::resolve_override_name(self.program, target)? else { return None };
         let mut fresh = Self::with_mode(self.program, self.cfg, self.mode);
         let span = self.program.defs[target.idx()].span;
         let expanded = fresh.apply_def(target, args, &HashMap::new(), &HashMap::new(), None, None, span, 1)?;
         super::canonical_expr_repr(self.program, &expanded)
+    }
+
+    /// Re-derive a zero-arity `Def = value` binding from the configuration
+    /// alone: the canonical HIR of the configured literal, or `None` when the
+    /// binding is not a value assignment on a zero-arity root definition.
+    fn expand_declared_value_override(&self, name: &str, args: &[Expr]) -> Option<String> {
+        if !args.is_empty() {
+            return None;
+        }
+        let value = self.cfg?.last_def_value(name)?;
+        let Some(RootSymbol::Def(d)) = self.program.lookup_resolved_root(name) else { return None };
+        if !self.program.defs[d.idx()].params.is_empty() {
+            return None;
+        }
+        Some(super::cfg_value_repr(value))
+    }
+
+    /// The configured literal a zero-arity use of `id` evaluates to, with the
+    /// definition that carries the binding.
+    fn value_override(&self, id: DefId) -> Option<(DefId, std::sync::Arc<tlx_front::cfg::CfgValue>)> {
+        let (owner, value) = self.redirect.as_ref()?.value_of(id)?;
+        Some((owner, value.clone()))
+    }
+
+    /// Lower a zero-arity use of a definition the configuration binds to a
+    /// literal (`Def = value`) to that literal and record the applied override.
+    fn apply_value_def(&mut self, id: DefId, owner: DefId, value: std::sync::Arc<tlx_front::cfg::CfgValue>, args: &[Expr]) -> Option<Expr> {
+        // The runtime returns the bound value for every call of the node, but
+        // the certified path only models the zero-arity form.
+        if !args.is_empty() {
+            return None;
+        }
+        let leaf = Expr::new(ExprKind::CfgLiteral(value.clone()), self.program.defs[owner.idx()].span);
+        let name = self.program.defs[id.idx()].name.to_string();
+        let target = if owner == id { super::cfg_value_repr(&value) } else { self.program.defs[owner.idx()].name.to_string() };
+        self.record_override(name, target, args, &leaf)?;
+        Some(leaf)
     }
 
     fn builtin_override(&self, op: B) -> Option<(DefId, DefId)> {
@@ -546,7 +586,7 @@ impl<'a> SymNormalizer<'a> {
                                 // fold recognizer only knows the shadowed body, so
                                 // let the call flow through `apply_def`, which
                                 // applies and records the configured replacement.
-                                let overridden = self.redirect.as_ref().is_some_and(|r| r.defs.contains_key(sum_id));
+                                let overridden = self.redirect.as_ref().is_some_and(|r| r.replaces_body(*sum_id));
                                 if !overridden {
                                     if let Some(folded) =
                                         self.try_expand_fn_fold(*sum_id, target_raw, env, op_env, cur_except, lex_at, e.span, depth)
@@ -864,6 +904,9 @@ impl<'a> SymNormalizer<'a> {
         span: Span,
         depth: usize,
     ) -> Option<Expr> {
+        if let Some((owner, value)) = self.value_override(id) {
+            return self.apply_value_def(id, owner, value, args);
+        }
         if self.cfg.is_some() {
             let redirect = self.redirect.as_ref()?;
             if let Some(&target) = redirect.defs.get(&id) {

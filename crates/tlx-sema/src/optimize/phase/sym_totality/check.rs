@@ -8,6 +8,7 @@ use super::super::sym_norm::RecOpKind;
 use super::shape::*;
 use super::{CheckEnv, ConstInfo, MvType, Shape, TotalityChecker, MAX_I32_U32};
 use crate::{builtins::Builtin as B, hir::*};
+use tlx_front::cfg::CfgValue;
 
 const MAX_FIX_SET_BOUND: u32 = 64;
 const MAX_ITER_REC_STEPS: u32 = 16;
@@ -74,7 +75,7 @@ impl<'a> TotalityChecker<'a> {
             ExprKind::Quant { kind: QuantKind::Exists, bounds, body } => {
                 let mut local_env = env.clone();
                 for b in bounds {
-                    if self.check_enumerable_set(&b.set, allow_prime, false, &local_env, steps).is_none() {
+                    if self.check_quant_domain(&b.set, allow_prime, false, &local_env, steps).is_none() {
                         return false;
                     }
                     let (elem, origin) = self.bound_elem_info(&b.set, false, &local_env);
@@ -313,7 +314,7 @@ impl<'a> TotalityChecker<'a> {
             ExprKind::Quant { bounds, body, .. } => {
                 let mut local_env = env.clone();
                 for b in bounds {
-                    if self.check_enumerable_set(&b.set, allow_prime, in_prime, &local_env, steps).is_none() {
+                    if self.check_quant_domain(&b.set, allow_prime, in_prime, &local_env, steps).is_none() {
                         return false;
                     }
                     let (elem, origin) = self.bound_elem_info(&b.set, in_prime, &local_env);
@@ -419,6 +420,10 @@ impl<'a> TotalityChecker<'a> {
             ExprKind::Bool(_) => Some(Shape::Bool),
             ExprKind::Num(n) => i32::try_from(*n).ok().map(|k| Shape::Int(Some((k, k)))),
             ExprKind::Str(s) => Some(Shape::Str(Some(BTreeSet::from([s.clone()])))),
+            ExprKind::CfgLiteral(v) => {
+                let s = self.cfg_value_shape(v);
+                (!shape_contains_top(&s) && shape_self_comparable(&s) && shape_has_safe_set_cards(&s, self.groups)).then_some(s)
+            }
             ExprKind::Var(v) => {
                 if let Some((tracked_prime, bv)) = &env.bound_vars {
                     if in_prime == *tracked_prime && !bv.contains(v) {
@@ -539,6 +544,8 @@ impl<'a> TotalityChecker<'a> {
                 if !self.check_form(pred, allow_prime, in_prime, &local_env, steps) {
                     return None;
                 }
+                // Elements of the filtered set satisfy `pred`.
+                let elem = self.narrow_filter_elem(bound, pred, &elem, in_prime, &self.var_shapes, env);
                 Some(Shape::Set { elem: Box::new(elem), finite: true, max_card: Some(max_card) })
             }
             ExprKind::SetMap { expr, bounds } => {
@@ -1549,6 +1556,22 @@ impl<'a> TotalityChecker<'a> {
         }
     }
 
+    /// Check a quantifier domain. `\E S \in SUBSET X` (or `\A`) enumerates the
+    /// powerset lazily at run time, so the domain is enumerable whenever `X` is
+    /// finite and the powerset's own cardinality — an over-approximation of the
+    /// model, and the reason `check_enumerable_set` caps `SUBSET` results — is
+    /// not required here. Value-position `SUBSET` keeps the exact guard, so
+    /// `Cardinality(SUBSET X)` still refuses when `2^|X|` would overflow.
+    fn check_quant_domain(&self, s: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> Option<(Shape, u32)> {
+        if let ExprKind::Builtin { op: B::Subset, args } = &*s.kind {
+            if let [base] = args.as_slice() {
+                let (elem, _) = self.check_enumerable_set(base, allow_prime, in_prime, env, steps)?;
+                return Some((Shape::Set { elem: Box::new(elem), finite: true, max_card: None }, MAX_I32_U32));
+            }
+        }
+        self.check_enumerable_set(s, allow_prime, in_prime, env, steps)
+    }
+
     /// Check `x \in S` membership with exact runtime preconditions for each set
     /// constructor (matching `tlx-value/src/ops/member.rs`).
     fn check_membership(&self, val: &Shape, set: &Expr, allow_prime: bool, in_prime: bool, env: &CheckEnv, steps: &mut usize) -> bool {
@@ -1667,6 +1690,7 @@ impl<'a> TotalityChecker<'a> {
                 let is_materialized = match &*set.kind {
                     ExprKind::SetEnum(_) | ExprKind::SetMap { .. } | ExprKind::Builtin { op: B::DotDot | B::Boolean, .. } => true,
                     ExprKind::Const(c) => matches!(self.consts.get(c), Some(ConstInfo::Value(_))),
+                    ExprKind::CfgLiteral(v) => matches!(&**v, CfgValue::Set(_)),
                     ExprKind::Var(_) => !in_prime && !matches!(env.bound_vars, Some((false, _))),
                     _ => false,
                 };

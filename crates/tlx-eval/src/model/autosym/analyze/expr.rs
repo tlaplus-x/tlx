@@ -24,6 +24,9 @@ impl<'a> Analyzer<'a> {
         }
         match &*e.kind {
             ExprKind::Num(_) | ExprKind::Decimal(_) | ExprKind::Str(_) | ExprKind::Bool(_) => Sh::plain(),
+            // Synthesized only by a certified normalization; no automatic
+            // symmetry candidate is derived from it.
+            ExprKind::CfgLiteral(_) => Sh::any(ALL),
             ExprKind::Var(v) => self.vars[v.idx()].clone(),
             ExprKind::InstVar { subst, .. } => self.expr(subst),
             ExprKind::Const(c) => self.constant(*c, e.span),

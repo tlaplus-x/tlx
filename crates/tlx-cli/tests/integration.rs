@@ -17,6 +17,7 @@ mod call_semantics;
 mod cardinality_stream;
 mod cc_at_exit;
 mod cfg_overrides;
+mod cfg_value_reductions;
 #[cfg(unix)]
 mod checkpoint;
 mod choose_soundness;
@@ -81,6 +82,7 @@ fn all_test_files_registered() {
         "cardinality_stream",
         "cc_at_exit",
         "cfg_overrides",
+        "cfg_value_reductions",
         "checkpoint",
         "choose_soundness",
         "classpath",

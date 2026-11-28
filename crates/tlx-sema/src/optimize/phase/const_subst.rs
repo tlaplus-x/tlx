@@ -3,8 +3,9 @@
 //! that connect declared substitutions to the generated model.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use tlx_front::cfg::{Config, ConstBinding};
+use tlx_front::cfg::{CfgValue, Config, ConstBinding};
 
 use crate::hir::{Bound, BoundVars, ConstId, DefId, DefKind, ExceptKey, Expr, ExprKind, LocalId, OpRef, RootSymbol, Span};
 
@@ -40,6 +41,31 @@ pub(crate) struct CfgRedirects {
     /// `OpRef::Builtin` nodes without a definition id, so the replacement has
     /// to be applied by operator as well as by node.
     pub builtins: HashMap<crate::builtins::Builtin, (DefId, DefId)>,
+    /// Zero-arity root definitions replaced by a configured literal
+    /// (`Def = value`), keyed by every copy the runtime binds. A zero-arity use
+    /// of such a definition evaluates to the literal, never to its source body.
+    pub values: HashMap<DefId, Arc<CfgValue>>,
+}
+
+impl CfgRedirects {
+    /// The configured literal a zero-arity use of `id` evaluates to, preferring
+    /// the definition itself over the terminal of a `<-` redirect the way
+    /// `Interp::call_def` (`tlx-eval/src/eval.rs`) looks it up, together with
+    /// the definition that carries the binding.
+    pub(super) fn value_of(&self, id: DefId) -> Option<(DefId, &Arc<CfgValue>)> {
+        if let Some(v) = self.values.get(&id) {
+            return Some((id, v));
+        }
+        let target = *self.defs.get(&id)?;
+        self.values.get(&target).map(|v| (target, v))
+    }
+
+    /// Whether a call of `id` runs a configured replacement instead of the
+    /// definition's own body, so a syntactic rewrite of that body (`CHOOSE` or
+    /// sum folds, opaque recursive walks) must not intercept it.
+    pub(super) fn replaces_body(&self, id: DefId) -> bool {
+        self.defs.contains_key(&id) || self.value_of(id).is_some()
+    }
 }
 
 /// DefIds called by an HIR expression (definitions, `LET` bodies, and operator
@@ -102,6 +128,7 @@ pub(crate) fn cfg_def_redirects(program: &Program, cfg: &Config) -> Option<CfgRe
     use crate::builtins::Effect;
     let mut raw: HashMap<DefId, DefId> = HashMap::new();
     let mut builtin_raw: HashMap<crate::builtins::Builtin, (DefId, DefId)> = HashMap::new();
+    let mut values: HashMap<DefId, Arc<CfgValue>> = HashMap::new();
     for b in &cfg.constants {
         let ConstBinding::Subst { name, op, module } = b else { continue };
         if module.is_some() {
@@ -119,6 +146,35 @@ pub(crate) fn cfg_def_redirects(program: &Program, cfg: &Config) -> Option<CfgRe
                 // Two bindings of the same node must agree (`last wins` would
                 // hide the earlier body from this analysis).
                 Some(prev) if prev != target => return None,
+                _ => {}
+            }
+        }
+    }
+    // `Def = value`: the runtime binds the literal to the OpDefNode every copy
+    // shares (`bind_cfg` -> `bind_value`), so a zero-arity use evaluates to the
+    // literal instead of the source body. A definition bound both ways is
+    // ambiguous (`def_value` and `def_redirect` are separate maps in
+    // `bind_cfg`); the certified path refuses it rather than guess.
+    for b in &cfg.constants {
+        let ConstBinding::Value { name, value, module } = b else { continue };
+        if module.is_some() {
+            return None;
+        }
+        let Some(RootSymbol::Def(lhs)) = program.lookup_resolved_root(name) else { continue };
+        // A standard-module builtin definition (`Nat`, `Int`, `EmptyBag`, ...)
+        // is referenced as `ExprKind::Builtin`, not `Apply{Def}`, so this
+        // lowering could not splice the literal in and would silently certify
+        // the un-overridden builtin. Refuse rather than certify the wrong model.
+        if program.defs[lhs.idx()].builtin.is_some() || !program.defs[lhs.idx()].params.is_empty() {
+            return None;
+        }
+        let value = Arc::new(value.clone());
+        for d in program.resolved_def_copies(lhs)? {
+            if raw.contains_key(&d) {
+                return None;
+            }
+            match values.insert(d, value.clone()) {
+                Some(prev) if *prev != *value => return None,
                 _ => {}
             }
         }
@@ -145,11 +201,12 @@ pub(crate) fn cfg_def_redirects(program: &Program, cfg: &Config) -> Option<CfgRe
         }
         out.insert(lhs, cur);
     }
+    let resolved = CfgRedirects { defs: out, builtins: builtin_raw, values };
     let mut budget = MAX_REDIRECT_WORK;
-    if !out.values().all(|&target| super::sym_totality::def_is_pure(program, cfg, &out, target, &mut budget)) {
+    if !resolved.defs.values().all(|&target| super::sym_totality::def_is_pure(program, cfg, &resolved, target, &mut budget)) {
         return None;
     }
-    for (op, &(_, target)) in &builtin_raw {
+    for (op, &(_, target)) in &resolved.builtins {
         let arity = op.metadata().arity;
         // A variadic builtin, or one used at a different arity, cannot be
         // spliced for a call site without changing its meaning.
@@ -160,10 +217,12 @@ pub(crate) fn cfg_def_redirects(program: &Program, cfg: &Config) -> Option<CfgRe
             return None;
         }
     }
-    if out.values().any(|&target| def_is_recursive(program, target)) {
+    // A value-overridden body never runs, so only a redirect into a body that
+    // does run can reintroduce a recursive replacement target.
+    if resolved.defs.values().any(|&target| !resolved.values.contains_key(&target) && def_is_recursive(program, target)) {
         return None;
     }
-    Some(CfgRedirects { defs: out, builtins: builtin_raw })
+    Some(resolved)
 }
 
 /// Resolve the RHS symbol name of a `.cfg` `<-` substitution into something a
@@ -256,6 +315,20 @@ const MAX_CANON_WORK: usize = 100_000;
 const MAX_CANON_BYTES: usize = 1_000_000;
 const MAX_CANON_DEPTH: usize = 128;
 const MAX_CERT_CONST_SUBSTS: usize = 1024;
+/// Context bytes recorded around an applied override use site. The Lean
+/// certificate proves the decomposition of this window by `rfl`; a whole
+/// normalized model formula (megabytes for large specifications) is not
+/// something the kernel can elaborate as a string equality.
+const MAX_OVERRIDE_MODEL_WINDOW: usize = 400;
+
+/// The nearest `byte` index at or after `at` that is a character boundary.
+fn char_boundary(s: &str, at: usize) -> usize {
+    let mut at = at.min(s.len());
+    while at < s.len() && !s.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
 
 struct CanonWriter<'a> {
     program: &'a Program,
@@ -434,6 +507,7 @@ impl<'a> CanonWriter<'a> {
         self.work -= 1;
         match &*e.kind {
             ExprKind::Bool(b) => self.push(&format!("Bool({b})")),
+            ExprKind::CfgLiteral(v) => self.push(&cfg_value_repr(v)),
             ExprKind::Num(n) => self.push(&format!("Num({n})")),
             ExprKind::Str(s) => self.push(&format!("Str({s:?})")),
             ExprKind::Decimal(s) => self.push(&format!("Dec({s:?})")),
@@ -607,6 +681,38 @@ impl<'a> CanonWriter<'a> {
     }
 }
 
+/// Deterministic, span-free representation of a `.cfg` constant value: the text
+/// a [`crate::hir::ExprKind::CfgLiteral`] leaf contributes to the canonical and
+/// syntactic HIR of a normalized formula, and the declaration an independent
+/// re-derivation of a `.cfg` `Def = value` binding has to reproduce.
+pub(in crate::optimize::phase) fn cfg_value_repr(v: &tlx_front::cfg::CfgValue) -> String {
+    use std::fmt::Write;
+    use tlx_front::cfg::CfgValue;
+    fn write(out: &mut String, v: &CfgValue) {
+        match v {
+            CfgValue::Int(n) => write!(out, "Int({n})").unwrap(),
+            CfgValue::Str(s) => write!(out, "Str({s:?})").unwrap(),
+            CfgValue::Bool(b) => write!(out, "Bool({b})").unwrap(),
+            CfgValue::ModelValue(m) => write!(out, "Model({m:?})").unwrap(),
+            CfgValue::Set(es) | CfgValue::Tuple(es) => {
+                let (open, close) = if matches!(v, CfgValue::Set(_)) { ("Set([", "])") } else { ("Tuple([", "])") };
+                out.push_str(open);
+                for (i, e) in es.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    write(out, e);
+                }
+                out.push_str(close);
+            }
+        }
+    }
+    let mut out = String::from("Lit(");
+    write(&mut out, v);
+    out.push(')');
+    out
+}
+
 /// Alpha-canonical, span-free, bounded representation of a normalized HIR
 /// expression, used to connect declared `.cfg` constant substitutions to the
 /// exact normalized expansion spliced into an emitted certificate.
@@ -704,7 +810,15 @@ pub(in crate::optimize::phase) fn attach_const_subst_obligation(
                 let seen = occurrences.entry((mi, o.applied_syntax.clone())).or_insert(0);
                 let at = m.match_indices(o.applied_syntax.as_str()).nth(*seen).map(|(at, _)| at)?;
                 *seen += 1;
-                Some((m.clone(), m[..at].to_string(), m[at + o.applied_syntax.len()..].to_string()))
+                // Record the expansion inside a bounded window of the model
+                // formula: a whole normalized formula can be megabytes, and the
+                // `rfl` decomposition is checked by the Lean kernel, which
+                // cannot elaborate a multi-kilobyte string equality. The window
+                // still pins the exact use site, with up to
+                // `MAX_OVERRIDE_MODEL_WINDOW` bytes of context on each side.
+                let lo = char_boundary(m, at.saturating_sub(MAX_OVERRIDE_MODEL_WINDOW));
+                let hi = char_boundary(m, (at + o.applied_syntax.len() + MAX_OVERRIDE_MODEL_WINDOW).min(m.len()));
+                Some((m[lo..hi].to_string(), m[lo..at].to_string(), m[at + o.applied_syntax.len()..hi].to_string()))
             })?;
             rows.push(Row {
                 name: o.name.clone(),

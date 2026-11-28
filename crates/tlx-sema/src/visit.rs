@@ -17,6 +17,7 @@ macro_rules! for_each_child {
             | ExprKind::Const(_)
             | ExprKind::Local(_)
             | ExprKind::OpArg(_)
+            | ExprKind::CfgLiteral(_)
             | ExprKind::At => {}
             ExprKind::Apply { args, .. } | ExprKind::Builtin { args, .. } => args.$iter().for_each(&mut *$f),
             ExprKind::Lambda { body, .. } => $f(body),

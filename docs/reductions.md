@@ -153,16 +153,24 @@ verbatim `SYMMETRY` keep the declared `VIEW` search completely intact and report
 coverage includes state `CONSTRAINT`, `ACTION_CONSTRAINT`, implied-init `PROPERTY`,
 `[][A]_sub` action `PROPERTY` conjuncts, and `.cfg` substitutions (emitting
 `ConstrainedCertificate` theorems when any constrained check is active), while excluding
-temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = value` overrides, and
-module-scoped/cyclic/recursive/impure/arity-changing `<-` overrides. A pure, non-recursive,
+temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, and
+module-scoped/cyclic/recursive/impure/arity-changing overrides. A zero-arity definition the
+configuration assigns a literal (`Def = value`) is applied the same way as a `<-` override by the
+equivariant symmetry lowering: the configured literal is spliced in at every use site and recorded
+in the same obligation. State projections keep refusing `Def = value` bindings. A pure, non-recursive,
 arity-preserving definition override (`Timeout <- MCTimeout`, a parameterized
 `CONSTANT C(_, _) <- Def`, a chain, or a builtin definition) is applied by the certified lowering;
 every applied use site is recorded and located at its own occurrence inside the syntactic HIR of
-the normalized model formula (`defSubstModelHIR`); `def_subst_bindings_match` checks the declared
-expansion, the `rfl`-checked slices prove the decomposition, and the concrete system is guarded by
-their conjunction so `certificate`/`certificate_with_overrides` consume it. Recursive replacement
+the normalized model formula (`defSubstModelHIR`, a bounded window around that occurrence);
+`def_subst_bindings_match` checks the declared expansion, the `rfl`-checked slices prove the
+decomposition, and the concrete system is guarded by their conjunction so
+`certificate`/`certificate_with_overrides` consume it. Recursive replacement
 targets and composed constrained emitters refuse overrides rather than emit an unguarded
-certificate. Certified unobserved-variable
+certificate. A `.cfg` set of `k`-subsets over a symmetric group may also mix key-free fixed atoms
+(`{{a1, a2, fa1}, {a1, a3, fa1}, {a2, a3, fa1}, {a1, a2, a3}}`): each fixed-atom stratum must be
+the exact union of the group's `k`-subsets, and the lowering emits
+`{Q \cup F : Q \in SUBSET G, |Q| \in K}` unions, so fixed atoms no longer force a plain
+enumeration. Certified unobserved-variable
 erasure can compose with certified automatic keyed symmetry (including disjoint products of full
 keyed groups) through `ErasedKeyedCertificate`, both for the `-optimize`
 `unobserved-state-projection` and for a declared tuple `VIEW` that omits certified-erasable

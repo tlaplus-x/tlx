@@ -351,7 +351,7 @@ pub(in crate::optimize::phase) fn collect_const_bindings<'a>(
     program: &Program,
     cfg: &'a Config,
 ) -> Option<BTreeMap<ConstId, &'a CfgValue>> {
-    if super::sym_totality::cfg_overrides_or_tables(program, cfg) {
+    if !super::sym_totality::cfg_constants_supported_with_value_defs(program, cfg) {
         return None;
     }
     let mut out = BTreeMap::new();

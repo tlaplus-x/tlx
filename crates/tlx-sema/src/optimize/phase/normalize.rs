@@ -123,14 +123,55 @@ impl<'a> Normalizer<'a> {
     }
 
     /// Re-derive a `.cfg` definition override from the configuration alone: the
-    /// configured replacement body applied to `args`, canonicalized the same way
-    /// the lowering records it.
+    /// configured replacement body applied to `args`, or the configured literal
+    /// of a `Def = value` binding, canonicalized the same way the lowering
+    /// records it.
     fn expand_declared_override(program: &'a Program, cfg: &'a Config, name: &str, args: &[Expr]) -> Option<String> {
+        if let Some(repr) = Self::expand_declared_value_override(program, cfg, name, args) {
+            return Some(repr);
+        }
         let target = cfg.last_constant_subst(name)?;
         let super::ConstSubstTarget::Def(target) = super::resolve_override_name(program, target)? else { return None };
         let mut fresh = Self::with_config(program, cfg);
         let expanded = fresh.apply_def(target, args, &HashMap::new(), 1)?;
         super::canonical_expr_repr(program, &expanded)
+    }
+
+    /// Re-derive a zero-arity `Def = value` binding from the configuration
+    /// alone: the canonical HIR of the configured literal, or `None` when the
+    /// binding is not a value assignment on a zero-arity root definition.
+    fn expand_declared_value_override(program: &'a Program, cfg: &'a Config, name: &str, args: &[Expr]) -> Option<String> {
+        if !args.is_empty() {
+            return None;
+        }
+        let value = cfg.last_def_value(name)?;
+        let Some(RootSymbol::Def(d)) = program.lookup_resolved_root(name) else { return None };
+        if !program.defs[d.idx()].params.is_empty() {
+            return None;
+        }
+        Some(super::cfg_value_repr(value))
+    }
+
+    /// The configured literal a zero-arity use of `id` evaluates to, with the
+    /// definition that carries the binding.
+    fn value_override(&self, id: DefId) -> Option<(DefId, std::sync::Arc<tlx_front::cfg::CfgValue>)> {
+        let (owner, value) = self.redirect.as_ref()?.value_of(id)?;
+        Some((owner, value.clone()))
+    }
+
+    /// Lower a zero-arity use of a definition the configuration binds to a
+    /// literal (`Def = value`) to that literal and record the applied override.
+    fn apply_value_def(&mut self, id: DefId, owner: DefId, value: std::sync::Arc<tlx_front::cfg::CfgValue>, args: &[Expr]) -> Option<Expr> {
+        // The runtime returns the bound value for every call of the node, but
+        // the certified path only models the zero-arity form.
+        if !args.is_empty() {
+            return None;
+        }
+        let leaf = Expr::new(ExprKind::CfgLiteral(value.clone()), self.program.defs[owner.idx()].span);
+        let name = self.program.defs[id.idx()].name.to_string();
+        let target = if owner == id { super::cfg_value_repr(&value) } else { self.program.defs[owner.idx()].name.to_string() };
+        self.record_override(name, target, args, &leaf)?;
+        Some(leaf)
     }
 
     pub fn expand_declared_const_subst(program: &'a Program, cfg: &'a Config, c: ConstId) -> Option<String> {
@@ -145,11 +186,16 @@ impl<'a> Normalizer<'a> {
             }
             ConstSubstTarget::Const(other) => Expr::new(ExprKind::Const(other), Span::default()),
             ConstSubstTarget::Def(id) => {
-                let body = Self::def_body(&program.defs[id.idx()])?;
                 let mut fresh = Self::with_config(program, cfg);
-                fresh.const_stack.extend_from_slice(&seen);
-                fresh.stack.push(id);
-                fresh.expand(&body, &HashMap::new(), None, 1)?
+                match fresh.value_override(id) {
+                    Some((owner, value)) => fresh.apply_value_def(id, owner, value, &[])?,
+                    None => {
+                        let body = Self::def_body(&program.defs[id.idx()])?;
+                        fresh.const_stack.extend_from_slice(&seen);
+                        fresh.stack.push(id);
+                        fresh.expand(&body, &HashMap::new(), None, 1)?
+                    }
+                }
             }
         };
         super::canonical_expr_repr(program, &resolved)
@@ -220,13 +266,19 @@ impl<'a> Normalizer<'a> {
                 if self.stack.contains(&id) {
                     return None;
                 }
-                let body = Self::def_body(&self.program.defs[id.idx()])?;
-                self.const_stack.push(c);
-                self.stack.push(id);
-                let res = self.expand(&body, &HashMap::new(), None, depth + 1);
-                self.stack.pop();
-                self.const_stack.pop();
-                res?
+                if let Some((owner, value)) = self.value_override(id) {
+                    // `C <- D` where the configuration binds `D` to a literal:
+                    // the runtime returns that value at every use of `C`.
+                    self.apply_value_def(id, owner, value, &[])?
+                } else {
+                    let body = Self::def_body(&self.program.defs[id.idx()])?;
+                    self.const_stack.push(c);
+                    self.stack.push(id);
+                    let res = self.expand(&body, &HashMap::new(), None, depth + 1);
+                    self.stack.pop();
+                    self.const_stack.pop();
+                    res?
+                }
             }
             ConstSubstTarget::Const(other) => {
                 self.const_stack.push(c);
@@ -243,6 +295,9 @@ impl<'a> Normalizer<'a> {
     /// replacement body and recorded for the certificate's override obligation;
     /// a configuration with an uncertifiable override fails closed.
     fn apply_def(&mut self, id: DefId, args: &[Expr], env: &HashMap<LocalId, Expr>, depth: usize) -> Option<Expr> {
+        if let Some((owner, value)) = self.value_override(id) {
+            return self.apply_value_def(id, owner, value, args);
+        }
         let redirect = self.redirect.as_ref()?;
         let target = *redirect.defs.get(&id).unwrap_or(&id);
         let d = &self.program.defs[target.idx()];
@@ -543,6 +598,11 @@ pub(in crate::optimize::phase) fn opaque_recursive_def_vars(
 
         fn enqueue_def(&mut self, id: DefId) -> bool {
             let id = *self.redirect.defs.get(&id).unwrap_or(&id);
+            // `Def = value`: the configured literal runs instead of the body,
+            // so the definition reads no state variable.
+            if self.redirect.values.contains_key(&id) {
+                return true;
+            }
             let d = &self.program.defs[id.idx()];
             if let Some(b) = d.builtin {
                 if let Some((_, replacement)) = self.redirect.builtins.get(&b) {
