@@ -67,6 +67,7 @@ STORE_INPUTS = (
     ('missing', ('scripts/bench.py', 'table'), MANIFEST),
     ('missing', ('scripts/bench.py', 'suite-report'), MANIFEST),
     ('missing', ('scripts/bench.py', 'migrate'), MANIFEST),
+    ('missing', ('scripts/bench.py', 'release', '--report-only'), MANIFEST),
     ('manifest', ('scripts/bench.py', 'suite-check'), 'bench/repr-models.toml'),
     ('manifest', ('scripts/bench.py', 'report'), 'bench/repr-models.toml'),
     ('manifest', ('scripts/bench.py', 'table'), 'bench/repr-models.toml'),

@@ -100,6 +100,8 @@ def build_parser(description=None, prog=None):
     bench_disk.add_args(sub.add_parser("disk", help="state spaces beyond memory: tlx -maxmem and TLC under a small heap"))
     from benchmarking import bench_suite
     bench_suite.add_args(sub)
+    from benchmarking import release
+    release.add_args(sub)
     from benchmarking import bench_profile
     bench_profile.add_args(sub.add_parser("profile", help="per-state cost by worker count (perf stat/record, -stats)"))
     from benchmarking import bench_ttfr

@@ -120,6 +120,7 @@ scripts/bench.py compare <A> <B> --metric cpu        # regression check between 
 scripts/bench.py ab --bin a=PATH --bin b=PATH --models X,Y --repeat 10
                                                      # interleaved A/B of two tlx binaries (min/median CPU and wall, peak RSS)
 scripts/bench.py layout --bin a=PATH --models X,Y    # compiled-tier start-up decisions (pre-run, layout misses, restarts)
+scripts/bench.py release v0.1.2 --report-only        # the cross-release comparison from the store (section 7)
 ```
 
 `compare` has three outcomes: **PASS** (exit 0), **REGRESSION** (exit 1), and
@@ -723,3 +724,87 @@ adaptive chooser produced.
 - A new field is added only together with the reader that consumes it, and a `schema_version` bump
   updates the validator (`scripts/benchmarking/records.py`), the readers and the migration in one change.
 
+## 7. Release comparison: `bench.py release`
+
+`bench.py release` compares two published releases - and both with TLC - on one machine class, from
+the canonical measurement store. It measures nothing itself: `--report-only` renders the comparison
+of what `bench/records/` and `bench/tlc-baselines/` already hold, and the campaign mode collects
+what is missing (sections 4 and 5) before rendering the same report.
+
+```sh
+python3 scripts/bench.py release v0.1.2 --report-only
+python3 scripts/bench.py release v0.1.2 --report-only --markdown target/release-v0.1.2.md
+python3 scripts/bench.py release v0.1.2 --dry-run --slices 4 --slots 4
+```
+
+`TAG` defaults to the newest `v*.*.*` tag and `--prev-tag` (default `auto`) to the release before
+it in version order; name a tag or commit to compare against another one, or `none` to report only
+the TLC side. A name that resolves to no commit is refused, so an unknown tag can never enter the
+report as an unknown revision. `--instance-type` (default `SA5.4XLARGE32`) is the machine class the
+comparison is quotable on.
+
+**Pairing fails closed.** A new-revision row and a previous-release row are compared only when every
+dimension that decides whether they are the same measurement agrees: model, machine class and
+architecture, mode, worker count, arguments, environment, memory limit, the input digest and the TLC
+version the timing was taken against. A dimension either record leaves unknown is not an agreement -
+two unknown input digests are two possibly different inputs - and a `-dirty` working-tree record names
+bytes nobody published, so it is not a release row at all. A row measured on another machine, against
+changed inputs or against another TLC version is therefore unpaired (`—`), never a ratio across
+incomparable evidence; a missing counterpart is not a zero. The TLC side is the row's own stored
+baseline, and it is used only when `historical_match` accepts it (section 5).
+
+**The report** is deterministic Markdown: the same store renders byte for byte the same text. It has
+three tables.
+
+- *Cohort summary* per mode and worker count: the models measured, how many paired, the median and
+  geometric-mean `previous / new` wall speedup, the median `previous / new` peak-RSS ratio, the
+  median `TLC / new` wall and RSS ratios, and how many models recorded a newly applied optimization
+  (a row with no previous release states no new optimization: it has nothing to differ from).
+- *Regressions and notable gains*: rows whose new wall time is both more than `--threshold` (default
+  5%) and more than `--min-delta` (default 0.05 s) slower than the previous release, beside the
+  largest wall-time gains and the largest peak-memory reductions (`--top`, default 8 each; a ratio of
+  one or below is neither a gain nor a reduction and is listed in neither). Both regression bounds
+  are required: a 5% slowdown of a 0.1 s model is not a result.
+- *Flagship open-source models* (`ext/*`, and the corpus models whose id names Raft, Zab or Mongo):
+  `previous s / MiB` -> `new s / MiB` against `TLC s / MiB`, the same-instance unreduced `-tlc`
+  twin's wall time and the optimizations the new record states.
+
+Ratios are `previous / new` and `TLC / new`, so a value above one means the new release (or tlx) is
+faster or used less peak memory on the same machine and input. `docs/performance.md` remains the
+report of record for the corpus as a whole; the release report is the cross-version delta beside it.
+
+**Campaign mode** (no `--report-only`) launches what the store is missing and then renders the same
+report. Each launch is one `scripts/cloud_verify.py --bench` invocation on the provider's spot
+capacity: first `tlcbase --missing --collect` for the missing TLC baselines, then `--slices` shards
+of `suite --missing --slice I/N --bin target/bench-bins/rel/tlx --isolate-cache
+--with-tlc-companion` with `--bench-bin rel=<TAG>`, so the harness is this checkout's and the binary
+under test is the released tag (`HARNESS-19`). `--slots` is the concurrent-instance share the
+launches may use, `--max-minutes` the suite's own budget per launch, and `--repeat` /
+`--tlc-repetitions` the sample counts. `--models` (ids or id substrings) and `--sizes` (size classes,
+or `all` for every class including `huge`) select the campaign's suite models, resolved once against
+`bench/suite.json` into exact ids: both passes get the same list, so a targeted campaign collects no
+TLC baseline for a model - or a size class - it will not run, and a filter that selects no suite model
+is refused before anything launches. An explicit `--models` also tells the suite pass `--sizes all`,
+because the suite's own default is `small,medium,large` and would otherwise drop a named `huge` model
+after the instance was provisioned. A launch with nothing missing exits successfully without writing
+its history file, which is a completed no-op and not a failure - the campaign goes on to the next
+shard. A suite verdict of 1 (regression) or 2 (inconclusive) is a result and is recorded; any other
+exit is an infrastructure refusal, and nothing it fetched is recorded, as is a verdict exit whose
+receipt does not hold the history file it was told to write. Only the receipt a launch writes for
+itself authorizes it: the result directory is new for every invocation, so an earlier run's receipt is
+never adopted and a re-issued command never becomes ambiguous. Each returned history file is imported
+into the canonical store and the published report is regenerated, so the campaign's output is
+committed as the usual history files, records, report policy and report. `--dry-run` prints the
+launches without running any.
+
+A campaign runs once per release. A history file whose records are already in the store is not
+overwritten: `suite --missing` refuses an occupied `--out`, so a resumed campaign takes the next
+attempt number (`suite-<tag>-s1of4-2.json`) and records only what the new launch returned.
+
+**The release webhook.** [`.github/workflows/release-benchmark.yml`](../.github/workflows/release-benchmark.yml)
+runs on a `v*.*.*` tag push (and by `workflow_dispatch` with an optional tag) and POSTs
+`{event, repo, tag, sha, run_id}` to the `MULTICA_RELEASE_BENCH_WEBHOOK_URL` repository secret,
+which starts the post-release benchmark autopilot. The GitHub tag glob also matches prereleases, so
+the tag is re-checked against `vX.Y.Z`: a tag push that is not one is skipped, an explicit dispatch
+input that is not one is an error, and without the secret the workflow logs that and succeeds - a
+fork, a prerelease or a repository that has not configured the autopilot stays green.
