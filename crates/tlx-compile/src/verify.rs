@@ -172,7 +172,34 @@ impl<'a> Check<'a> {
     /// representations `RefOp` states.
     fn ref_op(&mut self, e: &Expr, op: &crate::ir::RefOp, args: &[Expr]) -> Result {
         use crate::ir::RefOp as O;
-        let h = self.handle_ty()?;
+        let ret = match op {
+            O::DynEqInt | O::DynEqBool | O::DynToBool => Ty::Bool,
+            O::DynToInt => Ty::Int,
+            _ => {
+                let h = self.handle_ty()?;
+                return self.check_ref_op_with_handle(e, op, args, h);
+            }
+        };
+        same(e.ty, ret)?;
+        let expected = match op {
+            O::DynEqInt => &[Ty::Int][..],
+            O::DynEqBool => &[Ty::Bool][..],
+            O::DynToInt | O::DynToBool => &[][..],
+            _ => unreachable!(),
+        };
+        require(args.len() == expected.len() + 1, "dynamic scalar operation arity mismatch")?;
+        self.expr(&args[0])?;
+        require(
+            matches!(args[0].ty, Ty::Enc(sid) if matches!(self.t.shape(sid), Shape::Dyn)),
+            "dynamic scalar operation requires Shape::Dyn",
+        )?;
+        for (a, p) in args[1..].iter().zip(expected) {
+            self.expect(a, *p)?;
+        }
+        Ok(())
+    }
+    fn check_ref_op_with_handle(&mut self, e: &Expr, op: &crate::ir::RefOp, args: &[Expr], h: Ty) -> Result {
+        use crate::ir::RefOp as O;
         let (params, ret): (Vec<Ty>, Ty) = match op {
             O::Domain | O::Head | O::Tail | O::Field(_) => (vec![h], h),
             O::Apply | O::Single | O::Merge | O::Append => (vec![h, h], h),
@@ -197,6 +224,7 @@ impl<'a> Check<'a> {
                 require(Ty::Enc(*sid) != h, "value store conversion to a handle")?;
                 (vec![h], Ty::Enc(*sid))
             }
+            O::DynEqInt | O::DynEqBool | O::DynToInt | O::DynToBool => unreachable!(),
         };
         same(e.ty, ret)?;
         require(params.len() == args.len(), "value store operation arity mismatch")?;

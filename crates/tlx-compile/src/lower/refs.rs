@@ -32,6 +32,8 @@ impl Lowerer<'_> {
             RefOp::Select | RefOp::Cardinality | RefOp::Len | RefOp::ToInt => Ty::Int,
             RefOp::Member | RefOp::InDomain | RefOp::Eq | RefOp::ToBool => Ty::Bool,
             RefOp::ToEnc(sid) => Ty::Enc(*sid),
+            RefOp::DynEqInt | RefOp::DynEqBool | RefOp::DynToBool => Ty::Bool,
+            RefOp::DynToInt => Ty::Int,
             _ => self.handle_ty(),
         };
         Expr::new(ty, ExprKind::RefOp { op, args })

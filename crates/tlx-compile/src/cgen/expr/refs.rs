@@ -11,6 +11,33 @@ use crate::ir::*;
 
 impl CGen<'_> {
     pub(super) fn ref_op(&mut self, e: &Expr, op: &RefOp, args: &[Expr]) -> R<String> {
+        match op {
+            RefOp::DynEqInt | RefOp::DynEqBool => {
+                let k = self.fresh();
+                let h = format!("({})[0]", self.expr(&args[0])?);
+                let scalar = if *op == RefOp::DynEqInt { self.int_expr(&args[1])? } else { self.bool_expr(&args[1])? };
+                let tag = if *op == RefOp::DynEqInt { TAG_INT } else { TAG_BOOL };
+                let payload =
+                    if *op == RefOp::DynEqInt { format!("((int64_t)h{k} >> {TAG_BITS})") } else { format!("((h{k} >> {TAG_BITS}) != 0)") };
+                return Ok(format!(
+                    "({{ uint64_t h{k} = {h}; uint64_t t{k} = h{k} & {TAG_MASK}; if (t{k} != {tag}) return TLX_ERR; if ({tag} == {TAG_BOOL} && (h{k} >> {TAG_BITS}) > 1) return TLX_ERR; (int64_t)({payload} == ({scalar})); }})"
+                ));
+            }
+            RefOp::DynToInt | RefOp::DynToBool => {
+                let k = self.fresh();
+                let h = format!("({})[0]", self.expr(&args[0])?);
+                let tag = if *op == RefOp::DynToInt { TAG_INT } else { TAG_BOOL };
+                let value = if *op == RefOp::DynToInt {
+                    format!("((int64_t)h{k} >> {TAG_BITS})")
+                } else {
+                    format!("(int64_t)(h{k} >> {TAG_BITS})")
+                };
+                let canonical =
+                    if *op == RefOp::DynToBool { format!("if ((h{k} >> {TAG_BITS}) > 1) return TLX_ERR; ") } else { String::new() };
+                return Ok(format!("({{ uint64_t h{k} = {h}; if ((h{k} & {TAG_MASK}) != {tag}) return TLX_ERR; {canonical}{value}; }})"));
+            }
+            _ => {}
+        }
         if self.in_fn {
             return no("value store operation in a compiled function");
         }

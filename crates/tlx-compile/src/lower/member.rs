@@ -88,13 +88,27 @@ impl Lowerer<'_> {
         let typed = match (xs.ty, &*set.kind) {
             (Ty::Enc(sid), ExprKind::Const(v)) => self.member_const(&xs, sid, v, 0),
             (Ty::Int, ExprKind::Const(v)) => self.member_const_int(&xs, v),
+            _ if matches!(self.shape_of(xs.ty), Some(Shape::Dyn))
+                && matches!(self.shape_of(set.ty), Some(Shape::Set { elem, .. }) if matches!(**elem, Shape::Int { .. })) =>
+            {
+                let xi = self.ref_op(crate::ir::RefOp::DynToInt, vec![xs.clone()]);
+                self.bit_rank(&set, &xi, true).map(|rank| Expr::new(Ty::Bool, ExprKind::BitMember { set: set.clone(), rank }))
+            }
             // x \in lo..hi with computed bounds.
             (_, ExprKind::ValOp { op: B::DotDot, args }) if !self.ip.is_builtin_overridden(B::DotDot) => {
-                match (self.as_int(xs.clone()), self.as_int(args[0].clone()), self.as_int(args[1].clone())) {
-                    (Ok(xi), Ok(lo), Ok(hi)) => Some(and(vec![
-                        Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Ge, xi.clone(), lo)),
-                        Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, xi, hi)),
-                    ])),
+                let xi = self.dynamic_to_int(xs.clone()).map_or_else(|| self.as_int(xs.clone()), Ok);
+                match (xi, self.as_int(args[0].clone()), self.as_int(args[1].clone())) {
+                    (Ok(xi), Ok(lo), Ok(hi)) => {
+                        // Evaluate both bounds even if the lower-bound test is false.
+                        let (xi, bx) = self.share(xi);
+                        let (lo, bl) = self.share(lo);
+                        let (hi, bh) = self.share(hi);
+                        let member = and(vec![
+                            Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Ge, xi.clone(), lo)),
+                            Expr::new(Ty::Bool, ExprKind::IntCmp(CmpOp::Le, xi, hi)),
+                        ]);
+                        Some(let_in(bh.into_iter().chain(bl).chain(bx), member))
+                    }
                     _ => None,
                 }
             }
@@ -503,6 +517,15 @@ impl Lowerer<'_> {
     fn member_const(&mut self, x: &Expr, sid: ShapeId, set: &Value, depth: usize) -> Option<Expr> {
         if depth > 8 {
             return None;
+        }
+        if matches!(self.typing.shape(sid), Shape::Dyn) {
+            let xi = self.ref_op(crate::ir::RefOp::DynToInt, vec![x.clone()]);
+            let mark = self.frame.snapshot();
+            let (tx, bind) = self.share(xi);
+            if let Some(m) = self.member_const_int(&tx, set) {
+                return Some(let_in(bind, m));
+            }
+            self.frame.restore(mark);
         }
         // Structural tests and rank masks are cheaper than semantic tables.
         // In particular, total atom universes must retain their mask lowering.
