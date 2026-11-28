@@ -29,7 +29,7 @@ class QuotaWait(unittest.TestCase):
             with patch.object(cv, 'log'):
                 cv.wait_for_quota(provider, offer, 'x86_64', args.wait_quota, ledger, 'worker',
                                   monotonic=clock, sleep=clock.sleep)
-            self.assertEqual(ledger.remaining('worker'), 2)
+            self.assertEqual(ledger.recent_launches('worker'), 0)
             with ledger.locked() as rows:
                 self.assertEqual(rows[0]['region'], offer.region)
                 self.assertEqual(rows[0]['type'], offer.itype)
@@ -69,7 +69,7 @@ class QuotaWait(unittest.TestCase):
                 cv.launch_with_quota_wait(provider, machine, [], False, args, ledger, 'worker', set())
             waiting.assert_called_once()
             self.assertEqual(provider.launch.call_count, 2)
-            self.assertEqual(ledger.remaining('worker'), 1)
+            self.assertEqual(ledger.recent_launches('worker'), 1)
 
 
 if __name__ == '__main__':

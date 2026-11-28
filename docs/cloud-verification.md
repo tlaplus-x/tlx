@@ -58,6 +58,7 @@ scripts print is masked (`***` plus the last three digits of each account or use
 ```sh
 python3 scripts/cloud_verify.py --dry-run                       # identity, stock, price, image, network; creates nothing
 python3 scripts/cloud_verify.py [REV] --quick                   # default provider, 16 vCPU
+python3 scripts/cloud_verify.py [REV] --quick --slots 4         # fan out parallel shards up to 4 concurrent instances
 python3 scripts/cloud_verify.py [REV] --full --instance-type T --allow-big  # larger instance for the full tier
 python3 scripts/cloud_verify.py --provider P --list             # tagged instances, and the account's slots by owner
 python3 scripts/cloud_verify.py --provider P --list --mine      # exit 1 if an owned instance is still active
@@ -149,13 +150,15 @@ reaper never touch another owner. Cleanup across owners requires `--cleanup --al
 across owners.
 
 A locked `tlx-cloud-ledger.json` in git's common directory shares launch records across
-worktrees. An owner gets two launches in a rolling 12-hour window, at most 60 minutes each
-(default 60), with an estimated total compute cost of at most 5 CNY for Tencent/Aliyun.
-Network traffic charges are not included. The dry run prints remaining launches.
+worktrees. There is no fixed launch-count cap; instead, each owner's launches in a rolling
+12-hour window are limited to at most 60 minutes each (default 60, unless covered by a grant or
+`--budget-override`) and an estimated total compute cost of at most 5 CNY for Tencent/Aliyun
+(plus any `--budget-cny` from grants). Network traffic charges are not included. Launches and
+`--dry-run` print recent 12-hour launches and remaining estimated CNY budget.
 Reservations survive interruption and count conservatively when the API outcome is unknown;
 a launch the provider refused (quota, risk, permission, capacity), one the local admission
 refused, one that never reached the provider's launch call and a cancelled one consume neither a
-launch, a grant nor cost budget; their rows stay in the ledger as evidence.
+grant nor cost budget; their rows stay in the ledger as evidence.
 
 Launch admission. Before the launch call, and atomically with the ledger reservation, the run
 counts the account's instances: the provider's listing of every instance in all its regions
@@ -167,8 +170,9 @@ the account's spot instances are at the cap (exit 20; the message names the owne
 slots and which cap applies). That cap is the cloud config's `spot_instance_quota`, or the smaller
 of it and `--max-account-slots N` - the launcher's own cap on the account, which a wave of
 concurrent launchers honours together because the listing each of them reads is account-wide. The
-share is `default_share`, or the largest `--slots` of the owner's grants in the 12-hour
-window; a maintainer `--budget-override` is exempt from the share, not from the cap. Tencent's
+share is the largest of `default_share`, `--slots N` (1–16) passed on the launch invocation, and
+the `--slots` of the owner's grants in the 12-hour window, always bounded by the account cap
+above; a maintainer `--budget-override` is exempt from the share, not from the account cap. Tencent's
 own spot limits are not one account-wide number (2026-10-08: with 7 instances running, ap-shanghai
 refused one more with `LimitExceeded.UserSpotQuota` while ap-guangzhou accepted two more and refused a
 third with `LimitExceeded.SpotQuota`), so the Tencent provider also sends the exact request as a
@@ -196,9 +200,26 @@ preflights, which a background run would otherwise not see with an inherited ign
 running invocation reads. The run checks the flag after the preflights, while waiting for a slot
 and immediately before the provider's launch call; a cancel there launches nothing. Records include owner, time, instance,
 type, duration and estimated compute cost. More than 16 vCPU requires `--full` or `--bench`
-with `--allow-big`. A maintainer in the main worktree may use `--budget-override REASON`;
-The maintainer can give a linked-worktree branch one more launch in the 12-hour window with `scripts/cloud_verify.py --grant OWNER --minutes M [--slots N] [--reason TEXT]` (main checkout only, 1–720 minutes, default 60; above 180 minutes `--reason` is required and must name the heavy job the lane is for, for a named heavy job while retaining the spot-only policy - such a grant prints the spot-reclaim advisory; a lane that long usually also needs `--budget-cny`, since the estimate grows with the minutes; `--slots`, 1–16, raises the owner's share of concurrent instances for the window; `--budget-cny X`, 0–30, raises the owner's 12-hour estimated-spend cap of 5 CNY by X for the window, consumed or not). That worktree can then launch once with `--max-minutes` up to M from its own worktree without a budget override. The shared ledger records the grant and consumes it at launch reservation; a refused, cancelled or never-sent launch gives it back, and dry runs do not consume it. Grants expire after 12 hours and retain cost, capacity and quota checks; an optional `--budget-override REASON` records the maintainer’s reason when issuing one.
-the nonempty reason is recorded, and linked worktrees reject the option.
+with `--allow-big`. Coordinator operations (`--budget-override`, `--grant`, `--prune-sg`) require
+either a non-bare main worktree (`--git-dir` equals `--git-common-dir`), or a linked worktree
+backed by a **bare** shared repository (`git --git-dir <common-dir> rev-parse --is-bare-repository`
+is `true`) with `--coordinator-hub` passed explicitly (or `GIT_DIR` set to the bare common
+directory). Ordinary linked-worktree runs without `--coordinator-hub` reject all three options
+(exit 25), and `--coordinator-hub` is refused when the shared common directory is not bare.
+A coordinator may use `--budget-override REASON` (the nonempty reason is recorded) or grant a
+branch a longer launch lane, higher concurrency share, or extra spend cap with
+`scripts/cloud_verify.py --grant OWNER --minutes M [--slots N] [--budget-cny X] [--reason TEXT] [--coordinator-hub]`
+(1–720 minutes, default 60; above 180 minutes `--reason` is required and must name the heavy job
+the lane is for, retaining the spot-only policy and printing the spot-reclaim advisory; a lane
+that long usually also needs `--budget-cny`, since the estimate grows with the minutes; `--slots`,
+1–16, persists a 12-hour share grant for the owner; `--budget-cny X`, 0–30, raises the owner's
+12-hour estimated-spend cap of 5 CNY by X for the window, consumed or not). That branch can then
+launch once with `--max-minutes` up to M from its own worktree without a budget override; normal
+launches of 60 minutes or less do not consume a long-duration grant. The shared ledger records the
+grant and consumes it at launch reservation for a `>60`-minute launch; a refused, cancelled or
+never-sent launch gives it back, and dry runs do not consume it. Grants expire after 12 hours and
+retain cost, capacity and quota checks; an optional `--budget-override REASON` records the
+maintainer’s reason when issuing one.
 
 Advisories start with `WARNING (not a stop condition):`; in particular, an unavailable CAM
 self-termination role permits shutdown fallback. Fatal conditions start with `STOP:` and stop
@@ -280,16 +301,20 @@ To reclaim accumulated rules, the maintainer may run:
 
 ```sh
 python3 scripts/cloud_verify.py --provider tencent --cleanup --prune-sg
+# In a bare-repository worktree pool (where --git-common-dir is bare):
+python3 scripts/cloud_verify.py --provider tencent --cleanup --prune-sg --coordinator-hub
 ```
 
-This operation never terminates instances. It is refused outside the main checkout, while **any
+This operation never terminates instances. It is refused outside the main checkout (unless
+`--coordinator-hub` is passed in a linked worktree backed by a bare `--git-common-dir`), while **any
 project-tagged instance exists anywhere in that provider account**, or while recent launch ledger
 entries might still be hidden by listing lag. The zero-instance check and prune hold the same
 common-git ledger lock as launches. Only rules carrying a nonempty `cloud_verify:<owner>` tag are
 removed; ownerless legacy rules and manual rules stay. Tencent deletion includes the policy
 version to refuse stale positional indexes; Aliyun and AWS delete by stable rule IDs. Prune defaults
 to all configured regions; `--region` narrows deletion, never the account-wide idle check. Use it
-alone with `--cleanup`, without `--mine`, `--all`, `--list`, `--dry-run` or `--grant`.
+alone with `--cleanup` (and optionally `--coordinator-hub`), without `--mine`, `--all`, `--list`,
+`--dry-run`, `--grant` or `--slots`.
 
 These guards cover launches from this repository's common-git ledger. External tools and older
 already-running launchers do not acquire new guards retroactively; update launchers before starting

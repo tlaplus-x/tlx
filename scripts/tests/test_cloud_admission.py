@@ -213,19 +213,20 @@ class QuotaAdmission(LedgerCase):
         self.assertEqual(provider.dry_runs, 0)
         [row] = self.rows()
         self.assertEqual((row["status"], row["code"], row["local"], row["admission"]["in_use"]), ("refused", 20, True, 3))
-        self.assertEqual(self.ledger.remaining("worker"), 2)
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
-    def test_the_launch_line_states_the_policy_the_count_measures(self):
-        # 2026-10-10: with four grants in the window the launcher printed
-        # "6/2 launches remaining in 12 h", which reads as a policy of six
-        # launches per window rather than two plus a grant's four.
-        self.ledger.grant("worker", "r", minutes=60)
-        self.ledger.grant("worker", "r", minutes=60)
+    def test_the_launch_line_reports_recent_launches_and_remaining_cny_budget(self):
+        self.ledger.grant("worker", "r", minutes=60, budget_cny=5)
         with self.ledger.locked() as rows:
-            self.assertEqual(self.ledger.remaining("worker", rows), 4)
+            rows.append({"owner": "worker", "time": time.time(), "instance": "ins-1", "status": "launched",
+                         "provider": "tencent", "estimated_cost": 1.25})
+            self.ledger.write(rows)
+        with self.ledger.locked() as rows:
+            self.assertEqual(self.ledger.recent_launches("worker", rows), 1)
             self.assertEqual(self.ledger.launch_report("worker", rows),
-                             "owner worker: 4 launch(es) remaining in 12 h "
-                             "(policy: 2 base out of 12 h, 2 granted, 0 used)")
+                             "owner worker: 1 launch(es) in 12 h; "
+                             "8.75 of 10 CNY estimated budget remaining "
+                             "(5 CNY base + 5 CNY from grants, 1.25 CNY used)")
 
     def test_known_bad_the_launchers_own_cap_refuses_a_launch_the_quota_admits(self):
         # 2026-10-10: `--max-account-slots N` is the launcher's own cap on the
@@ -268,7 +269,7 @@ class QuotaAdmission(LedgerCase):
         entry = self.launch(provider, admitter, a)
         self.assertEqual(provider.run_instances, [OFFER])
         self.assertEqual((entry["status"], entry["instance"], entry["admission"]["in_use"]), ("launched", "ins-new", 2))
-        self.assertEqual(self.ledger.remaining("worker"), 1)
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)
 
     def test_on_demand_launches_are_outside_the_spot_quota(self):
         provider = FakeProvider([holders("a", "b", "c")])
@@ -294,7 +295,7 @@ class QuotaAdmission(LedgerCase):
         self.assertEqual(sum(clock.sleeps), 60 + 120)   # one poll after each refusal (in slices of at most a minute)
         self.assertEqual(provider.dry_runs, 0)
         self.assertEqual([r["status"] for r in self.rows()], ["refused", "refused", "launched"])
-        self.assertEqual(self.ledger.remaining("worker"), 1)
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)
 
     def test_the_wait_is_bounded_and_ends_without_a_launch(self):
         provider = FakeProvider([holders("a", "b", "c")])
@@ -305,7 +306,7 @@ class QuotaAdmission(LedgerCase):
         self.assertIn("admission wait expired", str(raised.exception))
         self.assertEqual(provider.run_instances, [])
         self.assertLessEqual(sum(clock.sleeps), 300)
-        self.assertEqual(self.ledger.remaining("worker"), 2)
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
     def test_auto_waits_until_the_earliest_recorded_deadline(self):
         provider = FakeProvider([holders("a")])
@@ -355,16 +356,87 @@ class Share(LedgerCase):
         self.launch(provider, admitter, a)
         self.assertEqual(len(provider.run_instances), 1)
 
-    def test_grant_cli_takes_slots(self):
+    def test_grant_and_launch_cli_take_slots(self):
         a = cv.parse_args(["--grant", "kylezh/x", "--minutes", "180", "--slots", "4"])
         self.assertEqual((a.grant, a.minutes, a.slots), ("kylezh/x", 180, 4))
-        for argv in (["--slots", "2"], ["--grant", "x", "--slots", "0"], ["--grant", "x", "--slots", str(cv.MAX_SLOTS + 1)]):
+        launch_a = cv.parse_args(["--slots", "4"])
+        self.assertEqual((launch_a.grant, launch_a.slots), (None, 4))
+        for argv in (["--slots", "0"], ["--slots", str(cv.MAX_SLOTS + 1)],
+                     ["--grant", "x", "--slots", "0"], ["--grant", "x", "--slots", str(cv.MAX_SLOTS + 1)],
+                     ["--cleanup", "--prune-sg", "--slots", "2"]):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 cv.parse_args(argv)
         with self.assertRaises(CloudStop):
             self.ledger.grant("x", "r", slots=0)
         self.ledger.grant("x", "r", slots=2)
         self.assertEqual(self.rows()[-1]["slots"], 2)
+
+    def test_launch_slots_raises_share_and_respects_account_caps(self):
+        # Launch --slots raises the owner's share without a grant, and takes max(grant, --slots).
+        with self.ledger.locked() as rows:
+            self.assertEqual(self.ledger.share(rows, "worker", 1, requested=4), 4)
+        self.ledger.grant("worker", "share grant", slots=6)
+        with self.ledger.locked() as rows:
+            self.assertEqual(self.ledger.share(rows, "worker", 1, requested=4), 6)
+            self.assertEqual(self.ledger.share(rows, "worker", 1, requested=8), 8)
+
+        # A wave of concurrent shards with --slots 4 stops at min(share=4, spot_instance_quota=3).
+        provider = FakeProvider([[]])
+        counter = [0]
+
+        def launch_unique(m, ips, fresh, minutes, arch):
+            m.token = f"tok-{counter[0]}"
+            provider.checkpoint()
+            provider.run_instances.append(m.offer)
+            counter[0] += 1
+            m.id = f"ins-{counter[0]}"
+
+        provider.launch = launch_unique
+        a = self.args("--slots", "4")
+        admitter = cv.Admitter(provider, "tencent", "worker", "spot", {"spot_instance_quota": 3},
+                               self.ledger.share(self.rows(), "worker", 1, a.slots),
+                               a.wait_quota, a.wait_auto, None, account_cap=a.max_account_slots,
+                               view=lambda: ([], time.time()))
+        for _ in range(3):
+            self.launch(provider, admitter, a)
+        with self.assertRaises(cv.AdmissionRefused) as raised:
+            self.launch(provider, admitter, a)
+        self.assertEqual(raised.exception.code, 20)
+        self.assertIn("3 of 3 account spot slots in use", str(raised.exception))
+        self.assertEqual(len(provider.run_instances), 3)
+
+        # --max-account-slots tighter than both --slots and spot_instance_quota still caps admission.
+        provider2 = FakeProvider([[]])
+        a2 = self.args("--slots", "5", "--max-account-slots", "2")
+        admitter2 = cv.Admitter(provider2, "tencent", "other", "spot", {"spot_instance_quota": 10}, 5,
+                                a2.wait_quota, a2.wait_auto, None, account_cap=a2.max_account_slots,
+                                view=lambda: (holders("other", "other"), time.time()))
+        with self.assertRaises(cv.AdmissionRefused) as raised2:
+            cv.launch_with_quota_wait(provider2, Machine(), [], False, a2, self.ledger, "other", set(), admitter2)
+        self.assertEqual(raised2.exception.code, 20)
+        self.assertIn("the cap is 2 from --max-account-slots", str(raised2.exception))
+        self.assertEqual(provider2.run_instances, [])
+
+    def test_dry_run_wires_launch_slots_into_admitter_share(self):
+        provider = FakeProvider([holders("worker", "worker")])
+        provider.currency, provider.label_suffix = "CNY", "fake"
+        provider.check_account = lambda: "qcs::cam:100000000001:uin/100000000002 (CAMUser)"
+        provider.offers = lambda types, arch, regions: [OFFER]
+        provider.mainland = lambda region: True
+        lines = []
+        with mock.patch.dict(os.environ, {cloud_common.CONFIG_ENV: Counting.config(self, spot_instance_quota=10)}), \
+             mock.patch.object(cv, "current_owner", return_value="worker"), \
+             mock.patch.object(cv, "LaunchLedger", return_value=self.ledger), \
+             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok")), \
+             mock.patch.object(cv, "make_provider", return_value=provider), \
+             mock.patch.object(cv, "local_toolchain", return_value="1.0.0"), \
+             mock.patch.object(cv, "log", side_effect=lines.append), \
+             mock.patch("cloud.setup.log", side_effect=lines.append):
+            rc = cv.run_checked(self.args("--quick", "--slots", "4", "--dry-run"), cv.Cancel(os.path.join(self.dir, "c")))
+        self.assertEqual(rc, 0)
+        text = "\n".join(lines)
+        self.assertIn("2 of 10 account spot slots in use (yours 2, share 4)", text)
+        self.assertIn("a launch now would be admitted", text)
 
     def test_a_released_instance_no_longer_counts(self):
         provider = FakeProvider([holders("a")])
@@ -394,7 +466,7 @@ class RefusalsCostNothing(LedgerCase):
             self.assertIsNotNone(self.ledger.available_grant(rows, "worker", 180))
             refused = rows[-1]
         self.assertEqual((refused["status"], refused["code"], refused["grant_returned"]), ("refused", 20, True))
-        self.assertEqual(self.ledger.remaining("worker"), 3)
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
     def test_risk_forbidden_and_zone_refusals_keep_the_grant_and_stop(self):
         for error in (CloudStop("risk control", 21), CloudStop("Forbidden", 22), SkipOffer("zone", "sold out")):
@@ -412,7 +484,7 @@ class RefusalsCostNothing(LedgerCase):
         self.launch(provider, admitter, a)
         with self.ledger.locked() as rows:
             self.assertIsNone(self.ledger.available_grant(rows, "worker", 180))
-        self.assertEqual(self.ledger.remaining("worker"), 2)
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)
 
     def test_an_unknown_outcome_after_the_call_stays_a_launch(self):
         provider = FakeProvider([[]], refuse=CloudStop("tccli cvm RunInstances timed out", cloud_common.INFRA_FAIL))
@@ -432,7 +504,7 @@ class RefusalsCostNothing(LedgerCase):
             self.launch(provider, admitter, a)
         self.assertEqual(provider.run_instances, [])
         self.assertEqual(self.rows()[-1]["status"], "refused")
-        self.assertEqual(self.ledger.remaining("worker"), 3)
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
 
 class CancelCheckpoints(LedgerCase):
@@ -452,15 +524,16 @@ class CancelCheckpoints(LedgerCase):
     def test_cancel_during_the_provider_setup_stops_at_the_launch_call(self):
         cancel = self.cancel()
         provider = FakeProvider([[]], before_run=lambda: cancel.set("signal 15"))
-        self.ledger.grant("worker", "r", minutes=60)
+        self.ledger.grant("worker", "r", minutes=180)
         admitter, a, _ = self.admitter(provider, cancel=cancel)
+        a.max_minutes = 180
         with self.assertRaises(cv.Cancelled):
             self.launch(provider, admitter, a, cancel)
         self.assertEqual(provider.run_instances, [])
         row = self.rows()[-1]
         self.assertEqual((row["status"], row.get("api_called")), ("cancelled", None))
         self.assertTrue(row["grant_returned"])
-        self.assertEqual(self.ledger.remaining("worker"), 3)
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
     def test_control_without_a_cancel_the_launch_proceeds(self):
         cancel = self.cancel()
@@ -576,8 +649,9 @@ class ProviderDryRunAdmission(LedgerCase):
         for code in ("LimitExceeded.UserSpotQuota", "LimitExceeded.SpotQuota"):
             self.ledger.write([])
             p, calls = self.provider(E(code, "spot quota exceeded", []))
-            self.ledger.grant("worker", "r", minutes=60)
+            self.ledger.grant("worker", "r", minutes=180)
             admitter, a, _ = self.admitter(p, quota=10)
+            a.max_minutes = 180
             with self.assertRaises(cloud_common.ProviderQuotaFull) as raised:
                 self.launch(p, admitter, a)
             self.assertEqual(raised.exception.code, 20)
@@ -586,7 +660,7 @@ class ProviderDryRunAdmission(LedgerCase):
             row = self.rows()[-1]
             self.assertEqual((row["status"], row["code"], row.get("api_called"), row["grant_returned"]),
                              ("refused", 20, None, True))
-            self.assertEqual(self.ledger.remaining("worker"), 3)
+            self.assertEqual(self.ledger.recent_launches("worker"), 0)
 
     def test_with_a_wait_the_same_offer_is_probed_and_launched_once(self):
         p, calls = self.provider(cloud_tencent.TencentError("LimitExceeded.UserSpotQuota", "x", []))
@@ -730,7 +804,7 @@ class ZoneQuotaRetry(LedgerCase):
                                                   ("ap-shanghai-8", "subnet-ap-shanghai-8")])
         self.assertEqual((entry["status"], entry["instance"]), ("launched", "ins-ap-shanghai-8"))
         self.assertEqual((offer.zone, offer.region, offer.itype), ("ap-shanghai-8", "ap-shanghai", "SA5.4XLARGE32"))
-        self.assertEqual(self.ledger.remaining("worker"), 1)                # one launch consumed, not two
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)          # one launch consumed, not two
         self.assertIn("zone ap-shanghai-5: quota refused; trying ap-shanghai-8 (same region/type)", self.logs)
 
     def test_known_bad_a_real_call_quota_refusal_also_falls_back_to_the_next_zone(self):
@@ -740,7 +814,7 @@ class ZoneQuotaRetry(LedgerCase):
         entry = self.launch_offer(p, self.offer())
         self.assertEqual(self.of_kind("run"), ["ap-shanghai-5", "ap-shanghai-8"])
         self.assertEqual((entry["status"], entry["instance"]), ("launched", "ins-ap-shanghai-8"))
-        self.assertEqual(self.ledger.remaining("worker"), 1)
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)
 
     def test_known_bad_every_zone_refusing_is_one_region_quota_stop_that_keeps_the_grant(self):
         E = cloud_tencent.TencentError
@@ -754,7 +828,7 @@ class ZoneQuotaRetry(LedgerCase):
         self.assertEqual(self.of_kind("run"), [])                          # nothing launched anywhere
         row = self.rows()[-1]
         self.assertEqual((row["status"], row["code"], row["grant_returned"]), ("refused", 20, True))
-        self.assertEqual(self.ledger.remaining("worker"), 3)               # the grant is kept
+        self.assertEqual(self.ledger.recent_launches("worker"), 0)         # no launch counted; grant kept
         with self.ledger.locked() as rows:
             self.assertIsNotNone(self.ledger.available_grant(rows, "worker", 180))
 
@@ -851,7 +925,7 @@ class EndToEnd(LedgerCase):
         [row] = self.rows()
         self.assertEqual((row["status"], row["instance"], row["admission"]["in_use"]), ("launched", "ins-new", 1))
         self.assertIn("released", row)
-        self.assertEqual(self.ledger.remaining("worker"), 1)
+        self.assertEqual(self.ledger.recent_launches("worker"), 1)
 
 
 class ListingAndIdentity(LedgerCase):
@@ -971,6 +1045,125 @@ class GrantBudget(LedgerCase):
         self.assertEqual(raised.exception.code, 25)
         self.assertIn("coordinator-only", str(raised.exception))
         self.assertEqual(self.rows(), [])
+
+
+    def test_more_than_two_cheap_launches_succeed_in_12h_while_spend_cap_still_refuses(self):
+        a = self.args()
+        for i in range(5):
+            with self.ledger.launch("worker", a, OFFER) as entry:
+                entry["instance"] = f"ins-{i}"
+        self.assertEqual(self.ledger.recent_launches("worker"), 5)
+        # 5 * 0.16 = 0.80 CNY used; adding 4.50 CNY crosses the 5 CNY cap.
+        with self.assertRaises(CloudStop) as raised:
+            self.admit(4.5)
+        self.assertEqual(raised.exception.code, 25)
+        self.assertIn("exceeds the 5 CNY cap", str(raised.exception))
+
+
+class BareHubCoordinator(testkit.GuardedTestCase):
+    """Bare-repository worktree pools have no non-bare main worktree, so
+    coordinator operations require --coordinator-hub (or GIT_DIR pointing to
+    the bare common directory) and stay refused for ordinary linked-worktree
+    invocations and non-bare linked worktrees."""
+
+    def setUp(self):
+        import subprocess
+        self.subprocess = subprocess
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.dir = d.name
+        seed = os.path.join(self.dir, "seed")
+        subprocess.run(["git", "init", "-qb", "main", seed], check=True)
+        subprocess.run(["git", "-C", seed, "-c", "user.email=fixture@example.com",
+                        "-c", "user.name=Fixture", "commit", "--allow-empty", "-qm", "Initial"], check=True)
+        # Bare hub + linked worktree
+        self.hub = os.path.join(self.dir, "hub.git")
+        subprocess.run(["git", "clone", "--bare", "-q", seed, self.hub], check=True)
+        self.bare_wt = os.path.join(self.dir, "bare-wt")
+        subprocess.run(["git", "-C", self.hub, "worktree", "add", "-q", "-b", "feature/shard", self.bare_wt], check=True)
+        # Standard non-bare repo + linked worktree
+        self.std_main = os.path.join(self.dir, "std-main")
+        subprocess.run(["git", "clone", "-q", seed, self.std_main], check=True)
+        self.std_wt = os.path.join(self.dir, "std-wt")
+        subprocess.run(["git", "-C", self.std_main, "worktree", "add", "-q", "-b", "feature/worker", self.std_wt], check=True)
+
+    def _patch_repo(self, workdir, extra_env=None):
+        def fake_git(*args, cwd=workdir, check=True, strip=True):
+            env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE")}
+            if extra_env:
+                env.update(extra_env)
+            p = self.subprocess.run(["git", *args], cwd=cwd, env=env, text=True, check=check, capture_output=True)
+            return p.stdout.strip() if strip else p.stdout
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(cv, "ROOT", workdir))
+        stack.enter_context(mock.patch.object(cv, "git", side_effect=fake_git))
+        stack.enter_context(mock.patch.object(cloud_common, "git", side_effect=fake_git))
+        stack.enter_context(mock.patch.object(cv, "log"))
+        stack.enter_context(mock.patch.object(cv, "warning"))
+        return stack
+
+    def test_known_bad_bare_hub_linked_worktree_refuses_without_coordinator_hub(self):
+        with self._patch_repo(self.bare_wt):
+            for argv in (["--grant", "feature/shard"],
+                         ["--budget-override", "urgent rerun"],
+                         ["--provider", "tencent", "--cleanup", "--prune-sg"]):
+                with self.subTest(argv=argv), self.assertRaises(CloudStop) as raised:
+                    cv.run_checked(cv.parse_args(argv), cv.Cancel())
+                self.assertEqual(raised.exception.code, 25)
+                self.assertIn("coordinator-only", str(raised.exception))
+
+    def test_known_bad_non_bare_linked_worktree_cannot_use_coordinator_hub(self):
+        with self._patch_repo(self.std_wt):
+            for argv in (["--coordinator-hub", "--grant", "feature/worker"],
+                         ["--coordinator-hub", "--budget-override", "bypass"],
+                         ["--coordinator-hub", "--provider", "tencent", "--cleanup", "--prune-sg"]):
+                with self.subTest(argv=argv), self.assertRaises(CloudStop) as raised:
+                    cv.run_checked(cv.parse_args(argv), cv.Cancel())
+                self.assertEqual(raised.exception.code, 25)
+                self.assertIn("bare repository", str(raised.exception))
+
+    def test_control_bare_hub_with_coordinator_hub_authorizes_grant_override_and_prune(self):
+        with self._patch_repo(self.bare_wt):
+            # 1. --grant writes into the bare common dir's shared ledger.
+            rc = cv.run_checked(cv.parse_args(["--coordinator-hub", "--grant", "feature/shard", "--minutes", "180"]), cv.Cancel())
+            self.assertEqual(rc, 0)
+            ledger_path = os.path.join(os.path.realpath(self.hub), "tlx-cloud-ledger.json")
+            with open(ledger_path) as f:
+                rows = json.load(f)
+            self.assertEqual((rows[-1]["owner"], rows[-1]["minutes"]), ("feature/shard", 180))
+            # 2. --budget-override passes coordinator check.
+            cv.check_override("approved bare-hub override", coordinator_hub=True)
+            # 3. --cleanup --prune-sg succeeds under the shared lock when idle.
+            provider = mock.Mock(all_regions=["ap-shanghai"])
+            provider.name = "tencent"
+            provider.check_account.return_value = "qcs::cam:100000000001:uin/100000000002"
+            provider.leftovers.return_value = []
+            with mock.patch.object(cv, "make_provider", return_value=provider):
+                rc = cv.run_checked(cv.parse_args(["--coordinator-hub", "--provider", "tencent", "--cleanup", "--prune-sg"]), cv.Cancel())
+            self.assertEqual(rc, 0)
+            provider.prune_ssh_rules.assert_called_once_with(["ap-shanghai"])
+
+    def test_control_git_dir_pointing_to_bare_hub_works_even_with_unborn_head(self):
+        # Point bare HEAD at an unborn branch to ensure --grant and --prune-sg never crash on bare HEAD.
+        self.subprocess.run(["git", "--git-dir", self.hub, "symbolic-ref", "HEAD", "refs/heads/unborn"], check=True)
+        with self._patch_repo(self.bare_wt, extra_env={"GIT_DIR": self.hub}):
+            rc = cv.run_checked(cv.parse_args(["--grant", "feature/shard", "--minutes", "120"]), cv.Cancel())
+            self.assertEqual(rc, 0)
+            provider = mock.Mock(all_regions=["ap-shanghai"])
+            provider.name = "tencent"
+            provider.check_account.return_value = "qcs::cam:100000000001:uin/100000000002"
+            provider.leftovers.return_value = []
+            with mock.patch.object(cv, "make_provider", return_value=provider):
+                rc = cv.run_checked(cv.parse_args(["--provider", "tencent", "--cleanup", "--prune-sg"]), cv.Cancel())
+            self.assertEqual(rc, 0)
+            provider.prune_ssh_rules.assert_called_once_with(["ap-shanghai"])
+
+    def test_bare_check_fails_closed_on_git_error(self):
+        with mock.patch.object(cv, "git", side_effect=["/fake/hub.git/worktrees/w", "/fake/hub.git",
+                                                        self.subprocess.CalledProcessError(128, ["git"])]):
+            with self.assertRaises(CloudStop) as raised:
+                cv.check_coordinator(coordinator_hub=True)
+            self.assertEqual(raised.exception.code, 25)
 
 
 if __name__ == "__main__":

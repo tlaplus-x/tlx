@@ -10,7 +10,8 @@ usage:
                           [--region R] [--on-demand] [-j N] [--cc CC] [--rust-from auto|mirror|upload|upstream]
                           [--crates-from auto|mirror|vendor|upstream] [--ssh-proxy auto|none|HOST:PORT]
                           [--keep-instance] [--dry-run] [--list] [--cleanup] [--max-minutes N] [-v]
-                          [--wait-quota MINUTES|auto] [--cancel] [--grant OWNER --minutes M [--slots N]]
+                          [--wait-quota MINUTES|auto] [--slots N] [--max-account-slots N] [--cancel]
+                          [--coordinator-hub] [--grant OWNER --minutes M [--slots N] [--budget-cny X] [--reason TEXT]]
 
 Launches one spot instance with the provider (default aliyun: Alibaba Cloud
 ECS, see scripts/cloud/cloud_aliyun.py; tencent: Tencent Cloud CVM, see
@@ -122,17 +123,22 @@ fetched by scripts/fetch-external.py) are uploaded in every mode.
 credentials it prints what it can. --list only lists tagged instances;
 --list --mine selects the current branch's owner tag, and --cleanup --mine
 terminates only that owner's instances. All-owner cleanup requires --all.
-The shared git ledger limits each branch to two launches in 12 h and 60 min
-per launch; more than 16 vCPU needs --full/--bench with --allow-big. The
-exit status is verify.py's (0 passed, 1 failed), 3 for infrastructure failure,
-or a classified STOP code 20-25 (docs/cloud-verification.md).
+The shared git ledger caps each branch at 5 CNY of estimated 12 h compute
+spend (for tencent/aliyun; expandable with --grant --budget-cny) and 60 min
+per launch (expandable with --grant --minutes); more than 16 vCPU needs
+--full/--bench with --allow-big. Coordinator operations (--grant,
+--budget-override, --prune-sg) require the main worktree, or --coordinator-hub
+in a linked worktree whose shared git common directory is a bare repository.
+The exit status is verify.py's (0 passed, 1 failed), 3 for infrastructure
+failure, or a classified STOP code 20-25 (docs/cloud-verification.md).
 
 Launch admission: before the launch call (atomically with the ledger
 reservation) the run counts the account's instances (the provider's listing
 of all regions plus the ledger's launches it cannot show yet) and refuses
 locally, without a provider call, when the owner already runs its share
-(default_share in the cloud config, or the --slots of a coordinator grant)
-or the account's spot_instance_quota is used up; on tencent the exact
+(the largest of default_share in the cloud config, --slots N on the launch,
+and the --slots of a coordinator grant in the 12 h window) or the account's
+spot_instance_quota (or --max-account-slots) is used up; on tencent the exact
 request then goes to RunInstances as a dry run first, whose quota answer
 also stops it before anything is created. --wait-quota MINUTES|auto waits
 for a slot instead (same offer, read-only checks). Refused, cancelled and
@@ -151,17 +157,44 @@ from cloud.cloud_common import AccountError, CloudStop, clippy_preflight, cloud_
 PROVIDERS = {"aliyun": "cloud.cloud_aliyun.AliyunProvider", "aws": "cloud.cloud_aws.AwsProvider", "tencent": "cloud.cloud_tencent.TencentProvider"}
 
 
-def check_coordinator():
-    if os.path.realpath(git("rev-parse", "--git-dir")) != os.path.realpath(git("rev-parse", "--git-common-dir")):
-        raise CloudStop("budget override/grant/security-group prune is coordinator-only (main worktree); ask the coordinator for a grant (cloud_verify.py --grant OWNER --minutes M)", 25)
+def _resolve_git_path(path):
+    return os.path.realpath(path if os.path.isabs(path) else os.path.join(ROOT, path))
 
 
-def check_override(reason):
+def _is_bare_git_dir(common_dir):
+    try:
+        return git("--git-dir", common_dir, "rev-parse", "--is-bare-repository") == "true"
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def check_coordinator(coordinator_hub=False):
+    git_dir = _resolve_git_path(git("rev-parse", "--git-dir"))
+    common_dir = _resolve_git_path(git("rev-parse", "--git-common-dir"))
+    if git_dir == common_dir:
+        return
+    if coordinator_hub and _is_bare_git_dir(common_dir):
+        return
+    if coordinator_hub:
+        raise CloudStop(
+            "--coordinator-hub is only valid when the shared git common directory is a bare repository; "
+            "run coordinator operations from the main worktree instead",
+            25,
+        )
+    raise CloudStop(
+        "budget override/grant/security-group prune is coordinator-only (main worktree, or a linked worktree "
+        "backed by a bare git common directory with --coordinator-hub); ask the coordinator for a grant "
+        "(cloud_verify.py --grant OWNER --minutes M)",
+        25,
+    )
+
+
+def check_override(reason, *, coordinator_hub=False):
     if reason is None:
         return
     if not reason.strip():
         raise CloudStop("budget override needs a nonempty reason", 25)
-    check_coordinator()
+    check_coordinator(coordinator_hub)
     warning("budget override: " + reason)
 
 
@@ -205,7 +238,7 @@ class LaunchLedger:
     launch, a grant or budget; its row stays as evidence.
     """
     def __init__(self, path=None):
-        self.path = path or os.path.join(git("rev-parse", "--git-common-dir"), "tlx-cloud-ledger.json")
+        self.path = path or os.path.join(_resolve_git_path(git("rev-parse", "--git-common-dir")), "tlx-cloud-ledger.json")
 
     @contextlib.contextmanager
     def locked(self):
@@ -231,35 +264,31 @@ class LaunchLedger:
         os.replace(tmp, self.path)
 
     def usage(self, owner, rows):
-        """The owner's 12 h window: (launches still allowed, used, granted).
-
-        The allowance is the policy "two launches in twelve hours plus every
-        coordinator grant the window holds"; `used` is what it has consumed, so a
-        caller can print the number together with the policy it measures instead
-        of a bare "6/2" that reads as a larger policy (2026-10-10: four grants in
-        the window made the launcher print "6/2 launches remaining in 12 h").
-        """
+        """The owner's rolling 12 h window: (launches used, spent CNY, cap CNY, extra grant CNY)."""
         cutoff = time.time() - GRANT_WINDOW_SECS
         recent = [row for row in rows if row.get("owner") == owner and row.get("time", 0) > cutoff]
-        granted = sum(row.get("grant", 0) for row in recent)
-        used = sum(not row.get("grant") and row.get("status") in LAUNCH_STATUSES for row in recent)
-        return max(0, 2 + granted - used), used, granted
+        counted = [row for row in recent if not row.get("grant") and row.get("status") in LAUNCH_STATUSES]
+        used = len(counted)
+        spent = sum(row.get("estimated_cost", 0) for row in counted if row.get("provider") in ("tencent", "aliyun"))
+        extra = sum(row.get("budget_cny", 0) for row in recent if row.get("grant"))
+        return used, spent, BASE_BUDGET_CNY + extra, extra
 
-    def remaining(self, owner, rows=None):
+    def recent_launches(self, owner, rows=None):
         if rows is None:
             with self.locked() as records:
-                return self.remaining(owner, records)
+                return self.recent_launches(owner, records)
         return self.usage(owner, rows)[0]
 
     def launch_report(self, owner, rows=None):
-        """The `N/2 launches remaining in 12 h` line, stating the policy it
-        measures so a grant-carrying window does not read as a larger policy."""
+        """The owner's 12 h launch count and remaining estimated CNY budget."""
         if rows is None:
             with self.locked() as records:
                 return self.launch_report(owner, records)
-        free, used, granted = self.usage(owner, rows)
-        return (f"owner {owner}: {free} launch(es) remaining in 12 h "
-                f"(policy: 2 base out of 12 h, {granted} granted, {used} used)")
+        used, spent, cap, extra = self.usage(owner, rows)
+        remaining_cny = max(0.0, cap - spent)
+        return (f"owner {owner}: {used} launch(es) in 12 h; "
+                f"{remaining_cny:.2f} of {cap:g} CNY estimated budget remaining "
+                f"({BASE_BUDGET_CNY:g} CNY base + {extra:g} CNY from grants, {spent:.2f} CNY used)")
 
     def check_grant_owner(self, owner, rows):
         """Resolve a local branch to the worker's portable tag, or retain a ledger owner."""
@@ -277,9 +306,9 @@ class LaunchLedger:
         raise CloudStop(f"grant owner {owner!r} is neither a local branch nor a recorded ledger owner" + hint, 25)
 
     def grant(self, owner, reason, minutes=60, slots=None, budget_cny=None):
-        """Coordinator-only: one more launch for `owner` within the 12 h window;
-        `slots` raises the owner's share (concurrent instances) for that window;
-        `budget_cny` raises the owner's estimated-spend cap for that window."""
+        """Coordinator-only: grant `owner` a longer-duration lane (`minutes`),
+        a higher 12 h concurrency share (`slots`), and/or extra 12 h estimated-
+        spend budget (`budget_cny`)."""
         if not 0 < minutes <= MAX_LONG_GRANT_MINUTES:
             raise CloudStop(f"grant --minutes must be between 1 and {MAX_LONG_GRANT_MINUTES}", 25)
         if minutes > MAX_GRANT_MINUTES and reason in ("", "coordinator grant"):
@@ -298,15 +327,19 @@ class LaunchLedger:
                 row["budget_cny"] = budget_cny
             rows.append(row)
             self.write(rows)
-            return self.remaining(owner, rows)
+            return row
 
     @staticmethod
-    def share(rows, owner, default):
-        """How many instances `owner` may run at the same time: the largest
-        `slots` of its grants in the 12 h window, at least `default`."""
+    def share(rows, owner, default, requested=None):
+        """How many instances `owner` may run at the same time: the largest of
+        `default`, `requested` (`--slots` on a launch), and the `slots` of its
+        grants in the 12 h window."""
         cutoff = time.time() - GRANT_WINDOW_SECS
-        return max([default] + [row.get("slots", 0) for row in rows
-                                if row.get("owner") == owner and row.get("grant") and row.get("time", 0) > cutoff])
+        values = [default] + [row.get("slots", 0) for row in rows
+                              if row.get("owner") == owner and row.get("grant") and row.get("time", 0) > cutoff]
+        if requested is not None:
+            values.append(requested)
+        return max(values)
 
     @staticmethod
     def extra_budget(rows, owner):
@@ -354,15 +387,9 @@ class LaunchLedger:
             if quota:
                 raise CloudStop(f"budget: {owner} had a quota refusal in {quota[-1].get('region')} within the hour; "
                                 "do not work around it in another region (ask the coordinator)", 20)
-        if self.remaining(owner, rows) == 0:
-            raise CloudStop(f"budget: {owner} already used 2 launches within 12 h", 25)
         if offer and a.provider in ("tencent", "aliyun"):
-            spent = sum(row.get("estimated_cost", 0) for row in rows
-                        if row.get("owner") == owner and row.get("time", 0) > time.time() - GRANT_WINDOW_SECS
-                        and row.get("status") in LAUNCH_STATUSES and row.get("provider") in ("tencent", "aliyun"))
+            _, spent, cap, extra = self.usage(owner, rows)
             estimate = offer.price * max(a.max_minutes, getattr(a, "min_lifetime_minutes", 0)) / 60
-            extra = self.extra_budget(rows, owner)
-            cap = BASE_BUDGET_CNY + extra
             if spent + estimate > cap:
                 raise CloudStop(f"budget: estimated 12 h cost {spent + estimate:.2f} CNY exceeds the {cap:g} CNY cap "
                                 f"({BASE_BUDGET_CNY:g} CNY base + {extra:g} CNY from grants)", 25)
@@ -397,8 +424,8 @@ class LaunchLedger:
                      "status": "reserved"}
             if admission is not None:
                 entry["admission"] = admission.record()
-            grant = self.available_grant(rows, owner, a.max_minutes)
-            if grant is not None and not a.budget_override:
+            grant = self.available_grant(rows, owner, a.max_minutes) if a.max_minutes > 60 and not a.budget_override else None
+            if grant is not None:
                 grant["consumed_by"] = entry["time"]
                 entry["grant_minutes"] = grant.get("minutes", 60)
             rows.append(entry)
@@ -539,8 +566,8 @@ def admit(view, rows, owner, provider_name, market, quota, share, now=None, acco
     if share is not None and len(mine) >= share:
         a.ok, a.code, a.next_free = False, 25, due(mine)
         a.reason = (f"admission: {owner} already runs {len(mine)} instance(s), its share is {share} ({a.line()}); "
-                    "nothing was sent to the provider. Wait for your instance (--wait-quota MINUTES|auto) or ask the "
-                    "coordinator for a grant with more slots (cloud_verify.py --grant OWNER --slots N)")
+                    "nothing was sent to the provider. Wait for your instance (--wait-quota MINUTES|auto) or raise "
+                    "your concurrency share with --slots N (bounded by the account spot quota)")
     elif market == "spot" and quota is not None and len(spot) >= quota:
         a.ok, a.code, a.next_free = False, 20, due(spot)
         a.reason = (f"admission: the account's spot quota is full: {a.line()}; held by {a.by_owner()}; "
@@ -792,14 +819,14 @@ def manage_instances(provider, a, owner, summary=None, released=None):
     return 1 if (active if a.mine else left) else 0
 
 
-def prune_security_groups(provider, ledger, regions):
+def prune_security_groups(provider, ledger, regions, *, coordinator_hub=False):
     """The only destructive SG operation: coordinator, idle account, launch lock.
 
     LaunchLedger.launch holds this same lock through the provider launch call,
     so zero-instance admission and deletion cannot race a supported launch.
     The check is account-wide even when pruning just one requested region.
     """
-    check_coordinator()
+    check_coordinator(coordinator_hub)
     with ledger.locked() as rows:
         recent = [r for r in rows if r.get("provider") == provider.name
                   and r.get("status") in LAUNCH_STATUSES
@@ -878,16 +905,23 @@ def parse_args(argv=None):
     ap.add_argument("--all", action="store_true", help="explicitly allow cleanup of every owner's instances")
     ap.add_argument("--allow-big", action="store_true", help="allow more than 16 vCPU for --full or --bench")
     ap.add_argument("--budget-override", metavar="REASON", help="coordinator-only budget exception, recorded in the ledger")
-    ap.add_argument("--grant", metavar="OWNER", help="coordinator-only: give OWNER (a branch) one more launch in the 12 h window "
-                    "(with --budget-cny also a larger estimated-spend cap, with --slots a larger share)")
-    ap.add_argument("--minutes", type=int, help="with --grant: maximum minutes for its one launch "
+    ap.add_argument("--coordinator-hub", action="store_true",
+                    help="authorize --grant, --budget-override, or --prune-sg from a linked worktree when the "
+                         "shared git common directory is a bare repository")
+    ap.add_argument("--grant", metavar="OWNER",
+                    help="coordinator-only: grant OWNER (a branch) a longer launch lane (--minutes), a higher 12 h "
+                         "concurrency share (--slots), and/or a larger 12 h estimated-spend cap (--budget-cny)")
+    ap.add_argument("--minutes", type=int, help="with --grant: maximum minutes for its one long launch "
                     f"(1-{MAX_LONG_GRANT_MINUTES}, above {MAX_GRANT_MINUTES} only with --reason; default 60)")
     ap.add_argument("--reason", help="with --grant: why the grant is needed; required above "
                     f"{MAX_GRANT_MINUTES} minutes, where it must name the heavy job")
     ap.add_argument("--budget-cny", type=float, metavar="X", help="with --grant: raise OWNER's estimated 12 h spend cap by X CNY "
                     f"for the window (0-{MAX_GRANT_BUDGET_CNY}; default: the base {BASE_BUDGET_CNY} CNY only)")
-    ap.add_argument("--slots", type=int, help=f"with --grant: how many instances OWNER may run at the same time (1-{MAX_SLOTS}; "
-                    "default: the provider's default_share in the cloud config, 1)")
+    ap.add_argument("--slots", type=int, metavar="N",
+                    help=f"maximum concurrent instances this owner may run (1-{MAX_SLOTS}; on a launch or --dry-run, "
+                         "raises this invocation's share while remaining bounded by spot_instance_quota and "
+                         "--max-account-slots; with --grant, persists a 12 h share grant for OWNER; default: the "
+                         "provider's default_share in the cloud config, 1)")
     ap.add_argument("--cancel", action="store_true", help="cancel this worktree's running cloud_verify before it launches "
                     "(it stops at its next checkpoint: after the preflights, while waiting for a slot, before the launch call)")
     ap.add_argument("--prune-sg", action="store_true", help="coordinator-only: prune owner-tagged ssh rules, "
@@ -901,16 +935,18 @@ def parse_args(argv=None):
     a.tier = a.tier or "quick"
     if a.disk_gb is not None and a.disk_gb < 20:
         ap.error("--disk-gb must be at least 20")
-    if a.prune_sg and (not a.cleanup or a.mine or a.all or a.list or a.dry_run or a.grant):
-        ap.error("--prune-sg requires --cleanup alone (no --mine/--all/--list/--dry-run); it never terminates instances")
+    if a.prune_sg and (not a.cleanup or a.mine or a.all or a.list or a.dry_run or a.grant or a.slots is not None):
+        ap.error("--prune-sg requires --cleanup alone (no --mine/--all/--list/--dry-run/--grant/--slots); it never terminates instances")
+    if a.coordinator_hub and not (a.grant or a.budget_override is not None or a.prune_sg):
+        ap.error("--coordinator-hub requires --grant, --budget-override, or --prune-sg")
     if a.minutes is not None and (not a.grant or not 0 < a.minutes <= MAX_LONG_GRANT_MINUTES):
         ap.error(f"--minutes requires --grant and must be between 1 and {MAX_LONG_GRANT_MINUTES}")
     if a.reason is not None and not a.grant:
         ap.error("--reason requires --grant")
     if (a.minutes or 60) > MAX_GRANT_MINUTES and not a.reason:
         ap.error(f"--minutes above {MAX_GRANT_MINUTES} requires --reason naming the heavy job")
-    if a.slots is not None and (not a.grant or not 0 < a.slots <= MAX_SLOTS):
-        ap.error(f"--slots requires --grant and must be between 1 and {MAX_SLOTS}")
+    if a.slots is not None and not 0 < a.slots <= MAX_SLOTS:
+        ap.error(f"--slots must be between 1 and {MAX_SLOTS}")
     if a.budget_cny is not None and (not a.grant or not 0 < a.budget_cny <= MAX_GRANT_BUDGET_CNY):
         ap.error(f"--budget-cny requires --grant and must be between 0 and {MAX_GRANT_BUDGET_CNY}")
     a.wait_auto = a.wait_quota == "auto"
@@ -1049,17 +1085,20 @@ def run_checked(a, cancel):
     single cleanup.
     """
     owner = current_owner() if a.mine or not (a.list or a.cleanup or a.grant) else None
-    check_override(a.budget_override)
+    check_override(a.budget_override, coordinator_hub=a.coordinator_hub)
     if a.prune_sg:
-        check_coordinator()
+        check_coordinator(a.coordinator_hub)
     if a.grant:
-        check_coordinator()
-        left = LaunchLedger().grant(a.grant, a.reason or a.budget_override or "coordinator grant",
-                                    minutes=a.minutes or 60, slots=a.slots, budget_cny=a.budget_cny)
+        check_coordinator(a.coordinator_hub)
+        ledger = LaunchLedger()
+        row = ledger.grant(a.grant, a.reason or a.budget_override or "coordinator grant",
+                           minutes=a.minutes or 60, slots=a.slots, budget_cny=a.budget_cny)
         if (a.minutes or 60) > MAX_GRANT_MINUTES:
             log(LONG_GRANT_HINT)
-        log(f"granted one launch to {a.grant}" + (f" with a share of {a.slots} concurrent instance(s)" if a.slots else "")
-            + (f" and {a.budget_cny:.2f} CNY more estimated spend" if a.budget_cny else "") + f": {left} remaining in 12 h")
+        log(f"granted {row['minutes']} min lane to {row['owner']}"
+            + (f" with a share of {a.slots} concurrent instance(s)" if a.slots else "")
+            + (f" and {a.budget_cny:.2f} CNY more estimated spend" if a.budget_cny else "")
+            + f" ({ledger.launch_report(row['owner'])})")
         return 0
     if a.cleanup and not (a.mine or a.all or getattr(a, "prune_sg", False)):
         raise CloudStop("cleanup without --mine requires explicit --all", 25)
@@ -1070,7 +1109,7 @@ def run_checked(a, cancel):
         regions = [a.region] if a.region else provider.all_regions
         if any(r not in provider.all_regions for r in regions):
             raise CloudStop("unknown prune region", 25)
-        return prune_security_groups(provider, ledger, regions)
+        return prune_security_groups(provider, ledger, regions, coordinator_hub=a.coordinator_hub)
     if not (a.list or a.cleanup):
         with ledger.locked() as rows:
             ledger.check(rows, owner, a)
@@ -1141,7 +1180,7 @@ def run_checked(a, cancel):
             view = slot_view(provider)
             with ledger.locked() as rows:
                 decision = admit(view, rows, me, a.provider, "spot", limits["spot_instance_quota"],
-                                 ledger.share(rows, me, limits["default_share"]) if me else None,
+                                 ledger.share(rows, me, limits["default_share"], a.slots) if me else None,
                                  account_cap=a.max_account_slots)
             log(decision.line() if me else decision.line().split(" (yours")[0])
             log(f"slots by owner: {decision.by_owner()}")
@@ -1157,7 +1196,7 @@ def run_checked(a, cancel):
     with ledger.locked() as rows:
         ledger.check(rows, owner, a, best)
         # A coordinator's budget override is also exempt from the share (the account quota still applies).
-        share = None if a.budget_override else ledger.share(rows, owner, limits["default_share"])
+        share = None if a.budget_override else ledger.share(rows, owner, limits["default_share"], a.slots)
     jobs = a.jobs or max(1, best.vcpus - 1)
     rust, crates = sources(provider, best.region, a.rust_from, a.crates_from)
     plan = setup.Plan(a=a, provider=provider, owner=owner, ledger=ledger, admitter=admitter_for(best.market, share),

@@ -17,43 +17,46 @@ class CloudGuards(unittest.TestCase):
         self.assertNotEqual(cloud.owner_tag("a?b"), cloud.owner_tag("a*b"))
         self.assertLessEqual(len(cloud.owner_tag("x" * 200)), 64)
 
-    def test_budget_refuses_third_and_override_is_logged(self):
+    def test_more_than_two_launches_succeed_within_spend_cap_and_override_is_logged(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = cloud.LaunchLedger(os.path.join(tmp, "ledger.json"))
             offer = common.Offer(1, "r", "z", "t", 16)
             a = cloud.parse_args([])
-            for iid in ("i1", "i2"):
+            for iid in ("i1", "i2", "i3", "i4", "i5"):
                 with ledger.launch("owner", a, offer) as entry:
                     entry["instance"] = iid
-            self.assertEqual(ledger.remaining("owner"), 0)
+            self.assertEqual(ledger.recent_launches("owner"), 5)
             with self.assertRaises(common.CloudStop) as raised:
                 with ledger.launch("owner", a, offer):
-                    self.fail("third launch allowed")
+                    self.fail("launch beyond 5 CNY cap allowed")
             self.assertEqual(raised.exception.code, 25)
             a.budget_override = "coordinator approved regression rerun"
             with ledger.launch("owner", a, offer) as entry:
-                entry["instance"] = "i3"
+                entry["instance"] = "i6"
             with open(ledger.path) as source:
                 self.assertEqual(json.load(source)[-1]["override"], a.budget_override)
-            self.assertEqual(ledger.remaining("other"), 2)
+            self.assertEqual(ledger.recent_launches("other"), 0)
 
-    def test_grant_adds_one_launch_for_the_owner(self):
+    def test_grant_allows_long_lane_without_short_launches_consuming_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = cloud.LaunchLedger(os.path.join(tmp, "ledger.json"))
-            offer = common.Offer(1, "r", "z", "t", 16)
-            a = cloud.parse_args([])
-            for iid in ("i1", "i2"):
-                with ledger.launch("owner", a, offer) as entry:
+            offer = common.Offer(0.2, "r", "z", "t", 16)
+            short_a = cloud.parse_args([])
+            long_a = cloud.parse_args(["--max-minutes", "180"])
+            with ledger.launch("owner", short_a, offer) as entry:
+                entry["instance"] = "i1"
+            self.assertEqual(ledger.grant("owner", "coordinator approved long run", minutes=180)["minutes"], 180)
+            for iid in ("i2", "i3"):
+                with ledger.launch("owner", short_a, offer) as entry:
                     entry["instance"] = iid
-            self.assertEqual(ledger.remaining("owner"), 0)
-            self.assertEqual(ledger.grant("owner", "coordinator approved a third run"), 1)
-            self.assertEqual(ledger.remaining("other"), 2)
-            with ledger.launch("owner", a, offer) as entry:
-                entry["instance"] = "i3"
-            self.assertEqual(ledger.remaining("owner"), 0)
+            self.assertEqual(ledger.recent_launches("owner"), 3)
+            self.assertEqual(ledger.recent_launches("other"), 0)
+            # Short <=60m launches did not consume the 180m grant.
+            with ledger.launch("owner", long_a, offer) as entry:
+                entry["instance"] = "i4"
             with self.assertRaises(common.CloudStop):
-                with ledger.launch("owner", a, offer):
-                    self.fail("launch beyond the grant allowed")
+                with ledger.launch("owner", long_a, offer):
+                    self.fail("second long launch beyond the grant allowed")
 
     def test_a_long_grant_needs_a_reason_and_is_capped_at_twelve_hours(self):
         """A named heavy job may run past three hours (user decision 2026-10-08); the reason is what
@@ -64,15 +67,15 @@ class CloudGuards(unittest.TestCase):
             for iid in ("i1", "i2"):
                 with ledger.launch("owner", cloud.parse_args([]), offer) as entry:
                     entry["instance"] = iid
-            self.assertEqual(ledger.remaining("owner"), 0)
+            self.assertEqual(ledger.recent_launches("owner"), 2)
             with self.assertRaises(common.CloudStop) as raised:
                 ledger.grant("owner", "coordinator grant", minutes=240)
             self.assertIn("--reason", str(raised.exception))
             with self.assertRaises(common.CloudStop):
                 ledger.grant("owner", "a named heavy job", minutes=cloud.MAX_LONG_GRANT_MINUTES + 1)
             # a ten-hour lane also costs more than the base cap, so the grant carries its budget
-            self.assertEqual(ledger.grant("owner", "named heavy TLC oracle lane", minutes=600,
-                                          budget_cny=20), 1)
+            row = ledger.grant("owner", "named heavy TLC oracle lane", minutes=600, budget_cny=20)
+            self.assertEqual((row["minutes"], row["budget_cny"]), (600, 20))
             a = cloud.parse_args(["--max-minutes", "600"])
             with ledger.launch("owner", a, offer) as entry:      # the long grant admits the launch
                 entry["instance"] = "i3"
@@ -113,7 +116,7 @@ class CloudGuards(unittest.TestCase):
             script = ("import sys; sys.path.insert(0, sys.argv[1]); import cloud_verify as c; "
                       "from cloud.cloud_common import CloudStop, Offer\n"
                       "try:\n"
-                      " with c.LaunchLedger(sys.argv[2]).launch('owner', c.parse_args([]), Offer(1,'r','z','t',16)) as row:\n"
+                      " with c.LaunchLedger(sys.argv[2]).launch('owner', c.parse_args([]), Offer(2,'r','z','t',16)) as row:\n"
                       "  row['instance'] = 'fake'\n"
                       "except CloudStop as error: sys.exit(error.code)\n")
             def launch(_):
@@ -130,10 +133,10 @@ class CloudGuards(unittest.TestCase):
             with self.assertRaises(common.CloudStop):
                 with ledger.launch("owner", a, offer):
                     raise common.InfraError("LimitExceeded.UserSpotQuota")
-            self.assertEqual(ledger.remaining("owner"), 2)
+            self.assertEqual(ledger.recent_launches("owner"), 0)
             with ledger.launch("owner", a, offer):
                 pass   # Unknown outcome after a lost connection stays reserved.
-            self.assertEqual(ledger.remaining("owner"), 1)
+            self.assertEqual(ledger.recent_launches("owner"), 1)
 
     def test_compute_cost_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -162,7 +165,7 @@ class CloudGuards(unittest.TestCase):
             with self.assertRaises(common.CloudStop):
                 ledger.check([], "owner", a, offer)
             with patch.object(cloud.time, "time", return_value=50000):
-                self.assertEqual(ledger.remaining("owner", [{"owner": "owner", "time": 1}]), 2)
+                self.assertEqual(ledger.recent_launches("owner", [{"owner": "owner", "time": 1, "status": "launched"}]), 0)
 
     def test_mine_list_and_cleanup_ignore_others(self):
         provider = Mock()

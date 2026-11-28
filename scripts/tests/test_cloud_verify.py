@@ -359,6 +359,17 @@ class Planning(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cloud_verify.parse_args(["--max-account-slots", "0"])
 
+    def test_slots_and_coordinator_hub_arguments(self):
+        self.assertIsNone(cloud_verify.parse_args([]).slots)
+        self.assertEqual(cloud_verify.parse_args(["--slots", "4"]).slots, 4)
+        self.assertEqual(cloud_verify.parse_args(["--grant", "branch", "--slots", "4", "--coordinator-hub"]).slots, 4)
+        self.assertTrue(cloud_verify.parse_args(["--cleanup", "--prune-sg", "--coordinator-hub"]).coordinator_hub)
+        self.assertTrue(cloud_verify.parse_args(["--budget-override", "reason", "--coordinator-hub"]).coordinator_hub)
+        for bad in (["--slots", "0"], ["--slots", str(cloud_verify.MAX_SLOTS + 1)],
+                    ["--cleanup", "--prune-sg", "--slots", "2"], ["--coordinator-hub"]):
+            with self.subTest(argv=bad), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                cloud_verify.parse_args(bad)
+
     def test_then_args(self):
         a = cloud_verify.parse_args(["--full", "--then", "--suites build,corpus-compile --env TLX_JIT=0",
                                      "--then", "old --suites corpus-compile --cold-cache", "--then", "--quick -j 4"])
@@ -1399,7 +1410,7 @@ class ClippyLaunchRefusal(unittest.TestCase):
              mock.patch.object(cloud_verify, "make_provider", return_value=provider), \
              mock.patch.object(cloud_verify, "log"):
             ledger.return_value.locked.return_value.__enter__.return_value = []
-            ledger.return_value.remaining.return_value = 2
+            ledger.return_value.launch_report.return_value = "owner c-d20: 0 launch(es) in 12 h"
             with self.assertRaises(cloud_verify.CloudStop) as raised:
                 cloud_verify.run(a)
         self.assertEqual(raised.exception.code, 23)
