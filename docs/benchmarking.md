@@ -362,7 +362,28 @@ baseline row. Section 1 describes how the report pairs the two.
 - `--slice I/N` partitions the remaining models into `N` load-balanced shards using the same
   longest-processing-time (LPT) balancer as `tlcbase` (`benchmarking.bench_budget.balance_slices`),
   keeping all selected runs of each model in one slice so `--with-tlc-companion` same-instance pairing
-  is preserved.
+  is preserved. `bench.py track --slice I/N` runs one shard of that suite on the cloud instance and
+  copies the shard's history file (`bench/history/<rev>-sliceIofN.json`) into the checkout, and
+  `bench.py suite-merge OUT IN...` joins the shards of one revision into a single history file: the
+  runs, the A/B base runs and the samples are the union, and the verdict is judged again over that
+  union with the thresholds the shards recorded. A duplicate A/B key keeps the `(new, base)` pair the
+  one shard measured interleaved on one instance, never a new run from one shard with a base run from
+  another. The inputs must agree on the revision, the A/B base,
+  the machine's instance type and architecture (slices are separate spot launches, so their recorded
+  machine strings name different zones and prices), the selected sizes, the repeat count, the TLC
+  version and the measured binaries;
+  `suite-merge` writes the merged history and `bench.py suite-report` ingests it into
+  `bench/records/` like any other history. It prints the merged verdict and exits with its status
+  (0 pass or baseline, 1 regression or count mismatch, 2 inconclusive); `--set K=V` adds a header
+  field to the merged file. Sharding is what keeps a campaign inside a cloud lease
+  instead of truncating it with `skipped (time budget)`. For example:
+
+  ```sh
+  python3 scripts/bench.py track --sizes all --slice 1/2
+  python3 scripts/bench.py track --sizes all --slice 2/2
+  python3 scripts/bench.py suite-merge bench/history/<rev>.json bench/history/<rev>-slice1of2.json bench/history/<rev>-slice2of2.json
+  python3 scripts/bench.py suite-report
+  ```
 - Within every `suite` run (sliced or unsliced), models execute **shortest-estimated-first** using
   (1) stored `bench/records/` wall times, else (2) stored `bench/tlc-baselines/` wall times /
   `tlc_1w_s`, else (3) size-tier fallbacks (`small: 2 s`, `medium: 30 s`, `large: 180 s`,

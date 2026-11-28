@@ -1521,7 +1521,7 @@ def fetch_stamp(when):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when)) if when else None
 
 
-def receipt_problem(receipt, rev, bench_bins=(), exit_code=0):
+def receipt_problem(receipt, rev, bench_bins=(), exit_code=0, bench=None):
     """Why `receipt` does not authorize the benchmark run of `rev` with
     `bench_bins` that exited `exit_code`, or None when it does. Every identity
     and scope field is validated here (HARNESS-12):
@@ -1530,6 +1530,11 @@ def receipt_problem(receipt, rev, bench_bins=(), exit_code=0):
                   left next to a failed run cannot authorize anything;
       bench       the receipt is of a benchmark launch;
       bench_bins  the same external binaries (name and revision) were built.
+    When `bench` is given, the receipt must also have requested exactly those
+    remote bench command strings: a launch of the same revision with other
+    arguments (e.g. another `--slice I/N` shard) is a different invocation and
+    does not authorize recording this one. Two receipts of the *same* launch
+    arguments remain ambiguous and are refused (HARNESS-06).
     `bench_bins` are the requested `(name, rev, features)` triples; a binary the
     receipt does not pin is a mismatch, not a wildcard (HARNESS-19)."""
     if not same_rev(receipt.get("rev"), rev):
@@ -1538,6 +1543,8 @@ def receipt_problem(receipt, rev, bench_bins=(), exit_code=0):
         return f"receipt exit {receipt.get('verify_exit')!r} is not {exit_code}"
     if not receipt.get("bench"):
         return "receipt is not of a benchmark launch"
+    if bench is not None and list(receipt.get("bench") or []) != list(bench):
+        return f"receipt bench {receipt.get('bench')!r} is not {list(bench)!r}"
     want = {name: bref for name, bref, _ in bench_bins}
     got = {b.get("name"): b.get("rev") for b in receipt.get("bench_bins") or [] if isinstance(b, dict)}
     if set(want) != set(got):
@@ -1548,21 +1555,23 @@ def receipt_problem(receipt, rev, bench_bins=(), exit_code=0):
     return None
 
 
-def select_bench_receipt(directory, rev, bench_bins=(), exit_code=0):
+def select_bench_receipt(directory, rev, bench_bins=(), exit_code=0, bench=None):
     """The one result directory under `directory` whose receipt authorizes the
     benchmark run of `rev` with `bench_bins` that exited `exit_code`, as
-    `(path, receipt, problem)`. No match (the launch wrote no receipt, or its
-    results did not come back) and more than one match (two concurrent runs of
-    the same revision) both authorize nothing: the caller must refuse instead
-    of guessing by mtime (HARNESS-06). `problem` is None exactly when a unique
-    directory was found."""
+    `(path, receipt, problem)`. `bench` optionally names the exact remote bench
+    command strings of this invocation, so the shards of one revision select
+    their own receipts instead of each other's. No match (the launch wrote no
+    receipt, or its results did not come back) and more than one match (two
+    concurrent runs of the same revision and arguments) both authorize nothing:
+    the caller must refuse instead of guessing by mtime (HARNESS-06). `problem`
+    is None exactly when a unique directory was found."""
     matches = []
     for name in sorted(os.listdir(directory)) if os.path.isdir(directory) else []:
         path = os.path.join(directory, name)
         if not os.path.isdir(path):
             continue
         receipt = read_receipt(path)
-        if receipt is not None and receipt_problem(receipt, rev, bench_bins, exit_code) is None:
+        if receipt is not None and receipt_problem(receipt, rev, bench_bins, exit_code, bench) is None:
             matches.append((path, receipt))
     if not matches:
         return None, None, f"no receipt under {directory} authorizes rev {rev} (exit {exit_code})"

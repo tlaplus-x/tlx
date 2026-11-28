@@ -61,7 +61,7 @@ RETIRED_ARGV = {
 MINIMAL_ARGV = {
     "liveness": ["--before", "HEAD", "--before-bin", "path"], "disk": ["--models", "A"],
     "suite-check": [], "suite": [], "suite-judge": ["run.json"],
-    "suite-report": [], "track": [], "profile": ["--models", "A"], "ttfr": ["--bin", "a=path"],
+    "suite-report": [], "suite-merge": ["merged.json", "one.json"], "track": [], "profile": ["--models", "A"], "ttfr": ["--bin", "a=path"],
     "ttfr-report": ["ttfr.json"], "tiers": [], "run": [], "compare": ["a.json", "b.json"],
     "report": [], "migrate": [], "history-report": ["history.json"], "ab": ["--models", "A"],
     "perf": ["--models", "A"], "layout": [], "table": [], "tlcbase": [],

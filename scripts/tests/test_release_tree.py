@@ -81,7 +81,7 @@ STORE_INPUTS = (
 #: the two sets cover the parser's subcommands, so a subcommand added to
 #: `bench.py` has to be classified before it can go silent.
 NOT_STORE_INPUT = frozenset({
-    'liveness', 'disk', 'suite', 'suite-judge', 'track', 'profile', 'ttfr', 'ttfr-report',
+    'liveness', 'disk', 'suite', 'suite-judge', 'suite-merge', 'track', 'profile', 'ttfr', 'ttfr-report',
     'tiers', 'run', 'compare', 'history-report', 'ab', 'perf', 'layout', 'tlcbase-merge',
     'tlcbase-report', 'scale', 'scale-report',
 })

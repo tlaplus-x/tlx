@@ -77,7 +77,7 @@ usage:
       Compare two history files (commit ids or paths): per run the min
       wall (or CPU) time of B over A's; exit 0 for pass, 1 for regression,
       2 for inconclusive (no regression proved, but noisy/incomplete samples).
-  scripts/bench.py suite | suite-check | suite-report | track
+  scripts/bench.py suite | suite-check | suite-report | suite-merge | track
       Continuous performance tracking over the fixed suite bench/suite.json
       (A/B against the previous recorded revision, bench/history/<rev>.json;
       `track` runs it on one cloud instance): see
@@ -86,7 +86,9 @@ usage:
       twin of every default-mode run (same model, workers, arguments, environment
       and cache policy), so a reduced row has a like-for-like unreduced timing;
       the report pairs the two by model, instance, revision, workers, input
-      digest and configuration.
+      digest and configuration. `track --slice I/N` measures one LPT-balanced
+      model shard of the suite on that instance; `suite-merge OUT IN...` joins
+      the shards' histories into one (like `tlcbase-merge`).
   scripts/bench.py table
       Regenerate the fixed report docs/performance.md from the canonical
       records (bench/records); it measures nothing. Also the default without
@@ -581,7 +583,7 @@ def main():
     from benchmarking import bench_profile
     from benchmarking import bench_suite
     from benchmarking import bench_ttfr
-    if a.cmd in ("suite", "suite-check", "suite-report", "suite-judge", "track"):
+    if a.cmd in ("suite", "suite-check", "suite-report", "suite-judge", "suite-merge", "track"):
         return finish_bench(bench_suite.dispatch(a))
     result = {"tiers": cmd_tiers, "run": cmd_run, "compare": cmd_compare, "history-report": cmd_history_report, "ab": cmd_ab, "perf": cmd_perf,
               "layout": cmd_layout, "table": cmd_table,

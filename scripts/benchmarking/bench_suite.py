@@ -16,10 +16,14 @@ report (docs/performance.md). Subcommands of scripts/bench.py:
   bench.py suite-report [--history DIR]
       Re-ingest the suite histories under bench/history/*.json into the canonical
       records and regenerate docs/performance.md from them.
-  bench.py track [--rev HEAD] [--base auto|REV|none] [--sizes ...] [--provider tencent]
+  bench.py suite-merge OUT IN...
+      Join the `--slice I/N` histories of one suite run into one history file.
+  bench.py track [--rev HEAD] [--base auto|REV|none] [--sizes ...] [--slice I/N]
+                 [--provider tencent]
       The coordinator's command after merges: the suite on one cloud instance
       (cloud_verify.py --bench), the history file copied into bench/, the
-      verdict printed; same exit codes.
+      verdict printed; same exit codes. `--slice I/N` runs one LPT-balanced
+      shard of the suite on that instance.
 
 See docs/benchmarking.md, "Continuous performance tracking".
 
@@ -1039,7 +1043,8 @@ def _run_suite(a, bench, resolve, es, binary, slow_for, *, out=None, root=ROOT):
     out = out or a.out or os.path.join(HISTORY, f"{rev or 'external'}{slice_suffix}.json")
     h = {"suite": True, "tla2tools": bench_machine.tla2tools_info(), "commit": rev,
          "date": time.strftime("%Y-%m-%d %H:%M:%S"), "machine": bench_machine.machine_desc(),
-         "instructions": instr, "repeat": a.repeat, "sizes": a.sizes, "runs": {}}
+         "instructions": instr, "repeat": a.repeat, "sizes": a.sizes, "runs": {},
+         "judgement": {"threshold": a.threshold, "max_noise": a.max_noise, "min_delta": a.min_delta}}
     if a.bin:
         h["bin"] = binary
         h["runner_commit"] = runner_commit
@@ -1265,6 +1270,8 @@ def previous_recorded(rev, hists, is_ancestor=None):
 def remote_args(a, base):
     """The bench.py argument string of the remote run."""
     parts = ["suite", f"--sizes {a.sizes}", f"--repeat {a.repeat}", f"--max-minutes {a.max_minutes}"]
+    if getattr(a, "slice", ""):
+        parts.append(f"--slice {a.slice}")
     if getattr(a, "isolate_cache", False):
         parts.append("--isolate-cache")
     if getattr(a, "with_tlc_companion", False):
@@ -1294,12 +1301,12 @@ def cloud_command(a, rev, base, args):
     return cmd
 
 
-def track_history(directory, rev, base):
+def track_history(directory, rev, base, slice_spec=""):
     """The suite history file a receipt directory holds for this run, or None:
-    `bench/history/<rev>.json`, the file the remote `bench.py suite` wrote, read
-    back so its own `commit` and `base` are checked against the run. A history
-    file of another revision (or another base) never gets recorded, whatever its
-    file name is (HARNESS-06, HARNESS-12)."""
+    `bench/history/<rev>[-sliceIofN].json`, the file the remote `bench.py suite`
+    wrote, read back so its own `commit`, `base` and `slice` are checked against
+    the run. A history file of another revision, another base or another shard
+    never gets recorded, whatever its file name is (HARNESS-06, HARNESS-12)."""
     hist = os.path.join(directory, "bench", "history")
     names = sorted(os.listdir(hist)) if os.path.isdir(hist) else []
     for name in names:
@@ -1317,18 +1324,26 @@ def track_history(directory, rev, base):
         have = (h.get("base") or {}).get("commit")
         # A baseline run must carry no base; an A/B run must carry the requested one.
         matched = cloud_common.same_rev(have, base) if base else not have
-        if matched:
+        if matched and (h.get("slice") or "") == (slice_spec or ""):
             return os.path.join(hist, name)
     return None
 
 
 def cmd_track(a):
+    slice_spec = getattr(a, "slice", "") or ""
+    if slice_spec:
+        # The remote suite validates the shard too; syntax errors are cheapest
+        # to refuse here, before a cloud instance is started.
+        try:
+            bench_budget.parse_slice(slice_spec)
+        except ValueError as e:
+            sys.exit(str(e))
     rev = git("rev-parse", "--short=12", a.rev)
     hists = load_history()
     base = None if a.base == "none" else previous_recorded(rev, hists) if a.base == "auto" else git("rev-parse", "--short=12", a.base)
     args = remote_args(a, base)
     cmd = cloud_command(a, rev, base, args)
-    print(f"track {rev}: base {base or 'none (baseline)'}\n  " + " ".join(cmd), flush=True)
+    print(f"track {rev}" + (f" slice {slice_spec}" if slice_spec else "") + f": base {base or 'none (baseline)'}\n  " + " ".join(cmd), flush=True)
     if a.dry_run:
         return 0
     bins = [("base", base, "")] if base else []
@@ -1341,14 +1356,15 @@ def cmd_track(a):
         print(f"cloud_verify exited {rc}: not a suite status (0, 1 or 2), nothing recorded; "
               f"results and receipt, if any, stay in {BENCH_RESULTS}", file=sys.stderr)
         return 3
-    d, _, problem = cloud_common.select_bench_receipt(BENCH_RESULTS, rev, bins, rc)
+    d, _, problem = cloud_common.select_bench_receipt(BENCH_RESULTS, rev, bins, rc, bench=[args])
     if problem:
         print(f"cloud_verify exited {rc} but no receipt authorizes recording it: {problem}", file=sys.stderr)
         return 3
-    src = track_history(d, rev, base)
+    src = track_history(d, rev, base, slice_spec)
     if not src:
         print(f"receipt {os.path.join(d, 'cloud.json')} holds no suite history for {rev}"
-              + (f" (base {base})" if base else ""), file=sys.stderr)
+              + (f" (base {base})" if base else "")
+              + (f" slice {slice_spec}" if slice_spec else ""), file=sys.stderr)
         return 3
     print(f"track {rev}: receipt {os.path.relpath(d, ROOT)}, history {os.path.relpath(src, ROOT)}", flush=True)
     os.makedirs(HISTORY, exist_ok=True)
@@ -1364,6 +1380,177 @@ def cmd_track(a):
     v = h.get("verdict") or {"outcome": "INCONCLUSIVE", "count_failures": [], "regressions": [], "inconclusive": [], "skipped": []}
     print_verdict(h, v)
     return exit_status(v) if h.get("verdict") else INCONCLUSIVE
+
+
+# ---------------------------------------------------------------- merge
+
+# The header fields every slice of one suite run must agree on: the revision,
+# the machine's instance type and architecture (checked separately: its launch
+# identity names the zone and price, which differ between the spot instances a
+# campaign uses), the measurement protocol (repeat count, selected sizes, TLC
+# version, binaries) and the judgement thresholds (also separate, because a
+# history written before that field existed used the suite defaults). A merged
+# file is those slices' rows under one header, so a difference would make one
+# file claim a protocol its rows were not produced under.
+SUITE_MERGE_FIELDS = ("commit", "repeat", "sizes", "tla2tools", "bin", "runner_commit", "bin_revs")
+
+
+def _machine_identity(h):
+    """The hardware a history's rows were measured on: its parsed instance type
+    and architecture, or the whole `machine` string when either cannot be
+    parsed (a local or synthetic machine, which has no spot launch identity)."""
+    from benchmarking.records import instance_info
+    info = instance_info(h.get("machine") or "")
+    if info["type"] and info["arch"]:
+        return (info["type"], info["arch"])
+    return h.get("machine")
+
+
+def _judgement(h):
+    """The thresholds a history was judged with; a history written before the
+    field existed used the suite defaults (`suite` has no threshold options)."""
+    return h.get("judgement") or {"threshold": 0.05, "max_noise": 0.25, "min_delta": 0.05}
+
+
+def _base_commit(h):
+    base = h.get("base") or {}
+    return base.get("commit") or None
+
+
+def _suite_run_evidence(run):
+    """How much a run proves, ordered as `records.evidence`: a completed run
+    (newest first on a tie) over a timeout (by the bound it measured), over a
+    run with expectation problems or no verdict (which proves only its date).
+    The measured minimum is the final tie-break between two completed runs of
+    the same key, because the suite's timing is the minimum of its repeats."""
+    from benchmarking.records import COMPLETE
+    run = run or {}
+    result = run.get("result")
+    wall = run.get("min")
+    wall = wall if isinstance(wall, (int, float)) and not isinstance(wall, bool) and math.isfinite(wall) else None
+    if result == "timeout":
+        return (1, wall or 0.0, run.get("date") or "", 0.0)
+    if run.get("count_problems"):
+        return (0, 0.0, run.get("date") or "", 0.0)
+    if result in COMPLETE and wall is not None:
+        return (2, 0.0, run.get("date") or "", -wall)
+    return (0, 0.0, run.get("date") or "", 0.0)
+
+
+def _suite_pair_evidence(new, base):
+    """Order two candidate measurements of one A/B key.
+
+    `new` and `base` are selected together, so the pair a shard measured on one
+    instance is never mixed with another shard's base run (the interleaved A/B
+    contract of section 1). A pair whose two sides both completed proves most,
+    then the new run's own evidence orders the candidates, then the base run's.
+    "Completed" is `records.COMPLETE` with no expectation problems - not the
+    report's looser `ok_result`, which counts a `skipped`/`killed` stub as
+    finished and would let an empty pair beat a real measurement."""
+    new_ev, base_ev = _suite_run_evidence(new), _suite_run_evidence(base or {})
+    both = base is not None and new_ev[0] == 2 and base_ev[0] == 2
+    return (both, new_ev, base_ev)
+
+
+def cmd_suite_merge(a):
+    """`suite-merge OUT IN...`: join the `--slice I/N` histories of one suite run.
+
+    Slicing keeps every run of a model in one shard, so the slices are disjoint
+    and the merged file is their union: all `runs`, every slice's `base.runs`,
+    and the samples of each shard. A duplicate A/B key keeps the `(new, base)`
+    pair one shard measured interleaved on one instance, never a new run from
+    one shard with a base run from another. The verdict is judged again over
+    the union with the thresholds the slices state (equal across inputs), so it
+    describes the whole revision rather than any one shard. Like
+    `tlcbase-merge`, the command writes the merged history; `suite-report`
+    ingests it."""
+    import bench
+    hs = []
+    for p in a.inputs:
+        h = bench.read_json(p)
+        if not isinstance(h, dict) or not h.get("suite"):
+            sys.exit(f"{p} is not a suite history file")
+        hs.append(h)
+    first = hs[0]
+    for field in SUITE_MERGE_FIELDS:
+        values = [h.get(field) for h in hs]
+        if any(v != values[0] for v in values[1:]):
+            sys.exit(f"{a.out}: the inputs disagree on {field} ({values!r}); merge slices of one suite run")
+    machines = [_machine_identity(h) for h in hs]
+    if any(m != machines[0] for m in machines[1:]):
+        sys.exit(f"{a.out}: the inputs were measured on different machines ({machines!r}); "
+                 "merge slices of one suite run")
+    if any(_base_commit(h) != _base_commit(first) for h in hs):
+        sys.exit(f"{a.out}: the inputs disagree on the A/B base revision "
+                 f"({[_base_commit(h) for h in hs]!r}); merge slices of one suite run")
+    judgements = [_judgement(h) for h in hs]
+    if any(j != judgements[0] for j in judgements[1:]):
+        sys.exit(f"{a.out}: the inputs were judged with different thresholds ({judgements!r})")
+
+    out = {k: v for k, v in first.items()
+           if k not in ("runs", "base", "samples", "verdict", "slices", "slice", "budget", "date", "date_end")}
+    out["slices"] = [{"file": os.path.basename(p), "slice": h.get("slice"), "date": h.get("date"),
+                      "date_end": h.get("date_end"), "runs": len(h.get("runs") or {}),
+                      "machine": h.get("machine"), "budget": h.get("budget"),
+                      "verdict": (h.get("verdict") or {}).get("outcome")} for p, h in zip(a.inputs, hs)]
+    for kv in a.set:
+        k, eq, v = kv.partition("=")
+        if not eq:
+            sys.exit(f"--set expects K=V, got {kv!r}")
+        out[k] = v
+    out["date"] = min(h.get("date") or "" for h in hs)
+    out["date_end"] = max((h.get("date_end") or h.get("date") or "") for h in hs)
+    # The shards' hardware agrees; their launch identities differ by zone and
+    # price, so the merged header states one deterministically and each shard's
+    # own string stays in `slices`.
+    out["machine"] = min(h.get("machine") or "" for h in hs)
+    out["runs"], base_runs, samples, origin = {}, {}, [], {}
+    ab = bool(_base_commit(first))
+    for p, h in zip(a.inputs, hs):
+        shard_base = (h.get("base") or {}).get("runs") or {}
+        for key, run in (h.get("runs") or {}).items():
+            if not ab:
+                if key in out["runs"] and _suite_run_evidence(run) <= _suite_run_evidence(out["runs"][key]):
+                    print(f"{key}: {p} proves no more than {origin[key]}; keeping the stronger run", file=sys.stderr)
+                    continue
+                out["runs"][key], origin[key] = run, p
+                continue
+            # An A/B row is the pair this shard measured interleaved on one
+            # instance: selecting the new run and its base run separately could
+            # divide one shard's new timing by another shard's base timing.
+            current = (out["runs"][key], base_runs.get(key)) if key in out["runs"] else None
+            if current is not None and _suite_pair_evidence(run, shard_base.get(key)) <= _suite_pair_evidence(*current):
+                print(f"{key}: {p} proves no more than {origin[key]}; keeping the interleaved pair", file=sys.stderr)
+                continue
+            out["runs"][key], origin[key] = run, p
+            if key in shard_base:
+                base_runs[key] = shard_base[key]
+            else:
+                # The selected shard did not measure a base for this entry, so
+                # no base run of another shard may stand in for it.
+                base_runs.pop(key, None)
+        for sample in h.get("samples") or []:
+            if isinstance(sample, dict):
+                samples.append(sample)
+    if _base_commit(first):
+        out["base"] = {"commit": _base_commit(first), "runs": base_runs}
+    out["samples"] = sorted(samples, key=lambda s: json.dumps(s, sort_keys=True))
+    skipped = []
+    for h in hs:
+        skipped += list((h.get("verdict") or {}).get("skipped") or [])
+    from benchmarking.records import COMPLETE
+    skipped = [k for k in dict.fromkeys(skipped) if (out["runs"].get(k) or {}).get("result") not in COMPLETE]
+    j = judgements[0]
+    compare = lambda ra, rb: bench.compare_runs(ra, rb, metric="wall", threshold=j["threshold"], max_noise=j["max_noise"],
+                                                min_delta=j["min_delta"], distinct_success_only=True)
+    v = judge(base_runs if _base_commit(first) else None, out["runs"], [], skipped, compare)
+    out["verdict"] = v
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with open(a.out, "w") as stream:
+        json.dump(out, stream, indent=1, sort_keys=True)
+    print(f"{len(out['runs'])} runs ({len(skipped)} skipped) from {len(hs)} slices -> {a.out}", flush=True)
+    print_verdict(out, v)
+    return exit_status(v)
 
 
 # ---------------------------------------------------------------- CLI
@@ -1414,11 +1601,18 @@ def add_args(sub):
     p.add_argument("--write", action="store_true")
     p = sub.add_parser("suite-report", help="re-ingest bench/history and regenerate docs/performance.md")
     p.add_argument("--history", default=HISTORY)
+    p = sub.add_parser("suite-merge", help="join the --slice I/N histories of one suite run into one history")
+    p.add_argument("out")
+    p.add_argument("inputs", nargs="+")
+    p.add_argument("--set", action="append", default=[], metavar="K=V", help="a header field of the merged file (repeatable)")
     p = sub.add_parser("track", help="run the suite on a cloud instance and record it (the coordinator's command after merges)")
     p.add_argument("--rev", default="HEAD")
     p.add_argument("--base", default="auto", help="auto (the previous recorded revision), a revision, or none")
     p.add_argument("--sizes", default=DEFAULT_SIZES)
     p.add_argument("--models", default="")
+    p.add_argument("--slice", default="",
+                   help="I/N: run the I-th of N load-balanced model slices of the suite on this instance "
+                        "(pass every slice, then join them with suite-merge)")
     p.add_argument("--isolate-cache", action="store_true", help="fresh TLX_CACHE per configuration and binary, shared by its samples")
     p.add_argument("--with-tlc-companion", action="store_true",
                    help="also measure a same-instance `-tlc` twin of every default-mode run (same model, workers, arguments, environment and cache policy)")
@@ -1478,5 +1672,7 @@ def dispatch(a):
         sys.exit(cmd_judge(a))
     if a.cmd == "suite-report":
         return cmd_report(a)
+    if a.cmd == "suite-merge":
+        sys.exit(cmd_suite_merge(a))
     if a.cmd == "track":
         sys.exit(cmd_track(a))

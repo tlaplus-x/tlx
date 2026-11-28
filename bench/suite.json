@@ -787,7 +787,7 @@
      "workers": 1
     }
    ],
-   "timeout_s": 600,
+   "timeout_s": 1800,
    "note": "Vanlightly Kafka",
    "expect": {
     "result": "deadlock",
@@ -1593,15 +1593,23 @@
   },
   {
    "id": "KeyValueStore/MCKVSSafetyLarge",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "large",
+   "timeout_s": 1800,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -2531,20 +2539,41 @@
   },
   {
    "id": "SlushProtocol/SlushLarge",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
+    },
+    {
      "mode": "default",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
+    },
+    {
+     "mode": "default",
+     "workers": 16,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
     }
    ],
    "expect": {
     "source": "unpinned"
-   }
+   },
+   "note": "244.3M distinct states; the 16 GiB soft budget spills the >100M-state graph instead of exhausting memory"
   },
   {
    "id": "SlushProtocol/SlushMedium",
@@ -3065,15 +3094,23 @@
   },
   {
    "id": "TLC/TestMCReachability",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "large",
+   "timeout_s": 1800,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -3637,15 +3674,23 @@
   },
   {
    "id": "byzpaxos/BPConProof",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "large",
+   "timeout_s": 1800,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -3713,15 +3758,23 @@
   },
   {
    "id": "c1cs/c1cs",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -3814,15 +3867,23 @@
   },
   {
    "id": "dag-consensus/TLCSailfish2",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -3831,15 +3892,23 @@
   },
   {
    "id": "detector_chan96/EnvironmentController",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -3886,15 +3955,23 @@
   },
   {
    "id": "diskpaxos/MC_HDiskSynod",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16
+    },
+    {
      "mode": "default",
      "workers": 1
+    },
+    {
+     "mode": "default",
+     "workers": 16
     }
    ],
    "expect": {
@@ -4109,20 +4186,41 @@
   },
   {
    "id": "ewd998/EWD998",
-   "size": "medium",
-   "timeout_s": 600,
+   "size": "huge",
+   "timeout_s": 3600,
    "category": [
     "corpus"
    ],
    "runs": [
     {
+     "mode": "compile",
+     "workers": 16,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
+    },
+    {
      "mode": "default",
-     "workers": 1
+     "workers": 1,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
+    },
+    {
+     "mode": "default",
+     "workers": 16,
+     "args": [
+      "-maxmem",
+      "16G"
+     ]
     }
    ],
    "expect": {
     "source": "unpinned"
-   }
+   },
+   "note": "219M distinct states / 2.3B product edges; the 16 GiB soft budget spills the >100M-state graph instead of exhausting memory"
   },
   {
    "id": "ewd998/EWD998Small",
