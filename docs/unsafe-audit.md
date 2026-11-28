@@ -51,7 +51,7 @@ Locations name files and functions (line numbers drift).
 | 12 | `io/store.rs`: `F_NOCACHE`, hole punching (`punch_hole`), `BlockStore::map` (`mmap`), `Mapping` (`unsafe impl Send/Sync`, `bytes`, `Drop` with `munmap`), `sysconf` | OS calls on files the store opened; read-only mappings | descriptors come from files the store opened; hole-punch offsets and lengths are page-aligned; the mapping is read-only, only unmapped on drop, and `Mapping::bytes` asserts the range lies inside it | doc; `assert` |
 | 13 | `io/durable.rs`: `sync_file` (macOS `fsync`) | `libc::fsync` on a valid descriptor | the descriptor is the open file's (the lock file uses std `File::try_lock`, the drive-cache flush std `sync_all`) | doc |
 | 14 | `io/spillvec.rs`: `Iter::next`, `next_block` | `*self.ptr` and `*self.ptr.add(self.pos)` through a raw pointer into the current block | `ptr`/`len` point to the values of `cur` (a borrowed or owned block) and are refreshed only when the next block is loaded, so they stay valid while `pos < len` | doc on both derefs |
-| 15 | `queue/codec.rs`: `put_raw`, `get_raw`, `put_xor`; `queue/reader.rs`: `Reader::next` | reinterprets `[u64]` as little-endian bytes (`from_raw_parts`), `copy_nonoverlapping`, `Vec::set_len` over reserved spare capacity; calls the `unsafe` `StateCodec::decode_trusted`/`decode_into_trusted` | little-endian targets only (the big-endian path is safe); the destination has exactly the words' bytes and does not overlap the source; exactly the bytes counted by `at` were written before `set_len`; a decoded record comes from the codec's encoder, or from a spilled segment whose bytes were verified against the checksums retained when the encoding was written (encoded-state contract below) | doc |
+| 15 | `queue/codec.rs`: `put_raw`, `get_raw`, `put_xor`; `queue/reader.rs`: `Reader::next`; `explore/order/store.rs`: `CandStore::get`; `explore/order/positions.rs`: `Counts::zeros`, `NewClasses::new` | reinterprets `[u64]` as little-endian bytes (`from_raw_parts`), `copy_nonoverlapping`, `Vec::set_len` over reserved spare capacity; calls the `unsafe` `StateCodec::decode_trusted`/`decode_into_trusted`; converts uniquely owned zeroed `Box<[u32]>`/`Box<[u64]>` into `Box<[AtomicU32]>`/`Box<[AtomicU64]>` | little-endian targets only (the big-endian path is safe); the destination has exactly the words' bytes and does not overlap the source; exactly the bytes counted by `at` were written before `set_len`; a decoded record comes from the codec's encoder, or from a spilled segment whose bytes were verified against the checksums retained when the encoding was written (encoded-state contract below); `AtomicU32`/`AtomicU64` match `u32`/`u64` size, alignment (compile-time asserted) and representation on uniquely owned boxes | doc; `const` size/align asserts |
 | 16 | `mem.rs`: `rss_bytes`, `physical_bytes` | `proc_pid_rusage` on a zeroed `rusage_info_v2` (macOS), `sysconf` | the flavor fills exactly that struct and writes only it; `sysconf` has no preconditions | doc |
 
 ### tlx-native, tlx-compile (generated code)
@@ -126,7 +126,7 @@ use a tuple layout with exactly the VIEW encoding's component shapes and offsets
 existing permutation routine receives only words produced by that matching VIEW encoder.
 Public raw
 closure-executor entry points carry this obligation in their Safety contracts.
-Runtime `queue/reader.rs` and `explore/order.rs` call trusted codec methods only for
+Runtime `queue/reader.rs` and `explore/order/store.rs` call trusted codec methods only for
 encoder-produced records (or validated recovered records), as described above.
 
 ### tlx-front, tlx-cli, tlx-base
@@ -255,7 +255,8 @@ still requires local contract and audit-row review; file equality cannot detect 
 | `crates/tlx-runtime/src/explore/checkpoint/recover.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/explore/checkpoint/write.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/explore/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
-| `crates/tlx-runtime/src/explore/order.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
+| `crates/tlx-runtime/src/explore/order/positions.rs` | reviewed | Zeroed `Box<[u32]>`/`Box<[u64]>` to `Box<[AtomicU32]>`/`Box<[AtomicU64]>` with compile-time layout assertions (row 15). |
+| `crates/tlx-runtime/src/explore/order/store.rs` | reviewed | Trusted decoding of encoder-produced candidate records with checksum verification on spill (row 15). |
 | `crates/tlx-runtime/src/explore/safepoint.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/fpset/disk.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
 | `crates/tlx-runtime/src/fpset/mod.rs` | reviewed | Exclusive fpset access, scoped callbacks, mapped I/O and codecs (rows 3-16). |
