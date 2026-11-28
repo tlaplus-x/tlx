@@ -209,7 +209,7 @@ pub(crate) fn scan(
             let mut steps = Vec::with_capacity(cx.prefix.len() + cx.cycle.len());
             for &(src, edge) in cx.prefix.iter().chain(&cx.cycle) {
                 let idx = edge as usize;
-                let e = graph.off[src as usize] + idx;
+                let e = graph.off.get(src as usize) + idx;
                 let t = graph.tgt[e];
                 steps.push(ReplayStep {
                     src,

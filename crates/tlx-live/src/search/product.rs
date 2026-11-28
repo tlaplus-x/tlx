@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use crate::recurrence::Condition;
 use crate::tableau::Automaton;
-use crate::{Bits, GraphView, Ids};
+use crate::{Bits, GraphView, Ids, Offsets};
 
 use super::automaton::{AutInfo, GraphBfs, NodeMap, Part, DENSE_LIMIT};
 use super::{Prod, NONE};
@@ -46,7 +46,7 @@ pub(super) struct Product<'a, G: GraphView> {
     parent: Vec<(u32, u32)>,
     /// Monotone `(start_node, dist)` spans while building with waiting states.
     levels: Vec<(u32, u32)>,
-    off: Vec<usize>,
+    off: Offsets,
     pub(super) tgt: Vec<u32>,
     /// Index into `edges[st[source]]` of the graph edge behind each product edge.
     pub(super) gedge: Ids,
@@ -62,8 +62,7 @@ impl<'a, G: GraphView> Product<'a, G> {
     /// search buffers (`map` is dropped before `fair_cycle` allocates `Search`).
     fn bytes(&self, map: &NodeMap) -> usize {
         let bfs = self.bfs;
-        let nodes =
-            self.st.capacity() * 4 + self.aq.bytes() + self.parent.capacity() * 8 + self.levels.capacity() * 8 + self.off.capacity() * 8;
+        let nodes = self.st.capacity() * 4 + self.aq.bytes() + self.parent.capacity() * 8 + self.levels.capacity() * 8 + self.off.bytes();
         self.aut.bytes()
             + self.info.bytes()
             + std::mem::size_of_val(self.recurrence)
@@ -125,7 +124,7 @@ impl<'a, G: GraphView> Product<'a, G> {
             aq: Ids::zeros(0, aut.states.len().saturating_sub(1) as u32),
             parent: Vec::new(),
             levels: Vec::new(),
-            off: vec![0],
+            off: Offsets::from(vec![0]),
             tgt: Vec::new(),
             gedge: Ids::default(),
         };
@@ -269,7 +268,7 @@ impl<G: GraphView> Prod for Product<'_, G> {
 
     #[inline]
     fn out(&self, v: u32) -> Range<usize> {
-        self.off[v as usize]..self.off[v as usize + 1]
+        self.off.range(v as usize)
     }
 
     #[inline]

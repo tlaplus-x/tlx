@@ -164,8 +164,11 @@ graph, the fallback re-exploration and the VIEW/SYMMETRY path check resident mem
 resident memory then as `base` (`mem::live_base`) and allows `max(budget, base + budget/4)`
 (`mem::live_limit`), plus `LIVE_RSS_SLACK` (8 MiB) for first-touch pages. Without this, small budgets
 failed on process baseline memory that has nothing to do with the graph. Edge-log pattern ids are stored as
-`u8`/`u16`/`u32` by the number of distinct patterns (`tlx_live::Ids`). The product is built and searched
-part by part (design.md §7.4): its memory is that of the largest part, or of the parts in progress together
+`u8`/`u16`/`u32` by the number of distinct patterns (`tlx_live::Ids`), and CSR edge offsets (`LiveGraph.off`,
+`tlx_live::Csr::off` and each product's `off`) are stored as `u32` while the graph has at most `u32::MAX`
+edges, widening to `u64` above that (`tlx_live::Offsets`): 4 B per state or product node instead of 8 B on
+ordinary graphs. The product is built and searched part by part (design.md §7.4): its memory is that of the
+largest part, or of the parts in progress together
 with several workers (over the budget together, they run one at a time); the nodes of waiting tableau states
 are not built, and only edges that can lie on an accepting cycle are stored. Inside each `Product`, per-node
 automaton state ids (`Ids::zeros(0, max)`) and the graph-edge index behind each retained product edge
@@ -477,16 +480,16 @@ violation, the log is discarded.
 ### 8.2 After the search: CSR graph
 
 Sources are numbered by worker order and log order; a fingerprint-to-id open-addressing table
-(`tlx_base::hash::FpMap`; `tlx_live::Csr`) translates targets; the CSR (`off`, `tgt`, edge pattern ids,
-actions, state pattern ids, id-to-fingerprint) replaces a stored graph of states, moving boxed bit-pattern
-words into `tlx_live::Bits` without copying (`Bits::from_boxed_words`). Counterexample states are
-recovered by re-executing from an initial state along the path, matching fingerprints
-(design.md §7.4) after extracting the lasso step metadata and dropping both `Csr` and the
-id-to-fingerprint vector; under `-spill always` or memory pressure the id-to-fingerprint vector is
-instead written to disk before the product search and only the lasso's fingerprints are read back
-(§2.4). This costs about 120-170 B per state against about 1260 B for a graph that stored
-states. Both passes over the edge log read blocks from disk if they spilled, with read-ahead; the second
-deletes blocks after reading.
+(`tlx_base::hash::FpMap`; `tlx_live::Csr`) translates targets; the CSR (`off` as width-adaptive
+`u32`/`u64` offsets, `tgt`, edge pattern ids, actions, state pattern ids, id-to-fingerprint) replaces a
+stored graph of states, moving boxed bit-pattern words into `tlx_live::Bits` without copying
+(`Bits::from_boxed_words`). Counterexample states are recovered by re-executing from an initial state
+along the path, matching fingerprints (design.md §7.4) after extracting the lasso step metadata and
+dropping both `Csr` and the id-to-fingerprint vector; under `-spill always` or memory pressure the
+id-to-fingerprint vector is instead written to disk before the product search and only the lasso's
+fingerprints are read back (§2.4). This costs about 120-170 B per state against about 1260 B for a graph
+that stored states. Both passes over the edge log read blocks from disk if they spilled, with read-ahead;
+the second deletes blocks after reading.
 
 ### 8.3 Interaction with layout-miss resume
 

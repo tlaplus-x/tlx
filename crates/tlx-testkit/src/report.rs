@@ -120,7 +120,7 @@ mod tests {
         let mut graph = LiveGraph {
             init: vec![0, 0],
             fps: vec![17, 23],
-            off: vec![0, 2, 3],
+            off: vec![0, 2, 3].into(),
             tgt: vec![1, 0, 1],
             state_pat: vec![0, 1],
             state_pats: vec![vec![1].into(), vec![2].into()],
@@ -267,9 +267,8 @@ mod tests {
             let init: Vec<_> = g.init.iter().map(|&i| g.fps[i as usize]).collect();
             let mut nodes: Vec<_> = (0..g.len())
                 .map(|i| {
-                    let edges: Vec<_> = (g.off[i]..g.off[i + 1])
-                        .map(|e| (g.fps[g.tgt[e] as usize], g.action_pats[g.edge_pat.get(e) as usize].to_vec()))
-                        .collect();
+                    let edges: Vec<_> =
+                        g.off.range(i).map(|e| (g.fps[g.tgt[e] as usize], g.action_pats[g.edge_pat.get(e) as usize].to_vec())).collect();
                     (g.fps[i], g.state_pats[g.state_pat[i] as usize].to_vec(), edges)
                 })
                 .collect();
@@ -373,7 +372,7 @@ mod tests {
         renumbered.fps.reverse();
         renumbered.state_pat.reverse();
         renumbered.init = vec![1, 1];
-        renumbered.off = vec![0, 1, 3];
+        renumbered.off = vec![0, 1, 3].into();
         renumbered.tgt = vec![0, 0, 1];
         renumbered.edge_pat = Default::default();
         for id in [0, 0, 1] {

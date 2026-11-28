@@ -14,6 +14,8 @@
 //! - `tlc`: TLC's own algorithm, for graphs whose nodes are classes of
 //!   states (VIEW, SYMMETRY), where TLC's verdicts depend on it.
 
+use std::ops::Range;
+
 mod normal;
 mod recurrence;
 mod search;
@@ -74,7 +76,7 @@ pub struct Graph {
 #[derive(Clone, Debug, Default)]
 pub struct Csr {
     pub init: Vec<u32>,
-    pub off: Vec<usize>,
+    pub off: Offsets,
     pub tgt: Vec<u32>,
     pub edge_pat: Ids,
     pub state_pat: Vec<u32>,
@@ -94,13 +96,13 @@ impl Csr {
 
     /// The number of edges of state `s`.
     pub fn degree(&self, s: u32) -> usize {
-        self.off[s as usize + 1] - self.off[s as usize]
+        self.off.range(s as usize).len()
     }
 
     /// Edge `i` of state `s`: its target and action-atom bits.
     #[inline]
     pub fn edge(&self, s: u32, i: usize) -> (u32, &Bits) {
-        let e = self.off[s as usize] + i;
+        let e = self.off.get(s as usize) + i;
         (self.tgt[e], &self.action_pats[self.edge_pat.get(e) as usize])
     }
 
@@ -113,7 +115,8 @@ impl Csr {
     /// The CSR form of `g` (each state's and edge's bits a pattern of their
     /// own).
     pub fn from_graph(g: &Graph) -> Csr {
-        let mut c = Csr { init: g.init.clone(), off: vec![0], ..Csr::default() };
+        let mut c = Csr { init: g.init.clone(), ..Csr::default() };
+        c.off.push(0);
         for (s, es) in g.edges.iter().enumerate() {
             c.state_pat.push(c.state_pats.len() as u32);
             c.state_pats.push(g.state_bits[s].clone());
@@ -195,6 +198,103 @@ impl Ids {
             Ids::U16(v) => v.capacity() * 2,
             Ids::U32(v) => v.capacity() * 4,
         }
+    }
+}
+
+/// CSR edge offsets, each stored in `u32` while the graph has at most
+/// `u32::MAX` edges (`4 B` per entry) and in `u64` above that (`8 B`): a
+/// state space of `2^32` edges already needs over 17 GiB of targets alone, so
+/// almost every graph fits the narrow form. [`Offsets::push`] widens the
+/// whole table when an offset outgrows `u32`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Offsets {
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl Default for Offsets {
+    fn default() -> Offsets {
+        Offsets::U32(Vec::new())
+    }
+}
+
+impl Offsets {
+    /// An empty table for `cap` offsets whose largest offset will be
+    /// `max_offset`, in the narrowest type that holds it.
+    pub fn with_capacity(cap: usize, max_offset: usize) -> Offsets {
+        if max_offset <= u32::MAX as usize {
+            Offsets::U32(Vec::with_capacity(cap))
+        } else {
+            Offsets::U64(Vec::with_capacity(cap))
+        }
+    }
+
+    /// Offset `i`.
+    #[inline]
+    pub fn get(&self, i: usize) -> usize {
+        match self {
+            Offsets::U32(v) => v[i] as usize,
+            Offsets::U64(v) => v[i] as usize,
+        }
+    }
+
+    /// The offsets `v..v + 1` as a range.
+    #[inline]
+    pub fn range(&self, v: usize) -> Range<usize> {
+        let (lo, hi) = match self {
+            Offsets::U32(o) => (o[v] as usize, o[v + 1] as usize),
+            Offsets::U64(o) => (o[v] as usize, o[v + 1] as usize),
+        };
+        lo..hi
+    }
+
+    /// Append `offset`, widening the table if it no longer fits `u32`.
+    pub fn push(&mut self, offset: usize) {
+        match self {
+            Offsets::U32(v) if offset <= u32::MAX as usize => v.push(offset as u32),
+            Offsets::U64(v) => v.push(offset as u64),
+            _ => *self = Offsets::U64((0..self.len()).map(|i| self.get(i) as u64).chain([offset as u64]).collect()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Offsets::U32(v) => v.len(),
+            Offsets::U64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The memory held (bytes).
+    pub fn bytes(&self) -> usize {
+        match self {
+            Offsets::U32(v) => v.capacity() * 4,
+            Offsets::U64(v) => v.capacity() * 8,
+        }
+    }
+}
+
+impl From<Vec<usize>> for Offsets {
+    /// A table of `v`, narrow unless an offset outgrows `u32`.
+    fn from(v: Vec<usize>) -> Offsets {
+        if v.iter().any(|&o| o > u32::MAX as usize) {
+            Offsets::U64(v.into_iter().map(|o| o as u64).collect())
+        } else {
+            Offsets::U32(v.into_iter().map(|o| o as u32).collect())
+        }
+    }
+}
+
+impl FromIterator<usize> for Offsets {
+    fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Offsets {
+        let mut o = Offsets::default();
+        for x in iter {
+            o.push(x);
+        }
+        o
     }
 }
 
@@ -521,7 +621,7 @@ fn eval_at<B1: std::borrow::Borrow<Bits>, B2: std::borrow::Borrow<Bits>>(
 
 #[cfg(test)]
 mod tests {
-    use super::{eval_lasso, Bits, Ltl};
+    use super::{eval_lasso, Bits, Ltl, Offsets};
 
     #[test]
     fn lasso_evaluation() {
@@ -550,5 +650,48 @@ mod tests {
         b.set(500, false);
         assert!(!b.get(5) && !b.get(500));
         assert!(Bits::from_u64(0b100).get(2));
+    }
+
+    #[test]
+    fn offsets_narrow_widen_and_account() {
+        let mut o = Offsets::with_capacity(4, 3);
+        assert!(matches!(o, Offsets::U32(_)), "small offsets are u32");
+        for x in [0, 1, 3] {
+            o.push(x);
+        }
+        assert!(matches!(o, Offsets::U32(_)));
+        assert_eq!((o.get(0), o.get(2)), (0, 3));
+        assert_eq!(o.range(1), 1..3);
+        assert_eq!(o.len(), 3);
+        assert!(!o.is_empty());
+        // The push that first exceeds u32::MAX widens the whole table.
+        let wide = u32::MAX as usize + 1;
+        o.push(wide);
+        assert!(matches!(o, Offsets::U64(_)), "offsets past u32::MAX widen");
+        assert_eq!((o.get(0), o.get(3)), (0, wide));
+        assert_eq!(o.range(0), 0..1);
+
+        // Pre-sized above u32::MAX: u64 from the start.
+        let mut big = Offsets::with_capacity(2, wide);
+        assert!(matches!(big, Offsets::U64(_)));
+        big.push(0);
+        big.push(wide);
+        big.push(wide + 1);
+        assert_eq!((big.get(1), big.get(2)), (wide, wide + 1));
+
+        // From an iterator, and bytes accounting: capacity times width.
+        let from_vec = Offsets::from(vec![0, 1, 3]);
+        assert_eq!(from_vec, [0, 1, 3].into_iter().collect::<Offsets>());
+        let wide_from_vec = Offsets::from(vec![0, wide]);
+        assert!(matches!(wide_from_vec, Offsets::U64(_)));
+        for o in [from_vec, wide_from_vec] {
+            let bytes = match &o {
+                Offsets::U32(v) => v.capacity() * 4,
+                Offsets::U64(v) => v.capacity() * 8,
+            };
+            assert_eq!(o.bytes(), bytes);
+        }
+        assert!(Offsets::default().is_empty());
+        assert_eq!(Offsets::default().bytes(), 0);
     }
 }

@@ -217,7 +217,8 @@ fn csr_relabeled_agrees() {
         for (s, &p) in perm.iter().enumerate() {
             inv[p as usize] = s;
         }
-        let mut c = Csr { init: g.init.iter().map(|&s| perm[s as usize]).collect(), off: vec![0], ..Csr::default() };
+        let mut c = Csr { init: g.init.iter().map(|&s| perm[s as usize]).collect(), ..Csr::default() };
+        c.off.push(0);
         for &s in &inv {
             let sp = intern(&mut c.state_pats, &g.state_bits[s]);
             c.state_pat.push(sp);

@@ -78,7 +78,9 @@ pub fn canon(g: &LiveGraph) -> Canon {
         .map(|i| CanonNode {
             fingerprint: g.fps[i],
             state_atoms: g.state_pats[g.state_pat[i] as usize].to_vec(),
-            edges: (g.off[i]..g.off[i + 1])
+            edges: g
+                .off
+                .range(i)
                 .map(|e| CanonEdge { target: g.fps[g.tgt[e] as usize], action_atoms: g.action_pats[g.edge_pat.get(e) as usize].to_vec() })
                 .collect(),
         })
