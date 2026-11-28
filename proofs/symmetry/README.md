@@ -66,6 +66,18 @@ connected Lean certificate emitters:
   key-valued map `[Proc -> Proc]`, set-valued map `[Proc -> SUBSET Proc]`, and
   nested matrix `[Proc -> [Proc -> BOOLEAN]]` certified by `EquivSymCertificate`.
   27 concrete states become 7 classes.
+- [CfgValueOverride.tla](CfgValueOverride.tla)
+  ([CfgValueOverride.cfg](CfgValueOverride.cfg)): `.cfg` value assignments on
+  zero-arity definitions (`NoVal = NoVal`, `Slot = {0, 1}`, `Tag = "idle"`) that
+  replace an unbounded `CHOOSE` and `Nat`, spliced in as `CfgLiteral` leaves with
+  one override obligation per applied use site. 7 concrete states become 3
+  classes under `Permutations(Proc)`.
+- [FixedAtomSubsets.tla](FixedAtomSubsets.tla)
+  ([FixedAtomSubsets.cfg](FixedAtomSubsets.cfg)): quorum sets over
+  `Permutations(Value) x Permutations(Acceptor)` whose members mix acceptor keys
+  with the fixed fake acceptor `fa1`; the stratified `k`-subset lowering emits
+  `{Q \cup F : Q \in SUBSET Acceptor, |Q| \in K}` unions per fixed-atom
+  stratum. 27 concrete states become 6 classes.
 - [ChooseSym.tla](ChooseSym.tla) ([ChooseSym.cfg](ChooseSym.cfg)):
   inductively unique leader `CHOOSE`, projected uniform-value message `CHOOSE`
   (direct and `LET`-bound), and recursive `CHOOSE` integer set-sum fold
@@ -103,6 +115,8 @@ cargo build --release
 ./target/release/tlx check proofs/symmetry/ProductSets.tla -compile
 ./target/release/tlx check proofs/symmetry/MultiKeyMsgs.tla -compile
 ./target/release/tlx check proofs/symmetry/KeyValMaps.tla -compile
+./target/release/tlx check proofs/symmetry/CfgValueOverride.tla -interp
+./target/release/tlx check proofs/symmetry/FixedAtomSubsets.tla -interp
 ./target/release/tlx check proofs/symmetry/ChooseSym.tla -compile
 ./target/release/tlx check proofs/symmetry/TupleView.tla -interp
 ./target/release/tlx check proofs/symmetry/TupleViewErased.tla -interp

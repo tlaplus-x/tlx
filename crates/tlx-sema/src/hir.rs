@@ -142,6 +142,12 @@ pub enum ExprKind {
     Decimal(Arc<str>),
     Str(Arc<str>),
     Bool(bool),
+    /// A `.cfg` constant value spliced into the HIR by a certified
+    /// normalization: a zero-arity definition the configuration assigns a
+    /// literal (`Def = value`, docs/compat.md D-23). Resolution never produces
+    /// it, so the runtime and compiled tiers never evaluate it; the certificate
+    /// emitters interpret it as the configured value.
+    CfgLiteral(Arc<tlx_front::cfg::CfgValue>),
 
     Var(VarId),
     /// A VARIABLE of an instantiated module, referenced inside an `ENABLED`

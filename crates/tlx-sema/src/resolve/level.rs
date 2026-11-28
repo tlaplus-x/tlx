@@ -503,7 +503,12 @@ impl Checker<'_> {
     pub(super) fn expr(&mut self, e: &Expr) -> Info {
         let span = e.span;
         match &*e.kind {
-            ExprKind::Num(_) | ExprKind::Decimal(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Const(_) => Info::at(CONSTANT),
+            ExprKind::Num(_)
+            | ExprKind::Decimal(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Const(_)
+            | ExprKind::CfgLiteral(_) => Info::at(CONSTANT),
             ExprKind::Var(_) => Info::at(1),
             ExprKind::InstVar { subst, .. } => {
                 let mut i = Info::at(1);

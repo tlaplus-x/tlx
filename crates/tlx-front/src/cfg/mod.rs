@@ -129,6 +129,25 @@ impl Config {
         }
     }
 
+    /// The last unqualified `name = value` entry, ignoring `<-` substitutions.
+    ///
+    /// `bind_cfg` (`tlx-eval/src/interp/cfg.rs`) keeps definition values and
+    /// definition substitutions in separate maps, so a definition the
+    /// configuration binds both ways is ambiguous; analyses that certify a
+    /// `Def = value` binding read the value entry through this method and
+    /// refuse configurations that also substitute the same name.
+    pub fn last_def_value(&self, name: &str) -> Option<&CfgValue> {
+        let mut found = None;
+        for b in &self.constants {
+            if let ConstBinding::Value { name: n, value, module: None } = b {
+                if n == name {
+                    found = Some(value);
+                }
+            }
+        }
+        found
+    }
+
     /// The effective unqualified `name <- op` substitution (last wins).
     pub fn last_constant_subst(&self, name: &str) -> Option<&str> {
         match self.effective_constant(name) {

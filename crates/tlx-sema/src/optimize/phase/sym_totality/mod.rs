@@ -494,13 +494,15 @@ pub(crate) fn cfg_overrides_or_tables(program: &Program, cfg: &Config) -> bool {
 /// Iteratively verify that `root_def` is transitively pure through all called
 /// definitions, `LET` bindings, operator arguments, and referenced substituted
 /// constants, with cycle handling and a bounded work budget. `redirect` is the
-/// `.cfg` definition-override map: an overridden operator is checked through
+/// `.cfg` definition-override table: an overridden operator is checked through
 /// the body that actually replaces it, so a pure wrapper cannot hide an
-/// effectful definition that runs in its place.
+/// effectful definition that runs in its place, and a definition bound to a
+/// configured literal (`Def = value`) is a pure leaf whose source body never
+/// runs.
 pub(in crate::optimize::phase) fn def_is_pure(
     program: &Program,
     cfg: &Config,
-    redirect: &HashMap<DefId, DefId>,
+    redirect: &super::CfgRedirects,
     root_def: DefId,
     budget: &mut usize,
 ) -> bool {
@@ -510,7 +512,11 @@ pub(in crate::optimize::phase) fn def_is_pure(
     let mut stack: Vec<Expr> = Vec::new();
 
     let push_def = |did: DefId, visited_defs: &mut BTreeSet<DefId>, stack: &mut Vec<Expr>| -> bool {
-        let did = *redirect.get(&did).unwrap_or(&did);
+        let did = *redirect.defs.get(&did).unwrap_or(&did);
+        // `Def = value` runs the configured literal instead of the body.
+        if redirect.values.contains_key(&did) {
+            return true;
+        }
         let d = &program.defs[did.idx()];
         if let Some(op) = d.builtin {
             return op.metadata().effect == Effect::Pure;
@@ -620,7 +626,23 @@ pub(in crate::optimize::phase) fn def_is_pure(
 /// targeting a pure, non-`LET` zero-arity root definition or zero-arity constant, or a
 /// pure, non-recursive, arity-preserving definition override (`F <- G`,
 /// `CONSTANT C(...) <- G`) that [`cfg_def_redirects`] resolved.
+///
+/// A zero-arity definition the configuration assigns a literal (`Def = value`) is
+/// refused here; [`cfg_constants_supported_with_value_defs`] admits it for the
+/// certified symmetry families, whose lowering splices the literal in.
 pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
+    cfg_constants_supported_inner(program, cfg, false)
+}
+
+/// [`cfg_constants_supported`] plus zero-arity `Def = value` literal assignments:
+/// the runtime replaces every copy of the definition by the configured value, and
+/// the certified equivariant symmetry lowering splices that value in as a
+/// `CfgLiteral` leaf with one override obligation per applied use site.
+pub fn cfg_constants_supported_with_value_defs(program: &Program, cfg: &Config) -> bool {
+    cfg_constants_supported_inner(program, cfg, true)
+}
+
+fn cfg_constants_supported_inner(program: &Program, cfg: &Config, value_defs: bool) -> bool {
     let any_non_let_def =
         |target: &str| program.defs.iter().enumerate().any(|(i, d)| &*d.name == target && !program.def_is_let(DefId(i as u32)));
     let Some(redirect) = super::const_subst::cfg_def_redirects(program, cfg) else { return false };
@@ -630,7 +652,7 @@ pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
             module.is_none()
                 && match program.lookup_resolved_root(name) {
                     Some(RootSymbol::Const(cid)) => program.consts[cid.idx()].arity == 0,
-                    Some(RootSymbol::Def(_)) => false,
+                    Some(RootSymbol::Def(d)) => value_defs && program.defs[d.idx()].params.is_empty() && redirect.values.contains_key(&d),
                     _ => !any_non_let_def(name),
                 }
         }
@@ -642,7 +664,7 @@ pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
                 Some(RootSymbol::Const(cid)) if program.consts[cid.idx()].arity == 0 => {
                     match super::resolve_const_subst_name(program, op) {
                         Some(super::ConstSubstTarget::PureBuiltin(_, _) | super::ConstSubstTarget::Const(_)) => true,
-                        Some(super::ConstSubstTarget::Def(did)) => def_is_pure(program, cfg, &redirect.defs, did, &mut purity_budget),
+                        Some(super::ConstSubstTarget::Def(did)) => def_is_pure(program, cfg, &redirect, did, &mut purity_budget),
                         None => false,
                     }
                 }
@@ -652,7 +674,7 @@ pub fn cfg_constants_supported(program: &Program, cfg: &Config) -> bool {
                     let arity = program.consts[cid.idx()].arity;
                     match super::resolve_override_name(program, op) {
                         Some(super::ConstSubstTarget::Def(did)) if program.defs[did.idx()].params.len() == arity => {
-                            def_is_pure(program, cfg, &redirect.defs, did, &mut purity_budget)
+                            def_is_pure(program, cfg, &redirect, did, &mut purity_budget)
                         }
                         _ => false,
                     }

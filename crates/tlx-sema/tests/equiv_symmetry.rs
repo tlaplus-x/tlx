@@ -2034,12 +2034,15 @@ Inv == Shrink(1..2) = {}
     assert!(certify_equiv_direct("NonInflRec", non_infl_rec, cfg, group).is_none(), "non-inflationary recursive operator must refuse");
 
     // 8. Inflationary RECURSIVE exceeding K <= 64 universe bound must refuse.
+    // The filtered set must genuinely hold more than 64 elements: `n = 1`
+    // would narrow to the singleton `{1}`, which is a bounded fixpoint the
+    // certifier now proves.
     let huge_fix = r#"---- MODULE HugeFix ----
 EXTENDS Integers
 CONSTANTS KeyEntries
 VARIABLE s
 RECURSIVE Reach(_)
-Reach(X) == LET nxt == X \cup {n \in 1..70 : n = 1} IN IF nxt = X THEN X ELSE Reach(nxt)
+Reach(X) == LET nxt == X \cup {n \in 1..70 : n > 0} IN IF nxt = X THEN X ELSE Reach(nxt)
 Init == s \in SUBSET KeyEntries
 Next == s' = s
 Inv == 1 \in Reach({})

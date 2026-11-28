@@ -1,7 +1,7 @@
 //! Value expression (`Expr`), `EXCEPT` path, multi-binder comprehension, and
 //! `.cfg` constant lowering for `equiv_sym`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tlx_front::cfg::CfgValue;
@@ -9,6 +9,14 @@ use tlx_front::cfg::CfgValue;
 use super::{AtomKey, AtomKind, GroupMask, LowerCtx, Shape, Slot};
 use crate::optimize::phase::sym_norm::{classify_ac_op, is_chooses_first_lambda, AcOpKind, RecOpKind};
 use crate::{builtins::Builtin as B, hir::*};
+
+/// One exact set of `k`-subsets of a single symmetric group, together with the
+/// key-free fixed atoms every member shares (`try_symmetric_k_subsets`).
+#[derive(Default)]
+struct KSubsetStratum {
+    group: Option<usize>,
+    moved: BTreeSet<BTreeSet<Arc<str>>>,
+}
 
 impl LowerCtx<'_> {
     pub(super) fn lower_expr_rec(&mut self, e: &Expr, allow_prime: bool, in_prime: bool) -> Option<String> {
@@ -47,6 +55,7 @@ impl LowerCtx<'_> {
                 let val = *self.consts.get(cid)?;
                 self.lower_cfg_value(val)
             }
+            ExprKind::CfgLiteral(val) => self.lower_cfg_value(val),
             ExprKind::Tuple(es) => {
                 let items: Vec<_> = es.iter().map(|x| self.lower_expr_rec(x, allow_prime, in_prime)).collect::<Option<_>>()?;
                 Some(format!("(Expr.seqLit [{}])", items.join(", ")))
@@ -811,55 +820,118 @@ impl LowerCtx<'_> {
         Some((mask, fixed))
     }
 
-    /// Recognize a symmetric set of k-subsets of a single group (e.g.
-    /// `Quorum = {{a1, a2}, {a1, a3}, {a2, a3}}`) and lower it to
-    /// `{Q \in SUBSET Group_g : Cardinality(Q) \in sizes}`.
+    /// A `.cfg` value that is one key-free atom, for the fixed part of a
+    /// stratified `k`-subset family. Symmetric model values belong on the moved
+    /// side and are never fixed here.
+    fn fixed_atom_key(&self, v: &CfgValue) -> Option<AtomKey> {
+        match v {
+            CfgValue::Int(n) => Some(AtomKey::Int(i128::from(*n))),
+            CfgValue::Str(s) => Some(AtomKey::Str(Arc::from(s.as_str()))),
+            CfgValue::Bool(b) => Some(AtomKey::Bool(*b)),
+            CfgValue::ModelValue(m) if !self.all_keys.contains(m.as_str()) => Some(AtomKey::Model(Arc::from(m.as_str()))),
+            _ => None,
+        }
+    }
+
+    /// Recognize a set of `k`-subsets of one group per fixed-atom stratum, e.g.
+    /// `Quorum = {{a1, a2}, {a1, a3}, {a2, a3}}` or the mixed
+    /// `{{a1, a2, fa1}, {a1, a3, fa1}, {a2, a3, fa1}, {a1, a2, a3}}` in which
+    /// `fa1` is a key-free atom outside every group. Each inner set is split
+    /// into the moved keys of one group and its key-free fixed atoms; all inner
+    /// sets sharing a fixed-atom stratum must together be the exact union of
+    /// the `|G_g|`-choose-`k` subsets of that group for the sizes `k` present.
+    /// A stratum lowers to `{Q \cup F : Q \in SUBSET Group_g, Cardinality(Q) \in
+    /// sizes}` and the strata combine with `\cup`, so no new certificate
+    /// definition is needed.
     fn try_symmetric_k_subsets(&mut self, elems: &[CfgValue]) -> Option<String> {
         if elems.is_empty() {
             return None;
         }
-        let mut group_idx: Option<usize> = None;
-        let mut subsets: BTreeSet<BTreeSet<&str>> = BTreeSet::new();
+        let mut strata: BTreeMap<BTreeSet<AtomKey>, KSubsetStratum> = BTreeMap::new();
         for elem in elems {
             let CfgValue::Set(sub) = elem else { return None };
-            let mut set = BTreeSet::new();
+            let mut fixed: BTreeSet<AtomKey> = BTreeSet::new();
+            let mut moved: BTreeSet<Arc<str>> = BTreeSet::new();
+            let mut group: Option<usize> = None;
             for item in sub {
-                let CfgValue::ModelValue(m) = item else { return None };
-                let gi = self.groups.iter().position(|g| g.key_set.contains(m.as_str()))?;
-                match group_idx {
-                    None => group_idx = Some(gi),
-                    Some(prev) if prev != gi => return None,
-                    Some(_) => {}
+                match item {
+                    CfgValue::ModelValue(m) if self.all_keys.contains(m.as_str()) => {
+                        let gi = self.groups.iter().position(|g| g.key_set.contains(m.as_str()))?;
+                        if group.is_some_and(|prev| prev != gi) {
+                            return None;
+                        }
+                        group = Some(gi);
+                        moved.insert(Arc::from(m.as_str()));
+                    }
+                    other => {
+                        fixed.insert(self.fixed_atom_key(other)?);
+                    }
                 }
-                set.insert(m.as_str());
             }
-            subsets.insert(set);
+            let stratum = strata.entry(fixed).or_default();
+            // No moved key: covered by the `k = 0` family of whichever group the
+            // stratum's other members use.
+            if let Some(gi) = group {
+                if stratum.group.is_some_and(|prev| prev != gi) {
+                    return None;
+                }
+                stratum.group = Some(gi);
+            }
+            stratum.moved.insert(moved);
         }
-        let gi = group_idx?;
-        let n = self.groups[gi].keys.len();
-        let sizes_present: BTreeSet<usize> = subsets.iter().map(BTreeSet::len).collect();
-        let mut expected_count = 0usize;
-        for bits in 0usize..(1usize << n) {
-            let pop = bits.count_ones() as usize;
-            if sizes_present.contains(&pop) {
-                expected_count += 1;
-                let sub: BTreeSet<&str> = (0..n).filter(|&i| (bits & (1 << i)) != 0).map(|i| self.groups[gi].keys[i].as_ref()).collect();
-                if !subsets.contains(&sub) {
+        // Every stratum must be exactly the union of its group's `k`-subsets.
+        for stratum in strata.values() {
+            let Some(gi) = stratum.group else { continue };
+            let n = self.groups[gi].keys.len();
+            let sizes: BTreeSet<usize> = stratum.moved.iter().map(BTreeSet::len).collect();
+            let mut expected = 0usize;
+            for bits in 0usize..(1usize << n) {
+                if !sizes.contains(&(bits.count_ones() as usize)) {
+                    continue;
+                }
+                expected += 1;
+                let sub: BTreeSet<Arc<str>> = (0..n).filter(|&i| (bits & (1 << i)) != 0).map(|i| self.groups[gi].keys[i].clone()).collect();
+                if !stratum.moved.contains(&sub) {
                     return None;
                 }
             }
+            if stratum.moved.len() != expected {
+                return None;
+            }
         }
-        if subsets.len() != expected_count {
-            return None;
+        let mut parts: Vec<String> = Vec::with_capacity(strata.len());
+        for (fixed, stratum) in &strata {
+            let fixed_exprs: Vec<String> = fixed
+                .iter()
+                .map(|k| {
+                    let id = self.atom_id_of(k.clone());
+                    format!("(Expr.atom {id})")
+                })
+                .collect();
+            let Some(gi) = stratum.group else {
+                // A stratum of one fixed-only set: `{{F}}`, with no group read.
+                parts.push(format!("(Expr.setEnum [(Expr.setEnum [{}])])", fixed_exprs.join(", ")));
+                continue;
+            };
+            self.used_groups |= 1 << gi;
+            let m = self.mask_lean(1 << gi);
+            let sizes: BTreeSet<usize> = stratum.moved.iter().map(BTreeSet::len).collect();
+            let size_exprs: Vec<String> = sizes.iter().map(|&k| self.int_expr(k as i128)).collect();
+            let filtered = format!(
+                "(Expr.setFilter (Expr.powerset (Expr.groupSet {m})) (Form.mem (Expr.card (Expr.localVar 0)) (SetPred.enum [{}])))",
+                size_exprs.join(", ")
+            );
+            if fixed.is_empty() {
+                parts.push(filtered);
+            } else {
+                parts.push(format!("(Expr.setMap {filtered} (Expr.cup (Expr.localVar 0) (Expr.setEnum [{}])))", fixed_exprs.join(", ")));
+            }
         }
-        let mask: GroupMask = 1 << gi;
-        self.used_groups |= mask;
-        let m = self.mask_lean(mask);
-        let size_exprs: Vec<String> = sizes_present.into_iter().map(|k| self.int_expr(k as i128)).collect();
-        Some(format!(
-            "(Expr.setFilter (Expr.powerset (Expr.groupSet {m})) (Form.mem (Expr.card (Expr.localVar 0)) (SetPred.enum [{}])))",
-            size_exprs.join(", ")
-        ))
+        let mut combined = parts.pop()?;
+        while let Some(part) = parts.pop() {
+            combined = format!("(Expr.cup {part} {combined})");
+        }
+        Some(combined)
     }
 
     pub(super) fn lower_cfg_value(&mut self, val: &CfgValue) -> Option<String> {
@@ -906,9 +978,20 @@ impl LowerCtx<'_> {
         }
     }
 
+    /// Whether a `.cfg` value is one key-free atom: the same test `lower_cfg_value`
+    /// applies when it lowers the value to `Expr.atom`.
+    fn cfg_value_is_atom(&self, v: &CfgValue) -> bool {
+        match v {
+            CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::Bool(_) => true,
+            CfgValue::ModelValue(m) => !self.all_keys.contains(m.as_str()),
+            _ => false,
+        }
+    }
+
     fn is_definitely_atom(&self, e: &Expr) -> bool {
         match &*e.kind {
             ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Decimal(_) => true,
+            ExprKind::CfgLiteral(v) => self.cfg_value_is_atom(v),
             ExprKind::Local(id) => self.local_atom_kind(*id) == AtomKind::Atom,
             ExprKind::Const(cid) => match self.consts.get(cid) {
                 Some(CfgValue::Int(_) | CfgValue::Str(_) | CfgValue::Bool(_)) => true,
@@ -964,6 +1047,10 @@ impl LowerCtx<'_> {
     pub(super) fn is_definitely_atom_set(&self, e: &Expr) -> bool {
         match &*e.kind {
             ExprKind::Local(id) => self.local_atom_kind(*id) == AtomKind::AtomSet,
+            ExprKind::CfgLiteral(v) => match &**v {
+                CfgValue::Set(es) => es.iter().all(|v| self.cfg_value_is_atom(v)),
+                _ => false,
+            },
             ExprKind::SetEnum(es) => es.iter().all(|x| self.is_definitely_atom(x)),
             ExprKind::SetFilter { bound, .. } => self.is_definitely_atom_set(&bound.set),
             ExprKind::SetMap { expr, .. } => self.is_definitely_atom(expr),

@@ -382,6 +382,9 @@ impl<'a> Typer<'a> {
         let t = match &*e.kind {
             H::Num(_) | H::Decimal(_) | H::Bool(_) => Ty::scalar(),
             H::Str(_) => Ty::Top,
+            // Synthesized only by a certified normalization, never by a program
+            // the runtime analyses.
+            H::CfgLiteral(_) => Ty::Top,
             H::Var(v) => self.vars[v.idx()].clone(),
             H::InstVar { subst, .. } => self.expr(subst),
             H::Const(c) => match &self.ip.consts[c.idx()] {

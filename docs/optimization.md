@@ -53,7 +53,7 @@ negative mutation checks are explicit.
 | Phase-dependent fields | `FieldCertificate.lean`: finite control phases over records, fixed-domain maps of records, scalar phase variables with scalar companions, or fixed-domain phase maps with parallel companion maps; whole-record/`EXCEPT`/singleton-`FnConstruct` transfers; phase-indexed observations (`observed : P → F → Bool`), per-slot monomorphic sentinels, kernel-checked (`decide`) liveness tables, and constrained action checks over both endpoints | Enabled (`-optimize`) |
 | Threshold counters | `ThresholdCounterCertificate.lean`: one or more monotone/resettable scalar natural counters or fixed-domain per-actor counter maps `[Actor -> Nat]` saturated in `VIEW` at `min(n_i, cap_i)` alongside arbitrary retained TLA+ state, with constrained state checks and counter-independent action checks | Enabled (`-optimize`) |
 | Automatic keyed symmetry | `KeyedCertificate.lean`: disjoint products of full groups (2–7 model values each, product order `<= 5040`) over fixed/mixed maps, scalar/optional key slots, key sets, single-key tagged record sets, fixed records, cardinalities, and point/whole-map writes | Enabled in default mode; delegates unsupported shapes to the fallback symmetry certificates below |
-| Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
+| Automatic equivariant symmetry | `EquivSymCertificate.lean`: disjoint products of full groups over closed recursive finite values (key-valued/nested maps, multi-key records, bounded sequences/tuples, sets, comprehensions, `KSubset`, fixed-atom stratified `k`-subset constants, `IsInjective`, standard `Bags` multisets `EmptyBag`/`SetToBag`/`BagToSet`/`IsABag`/`BagIn`/`CopiesIn`/`(+)`/`(-)`/`BagUnion`/`\sqsubseteq`/`BagCardinality`/`BagOfAll` plus pure `BagsExt` helpers, commutative-associative finite folds `FoldSet`/`FoldFunction`/`FoldFunctionOnSet`/`MapThenFoldSet`/`FoldBag`/recursive `CHOOSE` `+`/`*`/`\cup`/`\cap` folds, and index-ordered sequence folds `FoldSeq`/`FoldLeft`/`FoldRight`/`FoldLeftDomain`/`FoldRightDomain`) | Enabled in default mode when `KeyedCertificate` declines and no non-fold `CHOOSE` over keys is used |
 | Automatic choice-irrelevant symmetry | `ChooseSymCertificate.lean`: disjoint products of full groups with unique-witness key `CHOOSE`, uniform/constant projected-value `CHOOSE`, and recursive `CHOOSE` integer set-sum folds (`chooseFoldAdd`) | Enabled in default mode when `CHOOSE` is used within this certified subset |
 | Projection composed with symmetry | `ErasedKeyedCertificate.lean`, `ErasedEquivCertificate.lean`, `FieldSymCertificate.lean`, and `ThresholdSymCertificate.lean` (with `OrbitQuotient.lean`): unobserved-variable erasure, phase-dependent field masking, or in-place threshold-counter saturation composed with certified keyed or equivariant symmetry (including disjoint products of full groups) over one shared concrete source model via `Rules.lean`'s `compose` / `composeConstrained` | Enabled when `-optimize` selects erasure, phase-dependent fields, or threshold counters and the corresponding symmetry certificate matches the exact installed `VIEW` |
 | Declared tuple `VIEW` | `KeyedCertificate.lean`, `EquivSymCertificate.lean`, or `ChooseSymCertificate.lean` for a full-retention tuple (a bijection on states); `ErasedKeyedCertificate.lean` / `ErasedEquivCertificate.lean` for a tuple that omits certified-erasable variables, over the exact retained tuple | Enabled in default mode; computed, duplicated, guard-live, or otherwise uncertifiable views keep the declared `VIEW` search and report the refusal under `-stats` |
@@ -69,16 +69,21 @@ refused). The opaque recursive dependency walk used by the projection rules foll
 redirects, so an override cannot hide a live variable. Each applied use site is recorded as a
 `defSubstApplied` expansion and located at its own occurrence in the syntactic HIR of the
 normalized model formula that the certificate lowers (`defSubstModelHIR`, with
-`defSubstModelPrefix`/`Suffix`). Lean checks the declared-vs-applied equality
+`defSubstModelPrefix`/`Suffix`): a bounded window of at most 400 bytes of context on each side,
+so the kernel's `rfl` check stays feasible for specifications whose normalized formulas are
+megabytes. Lean checks the declared-vs-applied equality
 (`def_subst_bindings_match`) and the exact `++` decomposition by `rfl`
 (`def_subst_model_slice_<i>`); the concrete system is guarded by their conjunction
 (`before := if overrideGuard then <model> else <empty>`) and `override_consistent` discharges the
 guard, so `certificate` and the generated `certificate_with_overrides` theorem consume the override
 records rather than sitting next to them. A declared expansion that the lowering did not apply, one
 that does not occur in the normalized model, or a recursive replacement target refuses
-certification. Value overrides
-(`Def = value`), module-scoped overrides, impure or recursive replacements, and arity changes
-remain outside the certified subset. `ACTION_CONSTRAINT`
+certification. A zero-arity definition the configuration assigns a literal (`Def = value`) is
+lowered the same way by the equivariant symmetry emitter: the runtime binds the literal to the
+OpDefNode every copy shares, so the certified normalization splices it in as a configured-value
+leaf instead of running the shadowed body, and records one obligation per applied use site. The
+projection emitters, and module-scoped, doubly-bound, impure, recursive or arity-changing
+overrides, remain outside the certified subset. `ACTION_CONSTRAINT`
 predicates and `[][A]_sub` action `PROPERTY` conjuncts are additionally covered by
 `ErasureCertificate`, `KeyedCertificate`, `EquivSymCertificate`, `ChooseSymCertificate`,
 `ErasedKeyedCertificate`, `ErasedEquivCertificate`, `FieldCertificate`, `FieldSymCertificate`,
@@ -91,9 +96,9 @@ as globally observed so its value survives at both endpoints. `Ordered`, `Nested
 retained core state, refusing any read of a projected allocation magnitude, rank pattern,
 live-version table, or projected counter. `Length`, `History`, `Age`, and
 `AgeHistory` still fail closed when action constraints or action properties are present.
-Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = value` overrides, and
-module-scoped/cyclic/impure/arity-changing `<-` overrides remain outside the certified checking
-subset.
+Temporal/liveness properties, `ALIAS`, `POSTCONDITION`, `_POSSIBLE`, `Def = value` overrides (which
+only the equivariant symmetry emitter lowers), and module-scoped/cyclic/impure/arity-changing `<-`
+overrides remain outside the certified projection subset.
 Explicit user `VIEW` and `SYMMETRY` declarations retain TLC's contract and decline automatic
 projection. A user `VIEW` that is a (possibly nested) tuple of distinct state variables may still
 compose with **automatic symmetry** in the default mode: a full-retention tuple is certified by the

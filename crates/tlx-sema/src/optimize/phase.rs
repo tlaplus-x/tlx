@@ -42,7 +42,7 @@ pub use ordered::{ordered_projection, ordered_projection_with_spec, OrderedHisto
 pub use sequence::{sequence_length_projection, sequence_length_projection_with_spec};
 pub use spec::{CheckSpec, FieldProjection, AUTOSYM_MAX_GROUPS, AUTOSYM_MAX_KEYS, AUTOSYM_MAX_ORDER};
 pub use sym_norm::{infer_var_domains, proves_var_membership, SymNormalizer};
-pub use sym_totality::cfg_constants_supported;
+pub use sym_totality::{cfg_constants_supported, cfg_constants_supported_with_value_defs};
 
 pub use threshold::{threshold_counter_projection, threshold_counter_projection_with_spec};
 
@@ -53,9 +53,9 @@ pub(in crate::optimize::phase) use branch::{
 };
 pub(in crate::optimize::phase) use cert::OpenCert;
 pub(in crate::optimize::phase) use const_subst::{
-    attach_const_subst_obligation, canonical_expr_repr, cfg_def_redirects, resolve_const_subst_chain, resolve_const_subst_name,
-    resolve_const_subst_target, resolve_override_name, syntactic_expr_repr, AppliedOverride, CfgRedirects, ConstSubstTarget,
-    OverrideObligations,
+    attach_const_subst_obligation, canonical_expr_repr, cfg_def_redirects, cfg_value_repr, resolve_const_subst_chain,
+    resolve_const_subst_name, resolve_const_subst_target, resolve_override_name, syntactic_expr_repr, AppliedOverride, CfgRedirects,
+    ConstSubstTarget, OverrideObligations,
 };
 pub(in crate::optimize::phase) use hir_util::{
     atom_nat, collect_unchanged_excluding, expr_alpha_eq, expr_alpha_eq_with_locals, expr_structurally_eq, max_local, mentions_local,

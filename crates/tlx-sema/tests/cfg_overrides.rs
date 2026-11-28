@@ -30,7 +30,7 @@ fn root_call(prog: &mut Program, name: &str) -> Expr {
 }
 
 #[test]
-fn sym_totality_rejects_anonymous_instance_overrides() {
+fn sym_totality_applies_anonymous_instance_overrides() {
     let helper = r#"---- MODULE Helper ----
 Flag == TRUE
 ====
@@ -57,12 +57,13 @@ Inv == owner \in Proc
         "baseline without override should certify"
     );
 
-    // Value override of an operator imported via anonymous INSTANCE.
+    // A value assignment on an operator imported via anonymous INSTANCE is a
+    // zero-arity root definition the runtime binds (`bind_value`), so the
+    // certified lowering replaces it with the configured literal.
     let cfg_val = parse_cfg("CONSTANT Proc = {p1, p2}\nCONSTANT Flag = FALSE\nINIT Init\nNEXT Next\nINVARIANT Inv\n").unwrap();
-    assert!(
-        symmetry_certificate(&prog, &cfg_val, &init, &next, std::slice::from_ref(&inv), &[vec!["p1".into(), "p2".into()]]).is_none(),
-        "must reject .cfg value override of anonymous INSTANCE operator"
-    );
+    let cert = symmetry_certificate(&prog, &cfg_val, &init, &next, std::slice::from_ref(&inv), &[vec!["p1".into(), "p2".into()]])
+        .expect("zero-arity Def = value on an anonymous-INSTANCE operator must certify");
+    assert!(cert.contains("def_subst_model_slice"), "value-override obligation missing");
 
     // A pure substitution of an operator imported via anonymous INSTANCE is
     // what the runtime applies (`bind_cfg` looks it up in root scope), so the
@@ -340,4 +341,205 @@ Inv == Orig(0) /\ x >= 0
         !tlx_sema::optimize::cfg_constants_supported(&prog, &cfg),
         "a recursive replacement target must be outside the certified subset"
     );
+}
+
+fn certify(name: &str, tla: &str, cfg: &str, groups: &[Vec<String>]) -> Option<String> {
+    let dir = tlx_testkit::TempDir::new("cfg-value-override");
+    let path = dir.write(&format!("{name}.tla"), tla);
+    let mut p = Program::load(&path, &[]).unwrap();
+    p.resolve_all_root();
+    let roots = ["Init", "Next", "Inv"].map(|root| {
+        let Some(RootSymbol::Def(id)) = p.lookup_root(root) else { panic!("missing {root}") };
+        Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+    });
+    symmetry_certificate(&p, &parse_cfg(cfg).unwrap(), &roots[0], &roots[1], &roots[2..], groups)
+}
+
+const VALUE_OVERRIDE_TLA: &str = include_str!("../../../proofs/symmetry/CfgValueOverride.tla");
+const VALUE_OVERRIDE_CFG: &str = include_str!("../../../proofs/symmetry/CfgValueOverride.cfg");
+const FIXED_ATOM_TLA: &str = include_str!("../../../proofs/symmetry/FixedAtomSubsets.tla");
+const FIXED_ATOM_CFG: &str = include_str!("../../../proofs/symmetry/FixedAtomSubsets.cfg");
+
+#[test]
+fn cfg_value_override_on_zero_arity_definitions_certifies() {
+    let cert = certify("CfgValueOverride", VALUE_OVERRIDE_TLA, VALUE_OVERRIDE_CFG, &[vec!["p1".into(), "p2".into(), "p3".into()]])
+        .expect("Def = value overrides must certify");
+    // One obligation row per applied definition, declared == applied.
+    assert!(cert.contains("def defSubstDeclared"), "missing override obligation");
+    assert!(cert.contains("theorem certificate_with_overrides"), "override certificate missing");
+    for lit in ["Lit(Model(\\\"NoVal\\\"))", "Lit(Set([Int(0),Int(1)]))", "Lit(Str(\\\"idle\\\"))"] {
+        assert!(cert.contains(lit), "missing recorded literal {lit}");
+    }
+    // Declared, applied-canonical, applied and the model occurrence all carry it.
+    assert!(cert.matches("Lit(Model(\\\"NoVal\\\"))").count() >= 3, "declared/applied/recorded rows");
+}
+
+#[test]
+fn cfg_value_override_rejects_builtin_definition_assignments() {
+    // Uses of standard-module builtin definitions are `ExprKind::Builtin`, not
+    // `Apply{Def}`; the certified lowering cannot splice the configured literal
+    // in, so these bindings must fail closed instead of certifying the
+    // un-overridden builtin (the runtime does apply them).
+    let nat = r#"---- MODULE BuiltinNat ----
+EXTENDS Naturals
+CONSTANT Proc
+VARIABLE x
+Init == x = 1
+Next == x' = x
+Inv == x \in Nat
+====
+"#;
+    let groups = [vec!["p1".to_string(), "p2".to_string()]];
+    let cfg = "CONSTANTS\n  Proc = {p1, p2}\n  Nat = {p1}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify("BuiltinNat", nat, cfg, &groups).is_none(), "`Nat = {{p1}}` must not certify");
+    let cfg = "CONSTANTS\n  Proc = {p1, p2}\n  Nat = {\"a\"}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify("BuiltinNat", nat, cfg, &groups).is_none(), "`Nat = {{\"a\"}}` must not certify");
+
+    let bags = r#"---- MODULE BuiltinBag ----
+EXTENDS Bags
+CONSTANT Proc
+VARIABLE x
+Init == x = EmptyBag
+Next == x' = x
+Inv == x # EmptyBag
+====
+"#;
+    let cfg = "CONSTANTS\n  Proc = {p1, p2}\n  EmptyBag = p1\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify("BuiltinBag", bags, cfg, &groups).is_none(), "`EmptyBag = p1` must not certify");
+}
+
+#[test]
+fn cfg_value_override_keeps_builtin_constant_assignments() {
+    // A value binding on a builtin *constant* is a plain cfg value (no
+    // definition override) and stays supported.
+    let nat = r#"---- MODULE BuiltinNatConst ----
+EXTENDS Naturals
+CONSTANT Proc, Limit
+VARIABLES x, y
+Init == /\ x = 0
+        /\ y = 0
+Next == /\ \E p \in Proc : y' = 1
+        /\ x' = x
+Inv == x \in Limit
+====
+"#;
+    let groups = [vec!["p1".to_string(), "p2".to_string()]];
+    let cfg = "CONSTANTS\n  Proc = {p1, p2}\n  Limit = {0, 1}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    assert!(certify("BuiltinNatConst", nat, cfg, &groups).is_some(), "`CONSTANT Limit = {{0, 1}}` must still certify");
+}
+
+#[test]
+fn cfg_value_override_rejects_arity_and_ambiguous_bindings() {
+    let tla = r#"---- MODULE Ambiguous ----
+CONSTANT Proc
+VARIABLES owner
+Op(v) == v
+NoVal == CHOOSE v : v \notin Proc
+Init == owner = NoVal
+Next == \E p \in Proc : owner' = p
+Inv == owner \in Proc \cup {NoVal}
+====
+"#;
+    let groups = [vec!["p1".to_string(), "p2".to_string()]];
+    let base = "CONSTANTS\n  Proc = {p1, p2}\n";
+    // Baseline: the zero-arity definition bound to a model value certifies.
+    let ok = certify("Ambiguous", tla, &format!("{base}  NoVal = NoVal\nINIT Init\nNEXT Next\nINVARIANT Inv\n"), &groups);
+    assert!(ok.is_some(), "zero-arity Def = value must certify");
+    // An operator with parameters cannot be replaced by a value here.
+    assert!(
+        certify("Ambiguous", tla, &format!("{base}  Op = NoVal\nINIT Init\nNEXT Next\nINVARIANT Inv\n"), &groups).is_none(),
+        "arity-changing Def = value must be refused"
+    );
+    // Both `=` and `<-` bind the same definition: `bind_cfg` keeps the two
+    // maps apart, so the certified path refuses instead of guessing.
+    assert!(
+        certify("Ambiguous", tla, &format!("{base}  NoVal = NoVal\n  NoVal <- Init\nINIT Init\nNEXT Next\nINVARIANT Inv\n"), &groups)
+            .is_none(),
+        "a definition bound by both `=` and `<-` must be refused"
+    );
+    // Module-scoped value bindings stay outside the certified subset.
+    assert!(
+        certify("Ambiguous", tla, &format!("{base}  NoVal = [Ambiguous] NoVal\nINIT Init\nNEXT Next\nINVARIANT Inv\n"), &groups).is_none(),
+        "module-scoped Def = value must be refused"
+    );
+}
+
+#[test]
+fn filtered_tagged_record_union_narrows_its_element_shape() {
+    // `msgs` is a union of two record variants; only the "crit" variant carries
+    // `val`. A field read of a member of `{mm \in msgs : mm.type = "crit"}`
+    // must use the filtered variant, or `val` infers `Top` and the totality
+    // check refuses the certificate.
+    let tla = r#"---- MODULE TaggedMsgFilter ----
+EXTENDS Naturals, FiniteSets
+CONSTANT Proc
+VARIABLES msgs, sent
+Round == Nat
+Init == /\ msgs = {}
+        /\ sent = [p \in Proc |-> {}]
+Log(p) == /\ msgs' = msgs \cup {[type |-> "crit", val |-> p, bal |-> 0]}
+          /\ UNCHANGED sent
+Note(p) == /\ msgs' = msgs \cup {[type |-> "note", bal |-> 0]}
+           /\ UNCHANGED sent
+Copy(p) == /\ \E m \in {mm \in msgs : mm.type = "crit"} :
+                 sent' = [sent EXCEPT ![p] = sent[p] \cup {[val |-> m.val, bal |-> 0]}]
+           /\ UNCHANGED msgs
+Shuffle(p) == /\ \E S \in SUBSET {r \in sent[p] : r.bal \in Round} :
+                   sent' = [sent EXCEPT ![p] = S]
+              /\ UNCHANGED msgs
+Next == \E p \in Proc : Log(p) \/ Note(p) \/ Copy(p) \/ Shuffle(p)
+Inv == /\ \A p \in Proc : \A r \in sent[p] : r.val \in Proc
+       /\ \A m \in msgs : m.type \in {"crit", "note"}
+====
+"#;
+    let cfg = "CONSTANTS\n  Proc = {p1, p2, p3}\n  Round = {0, 1, 2}\nINIT Init\nNEXT Next\nINVARIANT Inv\n";
+    let cert = certify("TaggedMsgFilter", tla, cfg, &[vec!["p1".into(), "p2".into(), "p3".into()]])
+        .expect("a filtered tagged-record union must narrow its element shape");
+    assert!(cert.contains("namespace TlxOptimization.GeneratedEquivSymmetry"), "unexpected certificate");
+    assert!(!cert.contains("sorry"), "certificate must be complete");
+}
+
+#[test]
+fn fixed_atom_stratified_k_subsets_certify() {
+    let groups = [vec!["v1".to_string(), "v2".to_string()], vec!["a1".to_string(), "a2".to_string(), "a3".to_string()]];
+    let cert = certify("FixedAtomSubsets", FIXED_ATOM_TLA, FIXED_ATOM_CFG, &groups).expect("stratified k-subsets must certify");
+    // The `{fa1}` strata union `fa1` into every k-subset of the acceptor group;
+    // the empty stratum keeps the plain filter.
+    assert!(cert.contains("Expr.setMap"), "missing stratified setMap lowering");
+    assert!(cert.contains("(Expr.cup (Expr.localVar 0) (Expr.setEnum [(Expr.atom"), "fixed atoms must be united into each moved subset");
+    assert!(cert.contains("Expr.powerset (Expr.groupSet"), "missing powerset filter");
+    assert_eq!(cert.matches("Expr.setMap").count(), 2, "one setMap per fixed-atom stratum");
+}
+
+#[test]
+fn stratified_k_subsets_reject_broken_strata() {
+    let groups = [vec!["v1".to_string(), "v2".to_string()], vec!["a1".to_string(), "a2".to_string(), "a3".to_string()]];
+    let replace = |from: &str, to: &str| FIXED_ATOM_CFG.replace(from, to);
+    let certify_with = |cfg: &str| {
+        let dir = tlx_testkit::TempDir::new("cfg-k-subset-neg");
+        let path = dir.write("FixedAtomSubsets.tla", FIXED_ATOM_TLA);
+        let mut p = Program::load(&path, &[]).unwrap();
+        p.resolve_all_root();
+        let roots = ["Init", "Next", "Inv"].map(|root| {
+            let Some(RootSymbol::Def(id)) = p.lookup_root(root) else { panic!("missing {root}") };
+            Expr::new(ExprKind::Apply { op: OpRef::Def(id), args: vec![] }, p.defs[id.idx()].span)
+        });
+        symmetry_certificate(&p, &parse_cfg(cfg).unwrap(), &roots[0], &roots[1], &roots[2..], &groups)
+    };
+    // Baseline.
+    assert!(certify_with(FIXED_ATOM_CFG).is_some(), "baseline must certify");
+    // Omitting `{a2, a3, fa1}` leaves the `{fa1}` stratum short of the exact
+    // 2-subsets of `Acceptor`, so the family cannot be lowered as a filter.
+    let missing = replace("{a2, a3, fa1}, ", "");
+    assert_ne!(missing, FIXED_ATOM_CFG);
+    assert!(certify_with(&missing).is_none(), "an incomplete fixed-atom stratum must be refused");
+    // Mixing two groups inside one inner set is not one stratum's k-subset family.
+    let mixed = replace("{a1, a2, a3}", "{a1, v1, v2}");
+    assert_ne!(mixed, FIXED_ATOM_CFG);
+    assert!(certify_with(&mixed).is_none(), "a mixed-group inner set must be refused");
+    // A stratum that is not the exact k-subsets of its group (here only one of
+    // the three 2-subsets in the empty stratum) must be refused.
+    let short = replace("{a1, a2}, {a1, a3}, {a2, a3}", "{a1, a2}, {a1, a3}");
+    assert_ne!(short, FIXED_ATOM_CFG);
+    assert!(certify_with(&short).is_none(), "an incomplete empty stratum must be refused");
 }
