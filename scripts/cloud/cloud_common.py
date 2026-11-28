@@ -350,34 +350,52 @@ def full_gate_marker(root=ROOT):
 
 def clippy_preflight(root=ROOT, rev=None, runner=None, marker=None, jobs=CLIPPY_JOBS, dry_run=False):
     """Run the build suite's Clippy before an instance is provisioned, so a lint
-    error cannot consume a launch (HARNESS-08). Returns (ok, note). A dry run, a
-    revision without [workspace.lints], a launch of a revision other than the
-    checked-out tree, a tree already covered by a full-scope merge_gate marker
-    and a machine without a local cargo are skipped with a note rather than
-    refused: none of them can be linted here, and the remote suite still checks
-    the last two before it runs anything. `runner` (argv, cwd) -> exit status is
-    a test double."""
+    error cannot consume a launch (HARNESS-08). Returns (ok, note, ran). A dry
+    run, a revision without [workspace.lints], a launch of a revision other than
+    the checked-out tree, a tree already covered by a full-scope merge_gate
+    marker and a machine without a local cargo are skipped with a note rather
+    than refused: none of them can be linted here, and the remote suite still
+    checks the last two before it runs anything. `ran` states whether that
+    exact command is known to have covered this tree here (it passed, or a
+    full-scope marker records it), so a bench instance can skip paying for it
+    again (`remote_clippy_needed`). `runner` (argv, cwd) -> exit status is a
+    test double."""
     if dry_run:
-        return True, "prelaunch clippy skipped: a dry run provisions nothing"
+        return True, "prelaunch clippy skipped: a dry run provisions nothing", False
     if not workspace_lints(root):
-        return True, "prelaunch clippy skipped: this revision declares no [workspace.lints]"
+        return True, "prelaunch clippy skipped: this revision declares no [workspace.lints]", False
     if rev is not None and rev != git("rev-parse", "HEAD", cwd=root):
-        return True, f"prelaunch clippy skipped: revision {str(rev)[:12]} is not this worktree's HEAD"
+        return True, f"prelaunch clippy skipped: revision {str(rev)[:12]} is not this worktree's HEAD", False
     if marker is None:
         marker = full_gate_marker(root)
     if marker:
-        return True, f"prelaunch clippy skipped: merge_gate marker covers tree {str(marker.get('tree'))[:12]} (scope=full)"
+        return True, f"prelaunch clippy skipped: merge_gate marker covers tree {str(marker.get('tree'))[:12]} (scope=full)", True
     cargo = shutil.which("cargo")
     if cargo is None and runner is None:
-        return True, "prelaunch clippy skipped: no local cargo; the remote build suite still checks it"
+        return True, "prelaunch clippy skipped: no local cargo; the remote build suite still checks it", False
     cmd = [cargo or "cargo", "clippy", "--workspace", "--release", "--all-targets",
            "-j", str(jobs), "--", "-D", "warnings"]
     run = _run_status if runner is None else runner
     rc = run(cmd, cwd=root)
     if rc == 0:
-        return True, "prelaunch clippy passed"
+        return True, "prelaunch clippy passed", True
     return False, (f"prelaunch clippy failed (exit {rc}); the remote build suite would refuse this tree "
-                   "after the instance was paid for")
+                   "after the instance was paid for"), False
+
+
+def remote_clippy_needed(ran, platform=None):
+    """Whether a bench instance still has to run the build suite's Clippy.
+
+    `ran` is clippy_preflight's verdict (it passed here, or a full-scope
+    merge_gate marker records it) on the revision that is uploaded, so the same
+    command on the same tree cannot report anything new there -- except across
+    operating systems: lints behind `cfg(target_os = "linux")` are invisible to
+    a macOS Clippy, and letting one reach the timed run is exactly what the
+    instance's own check prevents. A preflight that was skipped (no cargo,
+    another revision, a dry run, no [workspace.lints]) never stands in for it.
+    `platform` (sys.platform) is injectable for the test."""
+    platform = sys.platform if platform is None else platform
+    return not (ran and platform.startswith("linux"))
 
 
 def _run_status(argv, cwd):
@@ -437,11 +455,24 @@ def release_preflight(root=ROOT, build=None, dry_run=False, binary=None, stale=N
 ENV_FILE = "~/tlx-env.sh"   # sourced before verify.py runs
 
 
+RUSTUP_UPSTREAM = "https://sh.rustup.rs"
+
+
 def rust_script(source, toolchain, arch, tarball=None):
     """Remote shell installing Rust `toolchain` and writing ~/tlx-env.sh.
     source: 'upstream' (rustup from static.rust-lang.org), 'mirror' (rustup
-    through rsproxy.cn), 'upload' (the standalone tarball `tarball`, already
-    copied to ~, installed without rustup)."""
+    through rsproxy.cn, falling back to upstream when the mirror serves nothing
+    usable), 'upload' (the standalone tarball `tarball`, already copied to ~,
+    installed without rustup).
+
+    A mirror answer that is empty (rsproxy.cn served 0 bytes) reads as success
+    to `curl | sh` and installs nothing, so the download is written to a file
+    and required to be non-empty first; a failed or empty mirror install falls
+    back to upstream, writing the upstream environment to ~/tlx-env.sh so no
+    later rustup call revisits the broken mirror (2026-11-28). The components
+    of rust-toolchain.toml come with the toolchain, so that the first cargo run
+    does not have to fetch them (rustup auto-installs missing components of the
+    pinned toolchain, which would stall the verification mid-run)."""
     if source == "upload":
         name = os.path.basename(tarball)
         d = name[:-len(".tar.xz")]
@@ -450,20 +481,43 @@ def rust_script(source, toolchain, arch, tarball=None):
                 f"rm -rf {shlex.quote(d)} {shlex.quote(name)}\n"
                 f"echo 'export PATH=$HOME/rust/bin:$PATH' > {ENV_FILE}\n"
                 f". {ENV_FILE} && rustc --version\n")
-    exports = ""
-    init = "https://sh.rustup.rs"
-    if source == "mirror":
-        exports = f"export RUSTUP_DIST_SERVER={RSPROXY['dist']} RUSTUP_UPDATE_ROOT={RSPROXY['update_root']}\n"
-        init = RSPROXY["rustup_init"]
-    elif source != "upstream":
+    if source not in ("upstream", "mirror"):
         raise ValueError(f"unknown Rust source {source!r}")
-    # The components of rust-toolchain.toml, so that the first cargo run does
-    # not have to fetch them (rustup auto-installs missing components of the
-    # pinned toolchain, which would stall the verification mid-run).
-    return ("set -e\n" + exports +
-            f"curl -sSf {init} | sh -s -- -y -q --profile minimal --default-toolchain {toolchain} -c rustfmt -c clippy >/dev/null 2>&1\n"
-            f"{{ printf '%s' {shlex.quote(exports)}; echo '. ~/.cargo/env'; }} > {ENV_FILE}\n"
-            f". {ENV_FILE} && rustc --version\n")
+    install = ("-y -q --profile minimal --default-toolchain " + toolchain
+               + " -c rustfmt -c clippy")
+    # (The `&&` list is an if/condition position under `set -e`: a failed
+    # download stops the script instead of being masked by the pipeline's last
+    # command.)
+    upstream = (f'curl -sSfL {RUSTUP_UPSTREAM} -o "$init" && [ -s "$init" ]'
+                f' && sh "$init" {install} >/dev/null 2>&1')
+    s = ["set -e"]
+    if source == "mirror":
+        exports = (f"export RUSTUP_DIST_SERVER={RSPROXY['dist']} "
+                   f"RUSTUP_UPDATE_ROOT={RSPROXY['update_root']}")
+        s += [f"mirror_exports={shlex.quote(exports)}",
+              'eval "$mirror_exports"']
+    s += ['init=$(mktemp)']
+    if source == "upstream":
+        s += [upstream]
+    else:
+        s += [f'if curl -sSfL {RSPROXY["rustup_init"]} -o "$init" && [ -s "$init" ]'
+              f' && sh "$init" {install} >/dev/null 2>&1; then',
+              '  env_exports="$mirror_exports"',
+              "else",
+              "  echo " + shlex.quote(f"WARNING (not a stop condition): {RSPROXY['rustup_init']} "
+                                    f"failed or served an empty file; installing Rust from {RUSTUP_UPSTREAM}") + " >&2",
+              "  unset RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT",
+              "  env_exports=''",
+              "  " + upstream,
+              "fi"]
+    # (Only the source that installed the toolchain goes into the environment
+    # file; a fallback must not leave the broken mirror to a later rustup.)
+    s += ["rm -f \"$init\"",
+          f": > {ENV_FILE}",
+          f"if [ -n \"${{env_exports:-}}\" ]; then printf '%s\\n' \"$env_exports\" >> {ENV_FILE}; fi",
+          f"echo '. ~/.cargo/env' >> {ENV_FILE}",
+          f". {ENV_FILE} && rustc --version"]
+    return "\n".join(s) + "\n"
 
 
 def cargo_config(source, vendor_dir=None):
@@ -480,6 +534,30 @@ def cargo_config(source, vendor_dir=None):
 
 
 BENCH_BINS = "target/bench-bins"   # under ~/tlx: the --bench-bin binaries, <NAME>/tlx
+HEAD_BINARY = "target/release/tlx"   # under ~/tlx: the binary of the uploaded revision
+
+# Bench subcommands that execute no tlx binary at all: `tlcbase` measures TLC
+# alone (and its merge/report subcommands only read the files it wrote).
+TLC_ONLY_COMMANDS = frozenset({"tlcbase", "tlcbase-merge", "tlcbase-report"})
+
+# Bench subcommands, and the option that names the binary each one measures:
+# omitting it falls back to building HEAD's target/release/tlx, so such a
+# command still needs that build even when another binary option is present
+# (`suite --base-bin ...` measures HEAD's binary against the base). A
+# subcommand that is not here keeps the build. `liveness` is deliberately
+# absent: its rustc probes link HEAD's own `target/release/deps/libtlx_*.rlib`,
+# which only HEAD's build produces, whatever --before-bin/--after-bin name.
+DEFAULT_HEAD_OPTION = {
+    "suite": "--bin", "track": "--bin", "profile": "--bin", "coverage": "--bin",
+    "disk": "--bin", "ab": "--bin", "perf": "--bin", "layout": "--bin",
+    "ttfr": "--bin",
+}
+
+# Bench options whose value names a tlx binary, either as NAME=PATH (the
+# repeatable --bin of ab/perf/layout/disk) or as a bare PATH
+# (suite/profile/coverage and --after-bin). --stats-bin names one of those
+# names, so it is not a path.
+BINARY_OPTIONS = ("--bin", "--base-bin", "--before-bin", "--after-bin")
 
 
 def parse_bench_bin(spec):
@@ -492,16 +570,94 @@ def parse_bench_bin(spec):
     return name, rev, features
 
 
-def bench_script(home, cc, machine, bins, cmds, deadline_at=None):
-    """Remote shell of a bench run in ~/tlx (pure): record the machine,
-    build target/release/tlx and each of `bins` ([(name, sha, features)],
-    from its own git worktree into BENCH_BINS/<name>/tlx), drop the cached
-    TLC -workers N results that came with corpus/out (they were measured on
-    another machine), then run scripts/bench.py once per entry of `cmds`
-    (argument strings). Exit status 1 if any of them failed."""
+def bench_binary_paths(words):
+    """The tlx binaries one `--bench` command names ([] when it names none)."""
+    paths = []
+    for i, w in enumerate(words):
+        value = None
+        for opt in BINARY_OPTIONS:
+            if w == opt and i + 1 < len(words):
+                value = words[i + 1]
+            elif w.startswith(opt + "="):
+                value = w[len(opt) + 1:]
+            if value is not None:
+                break
+        if value is None:
+            continue
+        name, sep, rest = value.partition("=")
+        # `--bin NAME=PATH` or a bare `--bin PATH`: NAME is the short label of a
+        # binary, never a path, so the same split as parse_bench_bin's.
+        paths.append(rest if sep and re.fullmatch(r"[A-Za-z0-9_.-]+", name) else value)
+    return paths
+
+
+def _is_head_binary(path):
+    """Whether `path` names the uploaded revision's own binary: a relative
+    `target/release/tlx`, its absolute form, or the `~/tlx` one."""
+    norm = os.path.normpath(path)
+    return norm == HEAD_BINARY or norm.endswith("/" + HEAD_BINARY)
+
+
+def head_binary_needed(cmds):
+    """Whether a bench pass executes the uploaded revision's own binary.
+
+    A command that names the binary it measures and every other one it runs
+    (`suite --bin target/bench-bins/<name>/tlx`, `ab --bin a=... --bin b=...`)
+    never builds or runs `target/release/tlx`, and `tlcbase` runs TLC alone;
+    building HEAD for those costs the instance a cold release build of the whole
+    workspace for nothing. Everything else -- an unqualified `run`, `suite
+    --base-bin ...` (whose --bin defaults to HEAD), a subcommand this does not
+    recognize -- keeps the build: a command whose binary resolution is not
+    provable here can never silently measure the wrong thing.
+    """
+    if not cmds:
+        return True
+    for c in cmds:
+        try:
+            words = shlex.split(c)
+        except ValueError:
+            return True
+        if not words:
+            return True
+        sub = words[0]
+        if sub in TLC_ONLY_COMMANDS:
+            continue
+        primary = DEFAULT_HEAD_OPTION.get(sub)
+        if primary is None:
+            return True
+        if not any(w == primary or w.startswith(primary + "=") for w in words):
+            return True          # omitting it measures HEAD's binary
+        if any(_is_head_binary(p) for p in bench_binary_paths(words)):
+            return True
+    return False
+
+
+def bench_script(home, cc, machine, bins, cmds, deadline_at=None, skip_head_build=False, skip_remote_clippy=False):
+    """Remote shell of a bench run in ~/tlx (pure): record the machine, build
+    the binaries the commands run, drop the cached TLC -workers N results that
+    came with corpus/out (they were measured on another machine), then run
+    scripts/bench.py once per entry of `cmds` (argument strings). Exit status 1
+    if any of them failed.
+
+    `CARGO_TARGET_DIR` is the uploaded tree's own `target/`, so the third-party
+    crates compile once for the tree and every `--bench-bin` worktree (`bins`,
+    [(name, sha, features)]) instead of once per worktree with its own empty
+    target/ -- and every consumer that assumes cargo's default target dir keeps
+    working (`bench_machine.TLX`, `tlxlib.build_tlx`, the release rlibs
+    `bench_liveness.probe` links, `coverage`'s `test-release` build).
+
+    The worktrees are built first, each copied out to BENCH_BINS/<name>/tlx
+    immediately, and the uploaded revision last: its build then owns
+    target/release/tlx and the newest `deps/libtlx_*.rlib`. `skip_head_build`
+    (from head_binary_needed) drops that last build and removes
+    target/release/tlx, so no `--bench-bin` binary is left at HEAD's path.
+    `skip_remote_clippy` (from `remote_clippy_needed`) drops the instance's
+    Clippy: the prelaunch one already covered this exact tree on Linux."""
     q = shlex.quote
+    target = '"$CARGO_TARGET_DIR/release/tlx"'
     s = ["set -u", f". {ENV_FILE}", f"cd {home}/tlx",
          f"export TLX_CLOUD_HOST=1 CC={q(cc)} TLX_JAVA=$(command -v java) TLX_BENCH_MACHINE={q(machine)}",
+         f"export CARGO_TARGET_DIR={home}/tlx/target",
          "mkdir -p bench",
          # (Retired instructions for the suite's history: best effort; a VM often has no usable counters.)
          "command -v perf >/dev/null 2>&1 || sudo -n apt-get install -y -qq linux-tools-common \"linux-tools-$(uname -r)\" >/dev/null 2>&1 || true",
@@ -510,21 +666,35 @@ def bench_script(home, cc, machine, bins, cmds, deadline_at=None):
          "$CC --version | head -1; } > bench/machine.txt 2>&1",
          "cat bench/machine.txt",
          "rm -f corpus/out/bench-tlc.json",
-         "rc=0",
-         # Bench mode skips verify.py's build suite. Check native Linux
-         # warnings here before any timed work, rather than merely claiming
-         # the local cross-Clippy skip is covered by the cloud build suite.
-         "echo '== cargo clippy --workspace --release --all-targets'",
-         "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1",
-         "echo '== cargo build --release'",
-         "cargo build -q --release -p tlx || exit 1"]
+         "rc=0"]
+    if skip_remote_clippy:
+        s += ["echo '== cargo clippy skipped: the local prelaunch Clippy covered this tree'"]
+    else:
+        # Bench mode skips verify.py's build suite. Check native Linux
+        # warnings here before any timed work, rather than merely claiming
+        # the local cross-Clippy skip is covered by the cloud build suite.
+        s += ["echo '== cargo clippy --workspace --release --all-targets'",
+              "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1"]
+    # (The worktrees come first: each build replaces the shared target dir's
+    # release/tlx, so it is copied to the path its commands name before the
+    # next build; the uploaded revision is built last and owns that path.)
     for name, sha, features in bins:
         src = f"{home}/bench-src/{name}"
         feat = f" --features {q(features)}" if features else ""
         s += [f"echo {q(f'== bench binary {name}: {sha[:12]}' + (f' (features {features})' if features else ''))}",
               f"git worktree add -q -f --detach {src} {sha} || exit 1",
               f"(cd {src} && cargo build -q --release -p tlx{feat}) || exit 1",
-              f"mkdir -p {BENCH_BINS}/{name} && cp {src}/target/release/tlx {BENCH_BINS}/{name}/tlx"]
+              f"mkdir -p {BENCH_BINS}/{name} && cp {target} {BENCH_BINS}/{name}/tlx"]
+    if skip_head_build:
+        # (No command runs it, and a later build's binary must not be left
+        # where HEAD's is expected.)
+        s += [f"echo '== cargo build skipped: no --bench command runs {HEAD_BINARY}'",
+              f"rm -f {HEAD_BINARY}"]
+    else:
+        # (A no-op for the uploaded tree -- CARGO_TARGET_DIR is its own target/
+        # -- and it leaves target/release/{tlx,deps} holding this revision.)
+        s += ["echo '== cargo build --release'",
+              "cargo build -q --release -p tlx || exit 1"]
     for c in cmds:
         deadline = f" --deadline-at {deadline_at}" if deadline_at is not None else ""
         s += [f"echo {q('== scripts/bench.py ' + c)}", f"python3 -u scripts/bench.py {c}{deadline} || rc=1"]

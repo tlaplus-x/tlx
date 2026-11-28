@@ -152,7 +152,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cloud import setup
 from cloud.session import Hooks, Session
 from cloud.setup import env_proxy, sources, then_args, verify_args, verify_runs_tlc
-from cloud.cloud_common import AccountError, CloudStop, clippy_preflight, cloud_limits, current_owner, mask_identity, owner_tag, release_preflight, warning, INFRA_FAIL, Interrupted, Machine, Offer, ProviderQuotaFull, ROOT, RetryClock, SkipOffer, SlotHolder, TERMINAL_STATES, ensure_local_key, git, local_toolchain, log, parse_bench_bin, rank_offers, retry_network, terminate_until_gone
+from cloud.cloud_common import AccountError, CloudStop, clippy_preflight, cloud_limits, current_owner, head_binary_needed, mask_identity, owner_tag, release_preflight, remote_clippy_needed, warning, INFRA_FAIL, Interrupted, Machine, Offer, ProviderQuotaFull, ROOT, RetryClock, SkipOffer, SlotHolder, TERMINAL_STATES, ensure_local_key, git, local_toolchain, log, parse_bench_bin, rank_offers, retry_network, terminate_until_gone
 
 PROVIDERS = {"aliyun": "cloud.cloud_aliyun.AliyunProvider", "aws": "cloud.cloud_aws.AwsProvider", "tencent": "cloud.cloud_tencent.TencentProvider"}
 
@@ -359,6 +359,43 @@ class LaunchLedger:
         self.release_instances(lambda row: row.get("owner") == owner and row.get("time") == when
                                and row.get("instance") in (None, instance), instance)
 
+    def release_dead_boot(self, owner, when, instance):
+        """Record that the instance reserved at `when` launched but never
+        answered ssh: released like any other instance, but the grant it
+        consumed goes back to the owner and the row is charged only for the
+        time it lived.
+
+        The next offer of the same launch is a new `launch()` reservation, and
+        `check` refuses a `>60`-minute launch without an unconsumed grant: a
+        dead boot that kept its grant would turn the retry into exit 25 and
+        leave the grant spent on a VM that never ran a job. The full
+        `max_minutes` estimate would likewise count against the 12 h CNY cap
+        for a launch that did nothing, so the row is re-estimated at the
+        provider's minimum lifetime (or the time it actually lived, when
+        longer). The row stays as evidence of the boot that failed."""
+        with self.locked() as rows:
+            row = next((r for r in rows if not r.get("grant") and not r.get("released")
+                        and r.get("owner") == owner and r.get("time") == when
+                        and r.get("instance") in (None, instance)), None)
+            if row is None:
+                return False
+            row["released"] = time.time()
+            if instance and not row.get("instance"):
+                row["instance"] = instance
+            row["dead_boot"] = True
+            rate = row.get("price_per_min")
+            if rate is not None:
+                lived = max(0.0, row["released"] - row["time"]) / 60
+                row["estimated_cost"] = min(row.get("estimated_cost") or 0.0,
+                                            rate * max(lived, row.get("min_lifetime_minutes") or 0))
+            for grant in rows:
+                if grant.get("grant") and grant.get("consumed_by") == row["time"]:
+                    del grant["consumed_by"]
+                    row["grant_returned"] = True
+                    break
+            self.write(rows)
+            return True
+
     def release_instances(self, match, instance=None):
         with self.locked() as rows:
             hit = False
@@ -418,8 +455,11 @@ class LaunchLedger:
                              "local": True, "admission": admission.record()})
                 self.write(rows)
                 raise AdmissionRefused(admission)
+            # (price_per_min and min_lifetime_minutes let a dead-boot release
+            # re-estimate the row to the time the instance actually lived.)
             entry = {"owner": owner, "time": now, "instance": None, "type": offer.itype,
                      "max_minutes": a.max_minutes, "estimated_cost": offer.price * max(a.max_minutes, getattr(a, "min_lifetime_minutes", 0)) / 60,
+                     "price_per_min": offer.price / 60, "min_lifetime_minutes": getattr(a, "min_lifetime_minutes", 0),
                      "provider": a.provider, "region": offer.region, "market": offer.market, "override": a.budget_override,
                      "status": "reserved"}
             if admission is not None:
@@ -1157,10 +1197,11 @@ def run_checked(a, cancel):
     # before an instance is provisioned (2026-10-08: a lint error consumed a
     # launch): the same all-targets Clippy, or the full-scope merge_gate marker
     # of the same tree, which already ran it.
+    ran_clippy = False
     if not (a.list or a.cleanup):
         # (Not for --list/--cleanup: they launch nothing, and a listing ran a
         # whole Clippy build on the shared machine, 2026-10-08.)
-        ok, note = clippy_preflight(ROOT, rev=sha, dry_run=a.dry_run)
+        ok, note, ran_clippy = clippy_preflight(ROOT, rev=sha, dry_run=a.dry_run)
         if not ok:
             raise CloudStop(f"prelaunch clippy refused: {note}", 23)
         log(note)
@@ -1202,7 +1243,12 @@ def run_checked(a, cancel):
     plan = setup.Plan(a=a, provider=provider, owner=owner, ledger=ledger, admitter=admitter_for(best.market, share),
                       offers=cands, jobs=jobs, sha=sha, label=label, bins=bins, then_shas=then_shas,
                       resolve=resolve, vargs=verify_args(a, sha, jobs), rust=rust, crates=crates, toolchain=toolchain,
-                      proxy=proxy, local_dir=setup.local_dir(a, provider, label), types=types, tlc=verify_runs_tlc(a))
+                      proxy=proxy, local_dir=setup.local_dir(a, provider, label), types=types, tlc=verify_runs_tlc(a),
+                      # The bench driver builds the uploaded revision only if a
+                      # --bench command runs its binary, and runs Clippy only if
+                      # this machine's preflight did not already cover the tree.
+                      skip_head_build=not head_binary_needed(a.bench),
+                      skip_remote_clippy=not remote_clippy_needed(ran_clippy))
     log(plan.description())
     if a.dry_run:
         setup.dry_run(a, best, provider, plan.admitter, ledger)

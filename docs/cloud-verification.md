@@ -32,9 +32,12 @@ marker.
 Cloud verification is also the Linux portability check, and `--bench` runs `bench.py` there for
 records on a quiet machine. The launcher pushes the revision with git, uploads the parts of
 `third_party/` and `corpus/out/` the tests read (the TLC oracle is cached, so remote runs need no
-Java), installs the pinned Rust toolchain, runs this tree's `verify.py -j <vCPUs-1>` with the output
-streamed back, and copies results (`summary.json`, logs, `cloud.json` with instance type, price and
-phase times) to `target/verify/<time>-<rev>-<provider>/`. The exit code is `verify.py`'s (0/1), or one
+Java), installs the pinned Rust toolchain (upstream, or through `rsproxy.cn` in a mainland region
+with `--rust-from auto`; a mirror answer that is empty or fails falls back to
+`https://sh.rustup.rs`, and `~/tlx-env.sh` records the source that installed the toolchain), runs
+this tree's `verify.py -j <vCPUs-1>` with the output streamed back, and copies results
+(`summary.json`, logs, `cloud.json` with instance type, price and phase times) to
+`target/verify/<time>-<rev>-<provider>/`. The exit code is `verify.py`'s (0/1), or one
 of the stop codes below. Provider modules (`scripts/cloud_*.py`) implement identity check, offer
 selection, launch with a dead-man switch, release and listing. The system disk is sized per provider
 (Tencent 512 GB, raised from 200 GB after two large models filled it: TLC's default fingerprint set
@@ -111,6 +114,19 @@ builds another revision (optionally with tlx-cli cargo features) into
 `target/bench-bins/NAME/tlx` for `bench.py ab`. Output (`bench/` contents, `bench.out`) comes back
 to `target/bench/<time>-<rev>-<provider>/`; copy files you want to commit into `bench/`.
 
+Before any timed work the driver builds what the `--bench` commands run in one `CARGO_TARGET_DIR`
+- the uploaded tree's own `$HOME/tlx/target` - shared with every `--bench-bin` worktree, so the
+third-party crates compile once per instance instead of once per worktree with its own empty
+`target/`. Using the tree's default target directory keeps everything that assumes cargo's default
+path working: `target/bench-bins/NAME/tlx`, the release rlibs `bench.py liveness` links its rustc
+probes against, and `coverage`'s build of another profile. The worktrees build first, each binary
+copied to `target/bench-bins/NAME/tlx` immediately; the uploaded revision builds last, so
+`target/release/tlx` and the newest `target/release/deps` are its own. When no `--bench` command
+runs that binary (`tlcbase`, `suite --bin target/bench-bins/NAME/tlx` without `--base-bin target/release/tlx`),
+the last build is skipped and `target/release/tlx` is removed, so no bench binary sits where HEAD's
+is expected. The driver runs the workspace Clippy itself only when the local preflight did not
+already cover this tree (section 4).
+
 ```sh
 python3 scripts/cloud_verify.py --bench "tlcbase --missing --collect --workers 1,16 --no-large" --bench "run --tlc --repeat 3" --max-minutes 60
 python3 scripts/cloud_verify.py --bench-bin nostats=HEAD:no-stats --bench-bin base=<rev> \
@@ -124,6 +140,12 @@ is smoke-tested on tiny scratch, external-path and simulation fixtures (10 secon
 fixture, 60 seconds per command). A smoke failure refuses the launch. This needs a
 current local release binary (`cargo build --release`); it does not collect timing
 baselines or write benchmark records.
+
+The preflight also runs the build suite's workspace Clippy, which is the same command a `--bench`
+instance would run. A passing run here on Linux — or a full-scope `merge_gate` marker for the same
+tree — therefore covers the revision that is uploaded, and the driver skips the instance's own
+check; a skipped preflight (no local cargo, a dry run, a revision other than this worktree's HEAD)
+and a macOS one, whose lints only see macOS cfg branches, leave it to the instance.
 
 `bench.py run`, `ab`, `disk`, `profile`, `suite` and `track` accept `--deadline-min M`
 for a total measurement budget, including warmups, repeated samples and variants.
@@ -222,12 +244,13 @@ retain cost, capacity and quota checks; an optional `--budget-override REASON` r
 maintainer’s reason when issuing one.
 
 Advisories start with `WARNING (not a stop condition):`; in particular, an unavailable CAM
-self-termination role permits shutdown fallback. Fatal conditions start with `STOP:` and stop
-without trying another offer:
+self-termination role permits shutdown fallback, and a first boot that never answers ssh releases
+that instance and tries the next offer once (section 6). Fatal conditions start with `STOP:` and
+stop without trying another offer:
 
 | Exit | Condition |
 |---|---|
-| 3 | Infrastructure failure, interruption or incomplete cleanup |
+| 3 | Infrastructure failure, interruption or incomplete cleanup (including an instance that never answered ssh) |
 | 20 | Provider quota exceeded (for a spot request: every zone of the region refused) |
 | 21 | Risk control or blocked account |
 | 22 | Forbidden operation or missing permission |
@@ -263,6 +286,17 @@ the retry budget is spent on it:
   failed step. A running provider state is not proof of SSH reachability;
 - the instance's state cannot be read: nothing is changed on a guess, and the command that would
   fix it is printed instead.
+
+A first boot that never answers ssh is not the allowlist's: the instance is terminated, its ledger
+reservation released and it leaves the run's `launched_ids`, the log says `WARNING (not a stop
+condition): <id> did not answer ssh ...; trying the next offer`, and the next offer is tried once.
+The release is a *dead boot*: the coordinator grant the launch consumed goes back to the owner and
+the row is re-charged at the provider's minimum lifetime instead of its unrun `--max-minutes`. The
+next offer is a new launch reservation, so without that a `>60`-minute launch would retry into
+`budget requires --max-minutes between 1 and 60` (exit 25), and a VM that ran no job would consume
+the 12-hour CNY cap. An instance the provider does not confirm as gone keeps its reservation and
+stays in `launched_ids`, so the run's own leftover check reports it and the run stops instead of
+paying for a second one.
 
 Visible setup commands retain stderr for diagnosis too. Each idempotent setup/upload step gets
 at most four attempts within a ten-minute network budget, capped before the dead-man's switch's
