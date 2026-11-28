@@ -103,7 +103,7 @@ impl<'a> Enumerator<'a> {
     /// Whether enumerating `e` in `env` can neither assign an unassigned
     /// variable nor branch into multiple paths (so `self.go(e, env, k)` is
     /// equivalent to `self.test(e, env, k)`).
-    fn is_pure_test(&self, e: &Expr, env: &Env, depth: usize) -> bool {
+    pub(super) fn is_pure_test(&self, e: &Expr, env: &Env, depth: usize) -> bool {
         if depth > 8 {
             return false;
         }

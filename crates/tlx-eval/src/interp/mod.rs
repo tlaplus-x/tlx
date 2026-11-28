@@ -85,12 +85,21 @@ pub struct Interp {
     /// side-effecting builtin (`Builtin::is_volatile`), not counting
     /// applications of operator parameters (`def_effectful`).
     pub(crate) def_effectful: Vec<bool>,
+    /// Definitions that transitively reach any volatile builtin (including
+    /// through `def_const` definitions, cfg builtin overrides, or operator
+    /// parameters) or are still pending. Used where memoization or streaming
+    /// must rule out latent effects inside cached lazy values.
+    pub(crate) def_effectful_strict: Vec<bool>,
     /// Constant-level, non-LET operators with (value) parameters: their
     /// applications in constant contexts are memoized (`memo`).
     pub(crate) def_memo: Vec<bool>,
     /// 0-ary, non-LET, state-level (not action-level, not constant),
     /// deterministic definitions: memoizable per state context.
     pub(crate) def_state_cacheable: Vec<bool>,
+    /// Sorted, deduplicated state variables transitively read by a strictly
+    /// effect-free, non-recursive `def_state_cacheable` definition (`None` if
+    /// ineligible or variable reads are not statically closed over `VarId`).
+    pub(crate) def_read_vars: Vec<Option<Box<[VarId]>>>,
     /// States TLC counts as generated that do not reach the explorer:
     /// intermediate states of action compositions enumerated so far, and
     /// successors that could not be completed (incomplete, or VIEW failed).
@@ -302,11 +311,13 @@ impl Interp {
             file_lazy_args: Vec::new(),
             lambda_action: Box::default(),
             def_state_cacheable: Vec::new(),
+            def_read_vars: Vec::new(),
             let_cacheable: Vec::new(),
             composed_states: Default::default(),
             init_rejected: Default::default(),
             def_pure: Vec::new(),
             def_effectful: Vec::new(),
+            def_effectful_strict: Vec::new(),
             def_memo: Vec::new(),
             const_cache: Vec::new(),
             closed_bounds: Default::default(),

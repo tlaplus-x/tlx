@@ -17,7 +17,7 @@ use crate::except::{self, Unchanged};
 use crate::interp::local::{self, Slot};
 use crate::interp::{ConstVal, Interp};
 use crate::lazy::{LambdaFcn, RecursiveFcn};
-use context::count_def_eval;
+pub(crate) use context::count_def_eval;
 pub use context::{Ctx, DefCache, MemoSource, StateMemo};
 
 /// Pseudo-local holding the value of `@` inside an EXCEPT update.
@@ -1343,11 +1343,26 @@ impl Interp {
         }
         let state_level = self.def_state_cacheable[d.idx()];
         if state_level {
+            let eval_primed_or_body = || {
+                if cx.primed && !cx.init {
+                    if let (Some(vars), Some(s1)) = (self.def_read_vars[d.idx()].as_deref(), cx.s1) {
+                        if !crate::memo::is_disabled(self.uid, d) {
+                            return self.call_primed_def_memo(d, vars, s1, cx, span);
+                        }
+                    }
+                }
+                count_def_eval(cx);
+                self.def_body(d, &Env::default(), cx, span)
+            };
             if let Some(m) = cx.cache.and_then(|c| c.memo(cx)) {
-                return m.get_or_eval(d, || {
-                    count_def_eval(cx);
-                    self.def_body(d, &Env::default(), cx, span)
-                });
+                return m.get_or_eval(d, eval_primed_or_body);
+            }
+            if cx.primed && !cx.init {
+                if let (Some(vars), Some(s1)) = (self.def_read_vars[d.idx()].as_deref(), cx.s1) {
+                    if !crate::memo::is_disabled(self.uid, d) {
+                        return self.call_primed_def_memo(d, vars, s1, cx, span);
+                    }
+                }
             }
         }
         if self.let_cacheable[d.idx()] && !cx.primed {

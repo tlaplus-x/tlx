@@ -58,7 +58,7 @@ impl StateMemo {
 
 /// Count an evaluation of a state-level definition's body in `cx` (`-stats`).
 #[inline(always)]
-pub(super) fn count_def_eval(cx: &Ctx) {
+pub(crate) fn count_def_eval(cx: &Ctx) {
     tlx_runtime::stats::count(if cx.primed { tlx_runtime::stats::C::DefEvalsPrimed } else { tlx_runtime::stats::C::DefEvals }, 1);
 }
 

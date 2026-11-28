@@ -29,13 +29,13 @@ use std::sync::Arc;
 
 use tlx_front::ast::QuantKind;
 use tlx_sema::builtins::Builtin as B;
-use tlx_sema::hir::{BoundVars, DefId, DefKind, Expr, ExprKind as H, LocalId, OpRef};
+use tlx_sema::hir::{BoundVars, DefId, DefKind, Expr, ExprKind as H, LocalId, OpRef, VarId};
 use tlx_value::{ops, order, LazySet, Value, ValueError};
 
 use crate::env::Env;
 use crate::error::EvalError;
 use crate::eval::Ctx;
-use crate::interp::Interp;
+use crate::interp::{constant_level_builtin, ConstVal, Interp};
 
 /// Maximum base size for per-element constraint probing (`\A e \in E : Q(e)`,
 /// `E \subseteq T`, membership comparability). Keeps up-front probing bounded
@@ -51,6 +51,89 @@ const MAX_VALUE_SCAN_DEPTH: usize = 8;
 
 fn verr(e: EvalError) -> ValueError {
     e.into()
+}
+
+/// A recognized subset constraint on an unassigned primed action variable `v'`.
+pub(crate) struct ActionConstraint(Constraint);
+
+/// Result of narrowing a powerset `SUBSET base` by leading action guards on `v'`.
+pub(crate) struct ActionNarrowing {
+    pub(crate) required: Vec<usize>,
+    pub(crate) optional: Vec<usize>,
+    pub(crate) min_card: usize,
+    pub(crate) max_card: usize,
+    /// Number of leading guards completely enforced by `(required, optional,
+    /// min_card..=max_card)` that the caller can skip from the continuation.
+    pub(crate) consumed: usize,
+}
+
+impl ActionNarrowing {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.min_card > self.max_card || self.max_card < self.required.len() || self.min_card > self.required.len() + self.optional.len()
+    }
+}
+
+/// Target subset variable being constrained: either a set-filter bound local
+/// (`{E \in SUBSET B : P(E)}`) or an unassigned primed state variable in a
+/// next-state action (`v' \in SUBSET U /\ L \subseteq v' /\ ...`).
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Local(LocalId),
+    PrimedVar { var: VarId, s1: &'a [Option<Value>] },
+}
+
+/// Recognize a leading subset guard `e` (in `env`) on an unassigned next-state
+/// variable `var'` (reusing the exact same constraint AST recognizer as
+/// `SubsetPred`).
+pub(crate) fn recognize_action_constraint(ip: &Interp, e: &Expr, var: VarId, s1: &[Option<Value>], env: &Env) -> Option<ActionConstraint> {
+    recognize_constraint(ip, e, Target::PrimedVar { var, s1 }, env).map(ActionConstraint)
+}
+
+/// Narrow `SUBSET base` by leading action guards on `var'` left-to-right,
+/// stopping at the first guard that cannot be safely proven error-free on the
+/// current candidate space. Returns `None` if `base.len() > MAX_PROBE_BASE` or
+/// zero constraints could be applied (caller falls back to unpruned `SUBSET`
+/// streaming).
+pub(crate) fn narrow_action_guards(
+    ip: &Arc<Interp>,
+    cx: &Ctx,
+    base: &ops::SubsetBase<'_>,
+    guards: &[(ActionConstraint, &Env)],
+) -> Option<ActionNarrowing> {
+    if base.len() > MAX_PROBE_BASE {
+        return None;
+    }
+    let mut state = CandidateState::new(base.len());
+    let mut applied = 0usize;
+    let mut consumed = 0usize;
+    for (ActionConstraint(kind), env) in guards {
+        match apply_constraint(kind, ip, env, cx, base, &mut state) {
+            Applied::Consumed => {
+                applied += 1;
+                consumed += 1;
+                state.canonicalize();
+                if state.is_empty() {
+                    break;
+                }
+            }
+            Applied::TightenedKeepResidual => {
+                applied += 1;
+                state.canonicalize();
+                break;
+            }
+            Applied::Stop => break,
+        }
+    }
+    if applied == 0 {
+        return None;
+    }
+    Some(ActionNarrowing {
+        required: state.required,
+        optional: state.optional,
+        min_card: state.min_card,
+        max_card: state.max_card,
+        consumed,
+    })
 }
 
 /// Compiled leading-prefix plan for filtering `SUBSET B` with bound variable `var`.
@@ -370,7 +453,7 @@ fn collect_steps(ip: &Interp, e: &Expr, target: LocalId, env: &Env, depth: usize
         _ => {}
     }
 
-    if let Some(kind) = recognize_constraint(ip, e, target, env) {
+    if let Some(kind) = recognize_constraint(ip, e, Target::Local(target), env) {
         *has_constraint = true;
         steps.push(Step::Constraint { kind, expr: e.clone() });
     } else {
@@ -382,19 +465,56 @@ fn is_target_var(e: &Expr, target: LocalId) -> bool {
     matches!(&*e.kind, H::Local(l) if *l == target)
 }
 
+fn is_var_expr(ip: &Interp, e: &Expr, var: VarId, env: &Env, depth: usize) -> bool {
+    if depth > MAX_EXPAND {
+        return false;
+    }
+    match &*e.kind {
+        H::Var(v) => *v == var,
+        H::Local(l) => env.lookup(*l).and_then(|b| b.by_name(&ip.prog)).is_some_and(|(a, aenv)| is_var_expr(ip, a, var, aenv, depth + 1)),
+        H::Apply { op: OpRef::Def(d), args } if args.is_empty() => {
+            ip.plain_op_body(*d).is_some_and(|(rd, body)| is_var_expr(ip, body, var, &ip.def_env(rd, env), depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn is_primed_var_expr(ip: &Interp, e: &Expr, var: VarId, env: &Env, depth: usize) -> bool {
+    if depth > MAX_EXPAND {
+        return false;
+    }
+    match &*e.kind {
+        H::Builtin { op: B::Prime, args } if args.len() == 1 => is_var_expr(ip, &args[0], var, env, depth + 1),
+        H::Local(l) => {
+            env.lookup(*l).and_then(|b| b.by_name(&ip.prog)).is_some_and(|(a, aenv)| is_primed_var_expr(ip, a, var, aenv, depth + 1))
+        }
+        H::Apply { op: OpRef::Def(d), args } if args.is_empty() => {
+            ip.plain_op_body(*d).is_some_and(|(rd, body)| is_primed_var_expr(ip, body, var, &ip.def_env(rd, env), depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn is_target_expr(ip: &Interp, e: &Expr, target: Target<'_>, env: &Env) -> bool {
+    match target {
+        Target::Local(l) => is_target_var(e, l),
+        Target::PrimedVar { var, .. } => is_primed_var_expr(ip, e, var, env, 0),
+    }
+}
+
 fn is_empty_set_literal(e: &Expr) -> bool {
     matches!(&*e.kind, H::SetEnum(es) if es.is_empty())
 }
 
-fn is_cardinality_of(ip: &Interp, e: &Expr, target: LocalId) -> bool {
+fn is_cardinality_of(ip: &Interp, e: &Expr, target: Target<'_>, env: &Env) -> bool {
     if ip.builtin_override(B::Cardinality).is_some() {
         return false;
     }
     match &*e.kind {
         H::Builtin { op: B::Cardinality, args } | H::Apply { op: OpRef::Builtin(B::Cardinality), args } => {
-            args.len() == 1 && is_target_var(&args[0], target)
+            args.len() == 1 && is_target_expr(ip, &args[0], target, env)
         }
-        H::Apply { op: OpRef::Def(d), args } if args.len() == 1 && is_target_var(&args[0], target) => {
+        H::Apply { op: OpRef::Def(d), args } if args.len() == 1 && is_target_expr(ip, &args[0], target, env) => {
             let rd = ip.redirect_def(*d);
             !ip.def_value.contains_key(&rd) && ip.prog.defs[rd.idx()].builtin == Some(B::Cardinality)
         }
@@ -419,16 +539,74 @@ fn builtin_op<'a>(ip: &Interp, e: &'a Expr) -> Option<(B, &'a [Expr])> {
     }
 }
 
-/// Whether `e` is effect-free and does not depend on `target`.
-fn is_pure_independent(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> bool {
-    ip.is_effect_free_in(e, env) && !expr_mentions_local(ip, e, target, env, &mut HashSet::new())
+/// Whether `e` is effect-free, reads no unassigned primed variable, and does
+/// not reference `var'` (permits `B::Prime` over already-assigned `w != var`).
+fn is_effect_free_primed_independent(
+    ip: &Interp,
+    e: &Expr,
+    var: VarId,
+    s1: &[Option<Value>],
+    env: &Env,
+    in_prime: bool,
+    depth: usize,
+) -> bool {
+    if depth > MAX_EXPAND {
+        return false;
+    }
+    let builtin = |op| ip.builtin_override(op).is_none() && constant_level_builtin(op);
+    match &*e.kind {
+        H::Builtin { op: B::Prime, args } if !in_prime && args.len() == 1 && ip.builtin_override(B::Prime).is_none() => {
+            return is_effect_free_primed_independent(ip, &args[0], var, s1, env, true, depth);
+        }
+        H::Var(w) => return !in_prime || (*w != var && s1.get(w.idx()).is_some_and(Option::is_some)),
+        H::InstVar { .. } => return false,
+        _ => {}
+    }
+    let here = match &*e.kind {
+        H::Apply { op: OpRef::Def(d), .. } | H::OpArg(OpRef::Def(d)) => {
+            !ip.has_def_value(*d) && ip.redirect_def(*d) == *d && ip.prog.defs[d.idx()].builtin.is_some_and(builtin)
+        }
+        H::Const(c) => matches!(ip.consts[c.idx()], Some(ConstVal::Value(_))),
+        H::Apply { op: OpRef::Const(_), .. } | H::OpArg(OpRef::Const(_)) | H::Let { .. } => false,
+        H::Local(id) => match env.lookup(*id) {
+            None | Some(crate::env::Binding::Val(_)) => true,
+            Some(b) => match b.by_name(&ip.prog) {
+                Some((a, aenv)) => is_effect_free_primed_independent(ip, a, var, s1, aenv, in_prime, depth + 1),
+                None => false,
+            },
+        },
+        H::Apply { op: OpRef::Param(_), .. }
+        | H::OpArg(OpRef::Param(_))
+        | H::BoxAction { .. }
+        | H::AngleAction { .. }
+        | H::Fairness { .. }
+        | H::TemporalQuant { .. } => false,
+        H::Builtin { op, .. } | H::Apply { op: OpRef::Builtin(op), .. } | H::OpArg(OpRef::Builtin(op)) => builtin(*op),
+        _ => true,
+    };
+    if !here {
+        return false;
+    }
+    let mut ok = true;
+    tlx_sema::visit::children(e, &mut |c| {
+        ok = ok && is_effect_free_primed_independent(ip, c, var, s1, env, in_prime, depth);
+    });
+    ok
 }
 
-fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Option<Constraint> {
+/// Whether `e` is effect-free and does not depend on `target`.
+fn is_pure_independent(ip: &Interp, e: &Expr, target: Target<'_>, env: &Env) -> bool {
+    match target {
+        Target::Local(l) => ip.is_effect_free_in(e, env) && !expr_mentions_local(ip, e, l, env, &mut HashSet::new()),
+        Target::PrimedVar { var, s1 } => is_effect_free_primed_independent(ip, e, var, s1, env, false, 0),
+    }
+}
+
+fn recognize_constraint(ip: &Interp, e: &Expr, target: Target<'_>, env: &Env) -> Option<Constraint> {
     // `\A v \in E : Q(v)`
     if let H::Quant { kind: QuantKind::Forall, bounds, body } = &*e.kind {
         if let [b] = bounds.as_slice() {
-            if is_target_var(&b.set, target) && is_single_elem_binder(&b.vars) && is_pure_independent(ip, body, target, env) {
+            if is_target_expr(ip, &b.set, target, env) && is_single_elem_binder(&b.vars) && is_pure_independent(ip, body, target, env) {
                 return Some(Constraint::ForallElem { vars: b.vars.clone(), body: body.clone(), negate: false });
             }
         }
@@ -440,22 +618,25 @@ fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Op
         (B::Not, [inner]) => {
             if let H::Quant { kind: QuantKind::Exists, bounds, body } = &*inner.kind {
                 if let [b] = bounds.as_slice() {
-                    if is_target_var(&b.set, target) && is_single_elem_binder(&b.vars) && is_pure_independent(ip, body, target, env) {
+                    if is_target_expr(ip, &b.set, target, env)
+                        && is_single_elem_binder(&b.vars)
+                        && is_pure_independent(ip, body, target, env)
+                    {
                         return Some(Constraint::ForallElem { vars: b.vars.clone(), body: body.clone(), negate: true });
                     }
                 }
             }
             if let Some((iop, iargs)) = builtin_op(ip, inner) {
                 match (iop, iargs) {
-                    (B::In, [elem, set]) if is_target_var(set, target) && is_pure_independent(ip, elem, target, env) => {
+                    (B::In, [elem, set]) if is_target_expr(ip, set, target, env) && is_pure_independent(ip, elem, target, env) => {
                         return Some(Constraint::ElemMem { elem: elem.clone(), required: false });
                     }
-                    (B::NotIn, [elem, set]) if is_target_var(set, target) && is_pure_independent(ip, elem, target, env) => {
+                    (B::NotIn, [elem, set]) if is_target_expr(ip, set, target, env) && is_pure_independent(ip, elem, target, env) => {
                         return Some(Constraint::ElemMem { elem: elem.clone(), required: true });
                     }
                     (B::Eq, [a, b])
-                        if (is_target_var(a, target) && is_empty_set_literal(b))
-                            || (is_target_var(b, target) && is_empty_set_literal(a)) =>
+                        if (is_target_expr(ip, a, target, env) && is_empty_set_literal(b))
+                            || (is_target_expr(ip, b, target, env) && is_empty_set_literal(a)) =>
                     {
                         return Some(Constraint::EmptyCmp { empty: false });
                     }
@@ -466,9 +647,9 @@ fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Op
         }
         // `E \subseteq T` or `T \subseteq E`
         (B::SubsetEq, [lhs, rhs]) => {
-            if is_target_var(lhs, target) && is_pure_independent(ip, rhs, target, env) {
+            if is_target_expr(ip, lhs, target, env) && is_pure_independent(ip, rhs, target, env) {
                 Some(Constraint::SubsetUpper { rhs: rhs.clone() })
-            } else if is_target_var(rhs, target) && is_pure_independent(ip, lhs, target, env) {
+            } else if is_target_expr(ip, rhs, target, env) && is_pure_independent(ip, lhs, target, env) {
                 Some(Constraint::SubsetLower { lhs: lhs.clone() })
             } else {
                 None
@@ -476,15 +657,15 @@ fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Op
         }
         // `x \in E`, `x \notin E`, `Cardinality(E) \in S`
         (B::In, [lhs, rhs]) => {
-            if is_target_var(rhs, target) && is_pure_independent(ip, lhs, target, env) {
+            if is_target_expr(ip, rhs, target, env) && is_pure_independent(ip, lhs, target, env) {
                 Some(Constraint::ElemMem { elem: lhs.clone(), required: true })
-            } else if is_cardinality_of(ip, lhs, target) && is_pure_independent(ip, rhs, target, env) {
+            } else if is_cardinality_of(ip, lhs, target, env) && is_pure_independent(ip, rhs, target, env) {
                 Some(Constraint::CardIn { set: rhs.clone() })
             } else {
                 None
             }
         }
-        (B::NotIn, [lhs, rhs]) if is_target_var(rhs, target) && is_pure_independent(ip, lhs, target, env) => {
+        (B::NotIn, [lhs, rhs]) if is_target_expr(ip, rhs, target, env) && is_pure_independent(ip, lhs, target, env) => {
             Some(Constraint::ElemMem { elem: lhs.clone(), required: false })
         }
         // `E = {}`, `E /= {}`, `E \cap T = {}`, `Cardinality(E) <cmp> k`
@@ -499,7 +680,9 @@ fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Op
                 _ => unreachable!(),
             };
             if matches!(op, B::Eq | B::Neq) {
-                if (is_target_var(lhs, target) && is_empty_set_literal(rhs)) || (is_target_var(rhs, target) && is_empty_set_literal(lhs)) {
+                if (is_target_expr(ip, lhs, target, env) && is_empty_set_literal(rhs))
+                    || (is_target_expr(ip, rhs, target, env) && is_empty_set_literal(lhs))
+                {
                     return Some(Constraint::EmptyCmp { empty: op == B::Eq });
                 }
                 if op == B::Eq {
@@ -512,19 +695,19 @@ fn recognize_constraint(ip: &Interp, e: &Expr, target: LocalId, env: &Env) -> Op
                     };
                     if let Some(cap_expr) = cap_side {
                         if let Some((B::Cap, [a, b])) = builtin_op(ip, cap_expr) {
-                            if is_target_var(a, target) && is_pure_independent(ip, b, target, env) {
+                            if is_target_expr(ip, a, target, env) && is_pure_independent(ip, b, target, env) {
                                 return Some(Constraint::Disjoint { other: b.clone(), var_on_left: true });
                             }
-                            if is_target_var(b, target) && is_pure_independent(ip, a, target, env) {
+                            if is_target_expr(ip, b, target, env) && is_pure_independent(ip, a, target, env) {
                                 return Some(Constraint::Disjoint { other: a.clone(), var_on_left: false });
                             }
                         }
                     }
                 }
             }
-            if is_cardinality_of(ip, lhs, target) && is_pure_independent(ip, rhs, target, env) {
+            if is_cardinality_of(ip, lhs, target, env) && is_pure_independent(ip, rhs, target, env) {
                 Some(Constraint::CardCmp { op: cmp, rhs: rhs.clone() })
-            } else if is_cardinality_of(ip, rhs, target) && is_pure_independent(ip, lhs, target, env) {
+            } else if is_cardinality_of(ip, rhs, target, env) && is_pure_independent(ip, lhs, target, env) {
                 Some(Constraint::CardCmp { op: cmp.flip(), rhs: lhs.clone() })
             } else {
                 None
@@ -591,10 +774,34 @@ fn def_mentions_local(ip: &Interp, d: DefId, target: LocalId, env: &Env, seen_de
 /// Conservative check that `e` does not read a runtime value containing a
 /// `LazyFcn` or `LazySet::Custom` (which could wrap an effectful expression).
 fn expr_reads_lazy_callable(ip: &Interp, e: &Expr, env: &Env, cx: &Ctx) -> bool {
+    expr_reads_lazy_callable_in(ip, e, env, cx, &mut HashSet::new(), 0)
+}
+
+fn expr_reads_lazy_callable_in(ip: &Interp, e: &Expr, env: &Env, cx: &Ctx, seen_defs: &mut HashSet<DefId>, depth: usize) -> bool {
+    if depth > MAX_EXPAND * 2 {
+        return true;
+    }
+    match &*e.kind {
+        H::Builtin { op: B::Prime, args } | H::Apply { op: OpRef::Builtin(B::Prime), args } if args.len() == 1 => {
+            return expr_reads_lazy_callable_in(ip, &args[0], env, &cx.primed(), seen_defs, depth + 1);
+        }
+        H::Let { defs, body } => {
+            return defs.iter().any(|&d| def_reads_lazy_callable(ip, d, env, cx, seen_defs, depth + 1))
+                || expr_reads_lazy_callable_in(ip, body, env, cx, seen_defs, depth + 1);
+        }
+        H::Apply { op: OpRef::Def(d), args } if ip.prog.def_is_let(*d) => {
+            return def_reads_lazy_callable(ip, *d, env, cx, seen_defs, depth + 1)
+                || args.iter().any(|a| expr_reads_lazy_callable_in(ip, a, env, cx, seen_defs, depth + 1));
+        }
+        H::OpArg(OpRef::Def(d)) if ip.prog.def_is_let(*d) => {
+            return def_reads_lazy_callable(ip, *d, env, cx, seen_defs, depth + 1);
+        }
+        _ => {}
+    }
     let here = match &*e.kind {
         H::Local(l) => match env.lookup(*l) {
             Some(crate::env::Binding::Val(v)) => value_has_lazy_callable(v, 0),
-            Some(b) => b.by_name(&ip.prog).is_some_and(|(a, aenv)| expr_reads_lazy_callable(ip, a, aenv, cx)),
+            Some(b) => b.by_name(&ip.prog).is_some_and(|(a, aenv)| expr_reads_lazy_callable_in(ip, a, aenv, cx, seen_defs, depth + 1)),
             None => false,
         },
         H::Var(v) => {
@@ -622,13 +829,57 @@ fn expr_reads_lazy_callable(ip: &Interp, e: &Expr, env: &Env, cx: &Ctx) -> bool 
     let mut found = false;
     tlx_sema::visit::children(e, &mut |c| {
         if !found {
-            found = expr_reads_lazy_callable(ip, c, env, cx);
+            found = expr_reads_lazy_callable_in(ip, c, env, cx, seen_defs, depth);
         }
     });
     found
 }
 
-fn value_has_lazy_callable(v: &Value, depth: usize) -> bool {
+fn def_reads_lazy_callable(ip: &Interp, d: DefId, env: &Env, cx: &Ctx, seen_defs: &mut HashSet<DefId>, depth: usize) -> bool {
+    if !seen_defs.insert(d) {
+        return false;
+    }
+    match &ip.prog.defs[d.idx()].kind {
+        DefKind::Op(body) => expr_reads_lazy_callable_in(ip, body, env, cx, seen_defs, depth),
+        DefKind::Fn { bounds, body } => {
+            bounds.iter().any(|b| expr_reads_lazy_callable_in(ip, &b.set, env, cx, seen_defs, depth))
+                || expr_reads_lazy_callable_in(ip, body, env, cx, seen_defs, depth)
+        }
+        DefKind::Pending => true,
+    }
+}
+
+fn env_has_lazy_callable(ip: &Interp, env: &Env, cx: &Ctx, depth: usize) -> bool {
+    if depth > MAX_EXPAND {
+        return true;
+    }
+    env.any_binding(&mut |b| match b {
+        crate::env::Binding::Val(v) => value_has_lazy_callable(v, 0),
+        crate::env::Binding::Op(_) => true,
+        crate::env::Binding::LetCache(cell) => cell.get().and_then(|c| c.get().cloned()).is_some_and(|v| value_has_lazy_callable(&v, 0)),
+        crate::env::Binding::Thunk(t) => {
+            t.memo.as_ref().and_then(|m| m.get()).is_some_and(|v| value_has_lazy_callable(v, 0))
+                || env_has_lazy_callable(ip, &t.env, cx, depth + 1)
+                || expr_reads_lazy_callable(ip, &t.expr, &t.env, cx)
+        }
+        crate::env::Binding::Name(id, aenv) => {
+            env_has_lazy_callable(ip, aenv, cx, depth + 1) || expr_reads_lazy_callable(ip, ip.prog.arena_expr(*id), aenv, cx)
+        }
+    })
+}
+
+/// Conservative check that `e`, any binding captured in `env`, or any state
+/// variable in `cx` contains a `LazyFcn` or `LazySet::Custom` (which could
+/// hide side effects even when reached indirectly through a user-defined or
+/// `LET` operator).
+pub(crate) fn expr_or_state_has_lazy_callable(ip: &Interp, e: &Expr, env: &Env, cx: &Ctx) -> bool {
+    cx.s0.is_some_and(|s| s.iter().any(|v| value_has_lazy_callable(v, 0)))
+        || cx.s1.is_some_and(|s| s.iter().flatten().any(|v| value_has_lazy_callable(v, 0)))
+        || env_has_lazy_callable(ip, env, cx, 0)
+        || expr_reads_lazy_callable(ip, e, env, cx)
+}
+
+pub(crate) fn value_has_lazy_callable(v: &Value, depth: usize) -> bool {
     if depth >= MAX_VALUE_SCAN_DEPTH {
         return true;
     }
@@ -752,6 +1003,10 @@ fn apply_constraint(
                 Value::Interval(lo, hi) if *hi < *lo => Vec::new(),
                 Value::Interval(lo, hi) if (*hi as i128 - *lo as i128 + 1) <= MAX_PROBE_BASE as i128 => {
                     (*lo..=*hi).map(Value::Int).collect()
+                }
+                Value::LazySet(_) if ops::size_if_known(&lhs_val).is_some_and(|n| n <= MAX_PROBE_BASE as i64) => {
+                    let Ok(es) = ops::enumerate(&lhs_val) else { return Applied::Stop };
+                    es
                 }
                 _ => return Applied::Stop,
             };
