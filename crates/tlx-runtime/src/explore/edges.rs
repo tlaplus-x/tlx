@@ -22,7 +22,7 @@
 
 use tlx_base::hash::{FpMap, Interner};
 
-pub use tlx_live::Ids;
+pub use tlx_live::{Ids, Offsets};
 
 use crate::io::{IoError, Spill, SpillVec};
 use crate::model::{ErrorKind, ModelError};
@@ -119,7 +119,7 @@ pub struct LiveGraph {
     /// The fingerprint of each node.
     pub fps: Vec<u64>,
     /// The edges of node `i` are at positions `off[i]..off[i + 1]`.
-    pub off: Vec<usize>,
+    pub off: Offsets,
     /// The target of each edge. The edges of a state are its successors in
     /// the model in the order they were generated, then the stuttering step
     /// (to itself).
@@ -146,7 +146,7 @@ impl LiveGraph {
         let pats = |p: &Vec<Box<[u64]>>| p.capacity() * 16 + p.iter().map(|b| b.len() * 8).sum::<usize>();
         self.init.capacity() * 4
             + self.fps.capacity() * 8
-            + self.off.capacity() * 8
+            + self.off.bytes()
             + self.tgt.capacity() * 4
             + self.edge_pat.bytes()
             + self.state_pat.capacity() * 4
@@ -565,7 +565,8 @@ pub(super) fn build_bytes<'a, 'm: 'a, S: 'm>(recs: impl Iterator<Item = &'a Edge
         Ids::U16(_) => 2,
         Ids::U32(_) => 4,
     };
-    (n, e, 8 * (n + 1) + 8 * n + 4 * n + (4 + pat_bytes) * e + index)
+    let off_bytes = if e <= u32::MAX as usize { 4 } else { 8 };
+    (n, e, off_bytes * (n + 1) + 8 * n + 4 * n + (4 + pat_bytes) * e + index)
 }
 
 /// The start of the message of `liveness_memory_error`.
@@ -667,13 +668,17 @@ pub(super) fn build_graph<S>(
     }
     init.sort_unstable();
     let init: Vec<u32> = init.into_iter().map(|(_, id)| id).collect();
-    let mut off = Vec::with_capacity(n + 2);
-    off.push(0usize);
+    // (The largest offset, one past the last edge, picks the widths: `u32`
+    // offsets unless the graph has more than `u32::MAX` edges.)
+    let edges: usize = degs.iter().map(|&d| d as usize + 1).sum();
+    let mut off = Offsets::with_capacity(n + 2, edges);
+    off.push(0);
+    let mut next = 0usize;
     for &d in &degs {
-        off.push(off.last().unwrap() + d as usize + 1);
+        next += d as usize + 1;
+        off.push(next);
     }
     drop(degs);
-    let edges = off[n];
     let mut tgt = vec![0u32; edges];
     let mut edge_pat = Ids::zeros(edges, actions.pats.len().saturating_sub(1) as u32);
     let mut state_pat = vec![0u32; n];
@@ -741,7 +746,7 @@ fn translate<S, P: PatId>(
     remap: Vec<(Vec<u32>, Vec<u32>)>,
     index: &FpMap,
     sink: Option<u32>,
-    off: &[usize],
+    off: &Offsets,
     tgt: &mut [u32],
     edge_pat: &mut [P],
     state_pat: &mut [u32],
@@ -754,7 +759,7 @@ fn translate<S, P: PatId>(
     let mut base = 0usize;
     for (r, (smap, amap)) in recs.into_iter().zip(remap) {
         let records = r.records as usize;
-        let (lo, hi) = (off_ref[base], off_ref[base + records]);
+        let (lo, hi) = (off_ref.get(base), off_ref.get(base + records));
         let (t, tr) = tgt_rest.split_at_mut(hi - lo);
         let (p, pr) = pat_rest.split_at_mut(hi - lo);
         let (s, sr) = sp_rest.split_at_mut(records);
@@ -849,7 +854,7 @@ mod tests {
         let g = build_mem(vec![w0, w1]).expect("complete");
         assert_eq!(g.fps, vec![fp(0), fp(1)]);
         assert_eq!(g.init, vec![1, 0]);
-        assert_eq!(g.off, vec![0, 2, 5]);
+        assert_eq!(g.off, Offsets::from(vec![0, 2, 5]));
         assert_eq!(g.tgt, vec![1, 0, 0, 0, 1]);
         let pat = |e: usize| g.action_pats[g.edge_pat.get(e) as usize][0];
         assert_eq!((0..5).map(pat).collect::<Vec<_>>(), vec![1, 0, 0, 0, 0]);
@@ -984,12 +989,12 @@ mod tests {
         expand(&mut w, 0, &[(1, true), (2, true)], Some(0));
         let g = build(vec![w], &Spill::default(), true).unwrap().expect("partial");
         assert_eq!(g.fps.len(), 2);
-        assert_eq!(g.off, vec![0, 3, 3]);
+        assert_eq!(g.off, Offsets::from(vec![0, 3, 3]));
         assert_eq!(g.tgt, vec![1, 1, 0]);
         assert_eq!(g.state_pat.len(), 2);
         // No states recorded: no sink.
         let g = build(vec![EdgeRec::new(&Parity, 1 << 20)], &Spill::default(), true).unwrap().expect("partial");
-        assert!(g.is_empty() && g.off == vec![0]);
+        assert!(g.is_empty() && g.off == Offsets::from(vec![0]));
     }
 
     #[test]
@@ -1047,7 +1052,7 @@ mod tests {
         for i in 0..g.len() {
             let s = (0..n).find(|&s| fp(s) == g.fps[i]).unwrap_or(0);
             let next = g.fps.iter().position(|&f| f == fp((s + 1) % n)).unwrap() as u32;
-            let es = &g.tgt[g.off[i]..g.off[i + 1]];
+            let es = &g.tgt[g.off.range(i)];
             assert_eq!(es, &[next, next, i as u32]);
             if i > 200 {
                 break;
