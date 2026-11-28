@@ -18,13 +18,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use tlx_base::hash::FxMap;
-use tlx_sema::hir::{DefId, Span};
+use tlx_sema::hir::{DefId, Span, VarId};
 use tlx_value::Value;
 
 use crate::apply::Cow;
 use crate::env::{Binding, Env};
 use crate::error::EResult;
-use crate::eval::Ctx;
+use crate::eval::{count_def_eval, Ctx};
 use crate::interp::Interp;
 
 /// Most entries per thread (cleared when full).
@@ -381,5 +381,58 @@ impl Interp {
         }
         let env2 = Env::default().bind_all(params.iter().copied().zip(owned.into_iter().map(Binding::Val)));
         self.def_body(d, &env2, cx, span)
+    }
+
+    /// Memoized evaluation of a strictly effect-free, 0-ary `def_state_cacheable`
+    /// definition `d` in primed context (`cx.primed && !cx.init`) where no
+    /// complete next-state `StateMemo` is available (e.g. inside `Enumerator`
+    /// variable loops or compiled-tier action host regions).
+    ///
+    /// Keyed by `(uid, d, keep_lazy, s1[vars])` where `vars` is the exact
+    /// transitive read set of `d`. Shares the thread-local memo table (zero
+    /// allocation on cache hit for `<= 4` read variables, automatic probation
+    /// disable if hit rate is low).
+    pub(crate) fn call_primed_def_memo(
+        self: &Arc<Self>,
+        d: DefId,
+        vars: &[VarId],
+        s1: &[Option<Value>],
+        cx: &Ctx<'_>,
+        span: Span,
+    ) -> EResult<Value> {
+        const MEMO_INLINE: usize = 4;
+        let n = vars.len();
+        let mut inline_refs: [&Value; MEMO_INLINE] = [&Value::Bool(false); MEMO_INLINE];
+        let mut heap_refs: Vec<&Value> = Vec::new();
+        if n <= MEMO_INLINE {
+            for (i, v) in vars.iter().enumerate() {
+                let Some(val) = s1.get(v.idx()).and_then(Option::as_ref) else {
+                    count_def_eval(cx);
+                    return self.def_body(d, &Env::default(), cx, span);
+                };
+                inline_refs[i] = val;
+            }
+        } else {
+            heap_refs.reserve(n);
+            for v in vars {
+                let Some(val) = s1.get(v.idx()).and_then(Option::as_ref) else {
+                    count_def_eval(cx);
+                    return self.def_body(d, &Env::default(), cx, span);
+                };
+                heap_refs.push(val);
+            }
+        }
+        let refs: &[&Value] = if n <= MEMO_INLINE { &inline_refs[..n] } else { &heap_refs };
+        let res = if keyable_refs(refs) { lookup(self.uid, d, cx.keep_lazy, refs) } else { Lookup::Disabled };
+        if let Lookup::Hit(v) = res {
+            return Ok(v);
+        }
+        count_def_eval(cx);
+        let v = self.def_body(d, &Env::default(), cx, span)?;
+        if matches!(res, Lookup::Miss) {
+            let owned: Vec<Value> = refs.iter().map(|r| (*r).clone()).collect();
+            insert(self.uid, d, cx.keep_lazy, owned, &v);
+        }
+        Ok(v)
     }
 }

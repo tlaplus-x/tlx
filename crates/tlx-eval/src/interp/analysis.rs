@@ -120,6 +120,7 @@ impl Interp {
         });
         self.def_pure = is_const;
         self.def_effectful = eff_ho.clone();
+        self.def_effectful_strict = self.strict_effects(&const_deps, &act_deps);
         self.const_cache = (0..n).map(|_| OnceLock::new()).collect();
         self.def_state_cacheable = (0..n)
             .map(|i| {
@@ -185,6 +186,7 @@ impl Interp {
             })
             .collect();
         self.def_recursive = recursive_defs(&call_deps);
+        self.def_read_vars = self.compute_def_read_vars();
         self.closed_bounds = self.find_closed_bounds();
     }
 
@@ -333,6 +335,236 @@ impl Interp {
         eff
     }
 
+    /// Strict effect classification: unlike `effects`, does not exclude
+    /// `def_const` dependencies (a cached constant may hold a `LazyFcn` or
+    /// `FilterSet` whose body contains a volatile builtin) and also follows
+    /// cfg builtin overrides (`builtin_override`) and operator parameters.
+    fn strict_effects(&self, const_deps: &[Vec<DefId>], act_deps: &[Vec<DefId>]) -> Vec<bool> {
+        let n = self.prog.defs.len();
+        let mut eff: Vec<bool> = Vec::with_capacity(n);
+        let mut override_deps: Vec<Vec<DefId>> = vec![Vec::new(); n];
+        for (i, ov_deps) in override_deps.iter_mut().enumerate() {
+            let d = DefId(i as u32);
+            if self.def_value.contains_key(&d) || self.def_redirect.contains_key(&d) {
+                eff.push(false);
+                continue;
+            }
+            let def = &self.prog.defs[i];
+            let local = match &def.kind {
+                DefKind::Op(e) => self.scan_strict_effects(e, ov_deps),
+                DefKind::Fn { body, bounds } => {
+                    let mut found = self.scan_strict_effects(body, ov_deps);
+                    for b in bounds {
+                        found |= self.scan_strict_effects(&b.set, ov_deps);
+                    }
+                    found
+                }
+                DefKind::Pending => true,
+            };
+            let builtin_eff = match def.builtin {
+                Some(b) => match self.builtin_override(b) {
+                    Some(ov) if ov != d => {
+                        ov_deps.push(ov);
+                        false
+                    }
+                    _ => is_effectful_builtin(b),
+                },
+                None => false,
+            };
+            eff.push(local || builtin_eff);
+        }
+        propagate(&mut eff, &[const_deps, act_deps, &override_deps], true);
+        eff
+    }
+
+    fn scan_strict_effects(&self, e: &Expr, deps: &mut Vec<DefId>) -> bool {
+        let here = match &*e.kind {
+            ExprKind::Builtin { op, .. } | ExprKind::Apply { op: OpRef::Builtin(op), .. } | ExprKind::OpArg(OpRef::Builtin(op)) => {
+                if let Some(ov) = self.builtin_override(*op) {
+                    deps.push(ov);
+                    false
+                } else {
+                    is_effectful_builtin(*op)
+                }
+            }
+            ExprKind::Apply { op: OpRef::Param(_), .. } | ExprKind::OpArg(OpRef::Param(_)) => true,
+            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+                match &self.consts[c.idx()] {
+                    Some(ConstVal::Op(OpRef::Builtin(op))) => {
+                        if let Some(ov) = self.builtin_override(*op) {
+                            deps.push(ov);
+                            false
+                        } else {
+                            is_effectful_builtin(*op)
+                        }
+                    }
+                    Some(ConstVal::Op(OpRef::Param(_)) | ConstVal::Table(_)) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        let mut found = here;
+        tlx_sema::visit::children(e, &mut |c| found |= self.scan_strict_effects(c, deps));
+        found
+    }
+
+    /// Compute the sorted, deduplicated set of state variables transitively
+    /// read by each strictly effect-free, non-recursive `def_state_cacheable`
+    /// definition (`None` if ineligible or variable reads are not statically
+    /// closed over `VarId`).
+    fn compute_def_read_vars(&self) -> Vec<Option<Box<[VarId]>>> {
+        let n = self.prog.defs.len();
+        let mut vars: Vec<Vec<VarId>> = vec![Vec::new(); n];
+        let mut deps: Vec<Vec<DefId>> = vec![Vec::new(); n];
+        let mut closed_ok = vec![true; n];
+        for i in 0..n {
+            let d = DefId(i as u32);
+            if self.def_value.contains_key(&d) {
+                continue;
+            }
+            if let Some(&t) = self.def_redirect.get(&d) {
+                deps[i].push(t);
+                continue;
+            }
+            if let Some(b) = self.prog.defs[i].builtin {
+                if let Some(ov) = self.builtin_override(b) {
+                    if ov != d {
+                        deps[i].push(ov);
+                    }
+                } else if !constant_level_builtin(b) {
+                    closed_ok[i] = false;
+                }
+                continue;
+            }
+            closed_ok[i] = match &self.prog.defs[i].kind {
+                DefKind::Op(e) => self.scan_read_vars(e, &mut vars[i], &mut deps[i]),
+                DefKind::Fn { bounds, body } => {
+                    let mut ok = self.scan_read_vars(body, &mut vars[i], &mut deps[i]);
+                    for b in bounds {
+                        ok &= self.scan_read_vars(&b.set, &mut vars[i], &mut deps[i]);
+                    }
+                    ok
+                }
+                DefKind::Pending => false,
+            };
+            vars[i].sort_unstable();
+            vars[i].dedup();
+        }
+        propagate(&mut closed_ok, &[&deps], false);
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                if !closed_ok[i] || self.def_effectful_strict[i] {
+                    continue;
+                }
+                let mut cur = std::mem::take(&mut vars[i]);
+                let before = cur.len();
+                for &dep in &deps[i] {
+                    cur.extend_from_slice(&vars[dep.idx()]);
+                }
+                if cur.len() > before {
+                    cur.sort_unstable();
+                    cur.dedup();
+                    if cur.len() > before {
+                        changed = true;
+                    }
+                }
+                vars[i] = cur;
+            }
+            if !changed {
+                break;
+            }
+        }
+        (0..n)
+            .map(|i| {
+                if self.def_state_cacheable[i]
+                    && !self.def_effectful_strict[i]
+                    && !self.def_recursive[i]
+                    && closed_ok[i]
+                    && !vars[i].is_empty()
+                {
+                    Some(vars[i].clone().into_boxed_slice())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn scan_read_vars(&self, e: &Expr, vars: &mut Vec<VarId>, deps: &mut Vec<DefId>) -> bool {
+        let here = match &*e.kind {
+            ExprKind::Var(v) => {
+                vars.push(*v);
+                true
+            }
+            ExprKind::InstVar { .. }
+            | ExprKind::Apply { op: OpRef::Param(_), .. }
+            | ExprKind::OpArg(OpRef::Param(_))
+            | ExprKind::BoxAction { .. }
+            | ExprKind::AngleAction { .. }
+            | ExprKind::Fairness { .. }
+            | ExprKind::TemporalQuant { .. } => false,
+            ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => {
+                if self.def_value.contains_key(d) {
+                    true
+                } else {
+                    let t = self.redirect_def(*d);
+                    if self.def_value.contains_key(&t) {
+                        true
+                    } else if let Some(b) = self.prog.defs[t.idx()].builtin {
+                        if let Some(ov) = self.builtin_override(b) {
+                            deps.push(ov);
+                            true
+                        } else {
+                            constant_level_builtin(b)
+                        }
+                    } else {
+                        deps.push(t);
+                        true
+                    }
+                }
+            }
+            ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+                match &self.consts[c.idx()] {
+                    Some(ConstVal::Value(_)) => true,
+                    Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => {
+                        let t = self.redirect_def(*d);
+                        if !self.def_value.contains_key(&t) {
+                            deps.push(t);
+                        }
+                        true
+                    }
+                    Some(ConstVal::Op(OpRef::Builtin(op))) => {
+                        if let Some(ov) = self.builtin_override(*op) {
+                            deps.push(ov);
+                            true
+                        } else {
+                            constant_level_builtin(*op)
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Let { defs, .. } => {
+                deps.extend(defs.iter().copied());
+                true
+            }
+            ExprKind::Builtin { op, .. } | ExprKind::Apply { op: OpRef::Builtin(op), .. } | ExprKind::OpArg(OpRef::Builtin(op)) => {
+                if let Some(ov) = self.builtin_override(*op) {
+                    deps.push(ov);
+                    true
+                } else {
+                    constant_level_builtin(*op)
+                }
+            }
+            _ => true,
+        };
+        let mut ok = here;
+        tlx_sema::visit::children(e, &mut |c| ok = ok && self.scan_read_vars(c, vars, deps));
+        ok
+    }
+
     /// Whether `e`, in `env`, is constant-level (TLC: level 0): it mentions
     /// no variable, prime, ENABLED, action or temporal operator and nothing
     /// nondeterministic or effectful, neither directly nor through
@@ -406,6 +638,81 @@ impl Interp {
         let mut ok = here;
         tlx_sema::visit::children(e, &mut |c| ok = ok && self.is_effect_free_in(c, env));
         ok
+    }
+
+    /// Whether `e`, in `env`, is strictly deterministic and effect-free across
+    /// user-defined operators (via `def_effectful_strict`, which also tracks
+    /// volatile builtins inside `def_const` and `builtin_override`s). Permits
+    /// state variables for a fixed evaluation snapshot `Ctx`, while rejecting
+    /// higher-order operator parameters, action/temporal constructs, and
+    /// `InstVar`. Callers that memoize or stream across values must also rule
+    /// out lazy callables captured in runtime values (`value_has_lazy_callable`).
+    pub(crate) fn is_strictly_effect_free_in(&self, e: &Expr, env: &crate::env::Env) -> bool {
+        fn check(ip: &Interp, e: &Expr, env: &crate::env::Env, depth: usize) -> bool {
+            if depth > 16 {
+                return false;
+            }
+            let check_def = |d: DefId| {
+                if ip.def_value.contains_key(&d) {
+                    return true;
+                }
+                let t = ip.redirect_def(d);
+                if ip.def_value.contains_key(&t) {
+                    return true;
+                }
+                if let Some(b) = ip.prog.defs[t.idx()].builtin {
+                    match ip.builtin_override(b) {
+                        Some(ov) => !ip.def_effectful_strict[ov.idx()] && !ip.def_by_name[ov.idx()],
+                        None => constant_level_builtin(b),
+                    }
+                } else {
+                    !ip.def_effectful_strict[t.idx()] && !ip.def_by_name[t.idx()]
+                }
+            };
+            let here = match &*e.kind {
+                ExprKind::Apply { op: OpRef::Def(d), .. } | ExprKind::OpArg(OpRef::Def(d)) => check_def(*d),
+                ExprKind::Const(c) | ExprKind::Apply { op: OpRef::Const(c), .. } | ExprKind::OpArg(OpRef::Const(c)) => {
+                    match &ip.consts[c.idx()] {
+                        Some(ConstVal::Value(_)) => true,
+                        Some(ConstVal::Def(d) | ConstVal::Op(OpRef::Def(d))) => check_def(*d),
+                        Some(ConstVal::Op(OpRef::Builtin(op))) => match ip.builtin_override(*op) {
+                            Some(ov) => !ip.def_effectful_strict[ov.idx()] && !ip.def_by_name[ov.idx()],
+                            None => constant_level_builtin(*op),
+                        },
+                        _ => false,
+                    }
+                }
+                ExprKind::Let { defs, .. } => defs.iter().all(|d| check_def(*d)),
+                ExprKind::Local(id) => match env.lookup(*id) {
+                    None | Some(crate::env::Binding::Val(_)) => true,
+                    Some(b) => match b.by_name(&ip.prog) {
+                        Some((a, aenv)) => check(ip, a, aenv, depth + 1),
+                        None => false,
+                    },
+                },
+                ExprKind::InstVar { .. }
+                | ExprKind::Apply { op: OpRef::Param(_), .. }
+                | ExprKind::OpArg(OpRef::Param(_))
+                | ExprKind::BoxAction { .. }
+                | ExprKind::AngleAction { .. }
+                | ExprKind::Fairness { .. }
+                | ExprKind::TemporalQuant { .. } => false,
+                ExprKind::Builtin { op, .. } | ExprKind::Apply { op: OpRef::Builtin(op), .. } | ExprKind::OpArg(OpRef::Builtin(op)) => {
+                    match ip.builtin_override(*op) {
+                        Some(ov) => !ip.def_effectful_strict[ov.idx()] && !ip.def_by_name[ov.idx()],
+                        None => constant_level_builtin(*op),
+                    }
+                }
+                _ => true,
+            };
+            if !here {
+                return false;
+            }
+            let mut ok = true;
+            tlx_sema::visit::children(e, &mut |c| ok = ok && check(ip, c, env, depth));
+            ok
+        }
+        check(self, e, env, 0)
     }
 
     /// A deterministic state argument can retain its unprimed value while

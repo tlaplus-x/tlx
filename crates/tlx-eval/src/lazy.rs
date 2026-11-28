@@ -234,11 +234,12 @@ struct FilterSet {
     env: Env,
     snap: Snap,
     /// The elements, once an enumeration completed (in its order), if the
-    /// predicate is constant-level (no variable, nothing effectful) and
+    /// predicate is deterministic/effect-free for its immutable snapshot and
     /// there are at most `MAX_MEMO_ELEMS`: a constant definition such as
-    /// `SortedSeqs == {s \in Seq(V) : ...}` is enumerated by the pre-run,
-    /// the lowering and the search, and each enumeration would evaluate the
-    /// predicate on the whole base set again.
+    /// `SortedSeqs == {s \in Seq(V) : ...}` or a memoized primed state-level
+    /// powerset filter such as `totalOpOrder'` is enumerated repeatedly, and
+    /// each enumeration would otherwise evaluate the predicate on the whole
+    /// base set again.
     memo: OnceLock<Arc<[Value]>>,
     /// The predicate compiled for sets of sequences, if it can be decided
     /// on prefixes (`seqfilter`).
@@ -292,6 +293,14 @@ const MAX_MEMO_ELEMS: usize = 1 << 17;
 impl fmt::Debug for FilterSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{{x \\in {} : ...}}", self.base)
+    }
+}
+
+impl FilterSet {
+    fn can_memoize(&self, cx: &Ctx) -> bool {
+        (self.ip.is_constant_in(&self.pred, &self.env) || self.ip.is_strictly_effect_free_in(&self.pred, &self.env))
+            && !crate::subsetfilter::value_has_lazy_callable(&self.base, 0)
+            && !crate::subsetfilter::expr_or_state_has_lazy_callable(&self.ip, &self.pred, &self.env, cx)
     }
 }
 
@@ -354,7 +363,8 @@ impl CustomSet for FilterSet {
         if !ops::is_finite_set(&self.base)? {
             return Ok(None);
         }
-        let mut kept = self.ip.is_constant_in(&self.pred, &self.env).then(Vec::new);
+        let cx = self.snap.ctx();
+        let mut kept = self.can_memoize(&cx).then(Vec::new);
         let mut visit = |x: Value, known: Option<bool>| {
             let member = match known {
                 Some(b) => b,
@@ -376,7 +386,6 @@ impl CustomSet for FilterSet {
                 Ok(true)
             }
         };
-        let cx = self.snap.ctx();
         let done = match &self.base {
             Value::LazySet(l) if matches!(**l, LazySet::Subset(_)) => {
                 match self.subset_pred.get_or_init(|| SubsetPred::compile(&self.ip, &self.vars, &self.pred, &self.env)) {

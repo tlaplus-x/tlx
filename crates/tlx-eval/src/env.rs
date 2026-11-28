@@ -237,6 +237,20 @@ impl Env {
         out
     }
 
+    /// Whether any binding reachable in `self` satisfies `pred`.
+    pub(crate) fn any_binding(&self, pred: &mut impl FnMut(&Binding) -> bool) -> bool {
+        let mut cur = &self.0;
+        while let Some(f) = cur {
+            for s in f.slots.iter().rev() {
+                if pred(&s.binding) {
+                    return true;
+                }
+            }
+            cur = &f.next.0;
+        }
+        false
+    }
+
     /// Whether `self` and `other` certainly bind the same locals the same
     /// way: the same ids in the same order (and frames), equal values, and
     /// by-name arguments of the same expression node in such environments.
