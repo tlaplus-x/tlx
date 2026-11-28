@@ -1,0 +1,75 @@
+name: Release benchmark
+
+# A published `vX.Y.Z` tag starts the post-release benchmark campaign: this
+# workflow notifies the Multica "Post-Release Benchmark & Comparison"
+# autopilot, which runs `scripts/bench.py release <tag>` (docs/benchmarking.md
+# section 7) and publishes `<tag> vs. <previous tag> vs. TLC`.
+#
+# The notification goes to the `MULTICA_RELEASE_BENCH_WEBHOOK_URL` repository
+# secret. Without it - a fork, or a repository that has not configured the
+# autopilot - the workflow still succeeds and does nothing, so an unset secret
+# never turns a release into a red check.
+#
+# The trigger pattern below is GitHub's glob, which also matches prerelease
+# tags (`v0.2.0-rc1`): the tag is re-checked against `^v<numbers>.<numbers>.<numbers>$`
+# before anything is posted, so only a published X.Y.Z release reaches the
+# autopilot. A tag push that is not a release is skipped; an explicit dispatch
+# input that is not one is an error, because a person asked for it.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to benchmark (default: the tag of this run, else the newest vX.Y.Z)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Notify the release benchmark autopilot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the release and post the webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.MULTICA_RELEASE_BENCH_WEBHOOK_URL }}
+          EVENT_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="$EVENT_TAG"
+          [ -n "$tag" ] || tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(git tag -l 'v*.*.*' --sort=-v:refname | head -n 1)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [ -n "$INPUT_TAG" ]; then
+              echo "not a vX.Y.Z release tag: '$tag'" >&2
+              exit 1
+            fi
+            echo "no vX.Y.Z release tag to report ('$tag'): nothing to notify"
+            exit 0
+          fi
+          sha=$(git rev-parse --verify "$tag^{commit}")
+          echo "release $tag at $sha"
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "MULTICA_RELEASE_BENCH_WEBHOOK_URL is not set: nothing to notify (forks stay green)"
+            exit 0
+          fi
+          printf '{"event":"tlx_release","repo":"%s","tag":"%s","sha":"%s","run_id":"%s"}\n' \
+            "$GITHUB_REPOSITORY" "$tag" "$sha" "$GITHUB_RUN_ID" > release-benchmark-payload.json
+          curl -sS --fail-with-body -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary @release-benchmark-payload.json

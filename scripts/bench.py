@@ -89,6 +89,30 @@ usage:
       digest and configuration. `track --slice I/N` measures one LPT-balanced
       model shard of the suite on that instance; `suite-merge OUT IN...` joins
       the shards' histories into one (like `tlcbase-merge`).
+  scripts/bench.py release [TAG] [--prev-tag TAG|auto|none] [--report-only]
+                           [--instance-type TYPE] [--markdown OUT] [--top N]
+                           [--threshold F] [--min-delta S] [--slices N] [--slots S]
+                           [--provider P] [--sizes LIST] [--models id,...] [--repeat R]
+                           [--tlc-repetitions N] [--tlc-workers LIST] [--max-minutes M]
+                           [--setup-minutes M] [--dry-run]
+      Cross-release comparison (scripts/benchmarking/release.py): TAG (default: the
+      newest v*.*.* tag) against --prev-tag (default auto: the release before it, or
+      `none`) and TLC, on the machine class --instance-type names. --report-only
+      renders it from the canonical records and launches nothing: the cohort summary
+      (mode/workers: paired models, median and geometric-mean prev/new wall speedup,
+      prev/new peak RSS, TLC/new wall and RSS, models with newly recorded
+      optimizations), the wall-time regressions (above --threshold and --min-delta
+      vs. the previous release) beside the largest gains and memory reductions, and
+      the flagship open-source models (ext/*, Raft, Zab, Mongo); --markdown also
+      writes it to a file. Rows are paired only on the same model, machine and
+      architecture, mode, workers, arguments, environment, memory limit, input
+      digest and TLC version, so a row of another machine or input shows `—`. The
+      campaign mode collects the missing TLC baselines and runs --slices suite
+      shards, one cloud_verify.py launch each (--slots concurrent instances,
+      --provider tencent), imports what each launch returned, regenerates the
+      report and publishes the comparison; a suite verdict of 1 or 2 is a result,
+      any other exit records nothing. --dry-run prints the launches without running
+      them.
   scripts/bench.py table
       Regenerate the fixed report docs/performance.md from the canonical
       records (bench/records); it measures nothing. Also the default without
@@ -583,13 +607,15 @@ def main():
     from benchmarking import bench_profile
     from benchmarking import bench_suite
     from benchmarking import bench_ttfr
+    from benchmarking import release as bench_release
     if a.cmd in ("suite", "suite-check", "suite-report", "suite-judge", "suite-merge", "track"):
         return finish_bench(bench_suite.dispatch(a))
     result = {"tiers": cmd_tiers, "run": cmd_run, "compare": cmd_compare, "history-report": cmd_history_report, "ab": cmd_ab, "perf": cmd_perf,
               "layout": cmd_layout, "table": cmd_table,
               "tlcbase": cmd_tlcbase, "tlcbase-merge": cmd_tlcbase_merge, "tlcbase-report": cmd_tlcbase_report, "scale": cmd_scale,
               "scale-report": cmd_scale_report, "liveness": bench_liveness.run, "disk": bench_disk.run,
-              "profile": bench_profile.run, "ttfr": bench_ttfr.run, "ttfr-report": bench_ttfr.run_report}[a.cmd](a)
+              "profile": bench_profile.run, "ttfr": bench_ttfr.run, "ttfr-report": bench_ttfr.run_report,
+              "release": bench_release.cmd_release}[a.cmd](a)
     return finish_bench(result)
 
 

@@ -66,7 +66,7 @@ MINIMAL_ARGV = {
     "report": [], "migrate": [], "history-report": ["history.json"], "ab": ["--models", "A"],
     "perf": ["--models", "A"], "layout": [], "table": [], "tlcbase": [],
     "tlcbase-merge": ["merged.json", "one.json"], "tlcbase-report": ["tlc.json"],
-    "scale": [], "scale-report": ["scale.json"],
+    "scale": [], "scale-report": ["scale.json"], "release": [],
 }
 
 # The defaults callers and documentation depend on (docs/benchmarking.md, bench
@@ -77,6 +77,8 @@ DOCUMENTED_DEFAULTS = {
     ("layout", "args"): "-compile -workers 1", ("layout", "jobs"): 1,
     ("scale", "workers"): "1,16,64,128,max", ("profile", "workers"): "1,4,8,16",
     ("tlcbase", "workers"): "1,16", ("table", "models"): None,
+    ("release", "prev_tag"): "auto", ("release", "instance_type"): "SA5.4XLARGE32",
+    ("release", "threshold"): 0.05, ("release", "min_delta"): 0.05,
 }
 
 
