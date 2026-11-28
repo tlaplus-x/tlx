@@ -123,6 +123,51 @@ class RecordsTest(unittest.TestCase):
         new['configuration']['compatibility'] = True
         self.assertFalse(historical_match(new, tlc))
 
+    def test_multi_worker_early_stop_pairs_without_exact_distinct_parity(self):
+        # docs/compat.md §0 Tier 3: multi-worker early-stop verdicts have
+        # worker-interleaving-dependent counts, whereas 1w runs and complete
+        # `success` searches still require exact `distinct` parity.
+        header = {'machine': 'x86_64 SA5.4XLARGE32'}
+        for verdict in ('deadlock', 'safety failure'):
+            for mode in ('compile', 'tlc'):
+                with self.subTest(verdict=verdict, mode=mode):
+                    tx = normalize(header, {'model': 'M', 'mode': mode, 'workers': 16, 'result': verdict,
+                                            'distinct': 134794, 'wall_s': 2.0, 'compatibility': True,
+                                            'tool': 'tlx'},
+                                   'bench/history/a.json', '/runs/M')
+                    tc = normalize(header, {'model': 'M', 'mode': '-tlc', 'workers': 16, 'result': verdict,
+                                            'distinct': 107549, 'wall_s': 20.0, 'tool': 'tlc'},
+                                   'bench/history/tlc.json', '/runs/M')
+                    self.assertTrue(historical_match(tx, tc))
+                    # Single-worker early stops still require exact distinct parity.
+                    tx_1w = copy.deepcopy(tx)
+                    tc_1w = copy.deepcopy(tc)
+                    tx_1w['workers'] = tc_1w['workers'] = 1
+                    self.assertFalse(historical_match(tx_1w, tc_1w))
+                    tx_1w['counts']['distinct'] = tc_1w['counts']['distinct']
+                    self.assertTrue(historical_match(tx_1w, tc_1w))
+        # Multi-worker `success` still requires exact distinct parity.
+        tx_ok = normalize(header, {'model': 'M', 'mode': 'compile', 'workers': 16, 'result': 'success',
+                                   'distinct': 100, 'wall_s': 2.0, 'compatibility': True, 'tool': 'tlx'},
+                          'bench/history/a.json', '/runs/M')
+        tc_ok = normalize(header, {'model': 'M', 'mode': '-tlc', 'workers': 16, 'result': 'success',
+                                   'distinct': 101, 'wall_s': 20.0, 'tool': 'tlc'},
+                          'bench/history/tlc.json', '/runs/M')
+        self.assertFalse(historical_match(tx_ok, tc_ok))
+        # When both sides record a violated property name, they must agree.
+        tx_v = normalize(header, {'model': 'M', 'mode': 'compile', 'workers': 16, 'result': 'safety failure',
+                                  'distinct': 50, 'wall_s': 2.0, 'compatibility': True, 'tool': 'tlx',
+                                  'samples': [{'result': 'safety failure', 'violated': 'InvA'}]},
+                         'bench/history/a.json', '/runs/M')
+        tc_v_same = normalize(header, {'model': 'M', 'mode': '-tlc', 'workers': 16, 'result': 'safety failure',
+                                       'distinct': 75, 'wall_s': 20.0, 'tool': 'tlc', 'violated': 'InvA'},
+                              'bench/history/tlc.json', '/runs/M')
+        tc_v_diff = normalize(header, {'model': 'M', 'mode': '-tlc', 'workers': 16, 'result': 'safety failure',
+                                       'distinct': 75, 'wall_s': 20.0, 'tool': 'tlc', 'violated': 'InvB'},
+                              'bench/history/tlc.json', '/runs/M')
+        self.assertTrue(historical_match(tx_v, tc_v_same))
+        self.assertFalse(historical_match(tx_v, tc_v_diff))
+
     def test_expectation_mismatch_rejects_baseline_reuse_and_pairing(self):
         tx = self.record(content_digest='input', tlc_version='tlc-version')
         tc = self.record(tool='tlc', mode='-tlc', revision=None, id='baseline',
@@ -254,6 +299,149 @@ class RecordsTest(unittest.TestCase):
         ingested, = ingest(build(other), other)
         self.assertEqual(ingested['revision'], 'deadbeef')
         self.assertEqual(ingested['provenance']['revision_source'], 'cloud receipt 2026-10-07-host')
+
+    def test_cloud_receipt_attributes_bare_suite_bin_and_base_bin_and_preserves_samples(self):
+        # HARNESS-19: `suite --bin PATH` (variant 'new') and `--base-bin PATH`
+        # (variant 'base') bind to cloud.json's `bench_bins`, while unreceipted
+        # external binaries stay at revision=None instead of inheriting the
+        # checkout commit. `normalize` also preserves `samples`/`warmups` in
+        # `raw_result` so canonical records remain self-contained.
+        receipt = {
+            'bench_bins': [
+                {'name': 'v0_1_2', 'rev': 'e5dffafd5419e069ccd854d7aa674d18631eea15', 'features': ''},
+                {'name': 'prev', 'rev': '1111111111111111111111111111111111111111', 'features': ''},
+            ],
+            'bench': [
+                'suite --bin target/bench-bins/v0_1_2/tlx --out bench/history/v012.json',
+                'suite --bin=target/bench-bins/v0_1_2/tlx --base-bin=target/bench-bins/prev/tlx --out=bench/history/ab.json',
+                'suite --bin /tmp/unreceipted/tlx --out bench/history/unreceipted.json',
+                'suite --base-bin target/bench-bins/prev/tlx --out bench/history/track.json',
+            ],
+        }
+        (self.root / 'target/bench/2026-11-28-host').mkdir(parents=True)
+        (self.root / 'target/bench/2026-11-28-host/cloud.json').write_text(json.dumps(receipt))
+        self.assertEqual(receipt_revisions(self.root), {
+            'bench/history/v012.json': ('2026-11-28-host', {'new': 'e5dffafd5419e069ccd854d7aa674d18631eea15'}),
+            'bench/history/ab.json': ('2026-11-28-host', {
+                'new': 'e5dffafd5419e069ccd854d7aa674d18631eea15',
+                'base': '1111111111111111111111111111111111111111',
+            }),
+            'bench/history/unreceipted.json': ('2026-11-28-host', {'new': None}),
+            'bench/history/track.json': ('2026-11-28-host', {'base': '1111111111111111111111111111111111111111'}),
+        })
+        run_row = {
+            'tool': 'tlx', 'model': 'M', 'mode': 'default', 'workers': 1,
+            'walls': [1.0, 1.1, 1.2], 'cpu': [1.0, 1.1, 1.2], 'rss_mib': [50.0, 50.0, 50.0],
+            'result': 'success', 'distinct': 10, 'generated': 20, 'depth': 3,
+            'samples': [{'result': 'success', 'wall_s': 1.0, 'optimizations': ['symmetry']}],
+            'warmups': [{'result': 'success', 'wall_s': 2.0, 'optimizations': ['symmetry']}],
+        }
+        (self.root / 'bench/history').mkdir(parents=True)
+        # 1. Receipted bare --bin attributes revision and preserves samples/warmups.
+        v012 = self.root / 'bench/history/v012.json'
+        v012.write_text(json.dumps({'suite': True, 'repeat': 1, 'commit': 'checkout-sha',
+                                    'machine': 'x86_64 SA5.4XLARGE32', 'runs': {'small:M:default:1w': run_row}}))
+        row_v012, = ingest(v012, self.root)
+        self.assertEqual(row_v012['revision'], 'e5dffafd5419e069ccd854d7aa674d18631eea15')
+        self.assertEqual(row_v012['provenance']['revision_source'], 'cloud receipt 2026-11-28-host')
+        self.assertEqual(row_v012['raw_result']['samples'], run_row['samples'])
+        self.assertEqual(row_v012['raw_result']['warmups'], run_row['warmups'])
+        self.assertEqual(br.reduction_note(row_v012), 'symmetry')
+        # 2. Both --bin= and --base-bin= are attributed independently.
+        ab = self.root / 'bench/history/ab.json'
+        ab.write_text(json.dumps({'suite': True, 'repeat': 1, 'commit': 'checkout-sha',
+                                  'machine': 'x86_64 SA5.4XLARGE32',
+                                  'base': {'commit': 'unknown', 'runs': {'small:M:default:1w': run_row}},
+                                  'runs': {'small:M:default:1w': run_row}}))
+        rows_ab = ingest(ab, self.root)
+        by_var = {r['configuration']['variant']: r for r in rows_ab}
+        self.assertEqual(by_var[None]['revision'], 'e5dffafd5419e069ccd854d7aa674d18631eea15')
+        self.assertEqual(by_var['base']['revision'], '1111111111111111111111111111111111111111')
+        # 3. Unreceipted bare --bin stays None (never inherits checkout-sha).
+        unrec = self.root / 'bench/history/unreceipted.json'
+        unrec.write_text(json.dumps({'suite': True, 'repeat': 1, 'commit': 'checkout-sha',
+                                     'machine': 'x86_64 SA5.4XLARGE32', 'runs': {'small:M:default:1w': run_row}}))
+        row_unrec, = ingest(unrec, self.root)
+        self.assertIsNone(row_unrec['revision'])
+        self.assertNotIn('revision_source', row_unrec['provenance'])
+        # 4. --base-bin only keeps checkout commit for HEAD ('new') and pins 'base'.
+        track = self.root / 'bench/history/track.json'
+        track.write_text(json.dumps({'suite': True, 'repeat': 1, 'commit': 'checkout-sha',
+                                     'machine': 'x86_64 SA5.4XLARGE32',
+                                     'base': {'commit': 'unknown', 'runs': {'small:M:default:1w': run_row}},
+                                     'runs': {'small:M:default:1w': run_row}}))
+        rows_track = {r['configuration']['variant']: r for r in ingest(track, self.root)}
+        self.assertEqual(rows_track[None]['revision'], 'checkout-sha')
+        self.assertEqual(rows_track['base']['revision'], '1111111111111111111111111111111111111111')
+
+    def test_check_passes_for_overlapping_cloud_receipt_suite_bin_runs(self):
+        # Overlapping receipted and unreceipted `suite --bin` histories must
+        # normalize under the same receipt-attributed revision in `migrate` and
+        # `bench_records.check(..., sources=True)`.
+        (self.root / 'bench/suite.json').write_text(json.dumps({'models': [{'id': 'M'}, {'id': 'N'}]}))
+        (self.root / 'bench/history').mkdir(parents=True)
+        (self.root / 'target/bench/2026-11-28-host').mkdir(parents=True)
+        receipt = {
+            'bench_bins': [{'name': 'v0_1_2', 'rev': 'e5dffafd5419e069ccd854d7aa674d18631eea15', 'features': ''}],
+            'bench': [
+                'suite --bin target/bench-bins/v0_1_2/tlx --out bench/history/v012-1.json',
+                'suite --bin target/bench-bins/v0_1_2/tlx --out bench/history/v012-2.json',
+                'suite --bin /tmp/custom/tlx --out bench/history/unrec-1.json',
+                'suite --bin /tmp/custom/tlx --out bench/history/unrec-2.json',
+            ],
+        }
+        (self.root / 'target/bench/2026-11-28-host/cloud.json').write_text(json.dumps(receipt))
+        row_m = {'tool': 'tlx', 'model': 'M', 'mode': 'default', 'workers': 1, 'walls': [1.0],
+                 'cpu': [1.0], 'result': 'success', 'distinct': 10}
+        row_n = {**row_m, 'model': 'N'}
+        for name, date, runs in [
+            ('v012-1.json', '2026-11-28 01:00:00', {'small:M:default:1w': row_m}),
+            ('v012-2.json', '2026-11-28 02:00:00', {'small:M:default:1w': row_m}),
+            ('unrec-1.json', '2026-11-28 01:00:00', {'small:N:default:1w': row_n}),
+            ('unrec-2.json', '2026-11-28 02:00:00', {'small:N:default:1w': row_n}),
+        ]:
+            (self.root / 'bench/history' / name).write_text(json.dumps({
+                'suite': True, 'repeat': 1, 'commit': 'checkout-sha', 'date': date,
+                'machine': 'x86_64 SA5.4XLARGE32', 'runs': runs}))
+        migrate(self.root)
+        br.generate(self.root)
+        self.assertEqual(br.check(self.root, sources=True), [])
+
+    def test_policy_refresh_preserves_verified_baseline_inputs_in_partial_checkout(self):
+        # Partial checkouts missing e.g. third_party/Examples must not erase or
+        # overwrite verified baseline_inputs digests with None, and refresh=False
+        # must leave reference_revision and ages untouched.
+        (self.root / 'bench/suite.json').write_text(json.dumps({'models': [
+            {'id': 'Present'}, {'id': 'MissingFiles'}, {'id': 'AbsentFromOracle'}]}))
+        policy_path = self.root / 'bench/report-policy.json'
+        initial = {
+            'schema_version': store.VERSION,
+            'stale_after_revisions': 20,
+            'reference_revision': 'pinned-ref',
+            'ages': {'abc123': 3},
+            'baseline_inputs': {
+                'Present': {'content_digest': 'old-digest', 'tlc_version': 'old-ver'},
+                'MissingFiles': {'content_digest': 'verified-missing', 'tlc_version': 'pinned-ver'},
+                'AbsentFromOracle': {'content_digest': 'verified-absent', 'tlc_version': 'pinned-ver'},
+            },
+        }
+        policy_path.write_text(json.dumps(initial, indent=2, sort_keys=True) + '\n')
+        # refresh=False leaves everything untouched.
+        unchanged = br.policy(self.root, refresh=False)
+        self.assertEqual(unchanged, initial)
+        # refresh=True updates only Present and preserves MissingFiles & AbsentFromOracle.
+        missing_model = {'id': 'MissingFiles', 'tla': str(self.root / 'no.tla'), 'cfg': str(self.root / 'no.cfg')}
+        oracle = {'Present': self.model, 'MissingFiles': missing_model}
+        with patch.object(br, 'ROOT', self.root), \
+             patch.object(br.bench_models, 'oracle', return_value=oracle), \
+             patch.object(br.bench_machine, 'tla2tools_info', return_value={'revision': None}):
+            refreshed = br.policy(self.root, refresh=True)
+        bi = refreshed['baseline_inputs']
+        self.assertEqual(bi['Present']['content_digest'], content_digest(self.model))
+        self.assertEqual(bi['Present']['tlc_version'], 'old-ver')
+        self.assertEqual(bi['MissingFiles'], initial['baseline_inputs']['MissingFiles'])
+        self.assertEqual(bi['AbsentFromOracle'], initial['baseline_inputs']['AbsentFromOracle'])
+        self.assertTrue(all(v['content_digest'] is not None for v in bi.values()))
 
     def test_disk_command_limits_survive_normalization(self):
         h = {'commit': 'abc', 'workers': 16, 'args': '--fractions 0.25,0.5'}
@@ -619,7 +807,10 @@ class RecordsTest(unittest.TestCase):
                 raw = cached_tlc(self.model, 1, Mock(side_effect=[good, bad, good]),
                                  root=self.root, version='v', instance='i', repetitions=3)
                 self.assertTrue(raw['count_problems'])
-                self.assertFalse(store.store_files(self.root))
+                self.assertIsNone(find_baseline(self.model, 1, root=self.root, version='v', instance='i'))
+                stored = baselines.stored_baseline(self.model, 1, root=self.root, version='v', instance='i')
+                self.assertIsNotNone(stored)
+                self.assertFalse(baselines.reusable(stored))
 
     def test_repeated_tlc_missing_cpu_and_parallel_violation_counts(self):
         samples = [dict(result='safety failure', exit=12, distinct=n, wall_s=w, cpu_s=c)
@@ -1060,6 +1251,168 @@ class RecordsTest(unittest.TestCase):
             bench.cmd_tlcbase(a)
         self.assertEqual(collect.call_count, 1)
         self.assertEqual(json.loads(path.read_text())['models']['M']['runs']['1']['wall_s'], 7)
+
+    def test_cached_tlc_persists_strongest_incomplete_bounds_and_upgrades_repetitions(self):
+        kw = dict(root=self.root, version='v', instance='SA5.4XLARGE32')
+        # 1. Error is persisted as non-reusable evidence.
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'error', 'wall_s': 1.0, 'exit': 255}), **kw)
+        stored = baselines.stored_baseline(self.model, 1, **kw)
+        self.assertIsNotNone(stored)
+        self.assertFalse(baselines.reusable(stored))
+        self.assertEqual(stored['measurement']['counts']['result'], 'error')
+        # 2. Timeout outranks error; longer timeout outranks shorter; shorter does not downgrade.
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'timeout', 'wall_s': 600.0, 'exit': 124}), **kw)
+        self.assertEqual(baselines.stored_baseline(self.model, 1, **kw)['measurement']['metrics']['wall_s'], 600.0)
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'timeout', 'wall_s': 1800.0, 'exit': 124}), **kw)
+        self.assertEqual(baselines.stored_baseline(self.model, 1, **kw)['measurement']['metrics']['wall_s'], 1800.0)
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'timeout', 'wall_s': 300.0, 'exit': 124}), **kw)
+        self.assertEqual(baselines.stored_baseline(self.model, 1, **kw)['measurement']['metrics']['wall_s'], 1800.0)
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'error', 'wall_s': 1.0, 'exit': 255}), **kw)
+        self.assertEqual(baselines.stored_baseline(self.model, 1, **kw)['measurement']['counts']['result'], 'timeout')
+        # 3. Completed 1-sample run replaces timeout; failed 3-sample upgrade never overwrites it.
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'success', 'exit': 0, 'distinct': 10, 'wall_s': 5.0}), **kw)
+        self.assertTrue(baselines.reusable(baselines.stored_baseline(self.model, 1, **kw)))
+        self.assertEqual(baselines.completed_repetitions(baselines.stored_baseline(self.model, 1, **kw)), 1)
+        cached_tlc(self.model, 1, Mock(return_value={'result': 'timeout', 'wall_s': 1800.0, 'exit': 124}),
+                   repetitions=3, min_repetitions=3, **kw)
+        still_one = baselines.stored_baseline(self.model, 1, **kw)
+        self.assertTrue(baselines.reusable(still_one))
+        self.assertEqual(baselines.completed_repetitions(still_one), 1)
+        # 4. Successful 3-sample upgrade replaces legacy 1-sample record cleanly.
+        samples = [dict(result='success', exit=0, distinct=10, wall_s=w, cpu_s=w) for w in (4.0, 6.0, 5.0)]
+        cached_tlc(self.model, 1, Mock(side_effect=samples), repetitions=3, min_repetitions=3, **kw)
+        upgraded = baselines.stored_baseline(self.model, 1, **kw)
+        self.assertEqual(baselines.completed_repetitions(upgraded), 3)
+        self.assertEqual(upgraded['measurement']['metrics']['wall_s'], 5.0)
+        # 5. Multi-sample timeout preserves timeout bound in evidence().
+        other = {'id': 'M2', 'tla': self.model['tla'], 'cfg': self.model['cfg']}
+        cached_tlc(other, 1, Mock(return_value={'result': 'timeout', 'wall_s': 1800.0, 'exit': 124}),
+                   repetitions=3, **kw)
+        to_entry = baselines.stored_baseline(other, 1, **kw)
+        self.assertEqual(store.evidence(to_entry['measurement'])[:2], (1, 1800.0))
+
+    def test_tlcbase_missing_classifies_bounds_honors_manifest_timeout_and_min_repetitions(self):
+        import argparse
+        import platform
+        import bench
+        from benchmarking.cli import parse_args
+        from benchmarking.commands import tlcbase
+        with self.assertRaises(SystemExit):
+            parse_args(['tlcbase', '--min-repetitions', '0'])
+        models = {}
+        for name in ('Unmeasured', 'BoundedTimeout', 'ShortTimeout', 'TlcError', 'LegacyOne', 'DoneThree'):
+            tla = self.root / f'{name}.tla'
+            cfg = self.root / f'{name}.cfg'
+            tla.write_text(f'---- MODULE {name} ----\n====\n')
+            cfg.write_text('INIT Init\n')
+            models[name] = {'id': name, 'tla': str(tla), 'cfg': str(cfg), 'source': 'fixture', 'tlc': {}}
+        kw = dict(root=self.root, version='v', instance='SA5.4XLARGE32')
+        cached_tlc(models['BoundedTimeout'], 1, Mock(return_value={'result': 'timeout', 'wall_s': 120.0, 'exit': 124}), **kw)
+        cached_tlc(models['ShortTimeout'], 1, Mock(return_value={'result': 'timeout', 'wall_s': 60.0, 'exit': 124}), **kw)
+        cached_tlc(models['TlcError'], 1, Mock(return_value={'result': 'error', 'wall_s': 1.0, 'exit': 255}), **kw)
+        cached_tlc(models['LegacyOne'], 1, Mock(return_value={'result': 'success', 'exit': 0, 'distinct': 5, 'wall_s': 2.0}), **kw)
+        samples3 = [dict(result='success', exit=0, distinct=5, wall_s=w) for w in (1.0, 2.0, 3.0)]
+        cached_tlc(models['DoneThree'], 1, Mock(side_effect=samples3), repetitions=3, **kw)
+        suite_timeouts = {'BoundedTimeout': 120, 'ShortTimeout': 300, 'Unmeasured': 240}
+        real_stored = baselines.stored_baseline
+        def lookup(m, w, **lk):
+            return real_stored(m, w, root=self.root, version=lk['version'], instance=lk['instance'])
+        def run_missing(*, min_repetitions=1, retry_incomplete=False, collect=False, timeout=None):
+            out_path = self.root / 'bench/history/missing.json'
+            a = argparse.Namespace(workers='1', missing=True, collect=collect, out=str(out_path),
+                                   force=False, timeout=timeout, slice='', instance_type='SA5.4XLARGE32',
+                                   min_repetitions=min_repetitions, tlc_repetitions=min_repetitions,
+                                   retry_incomplete=retry_incomplete)
+            calls = []
+            def fake_measured(m, w, t, **mkw):
+                calls.append((m['id'], w, t, mkw))
+                return {'result': 'success', 'distinct': 5, 'wall_s': 1.0, 'cpu_s': 1.0, 'maxrss_mib': 10.0}
+            with patch.object(bench, 'tlcbase_models', return_value=models), \
+                 patch.object(tlcbase, '_suite_timeouts', return_value=suite_timeouts), \
+                 patch.object(baselines, 'stored_baseline', side_effect=lookup), \
+                 patch.object(bench_machine, 'tla2tools_info', return_value={'revision': 'v', 'short': 'v'}), \
+                 patch.object(bench_machine, 'machine_desc', return_value=f'{platform.machine()} SA5.4XLARGE32'), \
+                 patch.object(bench_machine, 'jvm_info', return_value={}), \
+                 patch.object(bench_machine, 'git_commit', return_value='fixture'), \
+                 patch.object(bench, 'tlc_measured', side_effect=fake_measured), \
+                 patch.object(legacy, 'ingest'), \
+                 contextlib.redirect_stdout(io.StringIO()) as buf:
+                bench.cmd_tlcbase(a)
+            return buf.getvalue(), calls
+        # Default (min_repetitions=1): Unmeasured + ShortTimeout (60 < 300) are unmeasured/stale;
+        # BoundedTimeout (120 >= 120) is bounded-timeout; TlcError is tlc-error; LegacyOne & DoneThree satisfied.
+        text, calls = run_missing(collect=True)
+        self.assertIn('2 unmeasured/stale, 1 bounded-timeout, 1 tlc-error', text)
+        self.assertEqual([(mid, t) for mid, _, t, _ in calls], [('Unmeasured', 240), ('ShortTimeout', 300)])
+        # --min-repetitions 3 also flags LegacyOne (1 < 3) using non-suite default timeout 1800s.
+        text3, calls3 = run_missing(min_repetitions=3, collect=True)
+        self.assertIn('3 unmeasured/stale, 1 bounded-timeout, 1 tlc-error', text3)
+        self.assertEqual([(mid, t, mkw['min_repetitions'], mkw['repetitions']) for mid, _, t, mkw in calls3],
+                         [('Unmeasured', 240, 3, 3), ('ShortTimeout', 300, 3, 3), ('LegacyOne', 1800, 3, 3)])
+        # --retry-incomplete includes BoundedTimeout and TlcError too, and explicit --timeout overrides manifest.
+        text_retry, calls_retry = run_missing(retry_incomplete=True, collect=True, timeout=900)
+        self.assertIn('--retry-incomplete', text_retry)
+        self.assertEqual([(mid, t) for mid, _, t, _ in calls_retry],
+                         [('Unmeasured', 900), ('BoundedTimeout', 900), ('ShortTimeout', 900), ('TlcError', 900)])
+
+    def test_cmd_tlcbase_timeout_and_error_survive_real_ingest_and_history_archive(self):
+        # End-to-end: cmd_tlcbase -> real cached_tlc -> real legacy.ingest must
+        # keep every persisted timeout/error self-owned with full raw_result,
+        # never racing the history copy on SHA-256 id ties.
+        import argparse
+        import platform
+        import bench
+        from benchmarking.commands import tlcbase
+        models = {}
+        outcomes = {}
+        for i in range(10):
+            for kind in ('Timeout', 'Error'):
+                name = f'M_{kind}_{i}'
+                tla = self.root / f'{name}.tla'
+                cfg = self.root / f'{name}.cfg'
+                tla.write_text(f'---- MODULE {name} ----\n====\n')
+                cfg.write_text('INIT Init\n')
+                models[name] = {'id': name, 'tla': str(tla), 'cfg': str(cfg), 'source': 'fixture', 'tlc': {}}
+                if kind == 'Timeout':
+                    outcomes[name] = {'result': 'timeout', 'wall_s': 1800.0, 'cpu_s': 1790.0, 'exit': 124,
+                                      'at_timeout': {'distinct': 100 + i}, 'tlc_memory': '4096MB heap'}
+                else:
+                    outcomes[name] = {'result': 'error', 'wall_s': 1.5, 'cpu_s': 1.0, 'exit': 255,
+                                      'error': f'semantic error {i}', 'tlc_memory': '4096MB heap'}
+        (self.root / 'bench/suite.json').write_text(json.dumps({'models': [{'id': k} for k in models]}))
+        out_path = self.root / 'bench/history/tlc-incomplete.json'
+        args = argparse.Namespace(workers='1', missing=False, collect=False, out=str(out_path),
+                                  force=False, timeout=1800, slice='', tlc_repetitions=1)
+        real_cached = baselines.cached_tlc
+        real_ingest = legacy.ingest
+        with patch.object(bench, 'tlcbase_models', return_value=models), \
+             patch.object(bench_machine, 'machine_desc', return_value=f'{platform.machine()} SA5.4XLARGE32'), \
+             patch.object(bench_machine, 'tla2tools_info', return_value={'revision': 'v', 'short': 'v'}), \
+             patch.object(bench_machine, 'jvm_info', return_value={}), \
+             patch.object(bench_machine, 'git_commit', return_value='fixture'), \
+             patch.object(baselines, 'cached_tlc',
+                          side_effect=lambda m, w, fn, **kw: real_cached(m, w, fn, root=self.root, version='v',
+                                                                         instance='SA5.4XLARGE32', **kw)), \
+             patch.object(tlcbase, '_collect_tlc_measured', side_effect=lambda m, w, t, *_: dict(outcomes[m['id']])), \
+             patch.object(legacy, 'ingest', side_effect=lambda p: real_ingest(p, self.root)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bench.cmd_tlcbase(args)
+        stored = load_records(self.root)
+        self.assertEqual(len(stored), 20)
+        for row in stored:
+            self.assertTrue(row['provenance']['source'].startswith('bench/tlc-baselines/'), row['provenance'])
+            self.assertNotIn('reused_from', row['provenance'])
+            self.assertEqual(row['raw_result']['tlc_memory'], '4096MB heap')
+            if row['counts']['result'] == 'timeout':
+                self.assertIn('at_timeout', row['raw_result'])
+            else:
+                self.assertIn('error', row['raw_result'])
+        br.generate(self.root)
+        self.assertEqual(br.check(self.root, sources=True), [])
+        # Archiving (removing) the raw history file keeps all 20 self-owned bounds valid.
+        out_path.unlink()
+        self.assertEqual(br.check(self.root, sources=True), [])
+        self.assertEqual(len(migrate(self.root)), 20)
 
     def test_source_sync_rejects_relabelled_execution_mode(self):
         (self.root / 'bench/suite.json').write_text(json.dumps({'models': []}))

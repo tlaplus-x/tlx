@@ -207,14 +207,14 @@ def evidence(r):
     not the date, states how much the tool needed: 14400 s says more than
     1800 s of it.
     """
-    if (r.get('provenance') or {}).get('count_problems'):
-        return (0, 0.0, r.get('date') or '')
     result = (r.get('counts') or {}).get('result')
     wall = (r.get('metrics') or {}).get('wall_s')
-    if result in COMPLETE and wall:
-        return (2, 0.0, r.get('date') or '')
     if result == 'timeout':
         return (1, wall or 0.0, r.get('date') or '')
+    if (r.get('provenance') or {}).get('count_problems'):
+        return (0, 0.0, r.get('date') or '')
+    if result in COMPLETE and wall:
+        return (2, 0.0, r.get('date') or '')
     return (0, 0.0, r.get('date') or '')
 
 
@@ -340,10 +340,11 @@ def receipt_revisions(root=ROOT):
 
     A receipt names the artifact it wrote with `--out`, and its `bench_bins`
     state the revision of each external binary the launch fetched. An artifact's
-    `--bin LABEL=PATH` whose PATH sits under `bench-bins/<name>/` is that
-    binary, so LABEL adopts <name>'s revision. Only a revision the receipt's
-    `bench_bins` carries is adopted, never the runner checkout's own revision:
-    a variant the receipt does not pin stays unknown (HARNESS-19)."""
+    `--bin LABEL=PATH`, bare `--bin PATH` (variant `'new'`), or `--base-bin PATH`
+    (variant `'base'`) whose PATH sits under `bench-bins/<name>/` is that
+    binary, so that variant adopts `<name>`'s revision. Only a revision the
+    receipt's `bench_bins` carries is adopted, never the runner checkout's own
+    revision: an unreceipted external binary stays unknown (`None`, HARNESS-19)."""
     found = {}
     for receipt in sorted((Path(root) / 'target' / 'bench').glob('*/cloud.json')):
         try:
@@ -364,17 +365,44 @@ def receipt_revisions(root=ROOT):
                     target = token.partition('=')[2]
             if not target:
                 continue
+            target = Path(target).as_posix()
             revs = {}
             for i, token in enumerate(tokens):
-                if token != '--bin' or i + 1 >= len(tokens):
+                if token == '--bin' and i + 1 < len(tokens):
+                    arg, bare_label = tokens[i + 1], 'new'
+                elif token.startswith('--bin='):
+                    arg, bare_label = token.partition('=')[2], 'new'
+                elif token == '--base-bin' and i + 1 < len(tokens):
+                    arg, bare_label = tokens[i + 1], 'base'
+                elif token.startswith('--base-bin='):
+                    arg, bare_label = token.partition('=')[2], 'base'
+                else:
                     continue
-                label, _, path = tokens[i + 1].partition('=')
+                if bare_label == 'new' and '=' in arg:
+                    label, _, path = arg.partition('=')
+                    is_bare = False
+                else:
+                    label, path, is_bare = bare_label, arg, True
                 name = re.search(r'(?:^|/)bench-bins/([^/]+)/', path)
                 if label and name and name.group(1) in pinned:
                     revs[label] = pinned[name.group(1)]
+                elif is_bare and label and path:
+                    revs[label] = None
             if revs:
                 found[target] = (receipt.parent.name, revs)
     return found
+
+
+def apply_receipt(header, source, receipts):
+    """Merge cloud-receipt `bench_bins` provenance for `source` into `header`."""
+    if not isinstance(header, dict) or source not in receipts:
+        return header
+    name, revs = receipts[source]
+    merged = dict(header.get('bin_revs') or {})
+    for k, v in revs.items():
+        if v is not None or k not in merged:
+            merged[k] = v
+    return {**header, 'bin_revs': merged, 'bin_revs_receipt': name}
 
 
 # The archive locator: an artifact removed from the working tree stays readable
@@ -527,10 +555,16 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
         r['provenance']['reused_from'] = raw['baseline_id']
     if raw.get('metric_sources'):
         r['provenance']['metric_sources'] = raw['metric_sources']
+    sample_lists = {k: raw[k] for k in ('samples', 'warmups')
+                    if isinstance(raw.get(k), list) and all(isinstance(x, dict) for x in raw[k])}
     if isinstance(raw.get('raw_result'), dict):
-        r['raw_result'] = raw['raw_result']
+        r['raw_result'] = {**sample_lists, **raw['raw_result']}
     elif 'tlc_samples' in raw:
         r['raw_result'] = {k: v for k, v in raw.items() if k != 'raw_result'}
+    elif sample_lists or isinstance(raw.get('violated'), str):
+        r['raw_result'] = dict(sample_lists)
+    if 'raw_result' in r and 'violated' not in r['raw_result'] and isinstance(raw.get('violated'), str):
+        r['raw_result']['violated'] = raw['violated']
     # Coverage attributes belong in the same row as the timing they describe:
     # they are only comparable for the run that produced them. A run without a
     # census leaves them absent, so that "unmeasured" never reads as a share of
@@ -552,13 +586,18 @@ def normalize(header, raw, source, pointer, *, model=None, mode=None, workers=No
     # HARNESS-19: a variant label never identifies the measured binary. A
     # revision is adopted only when the artifact states it (`bin_revs`, or a
     # legacy top-level key); otherwise it stays unknown, however the row is
-    # labelled.
-    supplied, source_of = supplied_revision(header, variant)
-    if variant and r['tool'] == 'tlx' and source.endswith('.json') and revision is None:
+    # labelled. For bare `--bin` suite runs, `bin_revs['new']` overrides the
+    # runner checkout's `commit` (including `None` for unreceipted binaries).
+    revs = header.get('bin_revs') if isinstance(header.get('bin_revs'), dict) else {}
+    effective_variant = variant if variant else ('new' if 'new' in revs else None)
+    supplied, source_of = supplied_revision(header, effective_variant)
+    if effective_variant and r['tool'] == 'tlx' and source.endswith('.json') and revision is None:
         r['revision'] = supplied
     if variant in ('base', 'before'):
-        r['revision'] = supplied if supplied is not None else (
-            header['base'].get('commit') if isinstance(header.get('base'), dict) else None)
+        base_commit = header['base'].get('commit') if isinstance(header.get('base'), dict) else None
+        if base_commit == 'unknown':
+            base_commit = None
+        r['revision'] = supplied if supplied is not None else base_commit
     if supplied is not None and r['revision'] == supplied:
         r['provenance']['revision_source'] = source_of
     r['id'] = digest([source, pointer])[:24]

@@ -97,7 +97,7 @@ usage:
       the usage that replaces it (bench.py run / suite / track) instead of
       being silently ignored.
   scripts/bench.py tlcbase [--models id,...] [--filter S] [--slice I/N] [--workers 1,16]
-                           [--no-large] [--timeout 1800] [--force] [--out FILE]
+                           [--no-large] [--timeout S] [--min-repetitions N] [--retry-incomplete] [--force] [--out FILE]
       The TLC baseline: TLC alone on every corpus model (corpus/out/tlc.json
       plus the large tier of the manifests, runtime 61-700s, which has no
       oracle), once per worker count, one JVM at a time, as the oracle runs

@@ -197,8 +197,10 @@ def build_parser(description=None, prog=None):
     p.add_argument("--no-tier-columns", action="store_true", help=retired)
     p = sub.add_parser("tlcbase")
     p.add_argument("--tlc-repetitions", type=int, default=1, help="samples for a new TLC baseline; existing valid keys are reused")
+    p.add_argument("--min-repetitions", type=int, default=1, help="minimum completed samples required to treat a stored baseline as satisfied (default 1)")
     p.add_argument("--instance-type", default="", help="target baseline instance for --missing inventory (collection requires this actual instance)")
     p.add_argument("--missing", action="store_true", help="list exactly missing/stale baseline keys, without running TLC")
+    p.add_argument("--retry-incomplete", action="store_true", help="with --missing, include already-bounded timeouts and stored TLC errors")
     p.add_argument("--collect", action="store_true", help="with --missing, collect only the listed missing keys")
     p.add_argument("--models", default="", help="comma-separated ids (default: every model, see --no-large)")
     p.add_argument("--filter", default="", help="only models whose id contains this substring")
@@ -207,7 +209,7 @@ def build_parser(description=None, prog=None):
     p.add_argument("--no-large", action="store_true", help="only the models of corpus/out/tlc.json")
     p.add_argument("--large-min", type=int, default=61, help="large tier: manifest runtime at least S seconds (default 61)")
     p.add_argument("--large-max", type=int, default=700, help="large tier: manifest runtime at most S seconds (default 700)")
-    p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timeout", type=int, default=None, help="per-run TLC timeout in seconds (default: suite manifest timeout_s, else 1800)")
     p.add_argument("--force", action="store_true", help="measure again the runs already in --out")
     p.add_argument("--out", default="", help="baseline file (default bench/history/tlc-<tla2tools rev>[-sliceIofN].json)")
     p = sub.add_parser("tlcbase-merge")
@@ -253,4 +255,6 @@ def parse_args(argv, description=None, prog=None):
     args = ap.parse_args(argv)
     if getattr(args, "tlc_repetitions", 1) < 1:
         ap.error("--tlc-repetitions must be positive")
+    if getattr(args, "min_repetitions", 1) < 1:
+        ap.error("--min-repetitions must be positive")
     return ap, args

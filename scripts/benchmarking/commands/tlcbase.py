@@ -24,6 +24,46 @@ TLCBASE_KIND = "tlc-baseline"
 # TLC prints "Finished in <ms>ms" with this property (human-readable minutes and
 # seconds otherwise); it changes nothing else.
 TLC_MS_PROP = "-Dtlc2.TLC.asMilliSeconds=true"
+DEFAULT_TIMEOUT_S = 1800
+
+
+def _suite_timeouts():
+    """Map suite model ids to their manifest `timeout_s`, or {} if manifest is absent."""
+    from benchmarking.bench_suite import SUITE, load_manifest
+    if not os.path.isfile(SUITE):
+        return {}
+    return {m["id"]: m["timeout_s"] for m in load_manifest(SUITE)["models"]}
+
+
+def model_timeout(mid, explicit_timeout, suite_timeouts=None):
+    """Per-model TLC timeout: explicit --timeout, else manifest timeout_s, else 1800s."""
+    if explicit_timeout is not None:
+        return explicit_timeout
+    if suite_timeouts is None:
+        suite_timeouts = _suite_timeouts()
+    return suite_timeouts.get(mid, DEFAULT_TIMEOUT_S)
+
+
+def classify_baseline(entry, *, timeout, min_repetitions=1):
+    """Classify a stored TLC baseline entry for `tlcbase --missing`.
+
+    Returns `'satisfied'` (reusable with >= `min_repetitions` samples),
+    `'bounded-timeout'` (stored timeout whose measured `wall_s >= timeout`),
+    `'tlc-error'` (stored non-reusable `error`), or `'unmeasured'`.
+    """
+    from benchmarking.baselines import completed_repetitions, reusable
+    if entry is None:
+        return "unmeasured"
+    if reusable(entry):
+        return "satisfied" if completed_repetitions(entry) >= min_repetitions else "unmeasured"
+    m = entry["measurement"]
+    result = (m.get("counts") or {}).get("result")
+    if result == "timeout":
+        wall = (m.get("metrics") or {}).get("wall_s") or 0
+        return "bounded-timeout" if wall >= timeout else "unmeasured"
+    if result == "error":
+        return "tlc-error"
+    return "unmeasured"
 
 
 
@@ -67,7 +107,10 @@ def tlcbase_models(a):
         i, n = (int(x) for x in a.slice.split("/"))
         if not 1 <= i <= n:
             sys.exit(f"--slice expects I/N with 1 <= I <= N, got {a.slice}")
-        keys = tlcbase_slices({k: ms[k] for k in keys}, n, a.timeout, workers_list(a.workers))[i - 1]
+        timeout = a.timeout if a.timeout is not None else DEFAULT_TIMEOUT_S
+        suite_timeouts = None if a.timeout is not None else _suite_timeouts()
+        keys = tlcbase_slices({k: ms[k] for k in keys}, n, timeout, workers_list(a.workers),
+                              timeouts=suite_timeouts)[i - 1]
     return {k: ms[k] for k in keys}
 
 
@@ -84,16 +127,19 @@ def tlcbase_estimate(m, timeout, workers):
 
 
 
-def tlcbase_slices(ms, n, timeout, workers):
+def tlcbase_slices(ms, n, timeout, workers, *, timeouts=None):
     """`ms` ({id: model}) split into `n` lists of about equal estimated time
     (longest first onto the least loaded slice; deterministic), each in id
     order."""
     slices = [[] for _ in range(n)]
     load = [0.0] * n
-    for k in sorted(ms, key=lambda k: (-tlcbase_estimate(ms[k], timeout, workers), k)):
+    def est(k):
+        t = timeouts.get(k, timeout) if timeouts else timeout
+        return tlcbase_estimate(ms[k], t, workers)
+    for k in sorted(ms, key=lambda k: (-est(k), k)):
         i = min(range(n), key=lambda j: (load[j], j))
         slices[i].append(k)
-        load[i] += tlcbase_estimate(ms[k], timeout, workers)
+        load[i] += est(k)
     return [sorted(s) for s in slices]
 
 
@@ -152,7 +198,7 @@ def _collect_tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True):
 
 
 
-def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True, *, repetitions=1):
+def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True, *, repetitions=1, min_repetitions=1):
     """One measured TLC run, cached under the baseline key.
 
     `jvm_extra` is the heap/direct-memory the caller asked for, and it is what
@@ -163,7 +209,8 @@ def tlc_measured(m, workers, timeout, jvm_extra=(), default_heap=True, *, repeti
     from benchmarking.baselines import cached_tlc
     keyed = {**m, "measurement_constraints": list(jvm_extra)} if jvm_extra else m
     return cached_tlc(keyed, workers,
-                      lambda: _collect_tlc_measured(m, workers, timeout, jvm_extra, default_heap), repetitions=repetitions)
+                      lambda: _collect_tlc_measured(m, workers, timeout, jvm_extra, default_heap),
+                      repetitions=repetitions, min_repetitions=min_repetitions)
 
 
 
@@ -178,48 +225,80 @@ def accepted_timing(run):
 
 def cmd_tlcbase(a):
     import bench
+    from benchmarking import baselines
     from tlc import JVM_OPTS
     ws = workers_list(a.workers)
     ms = bench.tlcbase_models(a)
+    suite_timeouts = {} if a.timeout is not None else _suite_timeouts()
+    min_reps = getattr(a, "min_repetitions", 1)
+    retry_incomplete = getattr(a, "retry_incomplete", False)
+    reps = max(getattr(a, "tlc_repetitions", 1), min_reps)
+    selected = None
     if a.missing:
-        from benchmarking.baselines import find_baseline
         from benchmarking.records import instance_info
         version = bench_machine.tla2tools_info().get("revision") or bench_machine.tla2tools_info().get("short")
         actual_instance = instance_info(bench_machine.machine_desc())["type"]
         instance = getattr(a, "instance_type", "") or actual_instance
         if a.collect and instance != actual_instance:
             sys.exit("baseline collection instance differs from --instance-type; collect on the target cloud instance")
-        missing = [(k, w) for k, m in ms.items() for w in ws
-                   if not find_baseline(m, w, version=version, instance=instance)]
-        for k, w in missing:
+        unmeasured, bounded_timeouts, tlc_errors = [], [], []
+        for k, m in ms.items():
+            target_timeout = model_timeout(k, a.timeout, suite_timeouts)
+            for w in ws:
+                b = baselines.stored_baseline(m, w, version=version, instance=instance)
+                status = classify_baseline(b, timeout=target_timeout, min_repetitions=min_reps)
+                if status == "unmeasured":
+                    unmeasured.append((k, w))
+                elif status == "bounded-timeout":
+                    bounded_timeouts.append((k, w))
+                elif status == "tlc-error":
+                    tlc_errors.append((k, w))
+        if retry_incomplete:
+            wanted = set(unmeasured) | set(bounded_timeouts) | set(tlc_errors)
+            to_collect = [(k, w) for k in ms for w in ws if (k, w) in wanted]
+        else:
+            to_collect = unmeasured
+        for k, w in to_collect:
             print(f"missing/stale: {k} {w}w TLC {version} {instance}")
-        print(f"{len(missing)} missing/stale baseline keys")
-        if not a.collect:
+        summary = f"{len(unmeasured)} unmeasured/stale, {len(bounded_timeouts)} bounded-timeout, {len(tlc_errors)} tlc-error"
+        if retry_incomplete:
+            print(f"{len(to_collect)} baseline keys to collect ({summary}; --retry-incomplete)")
+        else:
+            print(summary)
+        selected = set(to_collect)
+        if not a.collect or not selected:
             return
     name = f"tlc-{bench_machine.tla2tools_info().get('short') or 'unknown'}" + (f"-slice{a.slice.replace('/', 'of')}" if a.slice else "")
     out = a.out or os.path.join(bench.HISTORY, name + ".json")
     h = bench.read_json(out, {})
     if h and h.get("kind") != TLCBASE_KIND:
         sys.exit(f"{out} is not a TLC baseline file")
+    header_timeout = (a.timeout if a.timeout is not None
+                      else max((model_timeout(k, None, suite_timeouts) for k in ms), default=DEFAULT_TIMEOUT_S))
     h.update({"kind": TLCBASE_KIND, "date": h.get("date") or time.strftime("%Y-%m-%d %H:%M:%S"), "machine": bench_machine.machine_desc(),
               "bench_machine": os.environ.get("TLX_BENCH_MACHINE", ""), "commit": bench_machine.git_commit(), "tla2tools": bench_machine.tla2tools_info(),
               "community_modules_sha256": bench_machine.sha256_short(os.path.join(TP, "community", "modules.jar")),
               "jvm": {**bench_machine.jvm_info(), "options": JVM_OPTS + [TLC_MS_PROP], "heap": "jvm-default",
                       "note": "no -Xmx and no -fpmem: the JVM's default max heap and TLC's default fpmem, as the oracle"},
-              "timeout_s": a.timeout, "workers": ws, "slice": a.slice or None})
+              "timeout_s": header_timeout, "workers": ws, "slice": a.slice or None})
     models = h.setdefault("models", {})
-    print(f"TLC baseline on {h['machine']}: {len(ms)} models, workers {','.join(map(str, ws))}, timeout {a.timeout}s -> "
+    model_count = len({k for k, _ in selected}) if selected is not None else len(ms)
+    print(f"TLC baseline on {h['machine']}: {model_count} models, workers {','.join(map(str, ws))}, timeout {header_timeout}s -> "
           f"{os.path.relpath(out, ROOT)}", flush=True)
     for k, m in ms.items():
+        ws_for_model = [w for w in ws if selected is None or (k, w) in selected]
+        if not ws_for_model:
+            continue
+        timeout = model_timeout(k, a.timeout, suite_timeouts)
         rec = models.setdefault(k, {})
         rec.update({"source": m["source"], "flags": m.get("flags") or [],
                     "oracle": {x: m["tlc"].get(x) for x in ("result", "violated", "distinct", "generated", "depth", "wall_s")} if m.get("tlc") else None,
                     "manifest": {"runtime": m.get("runtime"), "result": m.get("result"), "distinct": m.get("distinct"), "total": m.get("total")}})
         runs = rec.setdefault("runs", {})
-        for w in ws:
+        for w in ws_for_model:
             # Never trust a raw history row to decide freshness; tlc_measured
             # reuses the canonical key or collects this stale/missing key once.
-            r = bench.tlc_measured(m, w, a.timeout, repetitions=getattr(a, "tlc_repetitions", 1))
+            r = bench.tlc_measured(m, w, timeout, repetitions=reps, min_repetitions=min_reps)
             r.setdefault("date", time.strftime("%Y-%m-%d %H:%M:%S"))
             runs[str(w)] = r
             print(f"  {k:<60} {w:>2}w {r['result']:<16} {str(r.get('distinct', '-')):>10} wall {metric_text(r.get('wall_s'))}s "
