@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cloud import cloud_common
 from cloud import cloud_tencent
+from cloud import remote as cloud_remote
 import cloud_verify as cv
 import testkit
 from cloud.cloud_common import CloudStop, Offer, SkipOffer, SlotHolder
@@ -21,6 +22,9 @@ from cloud.cloud_common import CloudStop, Offer, SkipOffer, SlotHolder
 FAKE_CONFIG = {"tencent": {"arn": "qcs::cam:100000000001:uin/100000000002", "profile": "tlx-test",
                            "selfterm_role": "tlx-verify-selfterm", "spot_instance_quota": 3}}
 OFFER = Offer(0.16, "ap-shanghai", "ap-shanghai-5", "SA5.4XLARGE32", 16)
+OFFER2 = Offer(0.17, "ap-shanghai", "ap-shanghai-8", "SA5.4XLARGE32", 16)
+PRICEY = Offer(3.0, "ap-shanghai", "ap-shanghai-5", "SA5.4XLARGE32", 16)
+PRICEY_NEXT = Offer(3.1, "ap-shanghai", "ap-shanghai-8", "SA5.4XLARGE32", 16)
 
 
 def holders(*owners, state="RUNNING", market="spot"):
@@ -71,6 +75,30 @@ class FakeProvider:
 class Machine:
     def __init__(self, offer=OFFER):
         self.offer, self.id, self.token = offer, None, None
+
+
+class DeadBootProvider(FakeProvider):
+    """Every offer launches a new instance; the `dead` ones reach RUNNING but
+    never answer ssh, as when a spot boot's cloud-init hangs."""
+
+    def __init__(self, *args, dead=("ins-1",), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dead = set(dead)
+        self.terminated = []
+
+    def launch(self, m, ips, fresh, minutes, arch):
+        self.run_instances.append(m.offer)
+        self.checkpoint()
+        m.id = f"ins-{len(self.run_instances)}"
+
+    def wait_ready(self, m):
+        if m.id in self.dead:
+            raise cloud_common.InfraError("ssh did not come up (ports 22, 443, 2222)")
+        m.ip = "192.0.2.1"
+
+    def terminate(self, m):
+        self.terminated.append(m.id)
+        return True
 
 
 class LedgerCase(testkit.GuardedTestCase):
@@ -427,7 +455,7 @@ class Share(LedgerCase):
         with mock.patch.dict(os.environ, {cloud_common.CONFIG_ENV: Counting.config(self, spot_instance_quota=10)}), \
              mock.patch.object(cv, "current_owner", return_value="worker"), \
              mock.patch.object(cv, "LaunchLedger", return_value=self.ledger), \
-             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok")), \
+             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok", True)), \
              mock.patch.object(cv, "make_provider", return_value=provider), \
              mock.patch.object(cv, "local_toolchain", return_value="1.0.0"), \
              mock.patch.object(cv, "log", side_effect=lines.append), \
@@ -583,7 +611,7 @@ class CancelCheckpoints(LedgerCase):
 
         def clippy(*args, **kw):
             cv.Cancel.request(cancel.path)   # the cancel arrives while the preflight runs
-            return True, "prelaunch clippy passed"
+            return True, "prelaunch clippy passed", True
         with mock.patch.object(cv, "current_owner", return_value="worker"), \
              mock.patch.object(cv, "LaunchLedger", return_value=self.ledger), \
              mock.patch.object(cv, "clippy_preflight", side_effect=clippy), \
@@ -896,6 +924,103 @@ class ZoneQuotaRetry(LedgerCase):
         self.assertEqual(offer.zone, "ap-shanghai-8")
 
 
+class DeadBootRelease(LedgerCase):
+    """A launch whose instance never answers ssh must not keep its grant or be
+    charged the whole unrun `max_minutes`: the same owner launches the next
+    offer, and `check` refuses a >60-minute launch without an unconsumed grant
+    (2026-11-28: the retry of a dead spot boot died on exit 25)."""
+
+    def test_a_dead_boot_returns_its_grant_and_pays_only_for_the_time_it_lived(self):
+        self.ledger.grant("worker", "external campaign shard", minutes=180)
+        provider = FakeProvider([holders("other")])
+        admitter, _, _ = self.admitter(provider)
+        a = self.args("--max-minutes", "180")
+        a.min_lifetime_minutes = provider.min_lifetime_minutes
+        entry = self.launch(provider, admitter, a)
+        self.assertEqual(next(r for r in self.rows() if r.get("grant"))["consumed_by"], entry["time"])
+        self.assertAlmostEqual(entry["estimated_cost"], 0.16 * 180 / 60)
+
+        self.assertTrue(self.ledger.release_dead_boot("worker", entry["time"], entry["instance"]))
+
+        rows = self.rows()
+        grant = next(r for r in rows if r.get("grant"))
+        row = next(r for r in rows if not r.get("grant"))
+        self.assertNotIn("consumed_by", grant)          # available to the retry
+        self.assertEqual(self.ledger.available_grant(rows, "worker", 180)["minutes"], 180)
+        self.assertTrue(row["grant_returned"])
+        self.assertTrue(row["dead_boot"])
+        self.assertIn("released", row)
+        self.assertEqual((row["status"], row["instance"]), ("launched", "ins-new"))   # still evidence
+        # The 7-minute provider minimum, not the 180 minutes it never ran.
+        self.assertAlmostEqual(row["estimated_cost"], 0.16 * 7 / 60)
+
+    def test_the_release_is_a_no_op_for_a_row_that_is_not_this_launch(self):
+        self.ledger.write([{"owner": "worker", "time": 1.0, "instance": "ins-old", "status": "launched",
+                            "provider": "tencent", "estimated_cost": 1.0}])
+        self.assertFalse(self.ledger.release_dead_boot("worker", 2.0, "ins-new"))
+        self.assertNotIn("released", self.rows()[0])
+
+
+class DeadBootRetry(LedgerCase):
+    """The retry of a dead first boot passes the same budget checks as the
+    launch it replaces: a >60-minute grant and the 12 h CNY cap."""
+
+    def provider(self, offers):
+        provider = DeadBootProvider([holders("other")])
+        provider.currency, provider.label_suffix = "CNY", "fake"
+        provider.check_account = lambda: "qcs::cam:100000000001:uin/100000000002 (CAMUser)"
+        provider.offers = lambda types, arch, regions: list(offers)
+        provider.mainland = lambda region: True
+        provider.public_ips = lambda proxy: ["192.0.2.1"]
+        provider.terminate_hint = lambda m: "terminate it"
+        provider.leftovers = lambda regions, owner=None: []
+        return provider
+
+    def run_boot(self, provider, *argv):
+        """`run_checked` up to and including boot; the passes are stubbed so the
+        retry itself is what the test observes."""
+        with mock.patch.dict(os.environ, {cloud_common.CONFIG_ENV: Counting.config(self)}), \
+             mock.patch.object(cv, "current_owner", return_value="worker"), \
+             mock.patch.object(cv, "LaunchLedger", return_value=self.ledger), \
+             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok", True)), \
+             mock.patch.object(cv, "make_provider", return_value=provider), \
+             mock.patch.object(cv, "ensure_local_key", return_value=False), \
+             mock.patch.object(cv, "local_toolchain", return_value="1.0.0"), \
+             mock.patch.object(cloud_common.Machine, "wait_ssh", lambda self, timeout=300, **kw: None), \
+             mock.patch.object(cloud_remote, "prepare"), \
+             mock.patch.object(cloud_remote, "passes", lambda session: setattr(session, "rc", 0)), \
+             mock.patch("builtins.print"):
+            return cv.run_checked(self.args(*argv), cv.Cancel(os.path.join(self.dir, "c")))
+
+    def test_a_dead_first_boot_returns_the_grant_and_the_next_offer_launches(self):
+        self.ledger.grant("worker", "external campaign shard", minutes=180)
+        provider = self.provider([OFFER, OFFER2])
+        rc = self.run_boot(provider, "--quick", "--max-minutes", "180")
+        self.assertEqual(rc, 0)                                    # offer 2 launched, not exit 25
+        self.assertEqual(provider.run_instances, [OFFER, OFFER2])
+        self.assertEqual(provider.terminated, ["ins-1", "ins-2"])  # the dead boot, then cleanup
+        rows = self.rows()
+        grant = next(r for r in rows if r.get("grant"))
+        dead = next(r for r in rows if r.get("dead_boot"))
+        live = next(r for r in rows if r.get("instance") == "ins-2")
+        self.assertEqual(grant["consumed_by"], live["time"])        # the retry took it
+        self.assertTrue(dead["grant_returned"])
+        self.assertLess(dead["estimated_cost"], 0.16 * 180 / 60)
+        self.assertEqual(dead["instance"], "ins-1")
+
+    def test_a_dead_first_boot_is_not_charged_its_whole_max_minutes_against_the_cap(self):
+        # $3/h x 60 min twice would be 6 CNY against the 5 CNY base cap; the
+        # dead VM lived seconds, so only the 7-minute minimum is charged and the
+        # second offer fits.
+        provider = self.provider([PRICEY, PRICEY_NEXT])
+        rc = self.run_boot(provider, "--quick", "--max-minutes", "60")
+        self.assertEqual(rc, 0)
+        rows = self.rows()
+        dead = next(r for r in rows if r.get("dead_boot"))
+        self.assertAlmostEqual(dead["estimated_cost"], 3.0 * 7 / 60)
+        self.assertEqual(len(rows), 2)
+
+
 class EndToEnd(LedgerCase):
     def test_a_run_reserves_launches_terminates_and_releases_its_slot(self):
         provider = FakeProvider([holders("other")])
@@ -914,7 +1039,7 @@ class EndToEnd(LedgerCase):
         with mock.patch.dict(os.environ, {cloud_common.CONFIG_ENV: Counting.config(self)}), \
              mock.patch.object(cv, "current_owner", return_value="worker"), \
              mock.patch.object(cv, "LaunchLedger", return_value=self.ledger), \
-             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok")), \
+             mock.patch.object(cv, "clippy_preflight", return_value=(True, "ok", True)), \
              mock.patch.object(cv, "make_provider", return_value=provider), \
              mock.patch.object(cv, "ensure_local_key", return_value=False), \
              mock.patch.object(cv, "local_toolchain", return_value="1.0.0"), \

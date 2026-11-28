@@ -870,8 +870,28 @@ class Scripts(unittest.TestCase):
 
     def test_rust_mirror(self):
         s = rust_script("mirror", "1.93.0", "arm64")
-        self.assertIn("export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup\n", s)
-        self.assertIn("curl -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y -q --profile minimal --default-toolchain 1.93.0", s)
+        self.assertIn("export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup", s)
+        self.assertIn("curl -sSfL https://rsproxy.cn/rustup-init.sh -o \"$init\"", s)
+
+    def test_rust_mirror_requires_a_nonempty_file_and_falls_back_upstream(self):
+        # rsproxy.cn once served a 0-byte rustup-init.sh: `curl | sh` read that
+        # as success and installed nothing, and the setup died on the missing
+        # ~/.cargo/env with no hint of the mirror (2026-11-28).
+        s = rust_script("mirror", "1.93.0", "arm64")
+        mirror = s.index("curl -sSfL https://rsproxy.cn/rustup-init.sh -o \"$init\"")
+        self.assertLess(mirror, s.index('[ -s "$init" ]'))
+        self.assertLess(s.index('[ -s "$init" ]'), s.index("sh \"$init\""))
+        self.assertIn("WARNING (not a stop condition): https://rsproxy.cn/rustup-init.sh failed", s)
+        fallback = s.index("curl -sSfL https://sh.rustup.rs -o \"$init\"")
+        self.assertLess(mirror, fallback)
+        # The fallback installs from upstream, and the environment it writes
+        # must not send a later rustup back to the mirror that just failed.
+        self.assertLess(s.index("env_exports=''"), fallback)
+        self.assertLess(s.index("unset RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT"), fallback)
+        self.assertIn("env_exports=\"$mirror_exports\"", s)
+        # `set -e` + an `&&` list: a mirror failure is the condition of the
+        # fallback, never a masked pipeline's last command.
+        self.assertNotIn("| sh -s --", s)
 
     def test_rust_upstream_and_upload(self):
         self.assertIn("https://sh.rustup.rs", rust_script("upstream", "1.93.0", "x86_64"))
@@ -909,13 +929,91 @@ class Bench(unittest.TestCase):
         self.assertIn("rm -f corpus/out/bench-tlc.json", s)
         clippy = "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1"
         self.assertIn(clippy, s)
-        self.assertLess(s.index(clippy), s.index("cargo build -q --release -p tlx"))
+        head = "cargo build -q --release -p tlx || exit 1"
+        self.assertLess(s.index(clippy), s.index(head))
         self.assertLess(s.index(clippy), s.index("python3 -u scripts/bench.py"))
         self.assertIn(f"git worktree add -q -f --detach /root/bench-src/nostats {'a' * 40}", s)
         self.assertIn("cargo build -q --release -p tlx --features no-stats", s)
-        self.assertIn("cp /root/bench-src/nostats/target/release/tlx target/bench-bins/nostats/tlx", s)
+        self.assertIn('cp "$CARGO_TARGET_DIR/release/tlx" target/bench-bins/nostats/tlx', s)
+        # The worktrees build first (each copied out straight away) and the
+        # uploaded revision last, so target/release/tlx and the newest
+        # deps/libtlx_*.rlib are this revision's.
+        self.assertLess(s.index("git worktree add"), s.index(head))
+        self.assertLess(s.index(head), s.index("python3 -u scripts/bench.py"))
         self.assertLess(s.index("python3 -u scripts/bench.py table --measure-tlc || rc=1"), s.index("python3 -u scripts/bench.py run --tlc || rc=1"))
         self.assertTrue(s.endswith("exit $rc\n"))
+
+    def test_one_target_dir_is_shared_by_the_tree_and_every_bench_worktree(self):
+        # A worktree with its own empty target/ recompiled all ~200 third-party
+        # crates from scratch. The shared dir is the uploaded tree's own
+        # target/, so every consumer of cargo's default path keeps working
+        # (bench_machine.TLX, tlxlib.build_tlx, the release rlibs
+        # bench_liveness.probe links, coverage's test-release build), and each
+        # binary is still copied to the path its commands name.
+        s = cloud_common.bench_script("/home/ubuntu", "clang", "m", [("v0_1_2", "b" * 40, "")],
+                                      ["suite --bin target/bench-bins/v0_1_2/tlx"])
+        self.assertIn("export CARGO_TARGET_DIR=/home/ubuntu/tlx/target", s)
+        self.assertIn('cp "$CARGO_TARGET_DIR/release/tlx" target/bench-bins/v0_1_2/tlx', s)
+        # The uploaded revision's build writes that path directly: no copy over
+        # itself, which `cp` would refuse.
+        self.assertNotIn('cp "$CARGO_TARGET_DIR/release/tlx" target/release/tlx', s)
+        self.assertIn("cargo build -q --release -p tlx || exit 1", s)
+
+    def test_the_head_binary_is_built_only_for_a_command_that_runs_it(self):
+        # `suite --bin target/bench-bins/...` measures that binary and never
+        # HEAD's; building target/release/tlx for it paid a cold release build
+        # of the whole workspace on every --bench launch for nothing.
+        build = "cargo build -q --release -p tlx || exit 1"
+        skip = cloud_common.bench_script("/root", "clang", "m", [], ["suite --bin target/bench-bins/v/tlx"],
+                                         skip_head_build=True)
+        self.assertNotIn(build, skip)
+        self.assertNotIn("echo '== cargo build --release'", skip)
+        # A --bench-bin binary must not be left where HEAD's is expected.
+        self.assertIn("rm -f target/release/tlx", skip)
+        self.assertIn("python3 -u scripts/bench.py suite --bin target/bench-bins/v/tlx || rc=1", skip)
+        # A command that resolves to HEAD keeps it, and the build writes its own
+        # target/release/tlx (CARGO_TARGET_DIR is that directory).
+        keep = cloud_common.bench_script("/root", "clang", "m", [], ["suite --bin target/release/tlx"])
+        self.assertIn(build, keep)
+        self.assertNotIn("rm -f target/release/tlx", keep)
+
+    def test_the_remote_clippy_runs_only_when_the_local_preflight_did_not_cover_it(self):
+        clippy = "cargo clippy --workspace --release --all-targets -- -D warnings || exit 1"
+        self.assertIn(clippy, cloud_common.bench_script("/root", "clang", "m", [], ["run"]))
+        self.assertNotIn(clippy, cloud_common.bench_script("/root", "clang", "m", [], ["run"],
+                                                          skip_remote_clippy=True))
+
+    def test_a_command_that_names_its_own_binaries_needs_no_head_binary(self):
+        # tlcbase measures TLC alone; every explicit binary path that is not
+        # HEAD's means HEAD's target/release/tlx never runs.
+        for cmds in (["tlcbase --missing --collect --workers 1,16"],
+                     ["suite --bin target/bench-bins/v0_1_2/tlx"],
+                     ["suite --bin target/bench-bins/v0_1_2/tlx --base-bin target/bench-bins/base/tlx"],
+                     ["ab --bin a=target/bench-bins/a/tlx --bin b=target/bench-bins/b/tlx --models X"],
+                     ["disk --bin v0_1_2=target/bench-bins/v0_1_2/tlx --models X"]):
+            with self.subTest(cmds=cmds):
+                self.assertFalse(cloud_common.head_binary_needed(cmds))
+        for cmds in ([], ["run --tlc"], ["suite"], ["suite --bin /home/ubuntu/tlx/target/release/tlx"],
+                     ["suite --bin target/bench-bins/v/tlx --base-bin target/release/tlx"],
+                     ["ab --bin main=target/release/tlx --bin b=target/bench-bins/b/tlx"],
+                     # Omitting the measured binary falls back to HEAD's, so a
+                     # --base-bin alone still runs target/release/tlx.
+                     ["suite --base-bin target/bench-bins/base/tlx"],
+                     # liveness always needs HEAD's release rlibs: its probes
+                     # link target/release/deps/libtlx_*.rlib, which only HEAD's
+                     # build leaves behind.
+                     ["liveness --before X --before-bin target/bench-bins/b/tlx --after-bin target/bench-bins/a/tlx"],
+                     ["liveness --before-bin target/bench-bins/b/tlx --after-bin target/bench-bins/a/tlx"],
+                     ["table --measure-tlc"], ["tlcbase --missing", "run --tlc"]):
+            with self.subTest(cmds=cmds):
+                self.assertTrue(cloud_common.head_binary_needed(cmds))
+
+    def test_the_local_clippy_stands_in_for_the_instance_only_on_linux(self):
+        # A macOS Clippy only sees macOS cfg branches: a Linux-only lint would
+        # reach the timed run if the instance skipped its own check.
+        self.assertFalse(cloud_common.remote_clippy_needed(True, "linux"))
+        self.assertTrue(cloud_common.remote_clippy_needed(True, "darwin"))
+        self.assertTrue(cloud_common.remote_clippy_needed(False, "linux"))
 
 
 class Oracle(unittest.TestCase):
@@ -1266,8 +1364,9 @@ class ClippyPreflight(unittest.TestCase):
             return 101
 
         with mock.patch.object(cloud_common.shutil, "which", return_value="/usr/bin/cargo"):
-            ok, note = cloud_common.clippy_preflight(self.root, runner=runner, marker={})
+            ok, note, ran = cloud_common.clippy_preflight(self.root, runner=runner, marker={})
         self.assertFalse(ok)
+        self.assertFalse(ran)
         self.assertIn("prelaunch clippy failed (exit 101)", note)
         self.assertIn("would refuse this tree", note)
         self.assertEqual(seen, [(["/usr/bin/cargo", "clippy", "--workspace", "--release", "--all-targets",
@@ -1276,41 +1375,47 @@ class ClippyPreflight(unittest.TestCase):
     def test_a_clean_command_is_the_passing_control(self):
         self.manifest()
         with mock.patch.object(cloud_common.shutil, "which", return_value="/usr/bin/cargo"):
-            ok, note = cloud_common.clippy_preflight(self.root, runner=lambda argv, **kw: 0, marker={})
+            ok, note, ran = cloud_common.clippy_preflight(self.root, runner=lambda argv, **kw: 0, marker={})
         self.assertTrue(ok)
+        self.assertTrue(ran)
         self.assertEqual(note, "prelaunch clippy passed")
 
     def test_a_full_scope_marker_skips_the_command(self):
         self.manifest()
         marker = {"version": 1, "scope": "full", "tree": "t" * 12, "head": "h" * 12}
-        ok, note = cloud_common.clippy_preflight(self.root, marker=marker, runner=self.fail_if_run)
+        ok, note, ran = cloud_common.clippy_preflight(self.root, marker=marker, runner=self.fail_if_run)
         self.assertTrue(ok)
+        self.assertTrue(ran)          # the marker records that this exact tree was linted
         self.assertIn("merge_gate marker covers tree", note)
 
     def test_a_revision_without_workspace_lints_is_skipped(self):
         self.manifest("[workspace]\nmembers = []\n")
-        ok, note = cloud_common.clippy_preflight(self.root, runner=self.fail_if_run)
+        ok, note, ran = cloud_common.clippy_preflight(self.root, runner=self.fail_if_run)
         self.assertTrue(ok)
+        self.assertFalse(ran)
         self.assertIn("no [workspace.lints]", note)
 
     def test_a_machine_without_local_cargo_is_skipped_not_refused(self):
         self.manifest()
         with mock.patch.object(cloud_common.shutil, "which", return_value=None):
-            ok, note = cloud_common.clippy_preflight(self.root)
+            ok, note, ran = cloud_common.clippy_preflight(self.root)
         self.assertTrue(ok)
+        self.assertFalse(ran)
         self.assertIn("no local cargo", note)
 
     def test_a_launch_of_another_revision_is_skipped(self):
         self.manifest()
         with mock.patch.object(cloud_common, "git", return_value="h" * 12):
-            ok, note = cloud_common.clippy_preflight(self.root, rev="a" * 12, runner=self.fail_if_run)
+            ok, note, ran = cloud_common.clippy_preflight(self.root, rev="a" * 12, runner=self.fail_if_run)
         self.assertTrue(ok)
+        self.assertFalse(ran)
         self.assertIn("is not this worktree's HEAD", note)
 
     def test_a_dry_run_skips_the_expensive_check(self):
         self.manifest()
-        ok, note = cloud_common.clippy_preflight(self.root, dry_run=True, runner=self.fail_if_run)
+        ok, note, ran = cloud_common.clippy_preflight(self.root, dry_run=True, runner=self.fail_if_run)
         self.assertTrue(ok)
+        self.assertFalse(ran)
         self.assertIn("dry run provisions nothing", note)
 
 
@@ -1384,7 +1489,7 @@ class ReleasePreflightLaunchRefusal(unittest.TestCase):
         provider = mock.MagicMock()
         with mock.patch.object(cloud_verify, "current_owner", return_value="c-h02"), \
              mock.patch.object(cloud_verify, "LaunchLedger") as ledger, \
-             mock.patch.object(cloud_verify, "clippy_preflight", return_value=(True, "ok")), \
+             mock.patch.object(cloud_verify, "clippy_preflight", return_value=(True, "ok", True)), \
              mock.patch.object(cloud_verify, "release_preflight",
                                return_value=(False, "the release build failed (exit 101)")) as preflight, \
              mock.patch.object(cloud_verify, "make_provider", return_value=provider):
@@ -1406,7 +1511,7 @@ class ClippyLaunchRefusal(unittest.TestCase):
         with mock.patch.object(cloud_verify, "current_owner", return_value="c-d20"), \
              mock.patch.object(cloud_verify, "LaunchLedger") as ledger, \
              mock.patch.object(cloud_verify, "clippy_preflight",
-                               return_value=(False, "clippy: items_after_test_module")) as preflight, \
+                               return_value=(False, "clippy: items_after_test_module", False)) as preflight, \
              mock.patch.object(cloud_verify, "make_provider", return_value=provider), \
              mock.patch.object(cloud_verify, "log"):
             ledger.return_value.locked.return_value.__enter__.return_value = []
@@ -1826,6 +1931,8 @@ class RemoteDeadline(unittest.TestCase):
 # text-presence test proves neither an order nor a refusal).
 
 BOOT_OFFER = Offer(0.5, "ap-shanghai", "ap-shanghai-2", "SA5.MEDIUM4", 2)
+SECOND_OFFER = Offer(0.6, "ap-shanghai", "ap-shanghai-3", "SA5.MEDIUM4", 2)
+THIRD_OFFER = Offer(0.7, "ap-shanghai", "ap-shanghai-4", "SA5.MEDIUM4", 2)
 
 
 class BootMachine(cloud_common.Machine):
@@ -1881,6 +1988,26 @@ class BootProvider:
 
     def leftovers(self, regions, owner=None):
         return []
+
+
+def dead_first_provider(order, dead=("ins-1",)):
+    """A provider whose `dead` instances reach RUNNING but never answer ssh,
+    as when a spot boot's cloud-init hangs; the others come up normally."""
+    provider = BootProvider(order)
+    launched = []
+
+    def launch(m, ips, fresh, minutes, arch):
+        order.append(("launch", list(ips), fresh, minutes, arch))
+        launched.append(m)
+        m.id, m.t_launch = f"ins-{len(launched)}", 1000.0
+
+    def wait_ready(m):
+        order.append("wait_ready")
+        if m.id in dead:
+            raise cloud_common.InfraError("ssh did not come up (ports 22, 443, 2222)")
+
+    provider.launch, provider.wait_ready = launch, wait_ready
+    return provider
 
 
 class SessionCase(testkit.GuardedTestCase):
@@ -1956,14 +2083,45 @@ class BootPhase(SessionCase):
         self.assertEqual(session.machine.dead_at, 1000.0 + 30 * 60)
         self.assertEqual(session.phases["boot"] >= 0, True)
 
-    def test_a_failed_boot_leaves_the_instance_releasable(self):
+    def test_a_failed_boot_releases_the_instance_before_the_run_fails(self):
+        # A boot that never answers ssh cannot become the current machine of
+        # the run, so it is terminated and its ledger reservation released
+        # before the failure is reported (HARNESS-09, HARNESS-10).
         self.provider.fail = "wait_ready"
-        session = self.session()
-        with mock.patch.object(cloud_session, "terminate_until_gone", return_value=True) as release:
-            rc = session.run()
+        ledger = mock.Mock()
+        session = self.session(ledger=ledger)
+        rc = session.run()
         self.assertEqual(rc, cloud_common.INFRA_FAIL)
-        self.assertEqual(release.call_args.args[1].id, "ins-1")
+        self.assertEqual(self.provider.terminated, ["ins-1"])
+        self.assertFalse(session.launched_ids)         # nothing of this launch is left
+        ledger.release_dead_boot.assert_called_once_with("worker", 1000.0, "ins-1")
         self.assertNotIn("setup", session.phases)      # the failure ended the boot phase
+
+    def test_a_dead_boot_is_replaced_by_the_next_offer_once(self):
+        # A spot instance that reaches RUNNING with a hung cloud-init used to
+        # end the whole shard with "ssh did not come up"; it is now released
+        # and the next offer is tried.
+        provider = dead_first_provider(self.order, dead=("ins-1",))
+        ledger = mock.Mock()
+        session = self.session(provider=provider, ledger=ledger, offers=[BOOT_OFFER, SECOND_OFFER])
+        self.boot(session)
+        self.assertEqual(provider.terminated, ["ins-1"])
+        self.assertEqual(session.machine.id, "ins-2")
+        self.assertEqual(session.launched_ids, {"ins-2"})
+        ledger.release_dead_boot.assert_called_once_with("worker", 1000.0, "ins-1")
+        self.assertEqual(self.order.count("wait_ready"), 2)
+        self.assertIn(("wait_ssh", None), self.order)
+        self.assertIsInstance(session.machine.access, cloud_allowlist.SshAccess)
+
+    def test_a_second_dead_boot_stops_instead_of_paying_for_a_third_offer(self):
+        provider = dead_first_provider(self.order, dead=("ins-1", "ins-2"))
+        session = self.session(provider=provider, offers=[BOOT_OFFER, SECOND_OFFER, THIRD_OFFER])
+        with self.assertRaises(cloud_common.InfraError) as raised:
+            self.boot(session)
+        self.assertIn("no offer left to retry", str(raised.exception))
+        self.assertEqual(provider.terminated, ["ins-1", "ins-2"])
+        self.assertEqual(self.order.count("wait_ready"), 2)
+        self.assertNotIn("ins-3", provider.terminated)
 
     def test_an_interrupt_stops_the_session_without_a_traceback(self):
         provider = BootProvider(self.order, fail="wait_ready")
@@ -1974,20 +2132,25 @@ class BootPhase(SessionCase):
         self.assertEqual(rc, cloud_common.INFRA_FAIL)
         self.assertEqual(release.call_args.args[1].id, "ins-1")
 
-    def test_a_release_that_fails_is_reported_not_raised(self):
+    def test_a_boot_release_that_fails_is_reported_not_raised(self):
+        # The release inside boot is not confirmed: the machine stays current
+        # and in launched_ids, so the cleanup tries again and the run fails
+        # instead of looking clean over a live instance (HARNESS-09).
         provider = BootProvider(self.order, fail="wait_ready")
         session = self.session(provider=provider)
-        with mock.patch.object(cloud_session, "terminate_until_gone", return_value=False), \
+        with mock.patch.object(cloud_remote, "terminate_until_gone", return_value=False), \
+             mock.patch.object(cloud_session, "terminate_until_gone", return_value=False), \
              mock.patch("builtins.print") as printed:
             rc = session.run()
         self.assertEqual(rc, cloud_common.INFRA_FAIL)   # never 0 over a live instance
         self.assertIn("COULD NOT RELEASE ins-1",
                       "\n".join(c.args[0] for c in printed.call_args_list if c.args))
 
-    def test_a_terminate_exception_does_not_escape_the_cleanup(self):
+    def test_a_terminate_exception_does_not_escape_the_release_or_the_cleanup(self):
         provider = BootProvider(self.order, fail="wait_ready")
         session = self.session(provider=provider)
-        with mock.patch.object(cloud_session, "terminate_until_gone", side_effect=RuntimeError("api down")), \
+        with mock.patch.object(cloud_remote, "terminate_until_gone", side_effect=RuntimeError("api down")), \
+             mock.patch.object(cloud_session, "terminate_until_gone", side_effect=RuntimeError("api down")), \
              mock.patch.object(cloud_session, "warning") as warned:
             rc = session.run()
         self.assertEqual(rc, cloud_common.INFRA_FAIL)
@@ -2203,7 +2366,7 @@ class EntrypointAdapters(testkit.GuardedTestCase):
         with mock.patch.object(cloud_verify, "current_owner", return_value="worker"), \
              mock.patch.object(cloud_verify, "git", return_value="a" * 40), \
              mock.patch.object(cloud_verify, "local_toolchain", return_value="1.90"), \
-             mock.patch.object(cloud_verify, "clippy_preflight", return_value=(True, "ok")), \
+             mock.patch.object(cloud_verify, "clippy_preflight", return_value=(True, "ok", True)), \
              mock.patch.object(cloud_verify, "make_provider", return_value=provider), \
              mock.patch.object(cloud_verify, "LaunchLedger", return_value=mock.MagicMock()), \
              mock.patch.object(cloud_verify, "ensure_local_key", return_value=False) as key, \

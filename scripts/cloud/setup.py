@@ -136,6 +136,12 @@ class Plan:
     local_dir: str
     types: list              # the instance types that were offered, for a launch that fails on every one
     tlc: bool                # a pass runs TLC (fuzz suites): Java and the TLC jars are installed
+    # A --bench run builds the uploaded revision's binary only when a command
+    # runs it, and runs Clippy on the instance only when the local preflight
+    # did not already cover this tree (see head_binary_needed and
+    # remote_clippy_needed). Both default to the pre-optimization behavior.
+    skip_head_build: bool = False
+    skip_remote_clippy: bool = False
 
     @property
     def offer(self):

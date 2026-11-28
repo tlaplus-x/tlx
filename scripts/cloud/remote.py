@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from cloud import setup
 from cloud.allowlist import SshAccess
-from cloud.cloud_common import InfraError, Machine, SkipOffer, RESULT_TRANSFER_RETRY_SECS, bench_script, fetch_bench_results, fetch_oracle_results, fetch_results, fmt_secs, log, network_deadline, oracle_script, retry_network, run_remote_verify, setup_remote, warning
+from cloud.cloud_common import InfraError, Machine, SkipOffer, RESULT_TRANSFER_RETRY_SECS, bench_script, fetch_bench_results, fetch_oracle_results, fetch_results, fmt_secs, log, network_deadline, oracle_script, retry_network, run_remote_verify, setup_remote, terminate_until_gone, warning
 
 if TYPE_CHECKING:
     from cloud.session import Session
@@ -42,6 +42,34 @@ def periodic_fetch(stop, fetch):
             warning(f"periodic fetch failed (best effort): {type(e).__name__}: {e}")
 
 
+def release_dead_boot(session: "Session", provider, m):
+    """Release an instance that launched but never answered ssh, so the next
+    offer can be tried without two instances billing.
+
+    A spot instance that reaches RUNNING on a host whose cloud-init never
+    finishes is infrastructure, not a stop condition (2026-11-28: `STOP: ssh
+    did not come up` aborted a whole shard after a single offer). The ledger
+    reservation is released and the instance leaves `launched_ids` only once
+    the provider confirms it is gone; an unconfirmed release keeps both, so the
+    session's own leftover check reports it and the run never looks clean over
+    a live instance (HARNESS-09, HARNESS-10). The release is a *dead boot*: it
+    gives back the grant the launch consumed and charges the row only for the
+    time it lived, so the next offer can pass the same budget checks instead of
+    the retry dying on exit 25 (`LaunchLedger.release_dead_boot`). Returns True
+    when it is gone."""
+    try:
+        m.terminated = terminate_until_gone(provider, m)
+    except Exception as e:  # noqa: BLE001 - reported, never a silent leak
+        m.terminated = False
+        warning(f"terminate {m.id} failed: {type(e).__name__}: {e}")
+    if not m.terminated:
+        return False
+    if getattr(m, "ledger_time", None):
+        session.plan.ledger.release_dead_boot(session.plan.owner, m.ledger_time, m.id)
+    session.launched_ids.discard(m.id)
+    return True
+
+
 def boot(session: "Session"):
     """Launch one offer, wait for ssh, and attach the operator-IP allowlist.
 
@@ -49,7 +77,9 @@ def boot(session: "Session"):
     (no capacity in any zone of it) skips that region's remaining offers;
     anything else goes to the next offer. Every attempt is admitted and
     reserved through the ledger, so a refused launch costs no launch and no
-    grant.
+    grant. An instance that launched but never answered ssh is terminated,
+    released and replaced by the next offer once: a dead boot must not end the
+    shard.
     """
     a, plan = session.a, session.plan
     provider, ledger = plan.provider, plan.ledger
@@ -59,7 +89,9 @@ def boot(session: "Session"):
         # Leftovers of runs whose local process died (tencent: stopped or past their deadline).
         retry_network(provider.reap, "reap expired leftovers")
     last_err = None
+    last_failure = "launch"
     skipped_regions = set()
+    boot_retries = 1
     m = None
     for offer in plan.offers:
         if offer.region in skipped_regions:
@@ -76,7 +108,6 @@ def boot(session: "Session"):
             # earliest: remote jobs end before it, see remote_deadline.)
             m.dead_at = m.t_launch + a.max_minutes * 60 if m.t_launch else None
             log(f"launched {m.id} ({offer.itype}, {offer.zone}, {offer.market} {offer.price:.4f} {plan.currency}/h)")
-            break
         except SkipOffer as e:
             last_err = str(e)
             if provider.find_launched(m) and provider.terminate(m) and getattr(m, "ledger_time", None):
@@ -85,23 +116,40 @@ def boot(session: "Session"):
             warning(f"{e}; trying the next offer")
             if e.scope == "region":
                 skipped_regions.add(offer.region)
-    else:
-        raise InfraError(f"could not launch {', '.join(plan.types)} anywhere (last: {last_err})")
-
-    t = time.time()
-    provider.wait_ready(m)
-    log(f"running at {m.ip}")
-    m.wait_ssh()
-    # (Not before: during the boot wait a refused connection is sshd not being
-    # up yet, not a stale rule.) The launch wrote the security group for `ips`;
-    # from here the machine's transports notice on their own when that address
-    # has been left behind, and repair it (cloud/allowlist.py).
-    m.access = SshAccess(provider, m, ips)
-    if hasattr(provider, "check_deadman"):
-        # (An InfraError: the instance is terminated by the session's cleanup.)
-        retry_network(lambda: provider.check_deadman(m), f"dead-man's switch check on {m.id}")
-    session.phases["boot"] = time.time() - t
-    log(f"ssh up {fmt_secs(m.wall())} after the launch")
+            continue
+        t = time.time()
+        try:
+            provider.wait_ready(m)
+            log(f"running at {m.ip}")
+            m.wait_ssh()
+        except InfraError as e:
+            detail = getattr(e, "message", str(e))
+            last_err, last_failure = f"{m.id or 'the instance'} did not answer ssh: {detail}", "boot"
+            if not release_dead_boot(session, provider, m):
+                # (The machine stays current and in launched_ids: cleanup tries
+                # the release again and the leftover check fails the run, so a
+                # second offer is never paid for next to a live instance.)
+                raise InfraError(f"{last_err}; could not release {m.id}") from e
+            if boot_retries == 0:
+                raise InfraError(f"{last_err} (no offer left to retry)") from e
+            boot_retries -= 1
+            warning(f"{last_err}; trying the next offer")
+            m = session.machine = None
+            continue
+        # (Not before: during the boot wait a refused connection is sshd not
+        # being up yet, not a stale rule.) The launch wrote the security group
+        # for `ips`; from here the machine's transports notice on their own when
+        # that address has been left behind, and repair it (cloud/allowlist.py).
+        m.access = SshAccess(provider, m, ips)
+        if hasattr(provider, "check_deadman"):
+            # (An InfraError: the instance is terminated by the session's cleanup.)
+            retry_network(lambda: provider.check_deadman(m), f"dead-man's switch check on {m.id}")
+        session.phases["boot"] = time.time() - t
+        log(f"ssh up {fmt_secs(m.wall())} after the launch")
+        return
+    # (The wording matters: a dead boot is an infrastructure failure, not a
+    # refused launch, and `stop_code` reads the message.)
+    raise InfraError(f"could not {last_failure} {', '.join(plan.types)} anywhere (last: {last_err})")
 
 
 def prepare(session: "Session"):
@@ -134,7 +182,9 @@ def prepare(session: "Session"):
         # switch, so their results are complete when the instance goes.
         m.ssh(f"cat > {home}/bench-driver.sh <<'TLX_BENCH_EOF'\n"
               + bench_script(home, a.cc, machine, plan.bins, a.bench,
-                             deadline_at=m.dead_at - 300 if m.dead_at else None)
+                             deadline_at=m.dead_at - 300 if m.dead_at else None,
+                             skip_head_build=plan.skip_head_build,
+                             skip_remote_clippy=plan.skip_remote_clippy)
               + "TLX_BENCH_EOF\n")
         log(f"setup done ({fmt_secs(session.phases['setup'])}); running the benchmarks")
         return
