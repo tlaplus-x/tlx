@@ -14,13 +14,14 @@ use std::sync::Arc;
 use tlx_front::cfg::{CfgValue, Config, ConstBinding};
 
 use super::equiv_sym::{GroupInfo, GroupMask};
-use super::sym_norm::SymNormalizer;
+use super::sym_norm::{RecOpKind, SymNormalizer};
 use crate::{builtins::Builtin as B, hir::*, Program};
 
 mod bags;
 mod check;
 mod folds;
 mod infer;
+mod progress;
 mod shape;
 
 use shape::*;
@@ -133,6 +134,14 @@ pub(crate) struct CheckEnv {
     local_dom_except: HashMap<LocalId, (Expr, bool, Expr)>,
     /// Proven `key \in DOMAIN f` facts for arbitrary expressions (not just `Local`).
     proven_in_dom: Vec<(Expr, Expr, bool)>,
+    /// Sets statically proven non-empty along the current path (`S # {}`, `e \in S`, `Cardinality(S) > 0`).
+    nonempty_sets: Vec<(Expr, bool)>,
+    /// Proven membership facts `(elem, set, in_prime)` along the current path.
+    proven_members: Vec<(Expr, Expr, bool)>,
+    /// Expression-level narrowed shapes (e.g., `TaskParent[t] # 0` on constant tuples).
+    expr_overrides: Vec<(Expr, bool, Shape)>,
+    /// True when path facts along the current branch are provably contradictory.
+    unreachable: bool,
     var_overrides: HashMap<(VarId, bool), Shape>,
     fn_app_overrides: HashMap<(VarId, bool, Vec<PlaceKey>), Shape>,
     at_shape: Option<Shape>,
@@ -193,6 +202,9 @@ impl CheckEnv {
         self.local_dom.remove(&id);
         self.local_dom_except.remove(&id);
         self.fn_app_overrides.retain(|(_, _, ks), _| !ks.contains(&PlaceKey::Local(id)));
+        self.expr_overrides.retain(|(e, _, _)| !expr_mentions_local(e, id));
+        self.nonempty_sets.retain(|(e, _)| !expr_mentions_local(e, id));
+        self.proven_members.retain(|(e, s, _)| !expr_mentions_local(e, id) && !expr_mentions_local(s, id));
     }
 
     fn bind_var_override(&mut self, v: VarId, primed: bool, shape: Shape) {
@@ -455,6 +467,8 @@ pub(crate) struct TotalityChecker<'a> {
     consts: BTreeMap<ConstId, ConstInfo<'a>>,
     var_shapes: Vec<Shape>,
     allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
+    /// Recognized bounded finite `RECURSIVE` operators normalized in `NormMode::Equiv`.
+    rec_ops: HashMap<DefId, RecOpKind>,
     /// Scoped to state-projection emitters: permits reading `Len(seq)` and
     /// iterating `1..Len(seq)` on unbounded sequences while keeping all arithmetic
     /// strictly 32-bit overflow-checked.
@@ -692,7 +706,7 @@ fn normalize_for_totality<'a>(
     init: &Expr,
     next: &Expr,
     spec: super::CheckSpec<'_>,
-) -> Option<(Expr, Expr, super::OwnedCheckSpec, BTreeMap<ConstId, ConstInfo<'a>>)> {
+) -> Option<(Expr, Expr, super::OwnedCheckSpec, BTreeMap<ConstId, ConstInfo<'a>>, HashMap<DefId, RecOpKind>)> {
     if cfg_overrides_or_tables(program, cfg) {
         return None;
     }
@@ -701,7 +715,7 @@ fn normalize_for_totality<'a>(
     let next_norm = norm.normalize(next)?;
     let spec_norm = spec.try_map(|e| norm.normalize(e))?;
     let consts = collect_const_info(program, cfg);
-    Some((init_norm, next_norm, spec_norm, consts))
+    Some((init_norm, next_norm, spec_norm, consts, norm.rec_ops))
 }
 
 fn check_observations_total_inner(
@@ -717,11 +731,12 @@ fn check_observations_total_inner(
         return true;
     }
     let obs_only = super::CheckSpec { invariants: &[], ..spec };
-    let Some((init_norm, next_norm, spec_norm, consts)) = normalize_for_totality(program, cfg, init, next, obs_only) else {
+    let Some((init_norm, next_norm, spec_norm, consts, rec_ops)) = normalize_for_totality(program, cfg, init, next, obs_only) else {
         return false;
     };
     let empty_keys = BTreeSet::new();
-    let mut checker = TotalityChecker::with_const_info(program, &[], &empty_keys, consts, &init_norm, &next_norm, None);
+    let mut checker =
+        TotalityChecker::with_const_info_and_rec_ops(program, &[], &empty_keys, consts, &init_norm, &next_norm, None, rec_ops);
     checker.allow_unbounded_seq_len = allow_unbounded_seq_len;
     checker.age_clock = age_clock;
     let obs_env = CheckEnv::default();
@@ -751,10 +766,10 @@ pub(crate) fn check_model_totality_with_spec(
     let Some((groups, all_keys)) = super::equiv_sym::validate_groups(raw_groups) else {
         return false;
     };
-    let Some((init_norm, next_norm, spec_norm, consts)) = normalize_for_totality(program, cfg, init, next, spec) else {
+    let Some((init_norm, next_norm, spec_norm, consts, rec_ops)) = normalize_for_totality(program, cfg, init, next, spec) else {
         return false;
     };
-    let checker = TotalityChecker::with_const_info(program, &groups, &all_keys, consts, &init_norm, &next_norm, None);
+    let checker = TotalityChecker::with_const_info_and_rec_ops(program, &groups, &all_keys, consts, &init_norm, &next_norm, None, rec_ops);
     checker.check_all_with_spec(&init_norm, &next_norm, spec_norm.as_spec(), omitted)
 }
 
@@ -796,6 +811,20 @@ impl<'a> TotalityChecker<'a> {
         next_norm: &Expr,
         allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
     ) -> Self {
+        Self::with_const_info_and_rec_ops(program, groups, all_keys, consts, init_norm, next_norm, allow_choose_folds, HashMap::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_const_info_and_rec_ops(
+        program: &'a Program,
+        groups: &'a [GroupInfo],
+        all_keys: &'a BTreeSet<Arc<str>>,
+        consts: BTreeMap<ConstId, ConstInfo<'a>>,
+        init_norm: &Expr,
+        next_norm: &Expr,
+        allow_choose_folds: Option<&'a HashMap<LocalId, Option<Expr>>>,
+        rec_ops: HashMap<DefId, RecOpKind>,
+    ) -> Self {
         let mut checker = Self {
             program,
             groups,
@@ -803,12 +832,50 @@ impl<'a> TotalityChecker<'a> {
             consts,
             var_shapes: vec![Shape::Bottom; program.vars.len()],
             allow_choose_folds,
+            rec_ops,
             allow_unbounded_seq_len: false,
             age_clock: None,
             threshold_counters: BTreeSet::new(),
         };
         checker.var_shapes = checker.infer_var_shapes(init_norm, next_norm);
         checker
+    }
+
+    pub(crate) fn rec_op_kind(&self, id: DefId) -> Option<RecOpKind> {
+        self.rec_ops.get(&id).copied()
+    }
+
+    pub(crate) fn is_shape_key_free(&self, s: &Shape) -> bool {
+        shape_is_key_free(s)
+    }
+
+    pub(crate) fn fix_set_bound(
+        &self,
+        init: &Expr,
+        s_var: LocalId,
+        step: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+    ) -> Option<(u32, Shape)> {
+        let mut steps = MAX_STEPS;
+        self.compute_fix_set_bound(init, s_var, step, allow_prime, in_prime, env, &mut steps)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn iter_rec_info(
+        &self,
+        init: &Expr,
+        x_var: LocalId,
+        cond: &Expr,
+        step: &Expr,
+        base: &Expr,
+        allow_prime: bool,
+        in_prime: bool,
+        env: &CheckEnv,
+    ) -> Option<(u32, Shape, Shape)> {
+        let mut steps = MAX_STEPS;
+        self.compute_iter_rec_info(init, x_var, cond, step, base, allow_prime, in_prime, env, &mut steps)
     }
 
     pub(crate) fn set_threshold_counters(&mut self, counters: BTreeSet<VarId>) {

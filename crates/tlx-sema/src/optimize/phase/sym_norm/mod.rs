@@ -20,6 +20,7 @@
 
 mod folds;
 mod helpers;
+mod rec;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -36,6 +37,7 @@ pub(in crate::optimize::phase) use helpers::{
     block_non_target, block_unchanged_tuple, desugar_except_at, exact_tuple_arity, lookup_resolved_root,
 };
 pub use helpers::{infer_var_domains, proves_var_membership};
+pub(in crate::optimize::phase) use rec::RecOpKind;
 
 use helpers::{expr_contains_at, expr_syntactically_eq, is_infallible_path, paths_disjoint};
 
@@ -83,6 +85,8 @@ pub struct SymNormalizer<'a> {
     /// Synthetic bound `LocalId`s of lowered recursive `CHOOSE` sum folds
     /// (`NormMode::Choose`), mapped to optional domain supersets from `[S \in SUBSET D]`.
     pub(crate) fold_vars: HashMap<LocalId, Option<Expr>>,
+    /// Recognized bounded finite `RECURSIVE` operators normalized in `NormMode::Equiv`.
+    pub(in crate::optimize::phase) rec_ops: HashMap<DefId, RecOpKind>,
 }
 
 impl<'a> SymNormalizer<'a> {
@@ -129,6 +133,7 @@ impl<'a> SymNormalizer<'a> {
             let_vals: HashMap::new(),
             in_enabled: false,
             fold_vars: HashMap::new(),
+            rec_ops: HashMap::new(),
         }
     }
 
@@ -900,6 +905,18 @@ impl<'a> SymNormalizer<'a> {
                 for (k, &s_local) in d.params.iter().enumerate() {
                     if let Some(matched) = folds::match_rec_fold_body(self.program, id, s_local, Some((&d.params, k)), body, sum_only) {
                         return self.expand_op_fold(id, k, s_local, &matched, args, env, op_env, cur_except, lex_at, span, depth);
+                    }
+                }
+                if self.mode == NormMode::Equiv {
+                    for k in 0..d.params.len() {
+                        if let Some(matched) = rec::match_fix_set_body(self.program, id, &d.params, k, body) {
+                            return self.expand_fix_set(id, k, &matched, args, env, op_env, cur_except, lex_at, span, depth);
+                        }
+                    }
+                    for k in 0..d.params.len() {
+                        if let Some(matched) = rec::match_iter_rec_body(id, &d.params, k, body) {
+                            return self.expand_iter_rec(id, k, &matched, args, env, op_env, cur_except, lex_at, span, depth);
+                        }
                     }
                 }
             }

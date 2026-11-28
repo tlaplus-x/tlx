@@ -204,6 +204,49 @@ pub(super) fn expr_struct_eq(a: &Expr, ap: bool, b: &Expr, bp: bool) -> bool {
     }
 }
 
+pub(super) fn expr_alpha_eq(a: &Expr, ap: bool, b: &Expr, bp: bool) -> bool {
+    super::super::hir_util::expr_alpha_eq_primed(a, ap, b, bp, &[])
+}
+
+pub(super) fn expr_alpha_eq_with_map(a: &Expr, ap: bool, b: &Expr, bp: bool, initial_map: &[(LocalId, LocalId)]) -> bool {
+    super::super::hir_util::expr_alpha_eq_primed(a, ap, b, bp, initial_map)
+}
+
+pub(super) fn expr_mentions_local(e: &Expr, target: LocalId) -> bool {
+    let mut budget = 4096usize;
+    expr_mentions_local_rec(e, target, &mut budget)
+}
+
+fn expr_mentions_local_rec(e: &Expr, target: LocalId, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return true;
+    }
+    *budget -= 1;
+    if matches!(&*e.kind, ExprKind::Local(l) if *l == target) {
+        return true;
+    }
+    let mut found = false;
+    crate::visit::children(e, &mut |c| {
+        if !found {
+            found = expr_mentions_local_rec(c, target, budget);
+        }
+    });
+    found
+}
+
+/// True iff every value described by `s` contains zero moved symmetry keys and no `Top`.
+pub(crate) fn shape_is_key_free(s: &Shape) -> bool {
+    match s {
+        Shape::Bottom | Shape::Bool | Shape::Int(_) | Shape::Str(_) => true,
+        Shape::Top => false,
+        Shape::Model { groups, .. } => *groups == 0,
+        Shape::Set { elem, .. } | Shape::Seq { elem, .. } => shape_is_key_free(elem),
+        Shape::Tuple(ts) | Shape::Union(ts) => ts.iter().all(shape_is_key_free),
+        Shape::Record(fs) => fs.values().all(shape_is_key_free),
+        Shape::Func { dom, range, .. } => shape_is_key_free(dom) && shape_is_key_free(range),
+    }
+}
+
 pub(super) fn target_var(e: &Expr, primed: bool) -> Option<VarId> {
     if primed {
         let ExprKind::Builtin { op: B::Prime, args } = &*e.kind else { return None };

@@ -9,6 +9,7 @@
 //! ordered emitters).
 
 use super::domain::{Atom, Domains};
+use crate::builtins::Builtin as B;
 use crate::hir::*;
 use crate::visit;
 
@@ -144,90 +145,183 @@ pub(in crate::optimize::phase) fn expr_structurally_eq(a: &Expr, b: &Expr) -> bo
 
 /// Alpha-equivalent structural equality on HIR expressions (ignoring spans).
 pub(in crate::optimize::phase) fn expr_alpha_eq(a: &Expr, b: &Expr) -> bool {
-    let mut map = Vec::new();
-    expr_alpha_eq_rec(a, b, &mut map)
+    expr_alpha_eq_primed(a, false, b, false, &[])
 }
 
 /// Alpha-equivalent structural equality seeded with an initial local-binder mapping.
 pub(in crate::optimize::phase) fn expr_alpha_eq_with_locals(a: &Expr, b: &Expr, locals: &[(LocalId, LocalId)]) -> bool {
-    let mut map = locals.to_vec();
-    expr_alpha_eq_rec(a, b, &mut map)
+    expr_alpha_eq_primed(a, false, b, false, locals)
 }
 
-fn expr_alpha_eq_rec(a: &Expr, b: &Expr, locals: &mut Vec<(LocalId, LocalId)>) -> bool {
-    match (&*a.kind, &*b.kind) {
-        (ExprKind::Bool(x), ExprKind::Bool(y)) => x == y,
-        (ExprKind::Num(x), ExprKind::Num(y)) => x == y,
-        (ExprKind::Str(x), ExprKind::Str(y)) => x == y,
-        (ExprKind::Decimal(x), ExprKind::Decimal(y)) => x == y,
-        (ExprKind::Var(x), ExprKind::Var(y)) => x == y,
-        (ExprKind::Const(x), ExprKind::Const(y)) => x == y,
-        (ExprKind::Local(x), ExprKind::Local(y)) => {
-            if let Some((_, mapped)) = locals.iter().rev().find(|(l, _)| l == x) {
-                mapped == y
-            } else {
-                x == y
+/// Budgeted, bijective, prime-context-aware alpha-equivalent structural equality on HIR
+/// expressions (ignoring spans and transparent `TLCEval` wrappers).
+pub(in crate::optimize::phase) fn expr_alpha_eq_primed(a: &Expr, ap: bool, b: &Expr, bp: bool, locals: &[(LocalId, LocalId)]) -> bool {
+    let mut map = locals.to_vec();
+    let mut budget = 4096usize;
+    expr_alpha_eq_rec(a, ap, b, bp, &mut map, &mut budget)
+}
+
+fn push_bound_vars_alpha(v1: &BoundVars, v2: &BoundVars, map: &mut Vec<(LocalId, LocalId)>) -> Option<usize> {
+    match (v1, v2) {
+        (BoundVars::Many(a), BoundVars::Many(b)) | (BoundVars::Tuple(a), BoundVars::Tuple(b)) if a.len() == b.len() => {
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                map.push((x, y));
             }
+            Some(a.len())
         }
-        (ExprKind::Tuple(xs), ExprKind::Tuple(ys)) | (ExprKind::SetEnum(xs), ExprKind::SetEnum(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+        _ => None,
+    }
+}
+
+fn expr_alpha_eq_rec(a: &Expr, ap: bool, b: &Expr, bp: bool, map: &mut Vec<(LocalId, LocalId)>, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match (&*a.kind, &*b.kind) {
+        (ExprKind::Builtin { op: B::TLCEval, args }, _) if args.len() == 1 => expr_alpha_eq_rec(&args[0], ap, b, bp, map, budget),
+        (_, ExprKind::Builtin { op: B::TLCEval, args }) if args.len() == 1 => expr_alpha_eq_rec(a, ap, &args[0], bp, map, budget),
+        (ExprKind::Builtin { op: B::Prime, args: aa }, _) if !ap && aa.len() == 1 => expr_alpha_eq_rec(&aa[0], true, b, bp, map, budget),
+        (_, ExprKind::Builtin { op: B::Prime, args: ba }) if !bp && ba.len() == 1 => expr_alpha_eq_rec(a, ap, &ba[0], true, map, budget),
+        (ExprKind::Var(v1), ExprKind::Var(v2)) => v1 == v2 && ap == bp,
+        (ExprKind::Local(l1), ExprKind::Local(l2)) => {
+            for &(x, y) in map.iter().rev() {
+                if x == *l1 || y == *l2 {
+                    return x == *l1 && y == *l2;
+                }
+            }
+            l1 == l2
         }
-        (ExprKind::Record(xs), ExprKind::Record(ys)) => {
-            xs.len() == ys.len() && xs.iter().zip(ys).all(|((k1, v1), (k2, v2))| k1 == k2 && expr_alpha_eq_rec(v1, v2, locals))
-        }
+        (ExprKind::Const(c1), ExprKind::Const(c2)) => c1 == c2,
+        (ExprKind::Num(n1), ExprKind::Num(n2)) => n1 == n2,
+        (ExprKind::Decimal(d1), ExprKind::Decimal(d2)) => d1 == d2,
+        (ExprKind::Str(s1), ExprKind::Str(s2)) => s1 == s2,
+        (ExprKind::Bool(b1), ExprKind::Bool(b2)) => b1 == b2,
+        (ExprKind::At, ExprKind::At) => true,
         (ExprKind::Field { record: r1, field: f1 }, ExprKind::Field { record: r2, field: f2 }) => {
-            f1 == f2 && expr_alpha_eq_rec(r1, r2, locals)
+            f1 == f2 && expr_alpha_eq_rec(r1, ap, r2, bp, map, budget)
         }
         (ExprKind::FnApp { func: f1, args: a1 }, ExprKind::FnApp { func: f2, args: a2 }) => {
-            expr_alpha_eq_rec(f1, f2, locals) && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+            a1.len() == a2.len()
+                && expr_alpha_eq_rec(f1, ap, f2, bp, map, budget)
+                && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, ap, y, bp, map, budget))
         }
-        (ExprKind::Builtin { op: o1, args: a1 }, ExprKind::Builtin { op: o2, args: a2 }) => {
-            o1 == o2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+        (ExprKind::Tuple(a1), ExprKind::Tuple(a2))
+        | (ExprKind::SetEnum(a1), ExprKind::SetEnum(a2))
+        | (ExprKind::And(a1), ExprKind::And(a2))
+        | (ExprKind::Or(a1), ExprKind::Or(a2)) => {
+            a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, ap, y, bp, map, budget))
+        }
+        (ExprKind::Record(f1), ExprKind::Record(f2)) | (ExprKind::RecordSet(f1), ExprKind::RecordSet(f2)) => {
+            f1.len() == f2.len() && f1.iter().zip(f2).all(|((k1, v1), (k2, v2))| k1 == k2 && expr_alpha_eq_rec(v1, ap, v2, bp, map, budget))
+        }
+        (ExprKind::FnSet { domain: d1, range: r1 }, ExprKind::FnSet { domain: d2, range: r2 }) => {
+            expr_alpha_eq_rec(d1, ap, d2, bp, map, budget) && expr_alpha_eq_rec(r1, ap, r2, bp, map, budget)
         }
         (ExprKind::If { cond: c1, then: t1, els: e1 }, ExprKind::If { cond: c2, then: t2, els: e2 }) => {
-            expr_alpha_eq_rec(c1, c2, locals) && expr_alpha_eq_rec(t1, t2, locals) && expr_alpha_eq_rec(e1, e2, locals)
+            expr_alpha_eq_rec(c1, ap, c2, bp, map, budget)
+                && expr_alpha_eq_rec(t1, ap, t2, bp, map, budget)
+                && expr_alpha_eq_rec(e1, ap, e2, bp, map, budget)
+        }
+        (ExprKind::Case { arms: a1, other: o1 }, ExprKind::Case { arms: a2, other: o2 }) => {
+            a1.len() == a2.len()
+                && a1.iter().zip(a2).all(|((c1, v1), (c2, v2))| {
+                    expr_alpha_eq_rec(c1, ap, c2, bp, map, budget) && expr_alpha_eq_rec(v1, ap, v2, bp, map, budget)
+                })
+                && match (o1, o2) {
+                    (Some(x), Some(y)) => expr_alpha_eq_rec(x, ap, y, bp, map, budget),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (ExprKind::Builtin { op: op1, args: a1 }, ExprKind::Builtin { op: op2, args: a2 }) => {
+            op1 == op2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, ap, y, bp, map, budget))
+        }
+        (ExprKind::Apply { op: op1, args: a1 }, ExprKind::Apply { op: op2, args: a2 }) => {
+            op1 == op2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| expr_alpha_eq_rec(x, ap, y, bp, map, budget))
+        }
+        (ExprKind::Lambda { params: p1, body: b1 }, ExprKind::Lambda { params: p2, body: b2 }) if p1.len() == p2.len() => {
+            let saved = map.len();
+            for (&x, &y) in p1.iter().zip(p2.iter()) {
+                map.push((x, y));
+            }
+            let eq = expr_alpha_eq_rec(b1, ap, b2, bp, map, budget);
+            map.truncate(saved);
+            eq
+        }
+        (ExprKind::SetFilter { bound: b1, pred: p1 }, ExprKind::SetFilter { bound: b2, pred: p2 }) => {
+            if !expr_alpha_eq_rec(&b1.set, ap, &b2.set, bp, map, budget) {
+                return false;
+            }
+            let saved = map.len();
+            if push_bound_vars_alpha(&b1.vars, &b2.vars, map).is_none() {
+                return false;
+            }
+            let eq = expr_alpha_eq_rec(p1, ap, p2, bp, map, budget);
+            map.truncate(saved);
+            eq
+        }
+        (ExprKind::SetMap { expr: e1, bounds: bs1 }, ExprKind::SetMap { expr: e2, bounds: bs2 })
+        | (ExprKind::FnConstruct { bounds: bs1, body: e1 }, ExprKind::FnConstruct { bounds: bs2, body: e2 }) => {
+            if bs1.len() != bs2.len() {
+                return false;
+            }
+            let saved = map.len();
+            for (b1, b2) in bs1.iter().zip(bs2.iter()) {
+                if !expr_alpha_eq_rec(&b1.set, ap, &b2.set, bp, map, budget) || push_bound_vars_alpha(&b1.vars, &b2.vars, map).is_none() {
+                    map.truncate(saved);
+                    return false;
+                }
+            }
+            let eq = expr_alpha_eq_rec(e1, ap, e2, bp, map, budget);
+            map.truncate(saved);
+            eq
+        }
+        (ExprKind::Quant { kind: k1, bounds: bs1, body: e1 }, ExprKind::Quant { kind: k2, bounds: bs2, body: e2 })
+            if k1 == k2 && bs1.len() == bs2.len() =>
+        {
+            let saved = map.len();
+            for (b1, b2) in bs1.iter().zip(bs2.iter()) {
+                if !expr_alpha_eq_rec(&b1.set, ap, &b2.set, bp, map, budget) || push_bound_vars_alpha(&b1.vars, &b2.vars, map).is_none() {
+                    map.truncate(saved);
+                    return false;
+                }
+            }
+            let eq = expr_alpha_eq_rec(e1, ap, e2, bp, map, budget);
+            map.truncate(saved);
+            eq
+        }
+        (ExprKind::Choose { vars: v1, set: s1, body: e1 }, ExprKind::Choose { vars: v2, set: s2, body: e2 }) => {
+            let sets_eq = match (s1, s2) {
+                (Some(x), Some(y)) => expr_alpha_eq_rec(x, ap, y, bp, map, budget),
+                (None, None) => true,
+                _ => false,
+            };
+            if !sets_eq {
+                return false;
+            }
+            let saved = map.len();
+            if push_bound_vars_alpha(v1, v2, map).is_none() {
+                return false;
+            }
+            let eq = expr_alpha_eq_rec(e1, ap, e2, bp, map, budget);
+            map.truncate(saved);
+            eq
         }
         (ExprKind::Except { base: b1, updates: u1 }, ExprKind::Except { base: b2, updates: u2 }) => {
-            expr_alpha_eq_rec(b1, b2, locals)
-                && u1.len() == u2.len()
-                && u1.iter().zip(u2).all(|((p1, v1), (p2, v2))| {
+            u1.len() == u2.len()
+                && expr_alpha_eq_rec(b1, ap, b2, bp, map, budget)
+                && u1.iter().zip(u2).all(|((p1, r1), (p2, r2))| {
                     p1.len() == p2.len()
                         && p1.iter().zip(p2).all(|(k1, k2)| match (k1, k2) {
                             (ExceptKey::Field(f1), ExceptKey::Field(f2)) => f1 == f2,
-                            (ExceptKey::Index(i1), ExceptKey::Index(i2)) => {
-                                i1.len() == i2.len() && i1.iter().zip(i2).all(|(x, y)| expr_alpha_eq_rec(x, y, locals))
+                            (ExceptKey::Index(x1), ExceptKey::Index(x2)) => {
+                                x1.len() == x2.len() && x1.iter().zip(x2).all(|(i1, i2)| expr_alpha_eq_rec(i1, ap, i2, bp, map, budget))
                             }
                             _ => false,
                         })
-                        && expr_alpha_eq_rec(v1, v2, locals)
+                        && expr_alpha_eq_rec(r1, ap, r2, bp, map, budget)
                 })
-        }
-        (ExprKind::FnConstruct { bounds: b1, body: body1 }, ExprKind::FnConstruct { bounds: b2, body: body2 }) => {
-            if b1.len() != b2.len() {
-                return false;
-            }
-            let saved = locals.len();
-            let mut ok = true;
-            for (x, y) in b1.iter().zip(b2) {
-                if !expr_alpha_eq_rec(&x.set, &y.set, locals) {
-                    ok = false;
-                    break;
-                }
-                match (&x.vars, &y.vars) {
-                    (BoundVars::Many(l1), BoundVars::Many(l2)) | (BoundVars::Tuple(l1), BoundVars::Tuple(l2)) if l1.len() == l2.len() => {
-                        for (&id1, &id2) in l1.iter().zip(l2) {
-                            locals.push((id1, id2));
-                        }
-                    }
-                    _ => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            let res = ok && expr_alpha_eq_rec(body1, body2, locals);
-            locals.truncate(saved);
-            res
         }
         _ => false,
     }

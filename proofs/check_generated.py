@@ -393,6 +393,8 @@ def plan_certificate(lean, path, negative, lean_pool=None, run_positive=True):
                 ("Val.setFilter (Val.domain b1) (fun k =>\n        match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with\n        | some c1, some c2 => c1 - c2 > 0", "Val.setFilter (Val.domain b1) (fun k =>\n        match Val.bagCountOpt ops b1 k, Val.bagCountOpt ops b2 k with\n        | some c1, some c2 => c1 - c2 ≥ 0", "dropped positive-count filtering in bagDiff"),
                 ("(Val.foldSetAC ops .intAdd (Val.domain b) (Val.atom (ops.intAtom 0)) (fun k => Val.apply b k))", "(Val.foldSetAC ops .intAdd (Val.domain b) (Val.atom (ops.intAtom 0)) (fun _ => Val.atom (ops.intAtom 1)))", "replaced bagCard count sum with domain size"),
                 ("match (Val.fnLookup b k).bind (valInt ops) with\n          | some n => List.replicate n.toNat k", "match (Val.fnLookup b k).bind (valInt ops) with\n          | some _ => [k]", "dropped multiplicity replication in foldBag"),
+                ("| .key _ => false", "| .key _ => true", "treated symmetric keys as key-free in rawHasNoKey"),
+                ("| n + 1, acc => evalFixSet step n (Val.cup acc (step acc))", "| n + 1, acc => evalFixSet step n (step acc)", "dropped inflationary union in evalFixSet"),
                 ("next a b := ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "next a b := False ∧ ∃ s t, project s = a ∧ m.concrete.next s t ∧ project t = b", "discarded quotient successors"),
                 ("initial a := ∃ s, m.concrete.initial s ∧ project s = a", "initial a := False ∧ ∃ s, m.concrete.initial s ∧ project s = a", "discarded quotient initialization"),
             ] if namespace in {"GeneratedEquivSymmetry", "GeneratedErasedEquivSymmetry"} else [

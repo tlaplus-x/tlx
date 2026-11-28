@@ -98,8 +98,16 @@ pub fn symmetry_certificate_with_spec(
     let norm_spec = owned_spec.as_spec();
 
     let const_info = super::sym_totality::collect_const_info(program, cfg);
-    let totality =
-        super::sym_totality::TotalityChecker::with_const_info(program, &groups, &all_keys, const_info, &init_norm, &next_norm, None);
+    let totality = super::sym_totality::TotalityChecker::with_const_info_and_rec_ops(
+        program,
+        &groups,
+        &all_keys,
+        const_info,
+        &init_norm,
+        &next_norm,
+        None,
+        norm.rec_ops.clone(),
+    );
     if !totality.check_all_with_spec(&init_norm, &next_norm, norm_spec, &[]) {
         return None;
     }
@@ -160,8 +168,16 @@ pub fn symmetry_projection_certificate_with_spec(
     let norm_spec = owned_spec.as_spec();
 
     let const_info = super::sym_totality::collect_const_info(program, cfg);
-    let totality =
-        super::sym_totality::TotalityChecker::with_const_info(program, &groups, &all_keys, const_info, &init_norm, &next_norm, None);
+    let totality = super::sym_totality::TotalityChecker::with_const_info_and_rec_ops(
+        program,
+        &groups,
+        &all_keys,
+        const_info,
+        &init_norm,
+        &next_norm,
+        None,
+        norm.rec_ops.clone(),
+    );
     if !totality.check_all_with_spec(&init_norm, &next_norm, norm_spec, &omitted) {
         return None;
     }
