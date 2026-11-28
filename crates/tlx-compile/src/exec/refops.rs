@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tlx_layout::scalar;
 use tlx_layout::store::{self, RefOpError, Store, StorePin};
 
 use crate::ir::RefOp;
@@ -40,6 +41,24 @@ pub(crate) fn run_pinned(s: &StorePin<'_>, typing: &Typing, op: &RefOp, args: &[
     use RefOp as O;
     let w = |i: usize| args[i].w();
     out[0] = match op {
+        O::DynEqInt | O::DynEqBool => {
+            let h = w(0);
+            let want = if matches!(op, O::DynEqInt) { scalar::TAG_INT } else { scalar::TAG_BOOL };
+            match scalar::tag(h) {
+                t if t == want => {
+                    let value = if want == scalar::TAG_INT {
+                        scalar::as_int(h).ok_or(RefOpError::Eval)? as u64
+                    } else {
+                        scalar::as_bool(h).ok_or(RefOpError::Eval)? as u64
+                    };
+                    (value == w(1)) as u64
+                }
+                scalar::TAG_STR | scalar::TAG_MODEL_VALUE | scalar::TAG_BOOL | scalar::TAG_INT => return Err(RefOpError::Eval),
+                _ => return Err(RefOpError::Eval),
+            }
+        }
+        O::DynToInt => scalar::as_int(w(0)).ok_or(RefOpError::Eval)? as u64,
+        O::DynToBool => scalar::as_bool(w(0)).ok_or(RefOpError::Eval)? as u64,
         O::Domain => s.domain(w(0))?,
         O::Apply => s.apply(w(0), w(1))?,
         O::Select => match s.select(w(0), w(1))? {
@@ -136,11 +155,14 @@ impl RefOpTable {
     /// The table of `prog` (None if it has no value store operations).
     pub fn of(prog: &crate::verify::Program<'_>) -> Option<std::sync::Arc<RefOpTable>> {
         let typing = prog.typing();
-        let store = typing.ref_store()?;
+        let store = typing.ref_store();
         let mut ops: Vec<(RefOp, usize)> = Vec::new();
         let mut ids = std::collections::HashMap::new();
         let mut add = |e: &crate::ir::Expr| {
             if let crate::ir::ExprKind::RefOp { op, args } = &*e.kind {
+                if matches!(op, RefOp::DynEqInt | RefOp::DynEqBool | RefOp::DynToInt | RefOp::DynToBool) {
+                    return;
+                }
                 let key = (op.clone(), args.len());
                 ids.entry(key.clone()).or_insert_with(|| {
                     ops.push(key);
@@ -190,6 +212,7 @@ impl RefOpTable {
             h.finish()
         };
         let counts = ops.iter().map(|_| [AtomicU64::new(0), AtomicU64::new(0)]).collect();
+        let store = store?;
         Some(std::sync::Arc::new(RefOpTable { ops, ids, nodes, store, typing: typing.clone(), text, hash, counts }))
     }
 
@@ -365,5 +388,19 @@ mod tests {
                 assert_eq!(encoded.assume_init(), expected);
             }
         });
+    }
+
+    #[test]
+    fn dynamic_scalar_operations_use_immediate_handles() {
+        let store = store::StoreRef::new(1 << 20);
+        let typing = Typing::new(Arc::new(Layout::new(vec![Shape::Ref(store.clone())])));
+        let mut out = [0u64; 1];
+        let int = scalar::int_handle(-7).unwrap();
+        run_pinned(&store.pin(), &typing, &RefOp::DynEqInt, &[RArg::W(int), RArg::W(-7i64 as u64)], &mut out).unwrap();
+        assert_eq!(out[0], 1);
+        run_pinned(&store.pin(), &typing, &RefOp::DynEqInt, &[RArg::W(int), RArg::W(2)], &mut out).unwrap();
+        assert_eq!(out[0], 0);
+        run_pinned(&store.pin(), &typing, &RefOp::DynToInt, &[RArg::W(int)], &mut out).unwrap();
+        assert_eq!(out[0] as i64, -7);
     }
 }

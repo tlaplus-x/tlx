@@ -203,3 +203,75 @@ Absent == <<3, 4>> \in s
     assert_eq!(ir.wrong + native.wrong + ir.unsupported, 0, "{}", report.render());
     assert!(ir.agree > 0, "{}", report.render());
 }
+
+/// Force a Dyn state slot so layout inference cannot specialize the fixture away.
+/// The harness runs each predicate against the interpreter, closure executor
+/// and a native library loaded without a host-region table.
+#[test]
+fn dynamic_scalar_predicates_execute_without_host_regions() {
+    let mut body = String::from(
+        r#"EXTENDS Integers
+VARIABLES x, i, b, s
+Init == x = 0 /\ i = 0 /\ b = TRUE /\ s = {}
+Next == UNCHANGED <<x, i, b, s>>
+"#,
+    );
+    let mut cfg = String::from("INIT Init\nNEXT Next\nINVARIANTS");
+    let predicates = [
+        "x = i",
+        "i = x",
+        "x # i",
+        "i # x",
+        "x < i",
+        "i < x",
+        "x <= i",
+        "i <= x",
+        "x > i",
+        "i > x",
+        "x >= i",
+        "i >= x",
+        r"x \in i..(i+2)",
+        r"x \in 1..5",
+        r"x \in Nat",
+        r"x \in Int",
+        r"x \in s",
+        r"x \notin s",
+        "x = b",
+        "b = x",
+        "x # b",
+        "b # x",
+    ];
+    for (index, expr) in predicates.iter().enumerate() {
+        body.push_str(&format!("P{index} == {expr}\n"));
+        cfg.push_str(&format!(" P{index}"));
+    }
+    let int = Shape::Int { lo: -8, hi: 8 };
+    let shapes = vec![Shape::Dyn, int.clone(), Shape::Bool, Shape::Set { elem: Box::new(int), max_card: 3 }];
+    let h = Harness::with_shapes(&module("DynamicScalar", &body), &cfg, shapes);
+    assert!(h.native.invariants.iter().all(|&native| native), "{:?}", h.not_native());
+    assert_eq!(h.lib.as_ref().unwrap().n_regions(), 0);
+    for x in [
+        Value::Int(-7),
+        Value::Int(0),
+        Value::Int(3),
+        Value::Bool(false),
+        Value::Bool(true),
+        Value::str("abc"),
+        Value::ModelValue(Sym::new("a_1")),
+        Value::ModelValue(Sym::new("m")),
+    ] {
+        let mut report = DiffReport::default();
+        h.check_state(
+            &[x.clone(), Value::Int(-7), Value::Bool(true), Value::set_from(vec![Value::Int(-7), Value::Int(3)]).unwrap()],
+            &mut report,
+        );
+        report.assert_ok("dynamic scalar");
+        for (index, expr) in predicates.iter().enumerate() {
+            let comparable = if expr.contains('b') { matches!(x, Value::Bool(_)) } else { matches!(x, Value::Int(_)) };
+            if comparable {
+                let (ir, native) = report.tallies[&format!("invariant P{index}")];
+                assert_eq!((ir.agree, native.agree), (1, 1), "{x:?} {expr}\n{}", report.render());
+            }
+        }
+    }
+}

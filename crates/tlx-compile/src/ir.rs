@@ -105,6 +105,15 @@ impl MapPutPlan {
 /// shape (`Typing::ref_sid`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RefOp {
+    /// Compare a dynamic value handle with an unboxed scalar. Immediate
+    /// handles are checked in the native backend. Other handles fall back to
+    /// the interpreter by returning the normal compiled-evaluation error.
+    DynEqInt,
+    DynEqBool,
+    /// Extract an integer from an immediate dynamic value handle.
+    DynToInt,
+    /// Extract a Boolean from an immediate dynamic value handle.
+    DynToBool,
     /// `DOMAIN f`: handle -> handle.
     Domain,
     /// `f[k]` (absent: error): handles -> handle.

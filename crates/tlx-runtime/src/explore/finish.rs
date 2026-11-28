@@ -142,11 +142,11 @@ pub(super) fn finalize<'m, M: Model>(
         drop((edges, pre));
     }
     drop(_store_gc_guard);
+    // Pending requests can hold the last spill directory lease even when
+    // exploration stops on a violation. Release them before returning.
+    opts.spill.wait_for_writes();
+    opts.spill.wait_for_reads();
     if matches!(outcome, Outcome::Ok) && live_error.is_none() {
-        // Wait for any background spill I/O holding run-owned stores to finish
-        // releasing them, then surface any cleanup I/O failure (e.g. failed unlink).
-        opts.spill.wait_for_writes();
-        opts.spill.wait_for_reads();
         if let Some(e) = opts.spill.error() {
             outcome = Outcome::Io(e.0);
         }

@@ -168,15 +168,65 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Compare a one-word dynamic encoding with an immediate scalar.  The
+    /// dynamic word is a `tlx_layout::scalar` value, so this path is valid for
+    /// `Shape::Dyn` slots and does not involve the value-store arena.
+    fn dynamic_scalar_eq(&mut self, a: Expr, b: Expr) -> Option<Expr> {
+        let (dyn_arg, scalar_arg, source_order) = if matches!(self.shape_of(a.ty), Some(Shape::Dyn)) {
+            (a, b, true)
+        } else if matches!(self.shape_of(b.ty), Some(Shape::Dyn)) {
+            (b, a, false)
+        } else {
+            return None;
+        };
+        if !self.infallible_scalar(&scalar_arg) {
+            return None;
+        }
+        let (op, scalar_arg) = match self.as_int(scalar_arg) {
+            Ok(i) => (crate::ir::RefOp::DynEqInt, i),
+            Err(arg) => (crate::ir::RefOp::DynEqBool, self.as_bool(arg).ok()?),
+        };
+        let (dyn_arg, dyn_bind) = self.share(dyn_arg);
+        let (scalar_arg, scalar_bind) = self.share(scalar_arg);
+        let body = self.ref_op(op, vec![dyn_arg, scalar_arg]);
+        let binds: Vec<_> = if source_order {
+            scalar_bind.into_iter().chain(dyn_bind).collect()
+        } else {
+            dyn_bind.into_iter().chain(scalar_bind).collect()
+        };
+        Some(let_in(binds, body))
+    }
+
+    fn infallible_scalar(&self, x: &Expr) -> bool {
+        matches!(x.ty, Ty::Int | Ty::Bool)
+            || matches!(x.kind.as_ref(), ExprKind::Const(Value::Int(_) | Value::Bool(_)))
+            || matches!(self.shape_of(x.ty), Some(Shape::Int { .. } | Shape::Bool))
+    }
+
     /// A binary integer operator: `int` builds the unboxed operation when
     /// both operands are integers, else the boxed builtin `op` is used.
     fn int_binary(&mut self, op: B, args: &[hir::Expr], env: &LEnv, st: &St, int: impl FnOnce(Expr, Expr) -> Expr) -> Expr {
         let a = self.expr(&args[0], env, st);
         let b = self.expr(&args[1], env, st);
+        if let Some(a) = self.dynamic_to_int(a.clone()) {
+            if let Ok(b) = self.as_int(b.clone()) {
+                return int(a, b);
+            }
+        }
+        if let Some(b) = self.dynamic_to_int(b.clone()) {
+            if let Ok(a) = self.as_int(a.clone()) {
+                return int(a, b);
+            }
+        }
         match (self.as_int(a), self.as_int(b)) {
             (Ok(a), Ok(b)) => int(a, b),
             (a, b) => self.val_op(op, vec![either(a), either(b)]),
         }
+    }
+
+    pub(super) fn dynamic_to_int(&self, x: Expr) -> Option<Expr> {
+        matches!(x.ty, Ty::Enc(_) if matches!(self.shape_of(x.ty), Some(Shape::Dyn)))
+            .then(|| self.ref_op(crate::ir::RefOp::DynToInt, vec![x]))
     }
 
     /// Lower `e` to be combined with a value of type `ty`: a constructor is
@@ -948,6 +998,9 @@ impl Lowerer<'_> {
         if self.is_ref(a.ty) || self.is_ref(b.ty) {
             let (a, b) = (self.as_handle(a), self.as_handle(b));
             return self.ref_op(crate::ir::RefOp::Eq, vec![a, b]);
+        }
+        if let Some(eq) = self.dynamic_scalar_eq(a.clone(), b.clone()) {
+            return eq;
         }
         // Same encoding: word equality, when TLC compares any two values of
         // the shapes without an error; otherwise equal words are still

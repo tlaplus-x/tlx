@@ -292,3 +292,49 @@ Inv == \\A e \\in Edges : (e \\subseteq Nodes) /\\ (Cardinality(e) = 2)
         }
     }
 }
+
+/// A failed immediate-tag check replays the predicate with TLC's rules.
+#[test]
+fn dynamic_scalar_fallback_preserves_verdicts() {
+    for (value, predicate, error) in [
+        ("\"abc\"", "x = 1", true),
+        ("TRUE", "x = 1", true),
+        ("a_1", "x = 3", true),
+        ("\"abc\"", "x < 3", true),
+        ("m", "x # 1", false),
+        ("\"abc\"", r"x \notin Int", true),
+    ] {
+        let src = tlx_testkit::module(
+            "ScalarFallback",
+            &format!(
+                r#"EXTENDS Integers
+CONSTANTS a_1, m
+VARIABLES n, x
+Init == n = 0 /\ x = -7
+Next == n < 8 /\ n' = n + 1 /\ x' = IF n = 7 THEN {value} ELSE x
+Inv == n < 8 \/ ({predicate})"#
+            ),
+        );
+        let dir = TempDir::with_spec(
+            "scalar-fallback",
+            &src,
+            "CONSTANTS a_1 = a_1 m = m\nINIT Init\nNEXT Next\nINVARIANT Inv\nCHECK_DEADLOCK FALSE\n",
+        );
+        for (mode, backend) in [
+            ("-interp", &[][..]),
+            ("-compile", &[("TLX_NO_NATIVE", "1")]),
+            ("-compile", &[("TLX_JIT", "0"), ("TLX_NATIVE_SYNC", "1")]),
+            ("-compile", &[("TLX_JIT", "only")]),
+        ] {
+            let mut cmd = tlx_testkit::tlx!();
+            cmd.check("ScalarFallback.tla")
+                .cfg("ScalarFallback.cfg")
+                .dir(dir.path())
+                .args([mode, "-workers", "1"])
+                .envs(backend.iter().copied())
+                .envs([("TLX_PRERUN", "2"), ("TLX_PRERUN_REUSE", "0"), ("TLX_PARANOID", "1")]);
+            let out = cmd.run();
+            assert_eq!(out.code, if error { 76 } else { 0 }, "{value} {predicate} {backend:?}\n{}", out.text());
+        }
+    }
+}

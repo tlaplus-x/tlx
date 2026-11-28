@@ -12,6 +12,45 @@ use crate::ir::*;
 
 impl Gen<'_, '_, '_> {
     pub(super) fn ref_op(&mut self, e: &Expr, op: &RefOp, args: &[Expr]) -> R<Value> {
+        match op {
+            RefOp::DynEqInt | RefOp::DynEqBool => {
+                let p = self.expr(&args[0])?;
+                let h = self.load(p, 0);
+                let scalar = if *op == RefOp::DynEqInt { self.int_expr(&args[1])? } else { self.bool_expr(&args[1])? };
+                let want = if *op == RefOp::DynEqInt { TAG_INT } else { TAG_BOOL };
+                let tag = self.b.ins().band_imm(h, TAG_MASK as i64);
+                let expected = self.cmp_imm(IntCC::Equal, tag, want as i64);
+                self.check(expected);
+                let payload = if *op == RefOp::DynEqInt {
+                    self.b.ins().sshr_imm(h, TAG_BITS as i64)
+                } else {
+                    let payload = self.b.ins().ushr_imm(h, TAG_BITS as i64);
+                    let canonical = self.cmp_imm(IntCC::UnsignedLessThanOrEqual, payload, 1);
+                    self.check(canonical);
+                    self.b.ins().ushr_imm(h, TAG_BITS as i64)
+                };
+                let same = self.cmp(IntCC::Equal, payload, scalar);
+                let result = self.b.ins().band(expected, same);
+                return Ok(self.b2i(result));
+            }
+            RefOp::DynToInt | RefOp::DynToBool => {
+                let p = self.expr(&args[0])?;
+                let h = self.load(p, 0);
+                let tag = self.b.ins().band_imm(h, TAG_MASK as i64);
+                let want = if *op == RefOp::DynToInt { TAG_INT } else { TAG_BOOL };
+                let valid = self.cmp_imm(IntCC::Equal, tag, want as i64);
+                self.check(valid);
+                return Ok(if *op == RefOp::DynToInt {
+                    self.b.ins().sshr_imm(h, TAG_BITS as i64)
+                } else {
+                    let payload = self.b.ins().ushr_imm(h, TAG_BITS as i64);
+                    let canonical = self.cmp_imm(IntCC::UnsignedLessThanOrEqual, payload, 1);
+                    self.check(canonical);
+                    payload
+                });
+            }
+            _ => {}
+        }
         if self.in_fn {
             return no("value store operation in a compiled function");
         }
