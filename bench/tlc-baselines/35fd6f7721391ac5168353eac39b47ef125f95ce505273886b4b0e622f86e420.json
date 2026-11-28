@@ -1,0 +1,167 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "53dce010a323de504dc506ce98d12734446c8112e84d3838b9482ccb9480452e",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-tlc",
+    "model": "ext/logless-reconfig/MCMongoStaticRaft",
+    "revision": null,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "variant": null,
+    "workers": 1
+  },
+  "measurement": {
+    "aggregation": "median",
+    "baseline": null,
+    "category": [
+      "external"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "53dce010a323de504dc506ce98d12734446c8112e84d3838b9482ccb9480452e",
+    "counts": {
+      "depth": 15,
+      "distinct": 5509,
+      "generated": 39527,
+      "result": "success"
+    },
+    "date": "2026-11-28 17:12:22",
+    "id": "f110793bbb782c5d8086c1b7",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 4.478,
+      "instructions": null,
+      "rss_mib": 475.9,
+      "wall_s": 1.218
+    },
+    "mode": "-tlc",
+    "model": "ext/logless-reconfig/MCMongoStaticRaft",
+    "provenance": {
+      "count_problems": [],
+      "legacy": false,
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 3,
+        "requested": 3
+      },
+      "sample_spread": {
+        "cpu_s": 0.05783832067887458,
+        "wall_s": 0.024630541871921204
+      },
+      "source": "bench/tlc-baselines/35fd6f7721391ac5168353eac39b47ef125f95ce505273886b4b0e622f86e420.json"
+    },
+    "raw_result": {
+      "aggregation": "median",
+      "count_problems": [],
+      "cpu_s": 4.478,
+      "depth": 15,
+      "distinct": 5509,
+      "exit": 0,
+      "finished_s": 1.099,
+      "generated": 39527,
+      "left": 0,
+      "load": [
+        1.25,
+        1.25
+      ],
+      "maxrss_mib": 475.9,
+      "result": "success",
+      "sample_spread": {
+        "cpu_s": 0.05783832067887458,
+        "wall_s": 0.024630541871921204
+      },
+      "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+      "tlc_repetitions": 3,
+      "tlc_samples": [
+        {
+          "cpu_s": 4.346,
+          "depth": 15,
+          "distinct": 5509,
+          "exit": 0,
+          "finished_s": 1.107,
+          "generated": 39527,
+          "left": 0,
+          "load": [
+            1.28,
+            1.25
+          ],
+          "maxrss_mib": 473.8,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 1.218
+        },
+        {
+          "cpu_s": 4.605,
+          "depth": 15,
+          "distinct": 5509,
+          "exit": 0,
+          "finished_s": 1.126,
+          "generated": 39527,
+          "left": 0,
+          "load": [
+            1.25,
+            1.25
+          ],
+          "maxrss_mib": 482.6,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 1.238
+        },
+        {
+          "cpu_s": 4.478,
+          "depth": 15,
+          "distinct": 5509,
+          "exit": 0,
+          "finished_s": 1.099,
+          "generated": 39527,
+          "left": 0,
+          "load": [
+            1.25,
+            1.25
+          ],
+          "maxrss_mib": 475.9,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 1.208
+        }
+      ],
+      "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+      "wall_s": 1.218
+    },
+    "revision": null,
+    "samples": {
+      "cpu_s": [
+        4.346,
+        4.605,
+        4.478
+      ],
+      "wall_s": [
+        1.218,
+        1.238,
+        1.208
+      ]
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "workers": 1
+  },
+  "schema_version": 2
+}

@@ -1,0 +1,95 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "6eb1adf44dc6390adec983638d3c5c970b328132e5968e3a7c6ec0ba903e2924",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "default",
+    "model": "ext/etcd-raft/Traceetcdraft",
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "variant": null,
+    "workers": 1
+  },
+  "measurement": {
+    "aggregation": "median",
+    "baseline": null,
+    "category": [
+      "external",
+      "trace-validation"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "compatibility": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "6eb1adf44dc6390adec983638d3c5c970b328132e5968e3a7c6ec0ba903e2924",
+    "counts": {
+      "depth": null,
+      "distinct": null,
+      "generated": null,
+      "result": "skipped"
+    },
+    "date": "2026-11-28 11:16:59",
+    "id": "22ca981ae3b812f37a9aa8f3",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64, AMD EPYC 9754 128-Core Processor, 16 cores, THP always [madvise] never, tencent SA5.4XLARGE32 (ap-shanghai-5, spot 0.1584 CNY/h)",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": null,
+      "instructions": null,
+      "rss_mib": null,
+      "wall_s": null
+    },
+    "mode": "default",
+    "model": "ext/etcd-raft/Traceetcdraft",
+    "provenance": {
+      "cache": {
+        "initial_state": "empty",
+        "mode": "fresh-per-model",
+        "warmup": true
+      },
+      "count_problems": [],
+      "legacy": false,
+      "measurement_source": "bench/history/suite-v0.1.2-shard-small-medium-20261128.json#/runs/medium:ext/etcd-raft/Traceetcdraft:default:1w",
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 0,
+        "requested": 3
+      },
+      "revision_source": "cloud receipt 20261127-190851-9b562fc-tencent-x86_64",
+      "source": "bench/records/328c7a4c5f7c44705030a4c9fe765ffbeaabec94b48ab7e54e7b8c5dab0d3725.json"
+    },
+    "raw_result": {
+      "samples": [],
+      "warmups": [
+        {
+          "compatibility": false,
+          "cpu_s": 299.971,
+          "maxrss_mib": 147.0,
+          "result": "timeout",
+          "wall_s": 300
+        }
+      ]
+    },
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "samples": {
+      "cpu_s": [],
+      "wall_s": []
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "workers": 1
+  },
+  "schema_version": 2
+}

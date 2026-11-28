@@ -1,0 +1,118 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "fac5a81286b7283aac61dc4d287d02c5b5fbba66235775f187c5c3ef837c888c",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-tlc",
+    "model": "ext/etcd-raft/MCetcdraft_4s_t3_reconfig",
+    "revision": null,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "variant": null,
+    "workers": 16
+  },
+  "measurement": {
+    "aggregation": "last-attempt",
+    "baseline": null,
+    "category": [
+      "external",
+      "scaling"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "fac5a81286b7283aac61dc4d287d02c5b5fbba66235775f187c5c3ef837c888c",
+    "counts": {
+      "depth": null,
+      "distinct": null,
+      "generated": null,
+      "result": "timeout"
+    },
+    "date": "2026-11-28 23:58:42",
+    "id": "47812afe639afaaa74b377d1",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 5693.048,
+      "instructions": null,
+      "rss_mib": 8272.6,
+      "wall_s": 360.165
+    },
+    "mode": "-tlc",
+    "model": "ext/etcd-raft/MCetcdraft_4s_t3_reconfig",
+    "provenance": {
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "legacy": false,
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 0,
+        "requested": 3
+      },
+      "source": "bench/tlc-baselines/adf76887be360fbc772b0fe5d41b2f6185d2792f78eb2faf12d9356fd0921d4a.json"
+    },
+    "raw_result": {
+      "aggregation": "last-attempt",
+      "at_timeout": {
+        "init": 1
+      },
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "cpu_s": 5693.048,
+      "exit": -9,
+      "load": [
+        1.03,
+        16.07
+      ],
+      "maxrss_mib": 8272.6,
+      "result": "timeout",
+      "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+      "tlc_repetitions": 3,
+      "tlc_samples": [
+        {
+          "at_timeout": {
+            "init": 1
+          },
+          "cpu_s": 5693.048,
+          "exit": -9,
+          "load": [
+            1.03,
+            16.07
+          ],
+          "maxrss_mib": 8272.6,
+          "result": "timeout",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "wall_s": 360.165
+        }
+      ],
+      "wall_s": 360.165
+    },
+    "revision": null,
+    "samples": {
+      "cpu_s": [
+        5693.048
+      ],
+      "wall_s": [
+        360.165
+      ]
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "workers": 16
+  },
+  "schema_version": 2
+}
