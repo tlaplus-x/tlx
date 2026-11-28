@@ -24,7 +24,7 @@ import time
 from benchmarking import machine as bench_machine
 from benchmarking.records import (BASELINES, COMPLETE, ROOT, STORE, VERSION, digest, dump, evidence, instance_info,
                                   exit_ok, key_complete, key_id, measurement_key, normalize, peak_rss, scalar,
-                                  record_of_record, record_path, store_files, store_stem, write_records)
+                                  record_of_record, record_path, store_files, store_stem, validate)
 from harness.storage import file_lock
 from tlxlib import CORPUS_ROOT_CWD, model_cwd
 
@@ -41,12 +41,39 @@ def _repetitions_complete(record):
     return not reps or reps.get('completed', 0) >= reps.get('requested', 0)
 
 
+def _violated_names(record):
+    """Violated property name(s) carried in `record['raw_result']`, if any."""
+    raw = record.get('raw_result')
+    if not isinstance(raw, dict):
+        return frozenset()
+    if isinstance(raw.get('violated'), str) and raw['violated']:
+        return frozenset((raw['violated'],))
+    for key in ('samples', 'tlc_samples'):
+        items = raw.get(key)
+        if isinstance(items, list):
+            names = frozenset(s['violated'] for s in items
+                              if isinstance(s, dict) and isinstance(s.get('violated'), str) and s['violated'])
+            if names:
+                return names
+    return frozenset()
+
+
 def historical_match(tx, tc):
     """Historical comparison requires same hardware, workers, verdict and complete counts.
+
+    Under docs/compat.md section 0 tier 3, multi-worker early-stop verdicts
+    (`deadlock`, `safety failure`, etc.) have worker-interleaving-dependent
+    counts; exact `distinct` parity in compatibility mode is therefore required
+    only when `workers == 1` or `result == 'success'`. When both sides record a
+    violated property name, those names must also agree.
 
     A missing content digest remains visible as historical/unverified provenance;
     it does not make a reusable current baseline.
     """
+    require_distinct = (tx['mode'] != 'default'
+                        and tx['configuration'].get('compatibility') is not False
+                        and (tx['workers'] == 1 or tx['counts']['result'] == 'success'))
+    tx_violated, tc_violated = _violated_names(tx), _violated_names(tc)
     return (not tx['provenance'].get('count_problems') and not tc['provenance'].get('count_problems')
             and _repetitions_complete(tx)
             and tc.get('tool') == 'tlc' and tx['model'] == tc['model'] and tx['workers'] == tc['workers']
@@ -55,8 +82,9 @@ def historical_match(tx, tc):
             and tx['configuration'].get('cgroup_mib') == tc['configuration'].get('cgroup_mib')
             and (not tx['tlc_version'] or not tc['tlc_version'] or tx['tlc_version'] == tc['tlc_version'])
             and tx['counts']['result'] in COMPLETE and tx['counts']['result'] == tc['counts']['result']
-            and tx['counts']['distinct'] is not None and (tx['mode'] == 'default'
-                or tx['configuration'].get('compatibility') is False or tx['counts']['distinct'] == tc['counts']['distinct'])
+            and (not tx_violated or not tc_violated or tx_violated == tc_violated)
+            and tx['counts']['distinct'] is not None
+            and (not require_distinct or tx['counts']['distinct'] == tc['counts']['distinct'])
             and (not tx['content_digest'] or not tc['content_digest'] or tx['content_digest'] == tc['content_digest'])
             and tx['metrics']['wall_s'] and tc['metrics']['wall_s'])
 
@@ -190,6 +218,22 @@ def reusable(entry):
             and m['counts']['result'] in COMPLETE and bool(m['metrics']['wall_s']))
 
 
+def completed_repetitions(entry):
+    """Completed sample count of a reusable baseline entry, or 0 if not reusable."""
+    if not reusable(entry):
+        return 0
+    m = entry['measurement']
+    reps = m['provenance'].get('repetitions')
+    if isinstance(reps, dict) and type(reps.get('completed')) is int:
+        return reps['completed']
+    walls = (m.get('samples') or {}).get('wall_s')
+    if isinstance(walls, list):
+        count = sum(scalar(x) is not None for x in walls)
+        if count:
+            return count
+    return 1
+
+
 def baseline_file(record, root=ROOT):
     """The store file and key a TLC record belongs to.
 
@@ -208,14 +252,39 @@ def store_entry(record):
 
 
 def stronger(entry, stored):
-    """True when `entry` states at least as much about its key as `stored` does.
+    """True when `entry` states strictly more about its key than `stored` does.
 
-    A reusable measurement is the key's baseline and never yields to another
-    row. Everything else is a record of why the key has no measurement, and the
-    strongest such record is the current evidence - see `records.evidence`.
+    A reusable measurement is the key's baseline and only yields to a reusable
+    measurement with strictly more completed repetitions (for example upgrading
+    a legacy 1-sample baseline under `--min-repetitions`). Everything else is a
+    record of why the key has no measurement, and the strongest such record is
+    the current evidence - see `records.evidence`.
     """
-    return not reusable(stored) and (evidence(entry['measurement']), entry['measurement']['id']) \
+    if reusable(stored):
+        return reusable(entry) and completed_repetitions(entry) > completed_repetitions(stored)
+    return (evidence(entry['measurement']), entry['measurement']['id']) \
         > (evidence(stored['measurement']), stored['measurement']['id'])
+
+
+def store_baseline(record, root=ROOT):
+    """Persist one TLC record when absent or strictly stronger than the stored row."""
+    validate(record)
+    path, _ = baseline_file(record, root)
+    entry = store_entry(record)
+    if not path.exists():
+        dump(path, entry)
+        return True
+    stored = json.loads(path.read_text())
+    # A stored row that is not reusable (timeout, error, skipped) is not a
+    # measurement, and the key already pins the model digest, TLC version,
+    # workers and instance. A stronger record for that same key therefore
+    # supersedes it - a reusable measurement always, and otherwise a longer
+    # timeout bound or newer error record - while a valid reusable row only
+    # yields to a reusable upgrade with strictly more completed repetitions.
+    if stronger(entry, stored):
+        dump(path, entry)
+        return True
+    return False
 
 
 def seeded_store(records, root=ROOT):
@@ -236,22 +305,7 @@ def seed_baselines(records, root=ROOT):
     for r in records:
         if r.get('tool') != 'tlc':
             continue
-        path, _ = baseline_file(r, root)
-        entry = store_entry(r)
-        if not path.exists():
-            dump(path, entry)
-            continue
-        stored = json.loads(path.read_text())
-        # A stored row that is not reusable (timeout, error, skipped) is not a
-        # measurement, and the key already pins the model digest, TLC version,
-        # workers and instance. A stronger record for that same key therefore
-        # supersedes it - a reusable measurement always, and otherwise the newer
-        # record of the same kind: without this the store is first-write-wins,
-        # `find_baseline` keeps reporting the key as missing, no re-measurement
-        # can replace the stale row, and a key that was re-run at a longer
-        # timeout keeps reporting the shorter bound it outgrew.
-        if stronger(entry, stored):
-            dump(path, entry)
+        store_baseline(r, root)
 
 
 def instance_arches(root=ROOT):
@@ -311,9 +365,9 @@ def stored_baseline(model, workers, *, version, instance, root=ROOT, arch=None):
     return None
 
 
-def find_baseline(model, workers, *, version, instance, root=ROOT, arch=None):
+def find_baseline(model, workers, *, version, instance, root=ROOT, arch=None, min_repetitions=1):
     b = stored_baseline(model, workers, version=version, instance=instance, root=root, arch=arch)
-    return b if b is not None and reusable(b) else None
+    return b if b is not None and reusable(b) and completed_repetitions(b) >= min_repetitions else None
 
 
 def raw_baseline(b):
@@ -358,10 +412,12 @@ def collect_samples(collect, repetitions, workers):
     return raw
 
 
-def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=None, repetitions=1):
+def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=None, repetitions=1, min_repetitions=1):
     """The sole performance-TLC collection boundary; a valid key never invokes collect."""
     if type(repetitions) is not int or repetitions < 1:
         raise ValueError("TLC repetitions must be a positive integer")
+    if type(min_repetitions) is not int or min_repetitions < 1:
+        raise ValueError("TLC min_repetitions must be a positive integer")
     if version is None or instance is None:
         version = version or bench_machine.tla2tools_info().get('revision') or bench_machine.tla2tools_info().get('short')
         instance = instance or instance_info(bench_machine.machine_desc())['type']
@@ -370,7 +426,8 @@ def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=Non
     content = content_digest(model)
     lockpath = Path(root) / 'target/tlc-baseline-locks' / (digest(baseline_key(model['id'], workers, version, instance, content, arch=arch)) + '.lock')
     with file_lock(lockpath):
-        if b := find_baseline(model, workers, root=root, version=version, instance=instance, arch=arch):
+        if b := find_baseline(model, workers, root=root, version=version, instance=instance, arch=arch,
+                              min_repetitions=min_repetitions):
             return raw_baseline(b)
         raw = collect_samples(collect, repetitions, workers) if repetitions > 1 else collect()
         if content_digest(model) != content:
@@ -387,6 +444,5 @@ def cached_tlc(model, workers, collect, *, root=ROOT, version=None, instance=Non
                       f'{BASELINES}/{stem}.json', '/measurement', model=model['id'], mode='-tlc', workers=workers)
         r['provenance']['legacy'] = False
         b = store_entry(r)
-        if reusable(b):
-            write_records([r], root)
+        store_baseline(r, root)
         return raw_baseline(b)

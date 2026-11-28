@@ -28,9 +28,10 @@ import re
 
 from benchmarking import machine as bench_machine, models as bench_models
 from benchmarking.baselines import attach_baselines, content_digest, reusable, same_tlc_key, seed_baselines, store_entry
-from benchmarking.records import (CONTAINER, ROOT, STORE, VERSION, archive_inventory, archived_bytes, digest, dump,
-                                  load_records, load_store, measurement_key, normalize, realign_store, receipt_revisions,
-                                  record_path, store_lock, store_stem, validate, write_records)
+from benchmarking.records import (CONTAINER, ROOT, STORE, VERSION, apply_receipt, archive_inventory, archived_bytes,
+                                  digest, dump, evidence, load_records, load_store, measurement_key, normalize,
+                                  realign_store, receipt_revisions, record_path, store_lock, store_stem, validate,
+                                  write_records)
 
 
 # Frozen allowlist of historical documents. They are retired from the tree at the
@@ -305,11 +306,13 @@ def adopt_legacy(records, models, oracles, version):
 
 
 def _referenced_baseline(record, baselines):
-    """Return the existing reusable TLC baseline `record` references, or None."""
+    """Return the stored TLC row `record` references when it is at least as strong, else None."""
     if record.get('tool') != 'tlc':
         return None
     original = baselines.get(record['provenance'].get('reused_from'))
-    if original is not None and same_tlc_key(measurement_key(original), measurement_key(record)):
+    if original is None or not same_tlc_key(measurement_key(original), measurement_key(record)):
+        return None
+    if reusable(store_entry(original)) or evidence(original) >= evidence(record):
         return original
     return None
 
@@ -338,9 +341,7 @@ def migrate(root=ROOT):
         h = json.loads(data)
         if not isinstance(h, dict):
             continue
-        if source in receipts:
-            name, revs = receipts[source]
-            h = {**h, 'bin_revs': {**(h.get('bin_revs') or {}), **revs}, 'bin_revs_receipt': name}
+        h = apply_receipt(h, source, receipts)
         for raw, pointer, kw in measurement_rows(h):
             r = normalize(h, raw, source, pointer, **kw)
             out.append(r)
@@ -357,7 +358,7 @@ def migrate(root=ROOT):
     if _records.UNREADABLE:
         print(f'migrate: {len(_records.UNREADABLE)} store file(s) predate the schema and were rewritten or dropped')
     store_containers = set(CONTAINER.values())
-    baselines = {r['id']: r for r in existing.values() if r['tool'] == 'tlc' and reusable(store_entry(r))}
+    baselines = {r['id']: r for r in existing.values() if r['tool'] == 'tlc'}
     live_ids = {r['id'] for r in out} | {r['id'] for r in existing.values()
                                          if r['provenance']['source'].rsplit('/', 1)[0] in store_containers}
     retained, retained_ids = [], set()
@@ -445,16 +446,15 @@ def ingest(path, root=ROOT):
     source = path.relative_to(root.resolve()).as_posix()
     h = json.loads(path.read_text())
     receipts = receipt_revisions(root)
-    if source in receipts:
-        name, revs = receipts[source]
-        h = {**h, 'bin_revs': {**(h.get('bin_revs') or {}), **revs}, 'bin_revs_receipt': name}
+    h = apply_receipt(h, source, receipts)
     rs = [normalize(h, raw, source, ptr, **kw) for raw, ptr, kw in measurement_rows(h)]
     with store_lock(root):
         stored = load_records(root)
         # A history copy of a cached baseline is a reference, not new evidence.
-        # Resolve it to the existing reusable row so canonical evidence stays
-        # intact without deleting a row owned by this same source.
-        baselines = {r['id']: r for r in stored if r['tool'] == 'tlc' and reusable(store_entry(r))}
+        # Resolve it to the existing stored row when at least as strong so
+        # canonical evidence (including bounded timeouts/errors) stays intact
+        # without deleting a row owned by this same source.
+        baselines = {r['id']: r for r in stored if r['tool'] == 'tlc'}
         resolved, seen = [], set()
         for r in rs:
             original = _referenced_baseline(r, baselines)

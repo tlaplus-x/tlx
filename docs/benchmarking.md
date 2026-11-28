@@ -74,7 +74,11 @@ use `aggregation: last-attempt`; their scalar timing preserves the terminating
 attempt (including its actual timeout bound). Missing resource metrics display
 as unavailable. Samples are sequential and each uses the existing deadline admission.
 An existing valid key is always reused, even if it has only one sample; requesting
-more repetitions never replaces frozen evidence. Ingesting a history reference to
+more repetitions alone never replaces frozen evidence. Passing `--min-repetitions N`
+(default `1`) on `tlcbase` treats reusable baselines with fewer than `N` completed
+samples as unsatisfied so callers (for example `--min-repetitions 3 --tlc-repetitions 3`)
+can upgrade legacy 1-sample records without discarding valid evidence if collection fails.
+Ingesting a history reference to
 a reusable baseline preserves the canonical row and its raw samples byte for byte.
 Use a new input/tool/hardware key
 for new measurements. Historical scalar records remain valid.
@@ -288,7 +292,8 @@ The measurement method equals the oracle's (`scripts/tlc.py` options; no `-Xmx`/
 JVM's default heap and TLC's default fpmem; simulation models with `-seed 1`; one JVM at a time),
 plus `-Dtlc2.TLC.asMilliSeconds=true` so TLC prints "Finished in" in milliseconds. Each run
 records wall time (with JVM start-up), TLC's own "Finished in", JVM CPU time and peak RSS,
-counts, result and violated name; a timeout (default 1800 s) is recorded as `timeout`. The file
+counts, result and violated name; a timeout (defaulting to each suite model's manifest
+`timeout_s`, or `1800` s for non-suite models, unless `--timeout` is given) is recorded as `timeout`. The file
 header records machine, JVM version, TLC revision, community-modules hash, timeout and worker
 counts. `--slice I/N` splits the models into slices of similar estimated cost for parallel
 machines; `tlcbase-merge` joins them. A baseline is meaningful only on the machine type it was
@@ -463,6 +468,15 @@ An incomplete key still keeps one row, the strongest record of why it has none: 
 measured at a longer bound outranks a shorter one, otherwise the newer record is the current
 evidence, and a completed measurement supersedes either - so re-running a key at a longer
 timeout replaces the shorter bound it outgrew instead of leaving a stale row behind.
+`cached_tlc` shares this strongest-evidence persistence with `seed_baselines`, so non-reusable
+`timeout` and `error` runs are persisted when no stronger record exists for that key.
+`tlcbase --missing` inspects the stored row for each key and skips already-bounded timeouts
+(`wall_s` at least the model's target timeout) and stored TLC errors, reporting counts of
+`unmeasured/stale`, `bounded-timeout`, and `tlc-error` keys unless `--retry-incomplete` is passed.
+Baseline pairing (`historical_match`) requires matching hardware, worker count, verdict (`COMPLETE`,
+and violated property name when recorded), and outside `default` mode exact `distinct` parity for
+single-worker runs and successful searches (multi-worker early stops such as `deadlock` and
+`safety failure` have interleaving-dependent counts under [compat.md](compat.md) section 0 tier 3).
 When raw measurement sources are modified in a working tree, re-run `bench.py migrate`; `bench.py report --check`
 re-derives every present or archived source and fails a stored row no source produces, or a stored row weaker
 than the row its key derives. Migration validation compares the previous store with the migrated store: every retained row
