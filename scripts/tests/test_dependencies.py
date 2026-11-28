@@ -41,6 +41,13 @@ def pin_env(blob, **overrides):
     return json.dumps(fields)
 
 
+def community_pin_env(blob, **overrides):
+    """A COMMUNITY_MODULES_PIN_JSON value that declares exactly `blob` (tests only)."""
+    fields = {"sha256": hashlib.sha256(blob).hexdigest()}
+    fields.update(overrides)
+    return json.dumps(fields)
+
+
 def load_fetch_external():
     """A fresh fetch-external module so each test patches its own DEST/OVERLAY."""
     path = os.path.join(tlxlib.ROOT, "scripts", "fetch-external.py")
@@ -171,8 +178,8 @@ class CommandLine(Layout):
         self.assertIn("refusing", result.stderr)
 
 
-class BaselinePin(unittest.TestCase):
-    """DOC-09: the TLC oracle is a declared, verified baseline, never "a jar exists"."""
+class PinFixtures:
+    """Private scratch jars and CLI calls shared by the baseline-pin tests."""
 
     def write(self, name, blob):
         path = os.path.join(tempfile.mkdtemp(prefix="tlx-pin-"), name)
@@ -185,6 +192,10 @@ class BaselinePin(unittest.TestCase):
         script = os.path.join(tlxlib.ROOT, "scripts", "dependencies.py")
         return subprocess.run([sys.executable, script, *args], capture_output=True, text=True,
                               env={**os.environ, **(env or {})})
+
+
+class BaselinePin(PinFixtures, unittest.TestCase):
+    """DOC-09: the TLC oracle is a declared, verified baseline, never "a jar exists"."""
 
     def test_the_committed_pin_names_the_declared_baseline(self):
         pin = dependencies.TLA2TOOLS_PIN
@@ -265,6 +276,87 @@ class BaselinePin(unittest.TestCase):
         self.assertNotEqual(self.run_cli("verify-jar").returncode, 0, "verify-jar needs a path")
 
 
+class CommunityBaselinePin(PinFixtures, unittest.TestCase):
+    """DOC-09/HARNESS-15: CommunityModules is a declared, verified baseline too."""
+
+    def test_the_committed_pin_names_the_declared_release(self):
+        pin = dependencies.COMMUNITY_MODULES_PIN
+        self.assertEqual(pin["release"], "202609120237")
+        self.assertEqual(pin["sha256"],
+                         "3d9a282c360e90d55e9bbe99caa2987d508fef1556d652760b4af4455e283733")
+        self.assertIn(f"/releases/download/{pin['release']}/", pin["url"])
+        self.assertEqual(dependencies.declared_pin(dependencies.COMMUNITY_MODULES_PIN,
+                                                   dependencies.COMMUNITY_PIN_OVERRIDE_ENV), pin)
+
+    def test_a_matching_community_jar_is_accepted_and_its_identity_returned(self):
+        blob = synthetic_jar()
+        path = self.write("ok.jar", blob)
+        pin = {"sha256": hashlib.sha256(blob).hexdigest()}
+        self.assertEqual(dependencies.verify_community_modules(path, pin=pin),
+                         {"sha256": pin["sha256"], "revision": SYNTH_REV, "short": SYNTH_REV[:7],
+                          "version": "2.0 synthetic"})
+
+    def test_a_community_jar_that_is_not_the_pin_is_refused_even_though_it_exists(self):
+        blob = synthetic_jar(revision="b" * 40)
+        path = self.write("other.jar", blob)
+        with self.assertRaises(SystemExit) as caught:      # known bad: real pin, other bytes
+            dependencies.verify_community_modules(path, pin=dependencies.COMMUNITY_MODULES_PIN)
+        self.assertIn("not the declared CommunityModules baseline", str(caught.exception))
+        control = {"sha256": hashlib.sha256(blob).hexdigest()}
+        self.assertEqual(dependencies.verify_community_modules(path, pin=control)["sha256"],
+                         control["sha256"])
+
+    def test_missing_and_non_jar_community_files_are_refused(self):
+        pin = {"sha256": hashlib.sha256(synthetic_jar()).hexdigest()}
+        with self.assertRaises(SystemExit) as caught:
+            dependencies.verify_community_modules(
+                os.path.join(os.path.dirname(self.write("keep", b"")), "none.jar"), pin=pin)
+        self.assertIn("no modules.jar", str(caught.exception))
+        for name, blob in (("truncated.jar", synthetic_jar()[:128]), ("plain.jar", b"not a zip at all")):
+            path = self.write(name, blob)
+            with self.assertRaises(SystemExit) as caught:
+                dependencies.verify_community_modules(path, pin=pin)
+            self.assertIn("not the declared CommunityModules baseline", str(caught.exception), name)
+
+    def test_the_community_override_is_narrow_and_blank_means_committed(self):
+        blob = synthetic_jar()
+        path = self.write("ok.jar", blob)
+
+        def declared():
+            return dependencies.declared_pin(dependencies.COMMUNITY_MODULES_PIN,
+                                             dependencies.COMMUNITY_PIN_OVERRIDE_ENV)
+
+        with patch.dict(os.environ, {dependencies.COMMUNITY_PIN_OVERRIDE_ENV: community_pin_env(blob)}):
+            self.assertEqual(declared()["sha256"], hashlib.sha256(blob).hexdigest())
+            self.assertEqual(dependencies.verify_community_modules(path)["sha256"],
+                             hashlib.sha256(blob).hexdigest())
+        for bad in ("", "{not json", "{}", '{"nosuch": 1}', '[1]'):
+            with patch.dict(os.environ, {dependencies.COMMUNITY_PIN_OVERRIDE_ENV: bad}):
+                if bad in ("",):
+                    self.assertEqual(declared(), dependencies.COMMUNITY_MODULES_PIN)
+                else:
+                    with self.assertRaises(SystemExit):
+                        declared()
+
+    def test_pin_community_and_verify_community_commands(self):
+        blob = synthetic_jar()
+        path = self.write("ok.jar", blob)
+        full = self.run_cli("pin-community")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertEqual(json.loads(full.stdout), dependencies.COMMUNITY_MODULES_PIN)
+        self.assertEqual(self.run_cli("pin-community", "release").stdout.strip(),
+                         dependencies.COMMUNITY_MODULES_PIN["release"])
+        refused = self.run_cli("verify-community", path)     # known bad: real pin
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("not the declared CommunityModules baseline", refused.stderr)
+        accepted = self.run_cli("verify-community", path,
+                                env={dependencies.COMMUNITY_PIN_OVERRIDE_ENV: community_pin_env(blob)})
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("declared baseline", accepted.stdout)
+        self.assertNotEqual(self.run_cli("verify-community").returncode, 0,
+                            "verify-community needs a path")
+
+
 class BaselineDocuments(unittest.TestCase):
     """The committed pin, the docs and the TLC source checkout name one revision."""
 
@@ -299,6 +391,33 @@ class InstalledBaseline(unittest.TestCase):
         self.assertEqual(head.returncode, 0, head.stderr)
         self.assertEqual(head.stdout.strip(), dependencies.TLA2TOOLS_PIN["revision"],
                          "the source the citations point at must be the baseline revision")
+
+
+class InstalledCommunityBaseline(unittest.TestCase):
+    """The community pin describes the actual store and the canonical ClockSettles key."""
+
+    CLOCK_DIGEST = "dbdef99c55ecd1833e70f2ed6f1d4d25da71d10b46348dd8ef8019efcce3056d"
+
+    def test_the_installed_community_jar_is_the_pinned_bytes(self):
+        jar = os.path.join(tlxlib.TP, "community", "modules.jar")
+        if not os.path.isfile(jar):
+            self.skipTest("third_party/community/modules.jar is not fetched in this checkout")
+        identity = dependencies.verify_community_modules(jar)
+        self.assertEqual(identity["sha256"], dependencies.COMMUNITY_MODULES_PIN["sha256"],
+                         "the installed jar must be the pinned bytes, not just a jar")
+
+    def test_the_pinned_community_jar_reproduces_the_canonical_clock_digest(self):
+        jar = os.path.join(tlxlib.TP, "community", "modules.jar")
+        tla = os.path.join(tlxlib.TP, "external", "tlaplus-tests", "test-model", "examples",
+                           "SpecifyingSystems", "Liveness", "LiveHourClock.tla")
+        if not os.path.isfile(jar) or not os.path.isfile(tla):
+            self.skipTest("the community jar and the tlaplus-tests corpus are not fetched here")
+        from benchmarking import baselines
+        model = {"id": "bench/ClockSettles", "tla": tla,
+                 "cfg": os.path.join(tlxlib.ROOT, "bench", "stress", "ClockSettles.cfg"),
+                 "features": [], "flags": [], "tlc": {}}
+        self.assertEqual(baselines.content_digest(model), self.CLOCK_DIGEST,
+                         "the pinned modules.jar must reproduce the canonical baseline key")
 
 
 class Locking(Layout):
@@ -507,8 +626,9 @@ done
 [ -n "$out" ] || exit 2
 if [ -n "${FAKE_CURL_FAIL:-}" ]; then printf 'partial' >"$out"; exit 22; fi
 case "$url" in
-  # The pinned-baseline jar is a real archive; the test supplies its bytes.
+  # The pinned-baseline jars are real archives; the test supplies their bytes.
   *tla2tools.jar) cp "${FAKE_CURL_JAR:?}" "$out" ;;
+  *CommunityModules*) cp "${FAKE_CURL_COMMUNITY:?}" "$out" ;;
   *) printf 'payload\\n' >"$out" ;;
 esac
 """,
@@ -547,12 +667,22 @@ class FetchDepsScript(Layout):
 
     def setUp(self):
         super().setUp()
-        # The declared baseline is a fixed jar; a test cannot reproduce its bytes,
-        # so it declares a synthetic jar of its own through the pin override.
+        # The declared baselines are fixed jars; a test cannot reproduce their
+        # bytes, so it declares synthetic ones through the pin overrides.
         self.jar = synthetic_jar()
         self.jar_path = os.path.join(self.tmp.name, "synthetic-tla2tools.jar")
         with open(self.jar_path, "wb") as out:
             out.write(self.jar)
+        self.community = synthetic_jar(revision="c" * 40, version="CommunityModules synthetic")
+        self.community_path = os.path.join(self.tmp.name, "synthetic-community.jar")
+        with open(self.community_path, "wb") as out:
+            out.write(self.community)
+
+    def pin_envs(self):
+        """The synthetic pins plus the fake downloads that satisfy them."""
+        return {dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar),
+                dependencies.COMMUNITY_PIN_OVERRIDE_ENV: community_pin_env(self.community),
+                "FAKE_CURL_JAR": self.jar_path, "FAKE_CURL_COMMUNITY": self.community_path}
 
     def checkout(self, root):
         """A synthetic checkout: real third_party/ plus copies of the fetched scripts."""
@@ -585,7 +715,7 @@ class FetchDepsScript(Layout):
         with open(bundled, 'wb') as out:
             out.write(self.jar)
         env, log = self.fake_path()
-        env.update({'FAKE_CURL_JAR': self.jar_path, dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar)})
+        env.update(self.pin_envs())
         result = subprocess.run(['bash', script, '--tests-only'], cwd=root, capture_output=True,
                                 text=True, env={**os.environ, **env})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -605,7 +735,7 @@ class FetchDepsScript(Layout):
         with open(bundled, 'wb') as out:
             out.write(b'not the declared jar')
         env, log = self.fake_path()
-        env.update({'FAKE_CURL_JAR': self.jar_path, dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar)})
+        env.update(self.pin_envs())
         result = subprocess.run(['bash', script, '--tests-only'], cwd=root, capture_output=True,
                                 text=True, env={**os.environ, **env})
         self.assertNotEqual(result.returncode, 0)
@@ -618,7 +748,7 @@ class FetchDepsScript(Layout):
         root = self.main
         script = self.checkout(root)
         env, log = self.fake_path()
-        env = {**env, "FAKE_CURL_JAR": self.jar_path, dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar)}
+        env = {**env, **self.pin_envs()}
         result = subprocess.run(["bash", script], cwd=root, capture_output=True, text=True,
                                 env={**os.environ, **env})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -632,6 +762,8 @@ class FetchDepsScript(Layout):
         self.assertTrue(os.path.isfile(os.path.join(store, "Examples", "README")))
         self.assertEqual(snapshot(store)["tla2tools.jar"], self.jar,
                          "the verified download must be the published jar")
+        self.assertEqual(snapshot(store)["community/modules.jar"], self.community,
+                         "the verified CommunityModules download must be the published jar")
         with open(log) as source:
             argv = source.read().splitlines()
         # Staged next to the target (same filesystem) and renamed into place.
@@ -640,6 +772,12 @@ class FetchDepsScript(Layout):
             r"curl -sSfL -o \./\.tla2tools\.jar\.\w+ "
             + re.escape(dependencies.TLA2TOOLS_PIN["url"]), line)
             for line in argv), argv)
+        self.assertTrue(any(re.fullmatch(
+            r"curl -sSfL -o \.community\.\w+/\.modules\.jar\.\w+ "
+            + re.escape(dependencies.COMMUNITY_MODULES_PIN["url"]), line)
+            for line in argv), argv)
+        self.assertNotIn("releases/latest", "\n".join(argv),
+                         "the community download must use the pinned release URL")
         self.assertTrue(any(re.fullmatch(r"git clone -q --depth 1 https://github\.com/tlaplus/Examples\.git "
                                          r"\.Examples\.\w+", line) for line in argv), argv)
         self.assertTrue(any(line.startswith("unzip -q -o ") and line.endswith(" -d .") for line in argv), argv)
@@ -660,7 +798,7 @@ class FetchDepsScript(Layout):
         with open(foreign, "wb") as out:
             out.write(b"an older or arbitrary jar")
         env, _ = self.fake_path()
-        env = {**env, "FAKE_CURL_JAR": self.jar_path, dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar)}
+        env = {**env, **self.pin_envs()}
         result = subprocess.run(["bash", script], cwd=root, capture_output=True, text=True,
                                 env={**os.environ, **env})
         self.assertNotEqual(result.returncode, 0, "an existing foreign jar must fail the fetch")
@@ -676,6 +814,48 @@ class FetchDepsScript(Layout):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(snapshot(os.path.dirname(foreign))["tla2tools.jar"], self.jar)
 
+    def test_an_existing_foreign_community_jar_is_refused_not_silently_kept(self):
+        root = self.main
+        script = self.checkout(root)
+        foreign = os.path.join(root, "third_party", "community", "modules.jar")
+        os.makedirs(os.path.dirname(foreign), exist_ok=True)
+        with open(foreign, "wb") as out:
+            out.write(b"an older or arbitrary CommunityModules jar")
+        env, _ = self.fake_path()
+        env = {**env, **self.pin_envs()}
+        result = subprocess.run(["bash", script, "--tests-only"], cwd=root, capture_output=True,
+                                text=True, env={**os.environ, **env})
+        self.assertNotEqual(result.returncode, 0, "an existing foreign community jar must fail")
+        self.assertIn("refusing an existing", result.stderr)
+        with open(foreign, "rb") as source:
+            self.assertEqual(source.read(), b"an older or arbitrary CommunityModules jar",
+                             "the refused community jar must be left as it was, not replaced")
+        # Control: the jar that IS the declared baseline is accepted in place.
+        with open(foreign, "wb") as out:
+            out.write(self.community)
+        again = subprocess.run(["bash", script, "--tests-only"], cwd=root, capture_output=True,
+                               text=True, env={**os.environ, **env})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(snapshot(os.path.dirname(foreign))["modules.jar"], self.community)
+
+    def test_a_corrupt_community_download_is_refused_before_publication(self):
+        root = self.main
+        script = self.checkout(root)
+        wrong = os.path.join(self.tmp.name, "wrong-community.jar")
+        with open(wrong, "wb") as out:
+            out.write(self.community[:200])     # non-empty, but not the declared bytes
+        env, _ = self.fake_path()
+        env = {**env, **self.pin_envs(), "FAKE_CURL_COMMUNITY": wrong}
+        result = subprocess.run(["bash", script, "--tests-only"], cwd=root, capture_output=True,
+                                text=True, env={**os.environ, **env})
+        self.assertNotEqual(result.returncode, 0, "bytes that are not the pin must fail the fetch")
+        self.assertIn("refusing the bytes served by", result.stderr)
+        store = os.path.join(root, "third_party")
+        self.assertFalse(os.path.exists(os.path.join(store, "community")),
+                         "a refused body must not become third_party/community")
+        self.assertFalse([n for n in os.listdir(store) if n.startswith(".community")],
+                         "a refused body must not leave a staging directory")
+
     def test_a_download_that_is_not_the_pinned_jar_is_refused(self):
         root = self.main
         script = self.checkout(root)
@@ -683,7 +863,7 @@ class FetchDepsScript(Layout):
         with open(wrong, "wb") as out:
             out.write(self.jar[:200])           # non-empty, but not the declared bytes
         env, _ = self.fake_path()
-        env = {**env, "FAKE_CURL_JAR": wrong, dependencies.PIN_OVERRIDE_ENV: pin_env(self.jar)}
+        env = {**env, **self.pin_envs(), "FAKE_CURL_JAR": wrong}
         result = subprocess.run(["bash", script], cwd=root, capture_output=True, text=True,
                                 env={**os.environ, **env})
         self.assertNotEqual(result.returncode, 0, "bytes that are not the pin must fail the fetch")
