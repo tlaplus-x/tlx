@@ -1202,8 +1202,9 @@ fn concurrent_overflow_displacements_across_segments() {
 /// remaining subpages until memory pressure, so asserting the exact residency
 /// a chunk releases on a huge-page-backed mapping is kernel-dependent. The
 /// final reclaim check therefore bounds the residual by a fraction of the old
-/// table instead of requiring every page to be gone; the peak-residency bound
-/// stays the tight physical assertion.
+/// table instead of requiring every page to be gone, and the peak-residency
+/// bound allows that same residual; it still rejects the un-reclaimed
+/// `old + new` residency the chunked rehash exists to avoid.
 #[cfg_attr(miri, ignore)]
 #[test]
 fn chunked_grow_bounds_peak_bytes_and_rss() {
@@ -1277,16 +1278,29 @@ fn chunked_grow_bounds_peak_bytes_and_rss() {
         // discard to release at least three quarters of the old table rather
         // than an exact zero, so a kernel-dependent residual does not fail the
         // run; a discard that stopped releasing the old table would leave all
-        // `old_bytes` resident, and `peak_res` below is the tight bound.
+        // `old_bytes` resident.
+        let reclaim_residual = old_bytes / 4;
         assert!(
-            old_res <= old_bytes / 4,
+            old_res <= reclaim_residual,
             "old table still holds {old_res} B resident (new {new_res} B, peak {peak_res} B, old_bytes {old_bytes} B)"
         );
+        // The peak must allow that same kernel-dependent residual on top of
+        // the fully populated destination, plus one chunk whose pages may not
+        // have been reclaimed yet. Otherwise the two bounds in this test
+        // contradict each other: a run that legitimately leaves
+        // `reclaim_residual` resident at the end would fail the peak bound
+        // even though every discarded chunk was reclaimed promptly. Stopping
+        // the discard altogether leaves `old + new` resident (~77 MiB here),
+        // well above this bound, so the peak still detects a lost reclaim.
+        let peak_bound = new_bytes + reclaim_residual + super::table::REHASH_CHUNK_BYTES;
         assert!(
-            peak_res <= new_bytes + (4 << 20),
-            "peak physical residency {} MiB exceeded new_bytes {} MiB + 4 MiB (old+new={} MiB; old={old_res} B, new={new_res} B)",
+            peak_res <= peak_bound,
+            "peak physical residency {} MiB exceeded peak_bound {} MiB (new_bytes {} MiB + residual {} MiB + chunk {} MiB; old+new={} MiB; old={old_res} B, new={new_res} B)",
             peak_res >> 20,
+            peak_bound >> 20,
             new_bytes >> 20,
+            reclaim_residual >> 20,
+            super::table::REHASH_CHUNK_BYTES >> 20,
             (old_bytes + new_bytes) >> 20
         );
     }
