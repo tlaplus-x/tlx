@@ -16,7 +16,11 @@ fn s3_perms(atoms: &[Sym; 3]) -> Vec<Perm> {
                 continue;
             }
             perms.push(
-                atoms.iter().enumerate().filter_map(|(i, &s)| (i != img[i]).then_some((s, Value::ModelValue(atoms[img[i]])))).collect(),
+                atoms
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &s)| (i != img[i]).then_some((SymAtom::Model(s), Value::ModelValue(atoms[img[i]]))))
+                    .collect(),
             );
         }
     }
@@ -24,7 +28,10 @@ fn s3_perms(atoms: &[Sym; 3]) -> Vec<Perm> {
 }
 
 fn adjacent_transpositions(atoms: &[Sym]) -> Vec<Perm> {
-    atoms.windows(2).map(|w| HashMap::from([(w[0], Value::ModelValue(w[1])), (w[1], Value::ModelValue(w[0]))])).collect()
+    atoms
+        .windows(2)
+        .map(|w| HashMap::from([(SymAtom::Model(w[0]), Value::ModelValue(w[1])), (SymAtom::Model(w[1]), Value::ModelValue(w[0]))]))
+        .collect()
 }
 
 fn explicit_group() -> (Group, [Sym; 3]) {
@@ -350,7 +357,7 @@ fn factorized_rank_matches_materialized_symmetry_maps() {
                 let fp = fg.to_fast_perm(&part);
                 let expected = FastPerm::new(&maps[r]);
                 for &s in a.iter().chain(b.iter()) {
-                    assert_eq!(fp.get(s), expected.get(s), "rank={r}, sym={s:?}");
+                    assert_eq!(fp.get(SymAtom::Model(s)), expected.get(SymAtom::Model(s)), "rank={r}, sym={s:?}");
                 }
             }
         }
@@ -361,24 +368,32 @@ fn factorized_rank_matches_materialized_symmetry_maps() {
 fn non_full_subgroups_fall_back_to_explicit() {
     let a = [Sym::new("cyc_a"), Sym::new("cyc_b"), Sym::new("cyc_c")];
     let b = [Sym::new("cyc_d"), Sym::new("cyc_e")];
-    let c3 = vec![HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[2])), (a[2], Value::ModelValue(a[0]))])];
+    let c3 = vec![HashMap::from([
+        (SymAtom::Model(a[0]), Value::ModelValue(a[1])),
+        (SymAtom::Model(a[1]), Value::ModelValue(a[2])),
+        (SymAtom::Model(a[2]), Value::ModelValue(a[0])),
+    ])];
     let g_c3 = Group::from_generators(c3).unwrap();
     assert!(matches!(g_c3.kind, GroupKind::Explicit { .. }));
     assert_eq!(g_c3.symmetry_maps().len(), 2);
 
     let diag = vec![HashMap::from([
-        (a[0], Value::ModelValue(a[1])),
-        (a[1], Value::ModelValue(a[0])),
-        (b[0], Value::ModelValue(b[1])),
-        (b[1], Value::ModelValue(b[0])),
+        (SymAtom::Model(a[0]), Value::ModelValue(a[1])),
+        (SymAtom::Model(a[1]), Value::ModelValue(a[0])),
+        (SymAtom::Model(b[0]), Value::ModelValue(b[1])),
+        (SymAtom::Model(b[1]), Value::ModelValue(b[0])),
     ])];
     let g_diag = Group::from_generators(diag).unwrap();
     assert!(matches!(g_diag.kind, GroupKind::Explicit { .. }));
     assert_eq!(g_diag.symmetry_maps().len(), 1);
 
     let s3_2gen = vec![
-        HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[2])), (a[2], Value::ModelValue(a[0]))]),
-        HashMap::from([(a[0], Value::ModelValue(a[1])), (a[1], Value::ModelValue(a[0]))]),
+        HashMap::from([
+            (SymAtom::Model(a[0]), Value::ModelValue(a[1])),
+            (SymAtom::Model(a[1]), Value::ModelValue(a[2])),
+            (SymAtom::Model(a[2]), Value::ModelValue(a[0])),
+        ]),
+        HashMap::from([(SymAtom::Model(a[0]), Value::ModelValue(a[1])), (SymAtom::Model(a[1]), Value::ModelValue(a[0]))]),
     ];
     let g_s3 = Group::from_generators(s3_2gen).unwrap();
     assert!(matches!(g_s3.kind, GroupKind::Factorized(_)));
@@ -671,7 +686,7 @@ Next == UNCHANGED x
     let spec_bad = r#"---- MODULE BadSym ----
 EXTENDS TLC
 VARIABLE x
-Sym == Permutations({1})
+Sym == Permutations({"one", "two"})
 Init == x = 1
 Next == UNCHANGED x
 ====
@@ -681,7 +696,7 @@ Next == UNCHANGED x
     let ip_bad =
         Interp::new(Program::load(&dir_bad.join("BadSym.tla"), &[]).unwrap(), tlx_front::cfg::parse_cfg(cfg_bad).unwrap()).unwrap();
     let err = InterpModel::new(ip_bad).err().expect("non-model-value Permutations must fail");
-    assert!(err.message.contains("SYMMETRY permutations must map model values, found 1"), "got: {}", err.message);
+    assert!(err.message.contains("SYMMETRY permutations must map model values, found "), "got: {}", err.message);
 }
 
 #[test]
@@ -977,7 +992,7 @@ fn nine_pairs_rank_and_closure_order_and_tagged_status_fast_path() {
     for p in &pairs {
         let vals = [Value::ModelValue(p[1])];
         let idx = g9p.least_perm_index(&mut StateVals::Given(&vals), &[0], false).unwrap().expect("swap needed");
-        assert_eq!(maps[idx].get(&p[1]), Some(&Value::ModelValue(p[0])));
+        assert_eq!(maps[idx].get(&SymAtom::Model(p[1])), Some(&Value::ModelValue(p[0])));
     }
 
     // 2. Exact visit-sequence parity against `close_under_composition` for
@@ -994,7 +1009,7 @@ fn nine_pairs_rank_and_closure_order_and_tagged_status_fast_path() {
             let mut m = HashMap::new();
             for (k, &t) in p.iter().enumerate() {
                 if t as usize != k {
-                    m.insert(fac[k], Value::ModelValue(fac[t as usize]));
+                    m.insert(SymAtom::Model(fac[k]), Value::ModelValue(fac[t as usize]));
                 }
             }
             gens333.push(m);
@@ -1013,12 +1028,11 @@ fn nine_pairs_rank_and_closure_order_and_tagged_status_fast_path() {
     let oa = Sym::new("ov_a");
     let ob = Sym::new("ov_b");
     let oc = Sym::new("ov_c");
-    let ov_g = Group::from_factors_with_fallback(vec![vec![oa, ob, oc]], FallbackOrder::OverlappingSets(vec![vec![oa, ob], vec![ob, oc]]))
-        .unwrap();
+    let ov_g = from_model_factors(vec![vec![oa, ob, oc]], vec![vec![oa, ob], vec![ob, oc]]).unwrap();
     let GroupKind::Factorized(ov_fg) = &ov_g.kind else { unreachable!() };
     let ov_gens = vec![
-        HashMap::from([(oa, Value::ModelValue(ob)), (ob, Value::ModelValue(oa))]),
-        HashMap::from([(ob, Value::ModelValue(oc)), (oc, Value::ModelValue(ob))]),
+        HashMap::from([(SymAtom::Model(oa), Value::ModelValue(ob)), (SymAtom::Model(ob), Value::ModelValue(oa))]),
+        HashMap::from([(SymAtom::Model(ob), Value::ModelValue(oc)), (SymAtom::Model(oc), Value::ModelValue(ob))]),
     ];
     let ov_want: Vec<Vec<u16>> = closure(ov_gens).iter().map(|p| ov_fg.perm_to_img(p)).collect();
     let mut ov_got: Vec<Vec<u16>> = Vec::new();
@@ -1070,8 +1084,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // 1. Subset7 (`Permutations(N7) \cup Permutations({n5, n6})`): all 5039
     // non-identity perms are already generators, so BFS performs 0 compositions.
     let n7: Vec<Sym> = (0..7).map(|i| Sym::new(&format!("rm7_{i}"))).collect();
-    let g_sub7 =
-        Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7.clone()])).unwrap();
+    let g_sub7 = from_model_factors(vec![n7.clone()], vec![vec![n7[5], n7[6]], n7.clone()]).unwrap();
     let msg_sub = Value::tuple(vec![
         Value::ModelValue(n7[0]),
         Value::fcn_from_pairs(vec![(Value::ModelValue(n7[0]), Value::Bool(true)), (Value::ModelValue(n7[1]), Value::Int(0))]).unwrap(),
@@ -1083,9 +1096,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // 2. Roles7 (`Permutations({n0..n5}) \cup Permutations({n5, n6})`): with
     // only 2 observed atoms (`n0, n1` or `n5, n6`), only 41 non-identity ordered
     // pairs exist, so subgroup-skip + 41-pair saturation stops BFS early.
-    let g_roles7 =
-        Group::from_factors_with_fallback(vec![n7.clone()], FallbackOrder::OverlappingSets(vec![vec![n7[5], n7[6]], n7[..6].to_vec()]))
-            .unwrap();
+    let g_roles7 = from_model_factors(vec![n7.clone()], vec![vec![n7[5], n7[6]], n7[..6].to_vec()]).unwrap();
     BFS_COMPOSITIONS.with(|c| c.set(0));
     let _ = g_roles7.least_perm(&mut StateVals::Given(std::slice::from_ref(&msg_sub)), &[0]).unwrap();
     let comps_r1 = BFS_COMPOSITIONS.with(std::cell::Cell::get);
@@ -1105,9 +1116,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     // 2b. Verify intra-subgroup skip preserves exact `close_under_composition`
     // order even when two overlapping sets share 2 elements (`{a,b,c}` and `{b,c,d}`).
     let o4 = [Sym::new("ov4_a"), Sym::new("ov4_b"), Sym::new("ov4_c"), Sym::new("ov4_d")];
-    let g_ov4 =
-        Group::from_factors_with_fallback(vec![o4.to_vec()], FallbackOrder::OverlappingSets(vec![o4[0..3].to_vec(), o4[1..4].to_vec()]))
-            .unwrap();
+    let g_ov4 = from_model_factors(vec![o4.to_vec()], vec![o4[0..3].to_vec(), o4[1..4].to_vec()]).unwrap();
     let GroupKind::Factorized(fg_ov4) = &g_ov4.kind else { unreachable!() };
     let mut ov4_gens = Vec::new();
     for s in [&o4[0..3], &o4[1..4]] {
@@ -1115,7 +1124,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
             let mut m = HashMap::new();
             for (k, &t) in p.iter().enumerate() {
                 if t as usize != k {
-                    m.insert(s[k], Value::ModelValue(s[t as usize]));
+                    m.insert(SymAtom::Model(s[k]), Value::ModelValue(s[t as usize]));
                 }
             }
             if !ov4_gens.contains(&m) {
@@ -1139,9 +1148,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
     let w8: Vec<Sym> = (0..8).map(|i| Sym::new(&format!("ws8_{i}"))).collect();
     let k_enabled = Sym::new("ws_enabled");
     let k_epoch = Sym::new("ws_epoch");
-    let g_w8 =
-        Group::from_factors_with_fallback(vec![w8.clone()], FallbackOrder::OverlappingSets(vec![vec![w8[0], w8[7]], w8[..7].to_vec()]))
-            .unwrap();
+    let g_w8 = from_model_factors(vec![w8.clone()], vec![vec![w8[0], w8[7]], w8[..7].to_vec()]).unwrap();
     let GroupKind::Factorized(fg_w8) = &g_w8.kind else { unreachable!() };
     let worker_status = Value::fcn_from_pairs(
         w8.iter()
@@ -1192,7 +1199,7 @@ fn overlapping_closure_early_stops_and_fixed_domain_fcns_and_invariant_bags_scal
 #[test]
 fn factorized_symmetry_checks_partition_index_limits() {
     let max = usize::from(u16::MAX);
-    let atoms: Vec<_> = (0..max + 2).map(|i| Sym::new(&format!("indexLimit{i}"))).collect();
+    let atoms: Vec<_> = (0..max + 2).map(|i| SymAtom::Model(Sym::new(&format!("indexLimit{i}")))).collect();
     let build = |n| FactorizedGroup::new(vec![atoms[..n].to_vec()], FallbackOrder::DisjointFull);
     let group = build(max).unwrap();
     assert_eq!(group.lookup(atoms[max - 1]), Some((0, max - 1)));
@@ -1207,8 +1214,65 @@ fn factorized_symmetry_checks_partition_index_limits() {
 
 #[test]
 fn factorized_symmetry_rejects_unrepresentable_factor_id() {
-    let pair = vec![Sym::new("limitA"), Sym::new("limitB")];
+    let pair = ["limitA", "limitB"].map(Sym::new).map(SymAtom::Model).to_vec();
     let factors = vec![pair; usize::from(u16::MAX) + 2];
     let err = FactorizedGroup::new(factors, FallbackOrder::DisjointFull).err().expect("excess factor id accepted");
     assert!(err.message.contains("65537 factors"));
+}
+
+fn from_model_factors(factors: Vec<Vec<Sym>>, overlapping: Vec<Vec<Sym>>) -> EResult<Group> {
+    let typed = |sets: Vec<Vec<Sym>>| sets.into_iter().map(|s| s.into_iter().map(SymAtom::Model).collect()).collect();
+    Group::from_factors_with_fallback(typed(factors), FallbackOrder::OverlappingSets(typed(overlapping)))
+}
+
+#[test]
+fn typed_symmetry_closure_and_refinement_preserve_namesakes() {
+    for size in [2, 3] {
+        let names = ["t_a", "t_b", "t_c"].map(Sym::new);
+        let names = &names[..size];
+        for (kind, fixed_kind) in
+            [(SymAtom::Str as fn(Sym) -> SymAtom, SymAtom::Model as fn(Sym) -> SymAtom), (SymAtom::Model, SymAtom::Str)]
+        {
+            let atoms: Vec<_> = names.iter().copied().map(kind).collect();
+            let gens: Vec<_> = atoms.windows(2).map(|w| Perm::from([(w[0], w[1].to_value()), (w[1], w[0].to_value())])).collect();
+            let maps = closure(gens.clone());
+            assert_eq!(maps.len(), if size == 2 { 1 } else { 5 });
+            for map in &maps {
+                let mut images: Vec<_> = atoms.iter().map(|a| map.get(a).cloned().unwrap_or_else(|| a.to_value())).collect();
+                images.sort();
+                assert_eq!(images, atoms.iter().map(|a| a.to_value()).collect::<Vec<_>>());
+            }
+            let explicit = Group::explicit(maps);
+            let factors = Group::from_generators(gens).unwrap();
+            assert!(factors.symmetry_factors().is_some());
+            let last = atoms[size - 1].to_value();
+            let fixed = fixed_kind(names[size - 1]).to_value();
+            // All permutations tie on the set. The following atom decides the least image.
+            let pairs = Value::set_from(atoms.iter().map(|a| Value::tuple(vec![a.to_value(), Value::Int(1)])).collect()).unwrap();
+            let record = |v| Value::record(vec![(names[size - 1], Value::tuple(vec![pairs.clone(), v, fixed.clone()]))]);
+            let vals = [record(last)];
+            for group in [&explicit, &factors] {
+                let img = apply_chosen(group.least_view_perm(&mut StateVals::Given(&vals), &[0]).unwrap(), &vals);
+                assert_eq!(img, vec![record(atoms[0].to_value())]);
+            }
+        }
+    }
+}
+
+#[test]
+fn image_order_keeps_the_same_named_string_in_its_own_slot() {
+    let [a, b] = ["sameA", "sameB"].map(Sym::new);
+    for kind in [SymAtom::Model as fn(Sym) -> SymAtom, SymAtom::Str] {
+        let x = kind(a);
+        let y = kind(b);
+        let other = match x {
+            SymAtom::Model(_) => Value::Str(a),
+            SymAtom::Str(_) => Value::ModelValue(a),
+        };
+        let keys = [x.to_value(), y.to_value(), other];
+        let swap = FastPerm::new(&Perm::from([(x, y.to_value()), (y, x.to_value())]));
+        let order = ImageOrder::new(PermMap::Fast(&swap), 3, &|i| &keys[i]).unwrap();
+        assert_eq!(order.known, 3);
+        assert_eq!(&order.src[..3], &[1, 0, 2]);
+    }
 }

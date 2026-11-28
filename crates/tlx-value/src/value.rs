@@ -786,3 +786,37 @@ impl Hash for Value {
         }
     }
 }
+
+/// A permutation key whose kind distinguishes values sharing an interned name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SymAtom {
+    Model(Sym),
+    Str(Sym),
+}
+
+impl SymAtom {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::ModelValue(s) => Some(Self::Model(*s)),
+            Value::Str(s) => Some(Self::Str(*s)),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(self) -> Value {
+        match self {
+            Self::Model(s) => Value::ModelValue(s),
+            Self::Str(s) => Value::Str(s),
+        }
+    }
+
+    pub fn sym(self) -> Sym {
+        match self {
+            Self::Model(s) | Self::Str(s) => s,
+        }
+    }
+
+    pub fn compact_key(self) -> u64 {
+        (u64::from(matches!(self, Self::Str(_))) << 32) | u64::from(self.sym().id())
+    }
+}

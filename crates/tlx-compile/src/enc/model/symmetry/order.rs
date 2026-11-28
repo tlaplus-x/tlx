@@ -182,12 +182,12 @@ pub(super) fn map_scalar_part(fg: &FactorGroupSpec, table: &AtomTable, part: &Pa
 
 fn visit_moved_in_value(v: &Value, fg: &FactorGroupSpec, f: &mut impl FnMut(usize, usize)) {
     match v {
-        Value::ModelValue(m) => {
-            if let Some((g, k)) = fg.lookup(*m) {
+        Value::ModelValue(_) | Value::Str(_) => {
+            if let Some((g, k)) = fg.lookup(tlx_value::SymAtom::from_value(v).unwrap()) {
                 f(g, k);
             }
         }
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => {}
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => {}
         Value::Set(es) | Value::Tuple(es) => {
             for e in es.iter() {
                 visit_moved_in_value(e, fg, f);

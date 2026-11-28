@@ -468,7 +468,8 @@ pub(super) fn of_value(v: &Value, mask_of: &dyn Fn(Sym) -> Mask) -> Option<Sh> {
 /// itself; `None` if that cannot be told without enumerating a set the
 /// evaluator defines.
 pub(super) fn fixed_by(v: &Value, a: Sym, b: Sym) -> Option<bool> {
-    let image = |m: Sym| {
+    let image = |atom| {
+        let tlx_value::SymAtom::Model(m) = atom else { return None };
         if m == a {
             Some(Value::ModelValue(b))
         } else if m == b {

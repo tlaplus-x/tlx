@@ -28,10 +28,10 @@ mod sets;
 use std::sync::Arc;
 
 use crate::error::err;
-use crate::intern::Sym;
 use crate::lazy::LazySet;
 use crate::value::Value;
 use crate::Result;
+use crate::{Sym, SymAtom};
 
 pub use enumerate::{
     bound_kind, enumerate, enumerate_normalized, for_each_constrained_subset, for_each_element, for_each_enumerated,
@@ -154,9 +154,9 @@ pub(super) fn is_empty_set(s: &Value) -> bool {
 /// `permute` that shares the subvalues containing no moved model value
 /// (they are not rebuilt) and returns `None` when nothing changes. `image`
 /// maps a moved model value to its image (`None`: not moved).
-pub fn permute_shared(v: &Value, image: &impl Fn(Sym) -> Option<Value>) -> Result<Option<Value>> {
+pub fn permute_shared(v: &Value, image: &impl Fn(SymAtom) -> Option<Value>) -> Result<Option<Value>> {
     // The first element of `xs` that changes, with its index.
-    fn first_changed<'v>(xs: impl Iterator<Item = &'v Value>, image: &impl Fn(Sym) -> Option<Value>) -> Result<Option<(usize, Value)>> {
+    fn first_changed<'v>(xs: impl Iterator<Item = &'v Value>, image: &impl Fn(SymAtom) -> Option<Value>) -> Result<Option<(usize, Value)>> {
         for (i, x) in xs.enumerate() {
             if let Some(y) = permute_shared(x, image)? {
                 return Ok(Some((i, y)));
@@ -165,7 +165,7 @@ pub fn permute_shared(v: &Value, image: &impl Fn(Sym) -> Option<Value>) -> Resul
         Ok(None)
     }
     // The images of `es` (in order), or `None` when none changes.
-    fn all(es: &[Value], image: &impl Fn(Sym) -> Option<Value>) -> Result<Option<Vec<Value>>> {
+    fn all(es: &[Value], image: &impl Fn(SymAtom) -> Option<Value>) -> Result<Option<Vec<Value>>> {
         let Some((i, first)) = first_changed(es.iter(), image)? else {
             return Ok(None);
         };
@@ -178,8 +178,9 @@ pub fn permute_shared(v: &Value, image: &impl Fn(Sym) -> Option<Value>) -> Resul
         Ok(Some(out))
     }
     Ok(match v {
-        Value::ModelValue(m) => image(*m),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => None,
+        Value::ModelValue(m) => image(SymAtom::Model(*m)),
+        Value::Str(s) => image(SymAtom::Str(*s)),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => None,
         Value::Set(es) => all(es, image)?.map(Value::set_from).transpose()?,
         Value::Tuple(es) => all(es, image)?.map(Value::tuple),
         Value::Record(fs) => {
@@ -231,10 +232,11 @@ pub fn permute_shared(v: &Value, image: &impl Fn(Sym) -> Option<Value>) -> Resul
 /// Apply a model-value permutation (`perm` maps a model value to its image,
 /// or `None` to leave it unchanged) to every model value inside `v`
 /// (TLC `Value.permute`, used for SYMMETRY). The result is canonical.
-pub fn permute(v: &Value, perm: &dyn Fn(Sym) -> Option<Value>) -> Result<Value> {
+pub fn permute(v: &Value, perm: &dyn Fn(SymAtom) -> Option<Value>) -> Result<Value> {
     Ok(match v {
-        Value::ModelValue(m) => perm(*m).unwrap_or_else(|| v.clone()),
-        Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Interval(..) => v.clone(),
+        Value::ModelValue(m) => perm(SymAtom::Model(*m)).unwrap_or_else(|| v.clone()),
+        Value::Bool(_) | Value::Int(_) | Value::Interval(..) => v.clone(),
+        Value::Str(s) => perm(SymAtom::Str(*s)).unwrap_or_else(|| v.clone()),
         Value::Set(es) => Value::set_from(es.iter().map(|e| permute(e, perm)).collect::<Result<_>>()?)?,
         Value::Tuple(es) => Value::tuple(es.iter().map(|e| permute(e, perm)).collect::<Result<_>>()?),
         Value::Record(fs) => Value::record(fs.iter().map(|(k, x)| Ok((*k, permute(x, perm)?))).collect::<Result<_>>()?),

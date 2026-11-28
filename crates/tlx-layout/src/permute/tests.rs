@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tlx_value::{Sym, Value};
+use tlx_value::{Sym, SymAtom, Value};
 
 use super::*;
 use crate::dynval;
@@ -38,7 +38,7 @@ fn check_all(shape: &Shape, perm: &AtomPerm) {
         encode(shape, &v, &mut src).unwrap();
         let mut dst = vec![u64::MAX; n];
         plan.apply(&src, &mut dst);
-        let want = tlx_value::ops::permute(&v, &|m| Some(perm(&Value::ModelValue(m)))).unwrap();
+        let want = tlx_value::ops::permute(&v, &|m| Some(perm(&m.to_value()))).unwrap();
         let mut enc_want = vec![0u64; n];
         encode(shape, &want, &mut enc_want).unwrap();
         assert_eq!(dst, enc_want, "permuting {v} (got {})", decode(shape, &dst));
@@ -139,8 +139,8 @@ fn not_closed() {
     assert!(PermPlan::compile(&a, &swap("a", "c")).is_none());
 }
 
-fn sorted_syms(xs: &[&str]) -> Vec<Sym> {
-    let mut s: Vec<Sym> = xs.iter().map(|x| Sym::new(x)).collect();
+fn sorted_syms(xs: &[&str]) -> Vec<SymAtom> {
+    let mut s: Vec<_> = xs.iter().map(|x| SymAtom::Model(Sym::new(x))).collect();
     s.sort_unstable();
     s
 }
@@ -155,7 +155,7 @@ fn check_factor_all(shape: &Shape, fg: &FactorGroupSpec, img: &[u16]) {
         encode(shape, &v, &mut src).unwrap();
         let mut dst = vec![u64::MAX; n];
         plan.apply(fg, img, &src, &mut dst);
-        let want = tlx_value::ops::permute(&v, &|m| fg.map_sym(m, img).cloned()).unwrap();
+        let want = tlx_value::ops::permute(&v, &|m| fg.map_atom(m, img).cloned()).unwrap();
         let mut enc_want = vec![0u64; n];
         encode(shape, &want, &mut enc_want).unwrap();
         assert_eq!(dst, enc_want, "factor permuting {v} (got {})", decode(shape, &dst));
@@ -184,7 +184,7 @@ fn factor_plans_cover_compound_shapes_and_rank_maps() {
     rec_fields.sort_by_key(|f| f.0);
     let rec = Shape::Record(rec_fields.into());
     check_factor_all(&rec, &fg, &img);
-    let mut dom: Vec<Value> = k1.iter().copied().map(Value::ModelValue).collect();
+    let mut dom: Vec<Value> = k1.iter().copied().map(SymAtom::to_value).collect();
     dom.sort();
     let fcn = Shape::Fcn { dom: dom.into(), range: Box::new(a2.clone()), witness: FcnWitness::Enumerated, key_variants: Arc::from([]) };
     check_factor_all(&fcn, &fg, &img);
@@ -199,7 +199,7 @@ fn factor_plans_cover_compound_shapes_and_rank_maps() {
     let rp = RankPlan::compile(&sub_set, &fg).unwrap();
     for r in 0..sub_set.cardinality().unwrap() {
         let v = unrank(&sub_set, r);
-        let want = tlx_value::ops::permute(&v, &|m| fg.map_sym(m, &img).cloned()).unwrap();
+        let want = tlx_value::ops::permute(&v, &|m| fg.map_atom(m, &img).cloned()).unwrap();
         assert_eq!(rp.map_rank(&fg, &img, r), rank(&sub_set, &want).unwrap());
     }
     // Not closed under fg: partial factor rejected.
@@ -226,8 +226,8 @@ fn deep_nested_product_plan_is_linear_in_depth() {
     assert_eq!(count_nodes(&plan), 25, "nested product plan must be O(depth) with no cloned subtrees");
     // Verify execution under swap (a1 <-> a2).
     let layout = crate::Layout::new(vec![s]);
-    let mut v = Value::ModelValue(k[0]);
-    let mut want = Value::ModelValue(k[1]);
+    let mut v = k[0].to_value();
+    let mut want = k[1].to_value();
     for _ in 0..24 {
         v = Value::tuple(vec![v]);
         want = Value::tuple(vec![want]);
@@ -253,7 +253,7 @@ fn apply_orbit_dyn_does_not_intern_candidates() {
     let keys: Vec<Sym> = (1..=8).map(|i| Sym::new(&format!("dyn_probe_layout_{i}"))).collect();
     let mut sorted = keys.clone();
     sorted.sort_unstable();
-    let fg = FactorGroupSpec::new(&[&sorted]);
+    let fg = FactorGroupSpec::new(&[&sorted.iter().copied().map(SymAtom::Model).collect::<Vec<_>>()]);
     let plan = FactorPlan::compile(&Shape::Dyn, &fg).expect("Dyn plan");
     assert!(plan.has_dyn());
     let tup = Value::tuple(sorted.iter().copied().map(Value::ModelValue).collect());
@@ -273,8 +273,8 @@ fn apply_orbit_dyn_does_not_intern_candidates() {
 
 #[test]
 fn orbit_closure_in_nested_map_preserves_fixed_atoms_and_separate_factors() {
-    let mut servers = ["s1", "s2", "s3", "s4"].map(Sym::new);
-    let mut clients = ["c1", "c2"].map(Sym::new);
+    let mut servers = ["s1", "s2", "s3", "s4"].map(Sym::new).map(SymAtom::Model);
+    let mut clients = ["c1", "c2"].map(Sym::new).map(SymAtom::Model);
     servers.sort();
     clients.sort();
     let factors = [&servers[..], &clients[..]];
@@ -296,18 +296,43 @@ fn orbit_closure_in_nested_map_preserves_fixed_atoms_and_separate_factors() {
 
 #[test]
 fn explicit_cyclic_orbit_closes_only_intersecting_universes() {
-    let cycle = ["a", "b", "c"].map(Sym::new);
+    let cycle = ["a", "b", "c"].map(Sym::new).map(SymAtom::Model);
     let maps: Vec<std::collections::HashMap<_, _>> =
-        [1, 2].map(|step| (0..3).map(|i| (cycle[i], Value::ModelValue(cycle[(i + step) % 3]))).collect()).into();
+        [1, 2].map(|step| (0..3).map(|i| (cycle[i], cycle[(i + step) % 3].to_value())).collect()).into();
     let orbits = AtomOrbits::from_group(&maps);
     let closed = orbits.close(&atoms(&["b", "fixed"]));
     assert_eq!(closed, atoms(&["a", "b", "c", "fixed"]));
     assert_eq!(orbits.close(&atoms(&["fixed"])), atoms(&["fixed"]));
     for map in maps {
         let perm: AtomPerm = Arc::new(move |v| match v {
-            Value::ModelValue(s) => map.get(s).unwrap_or(v).clone(),
+            Value::ModelValue(s) => map.get(&SymAtom::Model(*s)).unwrap_or(v).clone(),
             _ => v.clone(),
         });
         check_all(&closed, &perm);
+    }
+}
+
+#[test]
+fn string_symmetry_plans_preserve_model_values_and_record_labels() {
+    let [a, b] = ["t_a", "t_b"].map(Sym::new);
+    let keys = [SymAtom::Str(a), SymAtom::Str(b)];
+    let group = FactorGroupSpec::new(&[&keys]);
+    let value = |s| Value::record(vec![(a, Value::tuple(vec![Value::Str(s), Value::ModelValue(a)]))]);
+    for shape in [Shape::Dyn, Shape::Ref(crate::store::StoreRef::new(usize::MAX))] {
+        let layout = crate::Layout::new(vec![shape.clone()]);
+        let factor = FactorPlan::compile(&shape, &group).unwrap();
+        let perm: AtomPerm = Arc::new(move |v| match v {
+            Value::Str(s) if *s == a => Value::Str(b),
+            Value::Str(s) if *s == b => Value::Str(a),
+            _ => v.clone(),
+        });
+        let explicit = PermPlan::compile(&shape, &perm).unwrap();
+        let mut words = vec![0; layout.words];
+        layout.encode_state(&[value(a)], &mut words).unwrap();
+        let mut out = words.clone();
+        explicit.apply(&words, &mut out);
+        assert_eq!(layout.decode_state(&out), vec![value(b)]);
+        factor.apply(&group, &[1, 0], &words, &mut out);
+        assert_eq!(layout.decode_state(&out), vec![value(b)]);
     }
 }

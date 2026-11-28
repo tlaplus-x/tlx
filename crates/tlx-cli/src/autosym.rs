@@ -417,8 +417,8 @@ fn apply(model: &mut InterpModel, an: &mut Analysis, off: bool, precertified: Op
 /// whole combined product; without it the declared group stays untouched
 /// (fail closed).
 fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<Applied>, ExitCode> {
-    let declared_factors: Vec<Vec<tlx_value::Sym>> = match model.symmetry_factors() {
-        Some(factors) => factors.into_iter().map(<[tlx_value::Sym]>::to_vec).collect(),
+    let declared_factors: Vec<Vec<tlx_value::SymAtom>> = match model.symmetry_factors() {
+        Some(factors) => factors.into_iter().map(<[tlx_value::SymAtom]>::to_vec).collect(),
         None => {
             note("not applied: the declared SYMMETRY is not a disjoint product of full symmetric groups");
             return Ok(None);
@@ -429,7 +429,7 @@ fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<
         note(&format!("not applied: the declared SYMMETRY product has order {declared_order}, above the certificate bound {MAX_ORDER}"));
         return Ok(None);
     }
-    let declared_atoms: std::collections::HashSet<tlx_value::Sym> = declared_factors.iter().flatten().copied().collect();
+    let declared_atoms: std::collections::HashSet<tlx_value::SymAtom> = declared_factors.iter().flatten().copied().collect();
     let declared_names: Vec<(Vec<String>, String)> =
         declared_factors.iter().map(|keys| (key_names(keys), declared_factor_text(an, keys))).collect();
     // Proven full candidates whose elements the declared group does not move.
@@ -439,7 +439,10 @@ fn apply_augmented(model: &mut InterpModel, an: &mut Analysis) -> Result<Option<
             s.full()
                 && s.candidate.elems.len() <= MAX_KEYS
                 && (2..=MAX_ORDER).contains(&s.group_order())
-                && s.candidate.elems.iter().all(|e| matches!(e, tlx_value::Value::ModelValue(m) if !declared_atoms.contains(m)))
+                && s.candidate
+                    .elems
+                    .iter()
+                    .all(|e| matches!(e, tlx_value::Value::ModelValue(m) if !declared_atoms.contains(&tlx_value::SymAtom::Model(*m))))
         })
         .collect();
     if extra.is_empty() {
@@ -519,31 +522,34 @@ fn order_of(n: usize) -> u128 {
 }
 
 /// The model values of a proven candidate, in cfg order.
-fn candidate_keys(s: &autosym::SetResult) -> Vec<tlx_value::Sym> {
+fn candidate_keys(s: &autosym::SetResult) -> Vec<tlx_value::SymAtom> {
     s.candidate
         .elems
         .iter()
         .filter_map(|e| match e {
-            tlx_value::Value::ModelValue(m) => Some(*m),
+            tlx_value::Value::ModelValue(m) => Some(tlx_value::SymAtom::Model(*m)),
             _ => None,
         })
         .collect()
 }
 
-fn key_names(keys: &[tlx_value::Sym]) -> Vec<String> {
-    keys.iter().map(|m| m.as_str().to_owned()).collect()
+fn key_names(keys: &[tlx_value::SymAtom]) -> Vec<String> {
+    keys.iter().map(|m| m.sym().as_str().to_owned()).collect()
 }
 
 /// TLA+ text of a factor of the declared group: the cfg constant that names
 /// the same model values when there is one, the explicit set otherwise.
-fn declared_factor_text(an: &Analysis, keys: &[tlx_value::Sym]) -> String {
+fn declared_factor_text(an: &Analysis, keys: &[tlx_value::SymAtom]) -> String {
     let named = an.sets.iter().find(|s| {
         s.candidate.elems.len() == keys.len()
-            && s.candidate.elems.iter().all(|e| matches!(e, tlx_value::Value::ModelValue(m) if keys.contains(m)))
+            && s.candidate
+                .elems
+                .iter()
+                .all(|e| matches!(e, tlx_value::Value::ModelValue(m) if keys.contains(&tlx_value::SymAtom::Model(*m))))
     });
     match named {
         Some(s) => format!("Permutations({})", s.candidate.name),
-        None => format!("Permutations({{{}}})", keys.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(", ")),
+        None => format!("Permutations({{{}}})", keys.iter().map(|m| m.sym().as_str()).collect::<Vec<_>>().join(", ")),
     }
 }
 

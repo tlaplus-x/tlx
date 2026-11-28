@@ -74,9 +74,8 @@ fn build_explicit_group(fg: &FactorGroupSpec, layout: &Layout) -> Vec<Vec<PermPl
             continue;
         }
         let fg_c = fg.clone();
-        let perm: AtomPerm = Arc::new(move |v: &Value| match v {
-            Value::ModelValue(s) => fg_c.map_sym(*s, &img).cloned().unwrap_or_else(|| v.clone()),
-            _ => v.clone(),
+        let perm: AtomPerm = Arc::new(move |v: &Value| {
+            tlx_value::SymAtom::from_value(v).and_then(|atom| fg_c.map_atom(atom, &img)).cloned().unwrap_or_else(|| v.clone())
         });
         let plans: Vec<PermPlan> = layout.vars.iter().map(|s| PermPlan::compile(s, &perm).unwrap()).collect();
         group.push(plans);
@@ -86,11 +85,23 @@ fn build_explicit_group(fg: &FactorGroupSpec, layout: &Layout) -> Vec<Vec<PermPl
 
 #[test]
 fn factorized_orbit_fp_matches_explicit_across_all_shapes() {
-    let mut k1 = vec![Sym::new("a1"), Sym::new("a2"), Sym::new("a3")];
+    for atom in [SymAtom::Model as fn(Sym) -> SymAtom, SymAtom::Str] {
+        check_compound_orbits(atom);
+    }
+}
+
+fn check_compound_orbits(atom: fn(Sym) -> SymAtom) {
+    let mv = |name: &str| atom(Sym::new(name)).to_value();
+    let atom_shape = |names: &[&str]| {
+        let mut values: Vec<_> = names.iter().map(|name| mv(name)).collect();
+        values.sort();
+        Shape::Atom(values.into())
+    };
+    let mut k1 = [Sym::new("a1"), Sym::new("a2"), Sym::new("a3")];
     k1.sort_unstable();
-    let mut k2 = vec![Sym::new("b1"), Sym::new("b2")];
+    let mut k2 = [Sym::new("b1"), Sym::new("b2")];
     k2.sort_unstable();
-    let fg = FactorGroupSpec::new(&[&k1, &k2]);
+    let fg = FactorGroupSpec::new(&[&k1.iter().copied().map(atom).collect::<Vec<_>>(), &k2.iter().copied().map(atom).collect::<Vec<_>>()]);
 
     let s_a = atom_shape(&["a1", "a2", "a3"]);
     let s_b = atom_shape(&["b1", "b2"]);
@@ -98,7 +109,7 @@ fn factorized_orbit_fp_matches_explicit_across_all_shapes() {
     s_a_nil_vals.sort();
     let s_a_nil = Shape::Atom(s_a_nil_vals.into());
 
-    let mut dom_a: Vec<Value> = k1.iter().copied().map(Value::ModelValue).collect();
+    let mut dom_a: Vec<Value> = k1.iter().copied().map(|s| atom(s).to_value()).collect();
     dom_a.sort();
 
     // 0: packed Record with branching field followed by packed Atom (tests PendingItem::PackedAtom)
@@ -200,7 +211,7 @@ fn factorized_orbit_fp_matches_explicit_across_all_shapes() {
 fn wide_two_word_bitset_is_orbit_invariant() {
     let mut keys: Vec<Sym> = (0..6).map(|i| Sym::new(&format!("m{i}"))).collect();
     keys.sort_unstable();
-    let fg = FactorGroupSpec::new(&[&keys]);
+    let fg = FactorGroupSpec::new(&[&model_atoms(&keys)]);
     let mut univ: Vec<Value> = (0..64).map(|i| Value::Str(Sym::new(&format!("f{i:02}")))).collect();
     univ.extend(keys.iter().copied().map(Value::ModelValue));
     univ.sort();
@@ -297,7 +308,7 @@ fn sym_view_dynamic_witness_ties_preserve_least_representative_inline_and_heap()
         k_a.sort_unstable();
         let mut k_b = vec![Sym::new("b1"), Sym::new("b2")];
         k_b.sort_unstable();
-        let fg = FactorGroupSpec::new(&[&k_a, &k_b]);
+        let fg = FactorGroupSpec::new(&[&model_atoms(&k_a), &model_atoms(&k_b)]);
 
         let dom_a: Vec<Value> = k_a.iter().copied().map(Value::ModelValue).collect();
         let s_a = Shape::Atom(dom_a.clone().into());
@@ -369,7 +380,7 @@ fn orbit_fp_dyn_s8_is_generator_invariant_and_interns_zero_entries() {
     }
     let mut keys: Vec<Sym> = (1..=8).map(|i| Sym::new(&format!("dyn_probe_compile_s8_{i}"))).collect();
     keys.sort_unstable();
-    let fg = FactorGroupSpec::new(&[&keys]);
+    let fg = FactorGroupSpec::new(&[&model_atoms(&keys)]);
     let layout = Layout::new(vec![Shape::Dyn]);
     let plans = vec![FactorPlan::compile(&Shape::Dyn, &fg).unwrap()];
     let fsym = FactorSymmetry::new(fg.clone(), plans, &layout);
@@ -417,7 +428,7 @@ fn uniform_dyn_fcn_keeps_single_unpinned_block_as_domain_grows() {
         k_a.sort_unstable();
         let mut k_b = vec![Sym::new("ud_b1"), Sym::new("ud_b2")];
         k_b.sort_unstable();
-        let fg = FactorGroupSpec::new(&[&k_a, &k_b]);
+        let fg = FactorGroupSpec::new(&[&model_atoms(&k_a), &model_atoms(&k_b)]);
 
         let dom_a: Vec<Value> = k_a.iter().copied().map(Value::ModelValue).collect();
         let fcn_dyn = Shape::Fcn {
@@ -472,5 +483,45 @@ fn uniform_dyn_fcn_keeps_single_unpinned_block_as_domain_grows() {
         img.swap(boff, boff + 1);
         apply_factor_img(&fsym, &layout, &img, &words, &mut swapped);
         assert_eq!(orbit_fp_factorized(&fsym, &layout, &swapped, sem.as_ref()), base_fp);
+    }
+}
+
+fn model_atoms(keys: &[Sym]) -> Vec<tlx_value::SymAtom> {
+    keys.iter().copied().map(tlx_value::SymAtom::Model).collect()
+}
+
+#[test]
+fn string_symmetry_least_words_agree_with_interpreter() {
+    let src = tlx_testkit::module("StringOrbit", "VARIABLE x\nInit == x = TRUE\nNext == UNCHANGED x");
+    for size in [2, 3] {
+        let mut model = load(&src, "INIT Init\nNEXT Next\n");
+        let symbols = ["t_a", "t_b", "t_c"].map(Sym::new);
+        let atoms: Vec<_> = symbols[..size].iter().copied().map(SymAtom::Str).collect();
+        model
+            .apply_symmetry(atoms.windows(2).map(|w| HashMap::from([(w[0], w[1].to_value()), (w[1], w[0].to_value())])).collect())
+            .unwrap();
+        let shape = Shape::Atom(atoms.iter().map(|a| a.to_value()).collect());
+        let pair = Shape::Tuple(vec![shape.clone(), Shape::Int { lo: 1, hi: 1 }].into());
+        let set = Shape::Set { elem: Box::new(pair), max_card: size };
+        let layout = Layout::new(vec![Shape::Tuple(vec![set, shape, Shape::Atom(vec![Value::ModelValue(symbols[0])].into())].into())]);
+        let fg = FactorGroupSpec::new(&[&atoms]);
+        let fsym = FactorSymmetry::new(fg.clone(), vec![FactorPlan::compile(&layout.vars[0], &fg).unwrap()], &layout);
+        let explicit = build_explicit_group(&fg, &layout);
+        let pairs = Value::set_from(atoms.iter().map(|a| Value::tuple(vec![a.to_value(), Value::Int(1)])).collect()).unwrap();
+        let state_with = |a: SymAtom| vec![Value::tuple(vec![pairs.clone(), a.to_value(), Value::ModelValue(symbols[0])])];
+        for atom in &atoms {
+            let state = state_with(*atom);
+            let expected = state_with(atoms[0]);
+            assert_eq!(model.least_state_in_orbit(&state).unwrap().unwrap_or_else(|| state.clone()), expected);
+            let mut words = vec![0; layout.words];
+            layout.encode_state(&state, &mut words).unwrap();
+            let mut best = Vec::new();
+            let moved = least_perm_words_factorized(&fsym, &[0], &layout, &words, &mut best).unwrap();
+            assert_eq!(layout.decode_state(if moved { &best } else { &words }), expected);
+            let mut canonical = vec![0; layout.words];
+            layout.encode_state(&expected, &mut canonical).unwrap();
+            assert_eq!(orbit_fp_factorized(&fsym, &layout, &words, None), fp_words(&canonical));
+            assert_eq!(orbit_fp_explicit(&explicit, &[0], &layout, &words, None, None).unwrap(), fp_words(&canonical));
+        }
     }
 }

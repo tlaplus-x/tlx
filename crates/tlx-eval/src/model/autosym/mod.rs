@@ -154,7 +154,7 @@ pub fn candidates(ip: &Arc<Interp>) -> Vec<Candidate> {
 }
 
 /// The model values the declared SYMMETRY moves.
-fn declared_support(model: &InterpModel) -> HashSet<Sym> {
+fn declared_support(model: &InterpModel) -> HashSet<tlx_value::SymAtom> {
     let mut out = model.group.moved_syms();
     if !out.is_empty() {
         return out;
@@ -167,7 +167,7 @@ fn declared_support(model: &InterpModel) -> HashSet<Sym> {
             for k in keys {
                 if let (Value::ModelValue(m), Ok(img)) = (&k, ops::apply(&f, &k)) {
                     if img != k {
-                        out.insert(*m);
+                        out.insert(tlx_value::SymAtom::Model(*m));
                     }
                 }
             }
@@ -300,8 +300,8 @@ pub fn analyze(model: &InterpModel) -> Analysis {
     Analysis { sets, effects, incomplete: an.overflow, forced: Vec::new(), elapsed: started.elapsed() }
 }
 
-fn is_declared(e: &Value, declared: &HashSet<Sym>) -> bool {
-    matches!(e, Value::ModelValue(m) if declared.contains(m))
+fn is_declared(e: &Value, declared: &HashSet<tlx_value::SymAtom>) -> bool {
+    matches!(e, Value::ModelValue(m) if declared.contains(&tlx_value::SymAtom::Model(*m)))
 }
 
 /// The classes of the elements of `c` that transpositions fixing every
@@ -384,7 +384,7 @@ impl SetResult {
     }
 
     /// Generators of the proven group: adjacent transpositions of each class.
-    pub fn generators(&self) -> Vec<HashMap<Sym, Value>> {
+    pub fn generators(&self) -> Vec<HashMap<tlx_value::SymAtom, Value>> {
         let Verdict::Proven { classes, .. } = &self.verdict else { return Vec::new() };
         classes.iter().flat_map(|cl| transpositions(cl)).collect()
     }
@@ -403,11 +403,11 @@ impl SetResult {
 }
 
 /// Adjacent transpositions of `elems`: generators of all their permutations.
-pub fn transpositions(elems: &[Value]) -> Vec<HashMap<Sym, Value>> {
+pub fn transpositions(elems: &[Value]) -> Vec<HashMap<tlx_value::SymAtom, Value>> {
     let mut out = Vec::new();
     for pair in elems.windows(2) {
         let (Value::ModelValue(a), Value::ModelValue(b)) = (&pair[0], &pair[1]) else { continue };
-        out.push(HashMap::from([(*a, pair[1].clone()), (*b, pair[0].clone())]));
+        out.push(HashMap::from([(tlx_value::SymAtom::Model(*a), pair[1].clone()), (tlx_value::SymAtom::Model(*b), pair[0].clone())]));
     }
     out
 }

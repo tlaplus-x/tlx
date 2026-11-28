@@ -32,6 +32,6 @@ pub mod value;
 pub use error::{ValueError, ValueErrorKind};
 pub use intern::Sym;
 pub use lazy::{CustomSet, LazyFcn, LazySet};
-pub use value::{FcnDom, FcnKind, Value};
+pub use value::{FcnDom, FcnKind, SymAtom, Value};
 
 pub type Result<T> = std::result::Result<T, ValueError>;

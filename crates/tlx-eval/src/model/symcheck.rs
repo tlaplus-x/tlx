@@ -101,7 +101,7 @@ fn generators(ip: &Arc<Interp>, e: &Expr, out: &mut Vec<Perm>, limit: usize, nes
             }
             for pair in values.windows(2) {
                 let (Value::ModelValue(a), Value::ModelValue(b)) = (&pair[0], &pair[1]) else { unreachable!() };
-                let p = HashMap::from([(*a, pair[1].clone()), (*b, pair[0].clone())]);
+                let p = HashMap::from([(tlx_value::SymAtom::Model(*a), pair[1].clone()), (tlx_value::SymAtom::Model(*b), pair[0].clone())]);
                 if !out.contains(&p) {
                     out.push(p);
                 }
@@ -146,7 +146,7 @@ fn permutations(m: &InterpModel, limit: usize) -> EResult<Vec<Perm>> {
             }
             images.push(v.clone());
             if v != *k {
-                p.insert(*s, v);
+                p.insert(tlx_value::SymAtom::Model(*s), v);
             }
         }
         if !p.is_empty() && !out.contains(&p) {
@@ -181,7 +181,7 @@ fn moves_state(s: &State, p: &symmetry::FastPerm) -> Result<bool, ModelError> {
 }
 
 fn label(p: &Perm) -> String {
-    let mut pairs: Vec<_> = p.iter().map(|(k, v)| format!("{} -> {v}", Value::ModelValue(*k))).collect();
+    let mut pairs: Vec<_> = p.iter().map(|(k, v)| format!("{} -> {v}", k.to_value())).collect();
     pairs.sort();
     pairs.join(", ")
 }
@@ -338,7 +338,7 @@ pub fn check(model: &InterpModel, bounds: &Bounds) -> Result<Report, ModelError>
 
 /// `check` of the given permutations (generators of a group) instead of
 /// the declared SYMMETRY.
-pub fn check_perms(model: &InterpModel, perms: Vec<HashMap<Sym, Value>>, bounds: &Bounds) -> Result<Report, ModelError> {
+pub fn check_perms(model: &InterpModel, perms: Vec<Perm>, bounds: &Bounds) -> Result<Report, ModelError> {
     if bounds.states == 0 || bounds.edges == 0 {
         return Err(ModelError::new("symmetry limits must be positive"));
     }
@@ -401,7 +401,7 @@ pub fn check_perms(model: &InterpModel, perms: Vec<HashMap<Sym, Value>>, bounds:
 /// that fixes every admitted state it reaches reduces nothing, and it must
 /// not displace a group that does reduce. The answer is evidence, not a
 /// proof; leaving a symmetry unapplied is always sound.
-pub fn probe_movement(model: &InterpModel, groups: &[Vec<HashMap<Sym, Value>>], bounds: &Bounds) -> Result<Vec<bool>, ModelError> {
+pub fn probe_movement(model: &InterpModel, groups: &[Vec<Perm>], bounds: &Bounds) -> Result<Vec<bool>, ModelError> {
     if bounds.states == 0 || bounds.edges == 0 {
         return Err(ModelError::new("symmetry limits must be positive"));
     }

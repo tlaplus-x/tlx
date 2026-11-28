@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tlx_base::partition::{FactorLayout, Partition, INLINE_KEYS};
 use tlx_sema::builtins::Builtin;
 use tlx_sema::hir::{DefKind, Expr, ExprKind, OpRef};
-use tlx_value::{ops, Sym, Value};
+use tlx_value::{ops, SymAtom, Value};
 
 use crate::env::Env;
 use crate::error::{EResult, EvalError};
@@ -32,7 +32,7 @@ pub(super) enum FallbackOrder {
     DisjointFull,
     /// Overlapping `Permutations(S_1) \cup ... \cup Permutations(S_m)` where
     /// each `S_i` is sorted ascending in TLC order and deduplicated by `(len, S_i)`.
-    OverlappingSets(Vec<Vec<Sym>>),
+    OverlappingSets(Vec<Vec<SymAtom>>),
     /// Explicit flat-image generator list in normalized declaration order.
     ExplicitGens(Vec<Vec<u16>>),
 }
@@ -41,9 +41,9 @@ pub(super) enum FallbackOrder {
 /// products of full symmetric groups (`Permutations(S1) \cup Permutations(S2)`)
 /// without expanding `|S|!` or running `O(|G|^2)` group closure.
 pub(in crate::model) fn symmetry_group(ip: &Arc<Interp>, e: &Expr) -> EResult<Group> {
-    let mut raw_factors: Vec<Vec<Sym>> = Vec::new();
+    let mut raw_factors: Vec<Vec<SymAtom>> = Vec::new();
     if collect_perm_factors(ip, e, &mut raw_factors, 0)? {
-        let mut normalized_sets: Vec<Vec<Sym>> = raw_factors
+        let mut normalized_sets: Vec<Vec<SymAtom>> = raw_factors
             .into_iter()
             .filter(|s| s.len() >= 2)
             .map(|mut s| {
@@ -78,7 +78,7 @@ pub(in crate::model) fn symmetry_group(ip: &Arc<Interp>, e: &Expr) -> EResult<Gr
 /// Syntactically recognize `Permutations(S)`, unions (`\cup`), empty sets, and
 /// 0-ary aliases without expanding `|S|!`. Returns `Ok(false)` when `e` is not
 /// of this form so the caller falls back to full evaluation.
-fn collect_perm_factors(ip: &Arc<Interp>, e: &Expr, out: &mut Vec<Vec<Sym>>, nesting: usize) -> EResult<bool> {
+fn collect_perm_factors(ip: &Arc<Interp>, e: &Expr, out: &mut Vec<Vec<SymAtom>>, nesting: usize) -> EResult<bool> {
     if nesting > 100 {
         return Ok(false);
     }
@@ -119,7 +119,7 @@ fn collect_perm_factors(ip: &Arc<Interp>, e: &Expr, out: &mut Vec<Vec<Sym>>, nes
                 let Value::ModelValue(m) = v else {
                     return Err(EvalError::new(format!("SYMMETRY permutations must map model values, found {v}")));
                 };
-                syms.push(*m);
+                syms.push(SymAtom::Model(*m));
             }
             if syms.len() >= 2 {
                 out.push(syms);
@@ -130,12 +130,20 @@ fn collect_perm_factors(ip: &Arc<Interp>, e: &Expr, out: &mut Vec<Vec<Sym>>, nes
     }
 }
 
+fn same_kind(a: SymAtom, b: SymAtom) -> bool {
+    match (a, b) {
+        (SymAtom::Str(_), SymAtom::Str(_)) => true,
+        (SymAtom::Model(x), SymAtom::Model(y)) => x.model_value_type() == y.model_value_type(),
+        _ => false,
+    }
+}
+
 /// Merge overlapping `Sym(S_i)` sets into pairwise-disjoint connected
-/// components sorted in TLC order (`Sym::cmp`). Returns `None` if any merged
+/// components sorted in TLC order (`SymAtom::cmp`). Returns `None` if any merged
 /// component mixes model-value types (so the caller falls back to explicit
 /// closure to preserve typed-vs-untyped `cmp_tlc` behavior).
-fn merge_uniform_factors(raw: &[Vec<Sym>]) -> Option<Vec<Vec<Sym>>> {
-    let mut all: Vec<Sym> = raw.iter().flat_map(|s| s.iter().copied()).collect();
+fn merge_uniform_factors(raw: &[Vec<SymAtom>]) -> Option<Vec<Vec<SymAtom>>> {
+    let mut all: Vec<SymAtom> = raw.iter().flat_map(|s| s.iter().copied()).collect();
     all.sort_unstable();
     all.dedup();
     if all.is_empty() {
@@ -150,7 +158,7 @@ fn merge_uniform_factors(raw: &[Vec<Sym>]) -> Option<Vec<Vec<Sym>>> {
             uf.union(i0, i);
         }
     }
-    let mut groups: HashMap<usize, Vec<Sym>> = HashMap::new();
+    let mut groups: HashMap<usize, Vec<SymAtom>> = HashMap::new();
     for (i, &m) in all.iter().enumerate() {
         groups.entry(uf.find(i)).or_default().push(m);
     }
@@ -160,8 +168,8 @@ fn merge_uniform_factors(raw: &[Vec<Sym>]) -> Option<Vec<Vec<Sym>>> {
             continue;
         }
         g.sort_unstable();
-        let ty = g[0].model_value_type();
-        if g[1..].iter().any(|m| m.model_value_type() != ty) {
+        let ty = g[0];
+        if g[1..].iter().any(|m| !same_kind(*m, ty)) {
             return None;
         }
         factors.push(g);
@@ -172,9 +180,9 @@ fn merge_uniform_factors(raw: &[Vec<Sym>]) -> Option<Vec<Vec<Sym>>> {
 
 /// Recognize whether an arbitrary generator list generates a disjoint product
 /// of full symmetric groups `prod_g Sym(K_g)` without closing the group.
-pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<Sym>>> {
-    let mut moved: Vec<Sym> = Vec::new();
-    let mut parsed: Vec<Vec<(Sym, Sym)>> = Vec::new();
+pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<SymAtom>>> {
+    let mut moved: Vec<SymAtom> = Vec::new();
+    let mut parsed: Vec<Vec<(SymAtom, SymAtom)>> = Vec::new();
     for p in gens {
         if p.is_empty() {
             continue;
@@ -182,13 +190,13 @@ pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<Sym>>>
         let mut pairs = Vec::with_capacity(p.len());
         let mut imgs = HashSet::with_capacity(p.len());
         for (&k, v) in p {
-            let Value::ModelValue(img) = v else { return None };
-            if !imgs.insert(*img) {
+            let img = SymAtom::from_value(v)?;
+            if !imgs.insert(img) {
                 return None;
             }
-            pairs.push((k, *img));
+            pairs.push((k, img));
             moved.push(k);
-            moved.push(*img);
+            moved.push(img);
         }
         if pairs.iter().any(|(_, img)| !p.contains_key(img)) {
             return None;
@@ -200,7 +208,7 @@ pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<Sym>>>
     }
     moved.sort_unstable();
     moved.dedup();
-    let idx_of = |s: Sym| moved.binary_search(&s).unwrap();
+    let idx_of = |s: SymAtom| moved.binary_search(&s).unwrap();
 
     let mut orbit_uf = UnionFind::new(moved.len());
     for p in &parsed {
@@ -239,10 +247,10 @@ pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<Sym>>>
                 return None;
             }
         }
-        let mut syms: Vec<Sym> = members.into_iter().map(|i| moved[i]).collect();
+        let mut syms: Vec<SymAtom> = members.into_iter().map(|i| moved[i]).collect();
         syms.sort_unstable();
-        let ty = syms[0].model_value_type();
-        if syms[1..].iter().any(|m| m.model_value_type() != ty) {
+        let ty = syms[0];
+        if syms[1..].iter().any(|m| !same_kind(*m, ty)) {
             return None;
         }
         factors.push(syms);
@@ -252,9 +260,9 @@ pub(super) fn recognize_disjoint_factors(gens: &[Perm]) -> Option<Vec<Vec<Sym>>>
 }
 
 fn has_full_cycle_with_adj_transp(
-    parsed: &[Vec<(Sym, Sym)>],
+    parsed: &[Vec<(SymAtom, SymAtom)>],
     orbit_uf: &mut UnionFind,
-    idx_of: &impl Fn(Sym) -> usize,
+    idx_of: &impl Fn(SymAtom) -> usize,
     root: usize,
     members: &[usize],
     transps: &[(usize, usize)],
@@ -312,11 +320,11 @@ impl UnionFind {
 }
 
 /// One full symmetric-group factor `Sym(K_g)` over `keys` sorted strictly
-/// ascending in TLC order (`Sym::cmp`).
+/// ascending in TLC order (`SymAtom::cmp`).
 #[derive(Clone)]
 pub(super) struct Factor {
-    pub(super) keys: Vec<Sym>,
-    /// Pre-built `Value::ModelValue(k)` matching `keys` so `PermMap::get`
+    pub(super) keys: Vec<SymAtom>,
+    /// Pre-built atom values matching `keys` so `PermMap::get`
     /// returns `&Value` with zero allocation.
     pub(super) values: Vec<Value>,
     /// Start offset of this factor in flat per-key arrays (`Partition`, tables).
@@ -327,10 +335,10 @@ pub(super) struct Factor {
 #[derive(Clone)]
 pub(super) struct FactorizedGroup {
     pub(super) factors: Vec<Factor>,
-    /// Sorted by `sym.id()` for fast lookup: `(sym_id, factor_idx, key_idx)`.
-    key_index: Vec<(u32, u16, u16)>,
-    min_id: u32,
-    max_id: u32,
+    /// Sorted by `sym.compact_key()` for fast lookup: `(sym_id, factor_idx, key_idx)`.
+    key_index: Vec<(u64, u16, u16)>,
+    min_id: u64,
+    max_id: u64,
     pub(super) total_keys: usize,
     /// Exact group order `prod_g |K_g|!`, saturating at `u128::MAX`.
     pub(super) order: u128,
@@ -339,7 +347,7 @@ pub(super) struct FactorizedGroup {
 }
 
 impl FactorizedGroup {
-    pub(super) fn new(raw_factors: Vec<Vec<Sym>>, fallback: FallbackOrder) -> EResult<FactorizedGroup> {
+    pub(super) fn new(raw_factors: Vec<Vec<SymAtom>>, fallback: FallbackOrder) -> EResult<FactorizedGroup> {
         // Factor ids are zero-based, but partition blocks also store the exclusive
         // end of each factor in a u16.
         if raw_factors.len() > usize::from(u16::MAX) + 1 {
@@ -358,15 +366,15 @@ impl FactorizedGroup {
                 order = order.saturating_mul(k);
             }
             for (k, &s) in keys.iter().enumerate() {
-                key_index.push((s.id(), g as u16, k as u16));
+                key_index.push((s.compact_key(), g as u16, k as u16));
             }
-            let values = keys.iter().copied().map(Value::ModelValue).collect();
+            let values = keys.iter().copied().map(SymAtom::to_value).collect();
             let len = keys.len();
             factors.push(Factor { keys, values, offset });
             offset += len;
         }
         key_index.sort_unstable_by_key(|&(id, _, _)| id);
-        let min_id = key_index.first().map_or(u32::MAX, |&(id, _, _)| id);
+        let min_id = key_index.first().map_or(u64::MAX, |&(id, _, _)| id);
         let max_id = key_index.last().map_or(0, |&(id, _, _)| id);
         Ok(FactorizedGroup { factors, key_index, min_id, max_id, total_keys: offset, order, fallback })
     }
@@ -375,8 +383,8 @@ impl FactorizedGroup {
     pub(super) fn perm_to_img(&self, p: &Perm) -> Vec<u16> {
         let mut img = self.identity_img();
         for (&k, v) in p {
-            if let (Some((g, ki)), Value::ModelValue(m)) = (self.lookup(k), v) {
-                if let Some((mg, mi)) = self.lookup(*m) {
+            if let (Some((g, ki)), Some(m)) = (self.lookup(k), SymAtom::from_value(v)) {
+                if let Some((mg, mi)) = self.lookup(m) {
                     debug_assert_eq!(g, mg);
                     img[self.factors[g].offset + ki] = mi as u16;
                 }
@@ -400,8 +408,8 @@ impl FactorizedGroup {
     }
 
     #[inline]
-    pub(super) fn lookup(&self, m: Sym) -> Option<(usize, usize)> {
-        let id = m.id();
+    pub(super) fn lookup(&self, m: SymAtom) -> Option<(usize, usize)> {
+        let id = m.compact_key();
         if id < self.min_id || id > self.max_id {
             return None;
         }
@@ -524,7 +532,7 @@ impl FactorizedGroup {
                 let k = dom[off + pos] as usize;
                 let t = tgt[off + pos] as usize;
                 if k != t {
-                    entries.push((f.keys[k].id(), f.values[t].clone()));
+                    entries.push((f.keys[k].compact_key(), f.values[t].clone()));
                 }
             }
         }

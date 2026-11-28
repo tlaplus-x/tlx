@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tlx_value::{Sym, Value};
+use tlx_value::{SymAtom, Value};
 
 use crate::shape::{join_all, map_shape, set_shape};
 use crate::Shape;
@@ -11,22 +11,22 @@ use crate::Shape;
 pub struct AtomOrbits(Vec<Shape>);
 
 impl AtomOrbits {
-    pub fn from_factors(factors: &[&[Sym]]) -> Self {
-        Self(factors.iter().map(|keys| Shape::Atom(keys.iter().copied().map(Value::ModelValue).collect())).collect())
+    pub fn from_factors(factors: &[&[SymAtom]]) -> Self {
+        Self(factors.iter().map(|keys| Shape::Atom(keys.iter().copied().map(SymAtom::to_value).collect())).collect())
     }
 
     /// The explicit group contains every non-identity permutation, so the
     /// images of one representative enumerate its entire orbit.
-    pub fn from_group(maps: &[HashMap<Sym, Value>]) -> Self {
+    pub fn from_group(maps: &[HashMap<SymAtom, Value>]) -> Self {
         let mut seen = HashSet::new();
         let mut orbits = Vec::new();
         for &key in maps.iter().flat_map(HashMap::keys) {
             if seen.insert(key) {
-                let mut values = vec![Value::ModelValue(key)];
+                let mut values = vec![key.to_value()];
                 for map in maps {
-                    if let Some(Value::ModelValue(image)) = map.get(&key) {
-                        if seen.insert(*image) {
-                            values.push(Value::ModelValue(*image));
+                    if let Some(image) = map.get(&key).and_then(SymAtom::from_value) {
+                        if seen.insert(image) {
+                            values.push(image.to_value());
                         }
                     }
                 }
