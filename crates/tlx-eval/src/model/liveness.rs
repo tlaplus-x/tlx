@@ -896,8 +896,29 @@ fn eventually(f: Ltl) -> Ltl {
 /// (`EnabledVia` atoms from the action-atom bits of the outgoing steps).
 pub use tlx_runtime::AtomBits;
 
+impl super::InterpModel {
+    /// Properties and fairness with the same atom numbering as this model's recorder.
+    pub fn liveness_input(&self) -> tlx_runtime::liveness::LiveInput<'_> {
+        tlx_runtime::liveness::LiveInput {
+            props: &self.live.props,
+            alone: &self.live.alone,
+            fairness: self
+                .live
+                .fairness
+                .iter()
+                .map(|f| tlx_live::Fairness { strong: f.strong, enabled: f.enabled, taken: f.taken })
+                .collect(),
+            concrete: self.has_view_or_symmetry(),
+        }
+    }
+}
+
 /// The interpreter's atoms on its own states.
 impl AtomBits<super::State> for super::InterpModel {
+    fn live_input(&self) -> Option<tlx_runtime::liveness::LiveInput<'_>> {
+        (!self.has_view_or_symmetry() && !self.live.is_empty()).then(|| self.liveness_input())
+    }
+
     fn state(&self, s: &super::State, out: &[&[u64]]) -> Result<Vec<u64>, tlx_runtime::ModelError> {
         self.live.state_bits(&self.ip, &s.vals, s.level, out).map_err(|e| self.error(e))
     }

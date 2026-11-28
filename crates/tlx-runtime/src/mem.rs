@@ -389,6 +389,13 @@ impl RssGuard {
         RssGuard { budget, limit, available }
     }
 
+    /// Search structures are still resident during an optional periodic scan.
+    /// Charge the recorded graph against the headroom measured before its build.
+    pub(crate) fn periodic(budget: usize, base: usize, recorded: usize) -> Self {
+        let available = if budget == usize::MAX { budget } else { budget.saturating_sub(base).saturating_sub(recorded) };
+        Self { budget, limit: budget, available }
+    }
+
     /// Ok while the process is within the limit, else the message of the
     /// failure, `what` (described lazily) being what grows.
     pub(crate) fn check(&self, what: &dyn Fn() -> String) -> Result<(), String> {

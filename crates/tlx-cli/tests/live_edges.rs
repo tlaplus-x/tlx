@@ -102,3 +102,58 @@ fn atom_errors_come_from_the_search() {
         }
     }
 }
+
+const PROGRESS: &str = r#"---- MODULE Progress ----
+EXTENDS Naturals
+VARIABLE x
+Init == x = 0
+Step == x < 80 /\ x' = x + 1
+Spec == Init /\ [][Step]_x
+Fair == Spec /\ WF_x(Step)
+Goal == <>(x = 80)
+====
+"#;
+
+#[test]
+fn periodic_checks_stop_at_a_closed_lasso_and_allow_frontier_progress() {
+    for (behavior, expected) in [("Fair", 0), ("Spec", 13)] {
+        let cfg = format!("SPECIFICATION {behavior}\nPROPERTY Goal\nCHECK_DEADLOCK FALSE\n");
+        let dir = tlx_testkit::TempDir::with_spec("periodic", PROGRESS, &cfg);
+        for tier in ["-interp", "-compile"] {
+            for workers in ["1", "4"] {
+                let out = tlx_testkit::tlx!()
+                    .dir(&dir)
+                    .args(["check", "Progress.tla", tier, "-workers", workers, "-stats"])
+                    .env("TLX_LIVE_CHECK_FIRST", "4")
+                    .env("TLX_PARANOID", "1")
+                    .timeout(std::time::Duration::from_secs(30))
+                    .run();
+                let text = out.text();
+                assert_eq!(out.code, expected, "{tier} {workers}: {text}");
+                assert!(text.contains("liveness: periodic checks"), "{text}");
+                if expected == 0 {
+                    assert!(text.contains("81 distinct states found"), "{text}");
+                } else {
+                    assert!(text.contains("5 distinct states found") && text.contains("Temporal property Goal was violated."), "{text}");
+                    assert!(text.contains("Stuttering") && !text.contains("absence of a fairness constraint"), "{text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tight_budget_defers_periodic_lasso_to_final_check() {
+    let dir = tlx_testkit::TempDir::with_spec("periodic-budget", PROGRESS, "SPECIFICATION Spec\nPROPERTY Goal\nCHECK_DEADLOCK FALSE\n");
+    let out = tlx_testkit::tlx!()
+        .dir(&dir)
+        .args(["check", "Progress.tla", "-interp", "-workers", "1", "-stats", "-maxmem", "1M"])
+        .env("TLX_LIVE_CHECK_FIRST", "4")
+        .timeout(std::time::Duration::from_secs(30))
+        .run();
+    let text = out.text();
+    assert_eq!(out.code, 13, "{text}");
+    assert!(!text.contains("liveness: periodic checks"), "{text}");
+    assert!(text.contains("81 distinct states found") && text.contains("Temporal property Goal was violated."), "{text}");
+    assert!(text.contains("Stuttering"), "{text}");
+}

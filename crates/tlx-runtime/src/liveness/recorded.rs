@@ -7,6 +7,7 @@ use super::{LiveInput, LiveResult, STUTTER};
 use crate::mem::RssGuard;
 use crate::{LiveGraph, Model, ModelError};
 
+#[derive(Debug)]
 struct ReplayStep {
     src: u32,
     edge: u32,
@@ -22,6 +23,42 @@ struct ReplayStep {
 /// of a compiled model: the interpreter checks again) or a path that does
 /// not follow the graph (a bug) is the result.
 pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, workers: usize, guard: RssGuard) -> LiveResult<M::State> {
+    match scan(input, g, workers, guard) {
+        Ok(Some(witness)) => witness.replay(m, input),
+        Ok(None) => LiveResult::Holds,
+        Err(msg) => LiveResult::OutOfMemory(msg),
+    }
+}
+
+/// Evidence owned independently of the graph and the workers' value store.
+#[derive(Debug)]
+pub struct RecordedWitness {
+    first: Option<u64>,
+    steps: Vec<ReplayStep>,
+    prefix: usize,
+    prop: usize,
+    state_pats: Vec<tlx_live::Bits>,
+    action_pats: Vec<tlx_live::Bits>,
+}
+
+impl RecordedWitness {
+    pub fn replay<M: Model>(self, m: &M, input: &LiveInput) -> LiveResult<M::State> {
+        let Self { first, steps, prefix, prop, state_pats, action_pats } = self;
+        let path = match replay(m, first, &steps) {
+            Ok(p) => p,
+            Err(e) => return LiveResult::Error(e),
+        };
+        let seq: Vec<(u32, &M::State, u32)> = steps.iter().zip(&path).map(|(step, (st, a))| (step.src, st, *a)).collect();
+        let sh = Shape::new(&seq, prefix);
+        let names =
+            violated_names(input, &sh, &mut |k| Ok(Cow::Borrowed(&state_pats[steps[sh.shown[k].pos].state_pat as usize])), &mut |k| {
+                Ok(Cow::Borrowed(&action_pats[steps[sh.shown[k].leave].action_pat as usize]))
+            });
+        violated(names, prop, &seq, &sh)
+    }
+}
+
+pub(crate) fn scan(input: &LiveInput, g: LiveGraph, workers: usize, guard: RssGuard) -> Result<Option<RecordedWitness>, String> {
     record_live_graph(&g);
     let LiveGraph { init, fps, off, tgt, edge_pat, state_pat, state_pats, action_pats } = g;
     let bits = |p: Vec<Box<[u64]>>| p.into_iter().map(tlx_live::Bits::from_boxed_words).collect();
@@ -32,7 +69,7 @@ pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, w
         let r = tlx_live::check_lasso_csr_stats(&graph, f, &input.fairness, workers, &mut guard.product(&mut peak, &mut err), &mut st);
         record_product(peak);
         record_check(&st);
-        let Ok(r) = r else { return LiveResult::OutOfMemory(err.unwrap_or_default()) };
+        let Ok(r) = r else { return Err(err.unwrap_or_default()) };
         if let Err(cx) = r {
             let steps: Vec<ReplayStep> = cx
                 .prefix
@@ -58,20 +95,10 @@ pub(super) fn check_recorded<M: Model>(m: &M, input: &LiveInput, g: LiveGraph, w
                 (std::mem::take(&mut csr.state_pats), std::mem::take(&mut csr.action_pats))
             };
             drop(fps);
-            let path = match replay(m, first, &steps) {
-                Ok(p) => p,
-                Err(e) => return LiveResult::Error(e),
-            };
-            let seq: Vec<(u32, &M::State, u32)> = steps.iter().zip(&path).map(|(step, (st, a))| (step.src, st, *a)).collect();
-            let sh = Shape::new(&seq, cx.prefix.len());
-            let names =
-                violated_names(input, &sh, &mut |k| Ok(Cow::Borrowed(&state_pats[steps[sh.shown[k].pos].state_pat as usize])), &mut |k| {
-                    Ok(Cow::Borrowed(&action_pats[steps[sh.shown[k].leave].action_pat as usize]))
-                });
-            return violated(names, i, &seq, &sh);
+            return Ok(Some(RecordedWitness { first, steps, prefix: cx.prefix.len(), prop: i, state_pats, action_pats }));
         }
     }
-    LiveResult::Holds
+    Ok(None)
 }
 
 /// Reclaim transient value-store allocations during lasso counterexample

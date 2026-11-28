@@ -30,6 +30,11 @@ use crate::model::{ErrorKind, ModelError};
 /// Evaluation of the liveness atoms (state predicates and action predicates
 /// of the temporal properties and fairness) on the states of a model.
 pub trait AtomBits<S> {
+    /// Formulas corresponding to this recorder's atom positions, when periodic checks are sound.
+    fn live_input(&self) -> Option<crate::liveness::LiveInput<'_>> {
+        None
+    }
+
     /// State-atom bits of `s`, given the action-atom bits of its outgoing
     /// steps (for `ENABLED` atoms derived from them).
     fn state(&self, s: &S, out: &[&[u64]]) -> Result<Vec<u64>, ModelError>;
@@ -550,11 +555,11 @@ const KINDS: [ErrorKind; 12] = [
 /// The memory `build` allocates for the graph of the records `recs`
 /// (bytes): the CSR arrays and the fingerprint index, while the records are
 /// freed as they are read.
-pub(super) fn build_bytes<S>(recs: &[EdgeRec<'_, S>]) -> (usize, usize, usize) {
-    let (n, e) = recs.iter().map(|r| r.counts()).fold((0, 0), |(n, e), (a, b)| (n + a, e + b));
+pub(super) fn build_bytes<'a, 'm: 'a, S: 'm>(recs: impl Iterator<Item = &'a EdgeRec<'m, S>> + Clone) -> (usize, usize, usize) {
+    let (n, e) = recs.clone().map(|r| r.counts()).fold((0, 0), |(n, e), (a, b)| (n + a, e + b));
     let index = FpMap::bytes_with_capacity(n);
     // (At most this many action patterns: each record's are distinct.)
-    let pats: usize = recs.iter().map(|r| r.actions.pats.len()).sum();
+    let pats: usize = recs.map(|r| r.actions.pats.len()).sum();
     let pat_bytes = match Ids::zeros(0, pats.saturating_sub(1) as u32) {
         Ids::U8(_) => 1,
         Ids::U16(_) => 2,
@@ -594,7 +599,17 @@ pub fn liveness_memory_error(what: &str, need: usize, budget: usize) -> String {
 /// expanded, where the others have no node (LiveWorker skips them: no
 /// behavior goes on from them, not even by stuttering). Here they are one
 /// sink node (the last, without edges).
-pub(super) fn build<S>(recs: Vec<EdgeRec<'_, S>>, spill: &Spill, partial: bool) -> Result<Option<LiveGraph>, IoError> {
+pub(super) fn build<S>(mut recs: Vec<EdgeRec<'_, S>>, spill: &Spill, partial: bool) -> Result<Option<LiveGraph>, IoError> {
+    build_graph(recs.iter_mut().collect(), spill, partial, true)
+}
+
+/// A periodic snapshot borrows the same logs that final translation drains.
+pub(super) fn build_graph<S>(
+    recs: Vec<&mut EdgeRec<'_, S>>,
+    spill: &Spill,
+    partial: bool,
+    drain: bool,
+) -> Result<Option<LiveGraph>, IoError> {
     if recs.iter().any(|r| r.failed) {
         return Ok(None);
     }
@@ -663,9 +678,9 @@ pub(super) fn build<S>(recs: Vec<EdgeRec<'_, S>>, spill: &Spill, partial: bool) 
     let mut edge_pat = Ids::zeros(edges, actions.pats.len().saturating_sub(1) as u32);
     let mut state_pat = vec![0u32; n];
     let ok = match &mut edge_pat {
-        Ids::U8(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill)?,
-        Ids::U16(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill)?,
-        Ids::U32(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill)?,
+        Ids::U8(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill, drain)?,
+        Ids::U16(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill, drain)?,
+        Ids::U32(p) => translate(recs, remap, &index, sink, &off, &mut tgt, p, &mut state_pat, spill, drain)?,
     };
     if !ok {
         return Ok(None);
@@ -722,7 +737,7 @@ impl PatId for u32 {
 /// reading spilled records.
 #[allow(clippy::too_many_arguments)]
 fn translate<S, P: PatId>(
-    recs: Vec<EdgeRec<'_, S>>,
+    recs: Vec<&mut EdgeRec<'_, S>>,
     remap: Vec<(Vec<u32>, Vec<u32>)>,
     index: &FpMap,
     sink: Option<u32>,
@@ -731,6 +746,7 @@ fn translate<S, P: PatId>(
     edge_pat: &mut [P],
     state_pat: &mut [u32],
     spill: &Spill,
+    drain: bool,
 ) -> Result<bool, IoError> {
     let mut parts = Vec::new();
     let (mut tgt_rest, mut pat_rest, mut sp_rest) = (tgt, edge_pat, state_pat);
@@ -750,8 +766,10 @@ fn translate<S, P: PatId>(
     let pool = tlx_base::par::Pool { threads: parts.len(), stack: tlx_base::par::Stack::Default };
     let results = pool.map_owned(parts, |abort, (r, smap, amap, t, p, s, first)| {
         let EdgeRec { fps, meta, .. } = r;
-        let mut it = fps.drain(Some(spill));
-        let mut mi = meta.drain(Some(spill));
+        let mut it =
+            if drain { std::mem::replace(fps, SpillVec::new(4096, "edges-fps")).drain(Some(spill)) } else { fps.iter(Some(spill)) };
+        let mut mi =
+            if drain { std::mem::replace(meta, SpillVec::new(4096, "edges-meta")).drain(Some(spill)) } else { meta.iter(Some(spill)) };
         let ok = (|| -> Option<()> {
             let mut e = 0;
             for (k, sk) in s.iter_mut().enumerate() {
