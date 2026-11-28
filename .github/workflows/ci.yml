@@ -279,8 +279,12 @@ jobs:
           TLX_CACHE: ${{ runner.temp }}/tlx-cache
           TLX_PROOF_DIR: ${{ runner.temp }}/tlx-proofs
         run: python3 scripts/spectest.py -j ${{ matrix.jobs }} --no-build --profile test-release --suite spectest-default --default-mode --results-json target/ci/default-mode.json
+      # The per-mode reports are diagnostic evidence for a red run, never an
+      # input to another job: a transient artifact-service failure must not
+      # fail a conformance job whose test steps all passed.
       - name: Retain conformance results
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: conformance-${{ matrix.os }}

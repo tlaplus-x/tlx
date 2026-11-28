@@ -38,6 +38,9 @@ built the C libraries into the shared cache, which the synchronous load then reu
 compiled (`-compile -workers 8`), and default mode
 (`--default-mode`, automatic symmetry with its Lean certificates written to an isolated
 `TLX_PROOF_DIR`). Each mode writes its own report under `target/ci/`, uploaded with the run.
+Retention is best-effort evidence collection: an upload failure is reported by its step but does
+not fail the job or the `CI` summary check, so a transient artifact-service outage cannot turn a
+test matrix whose checks passed red. The sanitizer workflows retain their logs the same way.
 
 ## What belongs in a test
 
