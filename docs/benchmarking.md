@@ -268,10 +268,12 @@ python3 scripts/cloud_verify.py --provider tencent --instance-type <type> \
 ## 3. TLC baseline
 
 TLC's baseline jar (`third_party/tla2tools.jar`) is pinned by version, manifest revision and
-SHA-256 in `scripts/dependencies.py` (`scripts/fetch-deps.sh`), while `third_party/community/modules.jar`
-is fetched from upstream `CommunityModules` `releases/latest` and recorded by SHA-256 in each
-baseline header. TLC times therefore need measuring once per machine type and input digest; later
-tlx benchmarks compare against the stored baseline instead of re-running TLC.
+SHA-256 in `scripts/dependencies.py` (`scripts/fetch-deps.sh`), and `third_party/community/modules.jar`
+is pinned by `CommunityModules` release `202609120237` and SHA-256 the same way; both are verified
+on install and a mismatched existing jar is refused, so an upstream `releases/latest` move cannot
+silently invalidate stored baselines. The community-modules SHA-256 is recorded in each baseline
+header. TLC times therefore need measuring once per machine type and input digest; later tlx
+benchmarks compare against the stored baseline instead of re-running TLC.
 
 ```sh
 scripts/bench.py tlcbase --slice 1/8                 # whole corpus, TLC -workers 1 and 16

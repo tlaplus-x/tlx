@@ -103,12 +103,43 @@ fi
 # The Examples models whose manifest runtime is above 700 s (the huge tier of
 # scripts/corpus.py: `corpus.py list --tier huge`) are for the cloud runs only; the
 # external corpora (corpus/external.json) are fetched by scripts/fetch-external.py.
-if [ ! -d community ]; then
+# third_party/community/modules.jar is part of every TLC baseline's input digest
+# (benchmarking/baselines.py), so it is pinned like tla2tools.jar: only the bytes
+# declared in scripts/dependencies.py (COMMUNITY_MODULES_PIN) may be installed or
+# kept. The release URL is immutable by tag while `releases/latest` is not, so a
+# download is verified before publication and an existing jar is verified instead
+# of trusted (DOC-09, HARNESS-15).
+community() {
+  file=community/modules.jar
+  if [ -e "$file" ]; then
+    if ! deps verify-community "$file"; then
+      echo "fetch-deps: refusing an existing $file that is not the declared CommunityModules baseline;" >&2
+      echo "  remove third_party/community to reinstall the pinned release, or restore:" >&2
+      echo "  scripts/dependencies.py pin-community" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ -d community ]; then
+    echo "fetch-deps: third_party/community exists without a verified $file;" >&2
+    echo "  remove third_party/community to reinstall the pinned CommunityModules release" >&2
+    return 1
+  fi
+  url="$(deps pin-community url)"
   staged="$(mktemp -d .community.XXXXXX)"
-  download https://github.com/tlaplus/CommunityModules/releases/latest/download/CommunityModules-deps.jar "$staged/modules.jar"
+  if ! download "$url" "$staged/modules.jar"; then
+    rm -rf "$staged"
+    return 1
+  fi
+  if ! deps verify-community "$staged/modules.jar"; then
+    rm -rf "$staged"
+    echo "fetch-deps: refusing the bytes served by $url for $file" >&2
+    return 1
+  fi
   (cd "$staged" && unzip -q -o modules.jar '*.tla' -d .)
   mv "$staged" community
-fi
+}
+community
 
 if [ ! -d tlapm ]; then
   staged="$(mktemp -d .tlapm.XXXXXX)"
