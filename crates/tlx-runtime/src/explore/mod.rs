@@ -1071,6 +1071,9 @@ impl<M: Model> Shared<'_, M> {
         // representatives' candidates (VIEW/SYMMETRY) go to disk; if that is
         // not enough (the next period), the queue's segments go to disk.
         b.reach(Stage::Frontier);
+        if let Some(o) = &self.order {
+            o.shrink();
+        }
         if self.spill_candidates() {
             return;
         }

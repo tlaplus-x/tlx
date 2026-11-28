@@ -248,3 +248,352 @@ fn representatives_under_a_tiny_budget() {
         assert_eq!(summary(&explore(&m, &o)), one, "{workers} workers");
     }
 }
+
+/// Shared coarse-fingerprint test model with controllable spin (to exercise both
+/// parallel and solo levels), optional invariant trap (for layout-miss resume),
+/// optional panic triggers (inside expansion or inside `resolve_kept`), and
+/// optional `StoreGc` (exercising mid-resolve `SP_STORE_GC` and `StoreFull`).
+mod resolve_lifecycle {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use tlx_runtime::{
+        explore, explore_resumable, Caps, Effects, ErrorKind, GcResult, Model, ModelError, Options, Report, ResumePoint, StoreGc,
+    };
+
+    pub(super) type State = (u32, u32, u32);
+
+    pub(super) struct CoarseModel {
+        pub(super) max_a: u32,
+        pub(super) max_b: u32,
+        pub(super) spin: u32,
+        pub(super) trap_inv: Option<State>,
+        pub(super) panic_on_expand: Option<State>,
+        pub(super) panic_on_inv: Option<State>,
+        pub(super) gc: Option<MockStoreGc>,
+        inv: Vec<String>,
+        acts: Vec<String>,
+    }
+
+    pub(super) struct MockStoreGc {
+        pub(super) collections: AtomicUsize,
+        pub(super) marked_states: AtomicUsize,
+        pub(super) inv_checks: AtomicUsize,
+        pub(super) store_full_fired: AtomicBool,
+        pub(super) trigger_store_full_on_inv: bool,
+    }
+
+    impl MockStoreGc {
+        pub(super) fn new(trigger_store_full_on_inv: bool) -> MockStoreGc {
+            MockStoreGc {
+                collections: AtomicUsize::new(0),
+                marked_states: AtomicUsize::new(0),
+                inv_checks: AtomicUsize::new(0),
+                store_full_fired: AtomicBool::new(false),
+                trigger_store_full_on_inv,
+            }
+        }
+    }
+
+    impl StoreGc<State> for MockStoreGc {
+        fn enter_scope(&self) -> Box<dyn std::any::Any + Send + Sync> {
+            Box::new(())
+        }
+        fn needs_gc(&self) -> bool {
+            // Trigger proactive SP_STORE_GC periodically during expand & resolve_kept.
+            let n = self.inv_checks.load(Ordering::Relaxed);
+            n > 0 && n.is_multiple_of(17) && self.collections.load(Ordering::Relaxed) < 8
+        }
+        fn mark_full(&self) {}
+        fn mark_state(&self, s: &State, mark: &mut dyn FnMut(u64)) {
+            self.marked_states.fetch_add(1, Ordering::Relaxed);
+            mark(((s.0 as u64) << 32) | ((s.1 as u64) << 16) | (s.2 as u64));
+        }
+        fn mark_words(&self, _words: &[u64], _mark: &mut dyn FnMut(u64)) {}
+        fn collect(&self, visit_roots: &mut dyn FnMut(&mut dyn FnMut(u64)) -> Result<(), String>) -> Result<GcResult, String> {
+            let mut roots = 0usize;
+            visit_roots(&mut |_h| {
+                roots += 1;
+            })?;
+            self.collections.fetch_add(1, Ordering::Relaxed);
+            Ok(GcResult { live_bytes: roots * 8, budget: 1 << 20, reclaimed_bytes: 0, full: false })
+        }
+    }
+
+    impl CoarseModel {
+        pub(super) fn new(max_a: u32, max_b: u32, spin: u32) -> CoarseModel {
+            CoarseModel {
+                max_a,
+                max_b,
+                spin,
+                trap_inv: None,
+                panic_on_expand: None,
+                panic_on_inv: None,
+                gc: None,
+                inv: vec!["Inv".into()],
+                acts: vec!["A".into(), "B".into(), "H".into()],
+            }
+        }
+    }
+
+    impl Effects for CoarseModel {
+        fn interrupts(&self, e: &ModelError) -> bool {
+            e.is_layout_miss()
+        }
+        fn resumes(&self, e: &ModelError) -> bool {
+            e.is_layout_miss()
+        }
+    }
+
+    impl Model for CoarseModel {
+        type State = State;
+        fn init_states(&self, out: &mut dyn FnMut(State)) -> Result<(), ModelError> {
+            out((0, 0, 0));
+            out((0, 0, 2));
+            out((1, 0, 1));
+            Ok(())
+        }
+        fn successors(&self, s: &State, out: &mut dyn FnMut(State, u32) -> bool) -> Result<(), ModelError> {
+            if self.panic_on_expand == Some(*s) {
+                panic!("injected expand panic");
+            }
+            let mut acc = s.0 as u64;
+            for i in 0..self.spin {
+                acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i as u64));
+            }
+            let (a, b, h) = *s;
+            if a < self.max_a && h != 3 && !out((a + 1, b, (h * 2 + b + 1) % 5), 0) {
+                return Ok(());
+            }
+            if b < self.max_b && h != 4 && !out((a, b + 1, (h + a + 2) % 5), 1) {
+                return Ok(());
+            }
+            if a < self.max_a && b < self.max_b {
+                let _ = out((a + 1, b + 1, (h + 1) % 5), 2);
+            }
+            Ok(())
+        }
+        fn fingerprint(&self, s: &State) -> u64 {
+            // Coarse VIEW fingerprint ignores hidden `h = s.2`.
+            ((s.0 as u64) << 32 | s.1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xBEEF
+        }
+        fn coarse_fingerprint(&self) -> bool {
+            true
+        }
+        fn check_invariants(&self, s: &State) -> Result<Option<usize>, ModelError> {
+            if self.panic_on_inv == Some(*s) {
+                panic!("injected resolve_kept invariant panic");
+            }
+            if let Some(gc) = &self.gc {
+                gc.inv_checks.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.trap_inv == Some(*s) {
+                return Err(ModelError::of_kind(ErrorKind::LayoutMiss, "layout miss in resolve"));
+            }
+            Ok(None)
+        }
+        fn check_invariants_gc(&self, s: &State, collect: &mut dyn FnMut(bool) -> bool) -> Result<Option<usize>, ModelError> {
+            if let Some(gc) = &self.gc {
+                if gc.trigger_store_full_on_inv
+                    && s.0 == self.max_a / 2
+                    && s.1 == self.max_b / 2
+                    && !gc.store_full_fired.swap(true, Ordering::AcqRel)
+                {
+                    // Simulate a mid-resolve StoreFull retry that parks for SP_STORE_GC.
+                    assert!(collect(false), "mid-resolve store GC collect should continue");
+                }
+            }
+            self.check_invariants(s)
+        }
+        fn check_init_property(&self, _s: &State) -> Result<Option<String>, ModelError> {
+            Ok(None)
+        }
+        fn constraint(&self, _s: &State) -> Result<bool, ModelError> {
+            Ok(true)
+        }
+        fn action_constraint(&self, _s: &State, _t: &State) -> Result<bool, ModelError> {
+            Ok(true)
+        }
+        fn check_transition(&self, _s: &State, _t: &State) -> Result<Option<usize>, ModelError> {
+            Ok(None)
+        }
+        fn invariant_names(&self) -> &[String] {
+            &self.inv
+        }
+        fn action_names(&self) -> &[String] {
+            &self.acts
+        }
+        fn action_property_names(&self) -> &[String] {
+            &[]
+        }
+        fn extra_generated(&self) -> u64 {
+            0
+        }
+        fn stop_requested(&self) -> bool {
+            false
+        }
+        fn render(&self, s: &State) -> String {
+            format!("({},{},{})", s.0, s.1, s.2)
+        }
+        fn caps(&self) -> Caps<'_, State> {
+            Caps {
+                format: None,
+                live_atoms: None,
+                effects: Some(self),
+                checkpoint: None,
+                gc: self.gc.as_ref().map(|g| g as &dyn StoreGc<State>),
+            }
+        }
+    }
+
+    pub(super) fn model_opts(workers: usize) -> Options {
+        Options { workers, check_deadlock: false, ..Default::default() }
+    }
+
+    pub(super) fn assert_same_stats(got: &Report<State>, want: &Report<State>, label: &str) {
+        assert_eq!(got.outcome, want.outcome, "{label}: outcome");
+        assert_eq!(got.stats.distinct, want.stats.distinct, "{label}: distinct");
+        assert_eq!(got.stats.generated, want.stats.generated, "{label}: generated");
+        assert_eq!(got.stats.depth, want.stats.depth, "{label}: depth");
+        assert_eq!(got.stats.outdegree, want.stats.outdegree, "{label}: outdegree");
+    }
+
+    pub(super) fn run_explore(m: &CoarseModel, workers: usize) -> Report<State> {
+        explore(m, &model_opts(workers))
+    }
+
+    pub(super) fn run_resumable(
+        m: &CoarseModel,
+        workers: usize,
+        from: Option<ResumePoint<State>>,
+        retain: Option<usize>,
+    ) -> (Report<State>, Option<ResumePoint<State>>) {
+        explore_resumable(m, &model_opts(workers), from, retain)
+    }
+}
+
+/// Layout-miss resume inside `resolve_kept()` works across both parallel and
+/// solo narrow levels, while non-resumable runs release `Order::current` early
+/// and handle errors inside `resolve_kept()` cleanly without panicking.
+#[test]
+fn multi_worker_view_resolve_resume_and_solo_modes() {
+    use resolve_lifecycle::*;
+    let plain = CoarseModel::new(10, 10, 0);
+    let baseline = run_explore(&plain, 1);
+    assert_eq!(baseline.outcome, Outcome::Ok);
+
+    let trap = (0..5u32)
+        .map(|h| (4, 4, h))
+        .find(|&s| {
+            let mut probe = CoarseModel::new(10, 10, 0);
+            probe.trap_inv = Some(s);
+            matches!(run_explore(&probe, 1).outcome, Outcome::Error(e) if e.is_layout_miss())
+        })
+        .expect("reachable representative at (4, 4)");
+
+    for spin in [0u32, 2000] {
+        let mut trapped = CoarseModel::new(10, 10, spin);
+        trapped.trap_inv = Some(trap);
+
+        // 1. Resumable run (`retain = Some`): Order::current stays intact across
+        //    resolve_kept so keep_resume builds a valid ResumePoint.
+        let (r1, resume) = run_resumable(&trapped, 4, None, Some(usize::MAX));
+        assert!(matches!(&r1.outcome, Outcome::Error(e) if e.is_layout_miss()), "spin={spin}: {:?}", r1.outcome);
+        let rp = resume.expect("layout miss inside resolve_kept must produce a ResumePoint");
+
+        let resumed_model = CoarseModel::new(10, 10, spin);
+        let (r2, none) = run_resumable(&resumed_model, 4, Some(rp), None);
+        assert!(none.is_none());
+        assert_same_stats(&r2, &baseline, &format!("resumed spin={spin}"));
+
+        // 2. Non-resumable run (`retain = None`): Order::current was released
+        //    early after expand_level; error in resolve_kept stops cleanly.
+        let (r3, no_resume) = run_resumable(&trapped, 4, None, None);
+        assert!(matches!(&r3.outcome, Outcome::Error(e) if e.is_layout_miss()), "spin={spin}: {:?}", r3.outcome);
+        assert!(no_resume.is_none());
+    }
+}
+
+/// Multi-worker ordered search with `StoreGc` handles both proactive
+/// `SP_STORE_GC` and `StoreFull` retries (`park_for_store_gc`) inside
+/// `resolve_kept()` across the split barriers without deadlocking or losing
+/// candidate roots.
+#[test]
+fn ordered_resolve_mid_resolve_store_gc() {
+    use resolve_lifecycle::*;
+    use std::sync::atomic::Ordering;
+    let plain = CoarseModel::new(10, 10, 0);
+    let baseline = run_explore(&plain, 1);
+    assert_eq!(baseline.outcome, Outcome::Ok);
+
+    for spin in [0u32, 1500] {
+        let mut m = CoarseModel::new(10, 10, spin);
+        m.gc = Some(MockStoreGc::new(true));
+        let got = run_explore(&m, 4);
+        assert_same_stats(&got, &baseline, &format!("store_gc spin={spin}"));
+        let gc = m.gc.as_ref().unwrap();
+        assert!(gc.store_full_fired.load(Ordering::Acquire), "spin={spin}: StoreFull inside resolve_kept must trigger");
+        assert!(gc.collections.load(Ordering::Acquire) > 0, "spin={spin}: SP_STORE_GC must run");
+        assert!(gc.marked_states.load(Ordering::Acquire) > 0, "spin={spin}: candidate/frontier roots must be scanned");
+    }
+}
+
+/// A worker panic during `expand_level` or `resolve_kept()` breaks both
+/// resolve barriers (`break_all()`) and unwinds cleanly without deadlocking
+/// peer workers (both with and without `StoreGc`).
+#[test]
+fn ordered_worker_panic_aborts_cleanly_across_resolve_barriers() {
+    use resolve_lifecycle::*;
+    let target = (0..5u32)
+        .map(|h| (3, 3, h))
+        .find(|&s| {
+            let mut probe = CoarseModel::new(8, 8, 0);
+            probe.trap_inv = Some(s);
+            matches!(run_explore(&probe, 1).outcome, Outcome::Error(e) if e.is_layout_miss())
+        })
+        .expect("reachable representative at (3, 3)");
+
+    for with_gc in [false, true] {
+        for panic_in_resolve in [false, true] {
+            let mut m = CoarseModel::new(8, 8, 1500);
+            if with_gc {
+                m.gc = Some(MockStoreGc::new(false));
+            }
+            if panic_in_resolve {
+                m.panic_on_inv = Some(target);
+            } else {
+                m.panic_on_expand = Some(target);
+            }
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_explore(&m, 4)));
+            assert!(res.is_err(), "with_gc={with_gc} panic_in_resolve={panic_in_resolve}: panic must propagate without deadlock");
+        }
+    }
+}
+
+/// A multi-worker ordered `resume_phase` that fails before calling `Order::start`
+/// (e.g., `Outcome::FpSetFull` while re-inserting archived states) returns the
+/// error cleanly instead of panicking on an unstarted `Order`.
+#[test]
+fn failed_ordered_resume_returns_error_without_panicking() {
+    use resolve_lifecycle::*;
+
+    let trap = (0..5u32)
+        .map(|h| (35, 35, h))
+        .find(|&s| {
+            let mut probe = CoarseModel::new(40, 40, 0);
+            probe.trap_inv = Some(s);
+            matches!(run_explore(&probe, 1).outcome, Outcome::Error(e) if e.is_layout_miss())
+        })
+        .expect("reachable representative at (35, 35)");
+    let mut trapped = CoarseModel::new(40, 40, 0);
+    trapped.trap_inv = Some(trap);
+    let (r1, resume) = run_resumable(&trapped, 4, None, Some(usize::MAX));
+    assert!(matches!(&r1.outcome, Outcome::Error(e) if e.is_layout_miss()));
+    let rp = resume.expect("resume point");
+    assert!(rp.len() > 1000, "need > 922 archived states to overflow fixed(0), got {}", rp.len());
+
+    let plain = CoarseModel::new(40, 40, 0);
+    let tiny = Options { workers: 4, fp: FpConfig::fixed(0), check_deadlock: false, ..Default::default() };
+    let (r2, none) = explore_resumable(&plain, &tiny, Some(rp), None);
+    assert!(none.is_none());
+    assert!(matches!(r2.outcome, Outcome::FpSetFull { .. }), "expected FpSetFull, got {:?}", r2.outcome);
+}

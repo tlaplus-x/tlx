@@ -56,21 +56,21 @@ fn resumed_positions_move_to_the_new_search_registry() {
 fn cleared_candidates_keep_capacity_charged_until_pressure_reclaims_it() {
     let order = Order::new(2);
     let codec = Words3;
-    let mut local = OrderLocal::new(&order, Some(&codec), 1 << 20);
+    let mut local = OrderLocal::new(Some(&codec), 1 << 20);
     let baseline = order.gauge().bytes();
     for i in 0..5000 {
         let at = local.store.push(vec![i, i * 2, i * 3], i, Meta { parent: 0, depth: 1, action: 0 });
         local.cands.push((i, 0), at, i);
     }
-    local.charge.set(order.gauge(), cand_bytes(&local));
+    local.account(order.gauge());
     let full = order.gauge().bytes();
     local.cands.clear();
     local.store.clear();
-    local.charge.set(order.gauge(), cand_bytes(&local));
+    local.account(order.gauge());
     assert_eq!(order.gauge().bytes(), full);
     local.cands.shrink_to_fit();
     local.store.shrink();
-    local.charge.set(order.gauge(), cand_bytes(&local));
+    local.account(order.gauge());
     assert!(order.gauge().bytes() < baseline + 1024);
     drop(local);
     assert_eq!(order.gauge().bytes(), baseline);
@@ -375,4 +375,167 @@ fn wide_table_ranks_and_counts_fallback() {
     let expected_len = expected_first[3] + (u32::MAX as u64) + 42;
     assert_eq!(&*first, &expected_first);
     assert_eq!(len, expected_len);
+}
+
+/// Deterministic verification that releasing `NewClasses`, worker `Positions`
+/// (+ `Order::current` when non-resumable) after expansion and releasing
+/// `Order::best` shards after candidate filtering prevents stacking previous-
+/// level metadata on top of `by_key` + `Ranks` + next-level `Table`s in both
+/// normal and `order.shrink()` pressure modes.
+#[test]
+fn early_release_eliminates_resolve_overlap_peak() {
+    let (parents, classes): (usize, u64) = if cfg!(miri) { (66, 128) } else { (2050, 4096) };
+    let min_new_classes_bytes = ((parents as u64).saturating_mul(16) / 64).clamp(1 << 6, 1 << 22).next_power_of_two() as usize * 8;
+    for shrinking in [false, true] {
+        for release_current in [true, false] {
+            let order = Order::new(2);
+            if shrinking {
+                order.shrink();
+            }
+            let parent_refs: Vec<LogRef> = (0..parents).map(|i| log_ref(i % 2, i / 2)).collect();
+            order.start(Arc::new(Positions::of_seq(&parent_refs)));
+
+            let mut locals = [OrderLocal::<Vec<u64>>::new(None, 0), OrderLocal::<Vec<u64>>::new(None, 0)];
+            for loc in &mut locals {
+                loc.positions = Some(order.current());
+                loc.counts = Some(order.counts.lock().clone().expect("counts"));
+                loc.new = Some(order.new.lock().clone().expect("new"));
+            }
+
+            // Populate distinct classes with 3 competing offers each from
+            // different parents (so workers genuinely race on classes while each
+            // parent belongs exclusively to one worker, as in BFS).
+            for c in 0..classes {
+                let fp = c.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x55AA_55AA;
+                let s = shard(fp);
+                // Offer 3 decreasing keys across parents/workers so all 3 get
+                // buffered before only the smallest key wins.
+                for rev in [2u64, 1, 0] {
+                    let parent_pos = c / 2 + rev;
+                    let key = (parent_pos, c % 2);
+                    let packed = pack_key(key);
+                    let mut best = order.best[s].lock();
+                    let won = match best.update_if_less(fp, key, packed) {
+                        Some(less) => less,
+                        None => {
+                            best.insert_new(fp, key, packed);
+                            true
+                        }
+                    };
+                    order.best_parts[s].set(order.gauge(), best.bytes());
+                    drop(best);
+                    assert!(won);
+                    let w = (parent_pos % 2) as usize;
+                    let at =
+                        locals[w].store.push(vec![c, rev, 0], fp, Meta { parent: parent_refs[parent_pos as usize], depth: 2, action: 0 });
+                    locals[w].cands.push(key, at, fp);
+                }
+            }
+            for loc in &locals {
+                loc.account(order.gauge());
+            }
+
+            // Measure exact component sizes at the end of expansion.
+            let expand_bytes = order.gauge().bytes();
+            let best_bytes: usize = order.best.iter().map(|b| b.lock().bytes()).sum();
+            assert!(best_bytes > 0);
+            let cands_bytes_before: usize = locals.iter().map(|l| l.cands.bytes()).sum();
+            assert!(cands_bytes_before >= (classes as usize) * 3 * 20);
+
+            // Step 1: post-expansion release (workers drop positions/new, leader
+            // calls release_after_expand).
+            for loc in &mut locals {
+                loc.positions = None;
+                loc.new = None;
+            }
+            order.release_after_expand(release_current);
+            let after_expand_release = order.gauge().bytes();
+            assert!(after_expand_release < expand_bytes, "NewClasses (and non-resumable Positions) must drop right after expand");
+            let released_after_expand = expand_bytes - after_expand_release;
+            if release_current {
+                // Both NewClasses and parent Positions (parents * 8 B + first) released.
+                assert!(released_after_expand >= parents * 8 + min_new_classes_bytes);
+            } else {
+                // Only NewClasses released; Order::current remains readable for layout-miss resume.
+                assert!(released_after_expand >= min_new_classes_bytes);
+                assert_eq!(order.current().pos(parent_refs[42]), 42);
+            }
+
+            // Step 2: filter_candidates + clear_best (before resolve_kept allocates).
+            for loc in &mut locals {
+                loc.cands.retain_best(&order);
+                if order.shrinking() {
+                    loc.cands.shrink_to_fit();
+                }
+                loc.cands_charge.set(order.gauge(), loc.cands.bytes());
+            }
+            let cands_bytes_after: usize = locals.iter().map(|l| l.cands.bytes()).sum();
+            if shrinking {
+                assert!(cands_bytes_after < cands_bytes_before, "shrink mode must reclaim losing candidate capacity before resolve_kept");
+            } else {
+                assert_eq!(cands_bytes_after, cands_bytes_before, "normal mode keeps CandBuf capacity across levels");
+            }
+            order.clear_best();
+            // Idempotent second call.
+            order.clear_best();
+            assert_eq!(order.best.iter().map(|b| b.lock().bytes()).sum::<usize>(), 0);
+
+            let after_clear_best = order.gauge().bytes();
+            let expected_drop = best_bytes + (cands_bytes_before - cands_bytes_after);
+            assert_eq!(after_expand_release - after_clear_best, expected_drop);
+
+            // Step 3: resolve_kept allocations (by_key + Ranks + TableEntries) run
+            // concurrently across both workers while Order::best is already 0 B.
+            let mut outdegrees = [OutdegreeHist::new(), OutdegreeHist::new()];
+            for p in 0..parents {
+                outdegrees[p % 2].add(0);
+            }
+            let mut resolve_alloc_peak = 0usize;
+            let mut held_tables = Vec::new();
+            let mut kept_total = 0usize;
+            for (w, loc) in locals.iter_mut().enumerate() {
+                let counts = loc.counts.take().expect("counts");
+                let scratch = Charge::default();
+                let (ranks, wide) = rank_and_count_kept(&loc.cands, &counts, &mut outdegrees[w], order.gauge(), &scratch);
+                let mut entries = TableEntries::with_capacity(loc.cands.len(), wide);
+                let table_charge = Charge::default();
+                table_charge.set(order.gauge(), entries.bytes());
+                for i in 0..loc.cands.len() {
+                    entries.push(loc.cands.pos_at(i), ranks.get(i));
+                }
+                kept_total += loc.cands.len();
+                resolve_alloc_peak += loc.cands.len() * 4 + ranks.bytes() + entries.bytes();
+                let cur = order.gauge().bytes();
+                // Current live bytes during resolve_kept must never include Order::best
+                // or NewClasses (or parent Positions when non-resumable).
+                assert!(
+                    cur <= after_clear_best + resolve_alloc_peak + 1024,
+                    "shrinking={shrinking} release_current={release_current}: cur={cur} after_clear_best={after_clear_best} resolve_alloc={resolve_alloc_peak}"
+                );
+                drop(ranks);
+                drop(scratch);
+                drop(counts);
+                let table = Arc::new(Table::new(0, entries, table_charge));
+                table.account(order.gauge());
+                held_tables.push((w, table));
+            }
+            assert_eq!(kept_total, classes as usize);
+            for (w, table) in held_tables {
+                order.next.lock()[w] = Some(table);
+            }
+
+            // Overall gauge peak must stay strictly below the old stacked peak
+            // (`expand_bytes + resolve_alloc_peak`), proving no level-boundary overlap.
+            let stacked_without_early_release = expand_bytes + resolve_alloc_peak;
+            assert!(
+                order.gauge().peak() < stacked_without_early_release,
+                "shrinking={shrinking} release_current={release_current}: peak={} must beat stacked={stacked_without_early_release}",
+                order.gauge().peak()
+            );
+
+            // Step 4: advance installs the next level cleanly and drops old current/counts.
+            order.advance();
+            assert_eq!(order.current().len, classes);
+        }
+    }
 }
