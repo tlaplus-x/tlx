@@ -1,0 +1,127 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "e30cb0cc61f817729cbb1171fd5e6ad2fc64bb5f73ff2559dc613679353b180d",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-tlc",
+    "model": "ext/pingcap/DistributedTransaction_Test1",
+    "revision": null,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "variant": null,
+    "workers": 1
+  },
+  "measurement": {
+    "aggregation": "last-attempt",
+    "baseline": null,
+    "category": [
+      "external"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "e30cb0cc61f817729cbb1171fd5e6ad2fc64bb5f73ff2559dc613679353b180d",
+    "counts": {
+      "depth": null,
+      "distinct": null,
+      "generated": null,
+      "result": "timeout"
+    },
+    "date": "2026-11-29 00:10:16",
+    "id": "9c937d618f512ae5eaa627a9",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64, AMD EPYC 9754 128-Core Processor, 16 cores, THP always [madvise] never, tencent SA5.4XLARGE32 (ap-shanghai-5, spot 0.1584 CNY/h)",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 400.049,
+      "instructions": null,
+      "rss_mib": 2820.4,
+      "wall_s": 360.093
+    },
+    "mode": "-tlc",
+    "model": "ext/pingcap/DistributedTransaction_Test1",
+    "provenance": {
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "legacy": false,
+      "measurement_source": "bench/history/tlc-wave-s1of2.json#/models/ext/pingcap/DistributedTransaction_Test1/runs/1",
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 0,
+        "requested": 3
+      },
+      "reused_from": "9c937d618f512ae5eaa627a9",
+      "source": "bench/tlc-baselines/7d1ed8c1a170be08ca96e29a75dc2a9b3bb146aa5bd65116594572994f958c5e.json"
+    },
+    "raw_result": {
+      "aggregation": "last-attempt",
+      "at_timeout": {
+        "init": 1
+      },
+      "baseline_id": "9c937d618f512ae5eaa627a9",
+      "content_digest": "e30cb0cc61f817729cbb1171fd5e6ad2fc64bb5f73ff2559dc613679353b180d",
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "cpu_s": 400.049,
+      "date": "2026-11-29 00:10:16",
+      "depth": null,
+      "distinct": null,
+      "exit": -9,
+      "generated": null,
+      "load": [
+        1.07,
+        1.01
+      ],
+      "maxrss_mib": 2820.4,
+      "measurement_revision": null,
+      "result": "timeout",
+      "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+      "tlc_repetitions": 3,
+      "tlc_samples": [
+        {
+          "at_timeout": {
+            "init": 1
+          },
+          "cpu_s": 400.049,
+          "exit": -9,
+          "load": [
+            1.07,
+            1.01
+          ],
+          "maxrss_mib": 2820.4,
+          "result": "timeout",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "wall_s": 360.093
+        }
+      ],
+      "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+      "wall_s": 360.093
+    },
+    "revision": null,
+    "samples": {
+      "cpu_s": [
+        400.049
+      ],
+      "wall_s": [
+        360.093
+      ]
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "workers": 1
+  },
+  "schema_version": 2
+}

@@ -1,0 +1,95 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "9c488fd92a7f2e3e68eaac9399a07a7b7ebe8eb78e526ba1855d38f6fc9b6202",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-compile",
+    "model": "ext/elastic/consensus",
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "variant": null,
+    "workers": 1
+  },
+  "measurement": {
+    "aggregation": "median",
+    "baseline": null,
+    "category": [
+      "external",
+      "compiled"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "compatibility": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "9c488fd92a7f2e3e68eaac9399a07a7b7ebe8eb78e526ba1855d38f6fc9b6202",
+    "counts": {
+      "depth": null,
+      "distinct": null,
+      "generated": null,
+      "result": "skipped"
+    },
+    "date": "2026-11-28 16:11:12",
+    "id": "703c515c857e6e673a36b8aa",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64, AMD EPYC 9754 128-Core Processor, 16 cores, THP always [madvise] never, tencent SA5.4XLARGE32 (ap-shanghai-5, spot 0.1584 CNY/h)",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": null,
+      "instructions": null,
+      "rss_mib": null,
+      "wall_s": null
+    },
+    "mode": "-compile",
+    "model": "ext/elastic/consensus",
+    "provenance": {
+      "cache": {
+        "initial_state": "empty",
+        "mode": "fresh-per-model",
+        "warmup": true
+      },
+      "count_problems": [],
+      "legacy": false,
+      "measurement_source": "bench/history/suite-v0.1.2-fle-elastic-pingcap.json#/runs/large:ext/elastic/consensus:compile:1w",
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 0,
+        "requested": 3
+      },
+      "revision_source": "cloud receipt 20261127-233517-e6ab271-tencent-x86_64",
+      "source": "bench/records/d884f5944492ac89405178650c6147def3aef3c8bf59d22085bc533f0fadff66.json"
+    },
+    "raw_result": {
+      "samples": [],
+      "warmups": [
+        {
+          "compatibility": false,
+          "cpu_s": 1799.564,
+          "maxrss_mib": 5555.0,
+          "result": "timeout",
+          "wall_s": 1797.998621235908
+        }
+      ]
+    },
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "samples": {
+      "cpu_s": [],
+      "wall_s": []
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "workers": 1
+  },
+  "schema_version": 2
+}

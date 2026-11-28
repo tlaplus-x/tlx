@@ -1,0 +1,171 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "d84eb77ab38e4970b35651d395263a76b0c1b00a584b97eed71e87a807517250",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-tlc",
+    "model": "ext/vanlightly-bookkeeper/LedgerChaining",
+    "revision": null,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "variant": null,
+    "workers": 1
+  },
+  "measurement": {
+    "aggregation": "median",
+    "baseline": null,
+    "category": [
+      "external"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "d84eb77ab38e4970b35651d395263a76b0c1b00a584b97eed71e87a807517250",
+    "counts": {
+      "depth": 40,
+      "distinct": 375963,
+      "generated": 2207914,
+      "result": "success"
+    },
+    "date": "2026-11-28 17:13:14",
+    "id": "f697ceec50a6e38ea6c19bb2",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 18.185,
+      "instructions": null,
+      "rss_mib": 2273.6,
+      "wall_s": 11.913
+    },
+    "mode": "-tlc",
+    "model": "ext/vanlightly-bookkeeper/LedgerChaining",
+    "provenance": {
+      "count_problems": [],
+      "legacy": false,
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 3,
+        "requested": 3
+      },
+      "sample_spread": {
+        "cpu_s": 0.04844652185867475,
+        "wall_s": 0.022328548644338118
+      },
+      "source": "bench/tlc-baselines/e8a6f3d203ba0b7fb2f79185c865de48cbc5a580a354f76ea1582a396b818f18.json"
+    },
+    "raw_result": {
+      "aggregation": "median",
+      "count_problems": [],
+      "cpu_s": 18.185,
+      "depth": 40,
+      "distinct": 375963,
+      "exit": 0,
+      "finished_s": 11.884,
+      "generated": 2207914,
+      "init": 1,
+      "left": 0,
+      "load": [
+        1.71,
+        1.6
+      ],
+      "maxrss_mib": 2273.6,
+      "result": "success",
+      "sample_spread": {
+        "cpu_s": 0.04844652185867475,
+        "wall_s": 0.022328548644338118
+      },
+      "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+      "tlc_repetitions": 3,
+      "tlc_samples": [
+        {
+          "cpu_s": 17.905,
+          "depth": 40,
+          "distinct": 375963,
+          "exit": 0,
+          "finished_s": 11.631,
+          "generated": 2207914,
+          "init": 1,
+          "left": 0,
+          "load": [
+            1.99,
+            1.84
+          ],
+          "maxrss_mib": 2273.6,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 11.808
+        },
+        {
+          "cpu_s": 18.185,
+          "depth": 40,
+          "distinct": 375963,
+          "exit": 0,
+          "finished_s": 11.735,
+          "generated": 2207914,
+          "init": 1,
+          "left": 0,
+          "load": [
+            1.84,
+            1.71
+          ],
+          "maxrss_mib": 2268.8,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 11.913
+        },
+        {
+          "cpu_s": 18.786,
+          "depth": 40,
+          "distinct": 375963,
+          "exit": 0,
+          "finished_s": 11.884,
+          "generated": 2207914,
+          "init": 1,
+          "left": 0,
+          "load": [
+            1.71,
+            1.6
+          ],
+          "maxrss_mib": 2285.5,
+          "result": "success",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 12.074
+        }
+      ],
+      "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+      "wall_s": 11.913
+    },
+    "revision": null,
+    "samples": {
+      "cpu_s": [
+        17.905,
+        18.185,
+        18.786
+      ],
+      "wall_s": [
+        11.808,
+        11.913,
+        12.074
+      ]
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "workers": 1
+  },
+  "schema_version": 2
+}

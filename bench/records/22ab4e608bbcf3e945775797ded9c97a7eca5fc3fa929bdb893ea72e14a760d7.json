@@ -1,0 +1,159 @@
+{
+  "key": {
+    "args": [
+      "-tlc"
+    ],
+    "cgroup_mib": null,
+    "content_digest": "d15d19d8de3f86c7cf0602d013435726744e85d0ba516923b53a162bd8d95c71",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-compile",
+    "model": "ext/vanlightly-kafka/kafka_replication_v3_5",
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "variant": null,
+    "workers": 16
+  },
+  "measurement": {
+    "aggregation": "median",
+    "baseline": "945965db53c571c9ec5e74f5",
+    "category": [
+      "external",
+      "compiled",
+      "scaling"
+    ],
+    "configuration": {
+      "args": [
+        "-tlc"
+      ],
+      "cgroup_mib": null,
+      "compatibility": true,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "d15d19d8de3f86c7cf0602d013435726744e85d0ba516923b53a162bd8d95c71",
+    "counts": {
+      "depth": 21,
+      "distinct": 6543758,
+      "generated": 28320695,
+      "result": "deadlock"
+    },
+    "date": "2026-11-29 00:33:15",
+    "evaluations": 257173303,
+    "fully_native": 255739491,
+    "host_calls": 464154,
+    "host_s": 0.675647749,
+    "host_time_share": 0.0006859611940738526,
+    "id": "4d0b7a8be90678f4a2e1c056",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64, AMD EPYC 9754 128-Core Processor, 16 cores, THP always [madvise] never, tencent SA5.4XLARGE32 (ap-guangzhou-6, spot 0.1582 CNY/h)",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 1102.488,
+      "instructions": 6406872616743,
+      "rss_mib": 2522.4,
+      "wall_s": 89.991
+    },
+    "mode": "-compile",
+    "model": "ext/vanlightly-kafka/kafka_replication_v3_5",
+    "native_share": 0.9944247245601538,
+    "provenance": {
+      "cache": {
+        "initial_state": "empty",
+        "mode": "fresh-per-model",
+        "warmup": true
+      },
+      "count_problems": [],
+      "legacy": false,
+      "measurement_source": "bench/history/suite-v0.1.2-wave2-accord-kafka.json#/runs/huge:ext/vanlightly-kafka/kafka_replication_v3_5:compile:16w:c5c6d052",
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 3,
+        "requested": 3
+      },
+      "revision_source": "cloud receipt 20261128-082759-448480d-tencent-x86_64",
+      "source": "bench/records/22ab4e608bbcf3e945775797ded9c97a7eca5fc3fa929bdb893ea72e14a760d7.json"
+    },
+    "raw_result": {
+      "samples": [
+        {
+          "compatibility": true,
+          "cpu_s": 1076.181,
+          "depth": 21,
+          "distinct": 6298668,
+          "generated": 27189890,
+          "maxrss_mib": 2522.4,
+          "result": "deadlock",
+          "wall_s": 88.352
+        },
+        {
+          "compatibility": true,
+          "cpu_s": 1102.488,
+          "depth": 21,
+          "distinct": 6242023,
+          "generated": 26879544,
+          "maxrss_mib": 2441.4,
+          "result": "deadlock",
+          "wall_s": 89.991
+        },
+        {
+          "compatibility": true,
+          "cpu_s": 1168.973,
+          "depth": 21,
+          "distinct": 6543758,
+          "generated": 28320695,
+          "maxrss_mib": 2622.6,
+          "result": "deadlock",
+          "wall_s": 94.269
+        }
+      ],
+      "warmups": [
+        {
+          "compatibility": true,
+          "cpu_s": 1222.712,
+          "depth": 21,
+          "distinct": 6815240,
+          "generated": 29779254,
+          "maxrss_mib": 2757.3,
+          "native_coverage": {
+            "diagnostic": true,
+            "evaluations": 257173303,
+            "fully_native": 255739491,
+            "host_calls": 464154,
+            "host_time_s": 0.675647749,
+            "host_time_share": 0.0006859611940738526,
+            "native_share": 0.9944247245601538,
+            "search_thread_s_est": 984.964973
+          },
+          "result": "deadlock",
+          "wall_s": 138.925
+        }
+      ]
+    },
+    "revision": "e5dffafd5419e069ccd854d7aa674d18631eea15",
+    "samples": {
+      "cpu_s": [
+        1076.181,
+        1102.488,
+        1168.973
+      ],
+      "wall_s": [
+        88.352,
+        89.991,
+        94.269
+      ]
+    },
+    "schema_version": 2,
+    "search_thread_s_est": 984.964973,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlx",
+    "workers": 16
+  },
+  "schema_version": 2
+}

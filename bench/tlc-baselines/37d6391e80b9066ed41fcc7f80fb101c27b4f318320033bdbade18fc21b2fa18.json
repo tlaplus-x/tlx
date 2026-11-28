@@ -1,0 +1,119 @@
+{
+  "key": {
+    "args": [],
+    "cgroup_mib": null,
+    "content_digest": "6eb1adf44dc6390adec983638d3c5c970b328132e5968e3a7c6ec0ba903e2924",
+    "env": null,
+    "hogs": 0,
+    "instance_arch": "x86_64",
+    "instance_type": "SA5.4XLARGE32",
+    "mode": "-tlc",
+    "model": "ext/etcd-raft/Traceetcdraft",
+    "revision": null,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "variant": null,
+    "workers": 16
+  },
+  "measurement": {
+    "aggregation": "last-attempt",
+    "baseline": null,
+    "category": [
+      "external",
+      "scaling",
+      "trace-validation"
+    ],
+    "configuration": {
+      "args": [],
+      "cgroup_mib": null,
+      "env": null,
+      "hogs": 0,
+      "variant": null
+    },
+    "content_digest": "6eb1adf44dc6390adec983638d3c5c970b328132e5968e3a7c6ec0ba903e2924",
+    "counts": {
+      "depth": null,
+      "distinct": null,
+      "generated": null,
+      "result": "error"
+    },
+    "date": "2026-11-29 00:04:16",
+    "id": "da68974b395667e2c92cd904",
+    "instance": {
+      "arch": "x86_64",
+      "description": "x86_64",
+      "type": "SA5.4XLARGE32"
+    },
+    "metrics": {
+      "cpu_s": 51.938,
+      "instructions": null,
+      "rss_mib": 1969.1,
+      "wall_s": 44.567
+    },
+    "mode": "-tlc",
+    "model": "ext/etcd-raft/Traceetcdraft",
+    "provenance": {
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "legacy": false,
+      "pointer": "/measurement",
+      "repetitions": {
+        "completed": 0,
+        "requested": 3
+      },
+      "source": "bench/tlc-baselines/37d6391e80b9066ed41fcc7f80fb101c27b4f318320033bdbade18fc21b2fa18.json"
+    },
+    "raw_result": {
+      "aggregation": "last-attempt",
+      "count_problems": [
+        "sample 1: incomplete TLC timing"
+      ],
+      "cpu_s": 51.938,
+      "error": "Error: Assumption line 462, col 8 to line 462, col 34 of module Traceetcdraft is false.\nFinished in 44417ms at (2026-11-29 00:04:16)\n",
+      "exit": 10,
+      "finished_s": 44.417,
+      "load": [
+        1.04,
+        1.07
+      ],
+      "maxrss_mib": 1969.1,
+      "result": "error",
+      "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+      "tlc_repetitions": 3,
+      "tlc_samples": [
+        {
+          "cpu_s": 51.938,
+          "error": "Error: Assumption line 462, col 8 to line 462, col 34 of module Traceetcdraft is false.\nFinished in 44417ms at (2026-11-29 00:04:16)\n",
+          "exit": 10,
+          "finished_s": 44.417,
+          "load": [
+            1.04,
+            1.07
+          ],
+          "maxrss_mib": 1969.1,
+          "result": "error",
+          "tlc_memory": "6935MB heap and 64MB offheap memory; Linux 6.8.0-138-generic amd64, Ubuntu 21.0.13.1 64bit, MSBDiskFPSet, DiskStateQueue",
+          "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+          "wall_s": 44.567
+        }
+      ],
+      "tlc_version": "2026.10.02.163556 (rev: 1813307)",
+      "wall_s": 44.567
+    },
+    "revision": null,
+    "samples": {
+      "cpu_s": [
+        51.938
+      ],
+      "wall_s": [
+        44.567
+      ]
+    },
+    "schema_version": 2,
+    "tlc_version": "1813307068bbc5759a441df820f3f548948d6b7a",
+    "tool": "tlc",
+    "workers": 16
+  },
+  "schema_version": 2
+}

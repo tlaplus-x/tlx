@@ -42,8 +42,8 @@ matching TLC baselines.
 | Execution mode | Workers | Matched configurations | Median TLC / tlx wall time | Median TLC / tlx peak RSS |
 |---|---:|---:|---:|---:|
 | Default | 1 | 168 | **9.27×** | **6.98×** |
-| Compiled | 1 | 51 | **7.30×** | **8.32×** |
-| Compiled | 16 | 22 | **11.36×** | **6.57×** |
+| Compiled | 1 | 65 | **5.90×** | **7.95×** |
+| Compiled | 16 | 28 | **9.86×** | **6.75×** |
 
 These measurements use Tencent SA5.4XLARGE32 instances (AMD EPYC 9754, 16 vCPU, 32 GB),
 one warm-up and three timed tlx repetitions. Times exclude the warm-up: the timed samples are
