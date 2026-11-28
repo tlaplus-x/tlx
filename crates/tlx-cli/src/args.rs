@@ -19,6 +19,12 @@ pub(crate) struct Args {
     pub(crate) tool: bool,
     /// `-nowarning`: no warnings.
     pub(crate) nowarning: bool,
+    /// `-view`: show counterexample and `-dump` states through the `.cfg`
+    /// `VIEW` (unless an `ALIAS` is configured).
+    pub(crate) view: bool,
+    /// `-difftrace`: show only the state fields that changed in a trace
+    /// (and in `-dump dot` labels).
+    pub(crate) difftrace: bool,
     /// The tier asked for (`-compile`, `-interp`; the last one given wins).
     pub(crate) tier: TierChoice,
     /// Compiled tier over encoded states (`tier`, resolved by `resolve_tier`).
@@ -138,6 +144,12 @@ pub(crate) fn physical_mib() -> u64 {
 }
 
 impl Args {
+    /// How counterexample and `-dump` states are shown (`-view`,
+    /// `-difftrace`).
+    pub(crate) fn render_opts(&self) -> tlx_eval::model::StateRenderOpts {
+        tlx_eval::model::StateRenderOpts { use_view: self.view, difftrace: self.difftrace }
+    }
+
     /// Zero disables checkpoints, otherwise the seconds override wins over
     /// minutes (including minutes outside the duration range).
     pub(crate) fn checkpoint_interval(&self, seconds: Option<u64>) -> Option<Duration> {
@@ -265,6 +277,8 @@ pub(crate) fn parse_args() -> Args {
         progress: false,
         tool: false,
         nowarning: false,
+        view: false,
+        difftrace: false,
         tier: TierChoice::Default,
         compile: false,
         tier_note: None,
@@ -327,6 +341,8 @@ pub(crate) fn parse_args() -> Args {
             "-progress" => a.progress = true,
             "-tool" => a.tool = true,
             "-nowarning" => a.nowarning = true,
+            "-view" => a.view = true,
+            "-difftrace" => a.difftrace = true,
             "-ir" => bad_args("-ir was removed; use -compile (the compiled tier, the default) or -interp (the interpreter)"),
             "-compile" => a.tier = TierChoice::Compile,
             "-interp" => a.tier = TierChoice::Interp,
@@ -422,6 +438,9 @@ pub(crate) fn parse_args() -> Args {
             _ if spec.is_some() => bad_args(&format!("more than one spec: {x}")),
             _ => spec = Some(PathBuf::from(x)),
         }
+    }
+    if let Some((_, o)) = &mut a.dump {
+        (o.use_view, o.difftrace) = (a.view, a.difftrace);
     }
     a.spec = spec.unwrap_or_else(|| bad_args("no spec given"));
     if a.spec.extension().is_none() {

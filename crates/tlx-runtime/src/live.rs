@@ -184,6 +184,20 @@ pub fn with_path<R>(path: Option<CurrentPath>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Run `f` with the trace path of the predecessor of the state being shown:
+/// `current_path()` ends at the state being rendered, so `f` evaluates
+/// `TLCExt!Trace` up to the state before it (the path that state was shown
+/// with). Outside a path context, or with an unavailable one, `f` runs
+/// unchanged.
+pub fn with_predecessor_path<R>(f: impl FnOnce() -> R) -> R {
+    let previous = match current_path() {
+        // (No parent: the state being rendered is the initial one.)
+        Some(CurrentPath::Known(node)) => node.parent.clone().map(CurrentPath::Known),
+        _ => return f(),
+    };
+    with_path(previous, f)
+}
+
 /// Set `current_path()` on this thread (for a thread that runs nothing
 /// else, such as a simulation worker); returns the previous one.
 pub(crate) fn set_path(path: Option<CurrentPath>) -> Option<CurrentPath> {

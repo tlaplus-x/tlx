@@ -129,6 +129,7 @@ fn all_test_files_registered() {
         "tiers",
         "tlc_equality",
         "value_store",
+        "view_difftrace",
         "view_symmetry",
         "view_trace",
         "widening",

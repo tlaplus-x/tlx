@@ -21,6 +21,40 @@ pub(crate) fn fmt_state<N: std::fmt::Display, V: std::fmt::Display>(
     fields.iter().map(|(n, v)| format!("/\\ {n} = {v}")).collect::<Vec<_>>().join("\n")
 }
 
+/// How a state is shown in a counterexample or a `-dump`: TLC's `-view`
+/// and `-difftrace` command-line options (docs/configuration.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateRenderOpts {
+    /// `-view`: show a state through the `.cfg` `VIEW`, unless an `ALIAS`
+    /// is configured (TLC evaluates the ALIAS first).
+    pub use_view: bool,
+    /// `-difftrace`: show only the fields of a state whose value differs
+    /// from the preceding state's; a state without a predecessor (State 1,
+    /// an initial-state violation) is shown in full.
+    pub difftrace: bool,
+}
+
+/// The fields of a state as TLC prints them; with `diff`, the fields whose
+/// value equals the predecessor's (same position and name) are left out.
+/// `bullet_single`: a lone field keeps the `/\ ` prefix (the ALIAS and a
+/// tuple `-view` do; a raw one-variable state does not, and a diffed raw
+/// state of a model with more variables keeps it for every changed line).
+fn render_fields(fields: &[(String, Value)], prev: Option<&[(String, Value)]>, diff: bool, bullet_single: bool) -> String {
+    let kept: Vec<(&str, &Value)> = if diff {
+        fields
+            .iter()
+            .enumerate()
+            .filter(|(i, (n, v))| prev.and_then(|p| p.get(*i)).is_none_or(|(pn, pv)| pn != n || !tlx_value::order::certainly_equal(v, pv)))
+            .map(|(_, (n, v))| (n.as_str(), v))
+            .collect()
+    } else {
+        fields.iter().map(|(n, v)| (n.as_str(), v)).collect()
+    };
+    // (TLC checks the model's variable count, not the number of changed
+    // fields, for the bullet of a raw state.)
+    fmt_state(kept, bullet_single || fields.len() != 1)
+}
+
 /// TLC's location record (`beginLine`, ..., `module`) of `l`.
 pub fn location_record(l: &Location) -> Value {
     use tlx_sema::source::Field;
@@ -359,24 +393,215 @@ impl InterpModel {
         Ok(())
     }
 
-    /// State `s` (number `level` of a trace, followed by `next` if any)
-    /// displayed through the ALIAS: its fields in the order written. None
-    /// without ALIAS or if it cannot be evaluated (then shown as usual).
-    pub fn render_alias(&self, s: &[Value], next: Option<&[Value]>, level: u32) -> Option<String> {
+    /// State `s` (number `level` of a trace, followed by `next` if any) as
+    /// TLC prints it in a counterexample: through the ALIAS if there is
+    /// one, else through `-view`'s VIEW, else its variables; with
+    /// `difftrace`, only the fields that differ from `prev` (State 1 has
+    /// no predecessor and is shown in full).
+    pub fn render_trace_state(
+        &self,
+        s: &[Value],
+        level: u32,
+        prev: Option<(&[Value], u32)>,
+        next: Option<&[Value]>,
+        opts: StateRenderOpts,
+    ) -> String {
+        self.render_state(s, level, prev, next, opts, true)
+    }
+
+    /// State `s` of a `-dump`: TLC's dumps ignore the ALIAS (they apply
+    /// only `-view` and `-difftrace`).
+    pub fn render_dump_state(&self, s: &[Value], level: u32, prev: Option<(&[Value], u32)>, opts: StateRenderOpts) -> String {
+        self.render_state(s, level, prev, None, opts, false)
+    }
+
+    /// `render_trace_state`, with `alias` deciding whether the ALIAS is
+    /// applied.
+    fn render_state(
+        &self,
+        s: &[Value],
+        level: u32,
+        prev: Option<(&[Value], u32)>,
+        next: Option<&[Value]>,
+        opts: StateRenderOpts,
+        alias: bool,
+    ) -> String {
+        let diff = opts.difftrace && prev.is_some();
+        if alias {
+            if let Some(fields) = self.alias_fields(s, next, level) {
+                // The predecessor's version of the ALIAS state, whose primed
+                // variables read the state that follows it: this one.
+                let prev_fields = if diff {
+                    prev.and_then(|(pv, pl)| tlx_runtime::live::with_predecessor_path(|| self.alias_fields(pv, Some(s), pl)))
+                } else {
+                    None
+                };
+                return render_fields(&fields, prev_fields.as_deref(), diff, true);
+            }
+        }
+        if opts.use_view {
+            if let Some(text) = self.render_view(s, level, prev, diff) {
+                return text;
+            }
+        }
+        let fields = self.state_fields(s);
+        // A raw state of a single-variable model has no bullet; one of a
+        // model with more variables keeps it for every line (as TLC).
+        let prev_fields = prev.map(|(pv, _)| self.state_fields(pv));
+        let raw = fields.iter().map(|(n, v)| (n.to_string(), (*v).clone())).collect::<Vec<_>>();
+        let prev_owned = prev_fields.map(|p| p.iter().map(|(n, v)| (n.to_string(), (*v).clone())).collect::<Vec<_>>());
+        render_fields(&raw, prev_owned.as_deref(), diff, false)
+    }
+
+    /// The fields of the ALIAS state of `s` (`next`: the state after it,
+    /// whose values fill primed variables; the state itself when there is
+    /// none): None without ALIAS or if it cannot be evaluated (then the
+    /// state is shown as usual).
+    fn alias_fields(&self, s: &[Value], next: Option<&[Value]>, level: u32) -> Option<Vec<(String, Value)>> {
         let alias = self.alias.as_ref()?;
         // In the last state, primed variables are read from the state itself.
         let t: Vec<Option<Value>> = next.unwrap_or(s).iter().cloned().map(Some).collect();
         let cx = Ctx::action(s, &t, level);
         let env = Env::default();
-        let fields: Vec<(String, Value)> = match self.alias_record(alias) {
-            Some(fs) => fs.iter().map(|(n, e)| Some((n.to_string(), self.ip.eval(e, &env, &cx).ok()?))).collect::<Option<_>>()?,
+        match self.alias_record(alias) {
+            Some(fs) => fs.iter().map(|(n, e)| Some((n.to_string(), self.ip.eval(e, &env, &cx).ok()?))).collect::<Option<_>>(),
             None => match self.ip.eval(alias, &env, &cx).ok().map(|v| v.fcn_canonical().unwrap_or(v))? {
-                Value::Record(r) => r.iter().map(|(n, v)| (n.as_str().to_string(), v.clone())).collect(),
-                _ => return None,
+                Value::Record(r) => Some(r.iter().map(|(n, v)| (n.as_str().to_string(), v.clone())).collect()),
+                _ => None,
             },
-        };
-        // (Unlike `render`, a single field also gets the bullet.)
-        Some(fmt_state(fields.iter().map(|(n, v)| (n, v)), true))
+        }
+    }
+
+    /// The value of the `-view` VIEW on `s` (`level`), if it is configured
+    /// and evaluates.
+    fn eval_view(&self, view: &Expr, s: &[Value], level: u32) -> Option<Value> {
+        self.ip.eval(view, &Env::default(), &Ctx::state(s, level)).ok()
+    }
+
+    /// `s` shown through `-view`'s VIEW: a tuple VIEW whose components are
+    /// the state variables is shown as `/\ variable = value` lines in
+    /// declaration order (TLC's `OpApplNode.toString(IValue)`); any other
+    /// value as itself. None without a VIEW or if it cannot be evaluated
+    /// (then the state is shown as usual).
+    fn render_view(&self, s: &[Value], level: u32, prev: Option<(&[Value], u32)>, diff: bool) -> Option<String> {
+        // (`-optimize` installs a synthetic state projection in `view`; it
+        // is not a user VIEW and must not be shown: concrete states stay
+        // concrete in counterexamples, docs/configuration.md.)
+        if self.state_projection {
+            return None;
+        }
+        let view = self.view.as_ref()?;
+        let v = self.eval_view(view, s, level)?;
+        if let Some(fields) = self.view_fields(view, &v) {
+            let mut text = None;
+            if diff {
+                if let Some((pv, pl)) = prev {
+                    if let Some(pval) = tlx_runtime::live::with_predecessor_path(|| self.eval_view(view, pv, pl)) {
+                        if let Some(prev_fields) = self.view_fields(view, &pval) {
+                            text = Some(render_fields(&fields, Some(&prev_fields), true, true));
+                        }
+                    }
+                }
+            }
+            return Some(text.unwrap_or_else(|| render_fields(&fields, None, false, true)));
+        }
+        // (TLC prints a non-tuple VIEW value as the value itself; with
+        // `-difftrace` it is shown when it changed.)
+        if diff {
+            if let Some((pv, pl)) = prev {
+                if tlx_runtime::live::with_predecessor_path(|| self.eval_view(view, pv, pl))
+                    .is_some_and(|pval| tlx_value::order::certainly_equal(&pval, &v))
+                {
+                    return Some(String::new());
+                }
+            }
+        }
+        Some(v.to_string())
+    }
+
+    /// The fields a tuple `-view` VIEW displays for value `v`: the state
+    /// variables its definition references, in declaration order, paired
+    /// with the tuple's components. None when the VIEW is not a tuple or
+    /// application, when `v` is not a tuple, or when the counts differ.
+    fn view_fields(&self, view: &Expr, v: &Value) -> Option<Vec<(String, Value)>> {
+        let vars = self.view_field_vars(view)?;
+        let Value::Tuple(elems) = v else { return None };
+        (elems.len() == vars.len())
+            .then(|| vars.iter().zip(elems.iter()).map(|(&i, v)| (self.ip.prog.vars[i].name.to_string(), v.clone())).collect())
+    }
+
+    /// The state variables of the body of the `-view` VIEW (through
+    /// zero-arity definitions, which TLC's free-parameter collection also
+    /// follows), in declaration order. None when the body is not a tuple or
+    /// an application (then there is no field layout to print).
+    fn view_field_vars(&self, view: &Expr) -> Option<Vec<usize>> {
+        let body = self.view_body(view)?;
+        if !matches!(&*body.kind, ExprKind::Tuple(_) | ExprKind::Apply { .. }) {
+            return None;
+        }
+        let mut vars = std::collections::BTreeSet::new();
+        self.view_vars(body, &mut vars, &mut std::collections::HashSet::new());
+        (!vars.is_empty()).then(|| vars.into_iter().collect())
+    }
+
+    /// The body of the `-view` VIEW (the reference the configuration
+    /// resolved to the definition).
+    fn view_body(&self, view: &Expr) -> Option<&Expr> {
+        let ExprKind::Apply { op: OpRef::Def(d), args } = &*view.kind else { return None };
+        if !args.is_empty() {
+            return None;
+        }
+        match &self.ip.prog.defs[self.ip.redirect_def(*d).idx()].kind {
+            DefKind::Op(body) => Some(body),
+            _ => None,
+        }
+    }
+
+    /// The state variables `e` references: its variable references and
+    /// those of the zero-arity definitions it applies (TLC's `allParams`;
+    /// the arguments of an application are its free variables, its
+    /// definition's parameters are not).
+    fn view_vars(&self, e: &Expr, vars: &mut std::collections::BTreeSet<usize>, seen: &mut std::collections::HashSet<usize>) {
+        match &*e.kind {
+            ExprKind::Var(v) => {
+                vars.insert(v.idx());
+            }
+            // (A variable of an instantiated module: its unprimed reference
+            // reads its substitution.)
+            ExprKind::InstVar { subst, .. } => self.view_vars(subst, vars, seen),
+            ExprKind::Apply { op: OpRef::Def(d), args } => {
+                // (TLC's `allParams` adds the applied definition's free
+                // parameters whatever its arity: the arguments are the
+                // caller's free variables, and the definition's own free
+                // variables stay free after substitution; its formal
+                // parameters are `Local`s and are not state variables.)
+                for a in args {
+                    self.view_vars(a, vars, seen);
+                }
+                self.view_def_vars(*d, vars, seen);
+            }
+            ExprKind::OpArg(OpRef::Def(d)) => self.view_def_vars(*d, vars, seen),
+            _ => tlx_sema::visit::children(e, &mut |c| self.view_vars(c, vars, seen)),
+        }
+    }
+
+    /// The state variables of definition `d`: its body (following the
+    /// bounds and body of a function definition). `seen` breaks recursion.
+    fn view_def_vars(&self, d: DefId, vars: &mut std::collections::BTreeSet<usize>, seen: &mut std::collections::HashSet<usize>) {
+        let d = self.ip.redirect_def(d);
+        if !seen.insert(d.idx()) {
+            return;
+        }
+        match &self.ip.prog.defs[d.idx()].kind {
+            DefKind::Op(body) => self.view_vars(body, vars, seen),
+            DefKind::Fn { bounds, body } => {
+                for b in bounds {
+                    self.view_vars(&b.set, vars, seen);
+                }
+                self.view_vars(body, vars, seen);
+            }
+            DefKind::Pending => {}
+        }
     }
 
     /// The fields of an ALIAS defined as a record constructor.

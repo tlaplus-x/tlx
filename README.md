@@ -309,7 +309,7 @@ of TLC's Java operators, are listed in [docs/features.md](docs/features.md).
 
 Known limitations ([docs/compat.md](docs/compat.md) section 5): real numbers and temporal
 quantifiers (`\EE`, `\AA`) are not supported (as in TLC); PlusCal is not translated (check the
-generated TLA+); some TLC options (`-continue`, `-difftrace`, `-fp`, ...) are not implemented;
+generated TLA+); some TLC options (`-continue`, `-fp`, ...) are not implemented;
 liveness checking needs memory for the behavior graph; `-coverage` reports per action only.
 
 ## Performance

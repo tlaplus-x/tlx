@@ -44,7 +44,7 @@ temporal operators) is not listed here: see [design.md](design.md) and the diffe
 
 ## 1. TLC command-line options
 
-tlx usage: `tlx check Spec.tla [-config X.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem X] [-spill auto|off|always] [-metadir DIR] [-maxdisk X] [-checkpoint MIN] [-recover DIR] [-fpmem X] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-coverage N] [-stats [json[=FILE]]]` (`-h`/`-help`/`--help` print the full help). An unrecognized option prints the usage and exits with 2.
+tlx usage: `tlx check Spec.tla [-config X.cfg] [-workers N|auto] [-deadlock] [-I dir]... [-progress] [-tool] [-nowarning] [-compile|-interp] [-tlc] [-optimize] [-proofdir DIR] [-noautosymmetry] [-checksymmetry [-suggest]] [-symmetrystates N] [-symmetrydepth D] [-symmetryperms N] [-symmetryedges N] [-maxmem X] [-spill auto|off|always] [-metadir DIR] [-maxdisk X] [-checkpoint MIN] [-recover DIR] [-fpmem X] [-fpbits N] [-simulate|-generate [num=N]] [-depth N] [-seed N] [-dump [dot[,actionlabels][,colorize]] file] [-dumpTrace json|tla file]... [-view] [-difftrace] [-coverage N] [-stats [json[=FILE]]]` (`-h`/`-help`/`--help` print the full help). An unrecognized option prints the usage and exits with 2.
 
 Each row is the support matrix: what TLC's option means, and whether (and how far) tlx accepts it. An
 option's spelling, default and effect are specified once in [configuration.md](configuration.md); the
@@ -83,9 +83,9 @@ behavior behind them is in [usage.md](usage.md), [scale.md](scale.md) and [desig
 | `-inv expr` | add an invariant expression on the command line | unsupported | |
 | `-invlevel n` | same as invariant `TLCGet("level") < n` | unsupported | |
 | `-postCondition mod!oper` | POSTCONDITION on the command line | unsupported | |
-| `-difftrace` | print only the changed variables in traces | unsupported | |
+| `-difftrace` | print only the changed variables in traces | supported | State 1 prints in full (compat.md D-36); with `-view` the diffed fields are the VIEW's; in `-dump dot` the label is the diff and the `tooltip` the full state |
 | `-terse` | `Print` does not expand values | unsupported | |
-| `-view` | apply VIEW when printing states | unsupported | |
+| `-view` | apply VIEW when printing states | supported | counterexamples and `-dump`, unless an `ALIAS` is configured |
 | `-userFile file` | write user output (`Print`) to a file | unsupported | |
 | `-lncheck default\|final\|seqfinal` (hidden) | when liveness is checked | unsupported | tlx checks only after the search ends (about `final`) |
 | `-dfid num` | iterative-deepening depth-first search | unsupported | |

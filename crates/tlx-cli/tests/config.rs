@@ -222,6 +222,7 @@ const ACCEPTED_CHECK_OPTIONS: &[&str] = &[
     "-coverage",
     "-deadlock",
     "-depth",
+    "-difftrace",
     "-dump",
     "-dumpTrace",
     "-dumptrace",
@@ -253,6 +254,7 @@ const ACCEPTED_CHECK_OPTIONS: &[&str] = &[
     "-symmetrystates",
     "-tlc",
     "-tool",
+    "-view",
     "-workers",
 ];
 

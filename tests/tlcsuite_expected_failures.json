@@ -73,11 +73,6 @@
    "id": "UserModuleOverrideTest",
    "result": "liveness failure",
    "reason": "a Java class next to the spec (UserModuleOverride.class) overrides Get: tlx cannot run Java code, so it evaluates the TLA+ definition"
-  },
-  {
-   "id": "ViewMapTest",
-   "result": "unknown",
-   "reason": "TLC command-line option -view (outside the contract)"
   }
  ]
 }

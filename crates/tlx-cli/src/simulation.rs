@@ -57,6 +57,7 @@ pub(crate) fn run(a: &Args, model: InterpModel, traces: u64, seed: u64, check_de
             opts: None,
             coverage: None,
             checkpoint: None,
+            render: a.render_opts(),
         };
         return finish(&m, r, &run);
     }
@@ -70,6 +71,7 @@ pub(crate) fn run(a: &Args, model: InterpModel, traces: u64, seed: u64, check_de
         opts: None,
         coverage: None,
         checkpoint: None,
+        render: a.render_opts(),
     };
     finish(&model, r, &run)
 }
@@ -125,7 +127,7 @@ fn run_simulation<T: Tier>(a: &Args, m: &T, opts: &tlx_runtime::SimOptions, init
     // Temporal properties are checked on every behavior.
     let check = |trace: &[tlx_runtime::TraceStep<T::State>], succs: &[Vec<(T::State, u32)>]| {
         let steps: Vec<_> = trace.iter().map(|t| (t.state.clone(), t.action)).collect();
-        let view = live::TraceView::new(m, base.init_label());
+        let view = live::TraceView::new(m, base.init_label(), a.render_opts());
         // TLC's algorithm (LiveCheck1), also without VIEW or SYMMETRY: its
         // verdicts differ from those on the behavior's graph (e.g. it
         // evaluates the state predicates of a node on the previous state).
